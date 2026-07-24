@@ -13,7 +13,7 @@ open questions.
 
 | # | Suggestion | Status |
 | --- | --- | --- |
-| S1 | Dense action indexing | Deferred — explained below, awaiting decision |
+| S1 | Dense action indexing | **Partly retracted** — the diagnosis holds, the bounded-region fix does not |
 | S2 | Symmetry operations in the engine | Deferred — probably not yet |
 | S3 | The evaluator seam | Deferred — explained below |
 | S4 | Differential test against the old engine | Later |
@@ -100,28 +100,56 @@ occupied cell a placement may be. `R` is a *representation bound* — how far fr
 the origin the model can address. They are unrelated numbers that both happen to
 be radii.
 
-### The trade-off, stated honestly
+### The bounded-region fix has already been tried, and it broke training
 
-This bounds what the model can address, while the game itself stays unbounded.
-The rules do not change (per your instruction); the engine still plays on an
-infinite board. But a position whose stones escape radius `R` cannot be encoded.
+**This retracts the recommendation as originally written.** A fixed radius `R`
+is not a safe answer here, and the evidence is in your own history.
 
-Three ways to handle that:
+`dense_cnn` / `restnet` used exactly this: a fixed 41×41 crop, which is a
+radius-20 hex disk (`dense_cnn_restnet/constants.py:9-10`,
+`hexo_models/dense_cnn/rust/src/constants.rs:14-15`). The architecture doc
+records the outcome:
 
-- **(a)** Make out-of-region placements illegal. Rejected — that changes the rules.
-- **(b)** Engine stays infinite; the action encoding covers radius `R`; escaping
-  `R` is an operational error the runner reports. Pick `R` with margin and
-  instrument the maximum radius ever reached so the margin is measured, not
-  assumed.
-- **(c)** Recentre the index dynamically. Rejected — it reintroduces exactly the
-  instability described above.
+> "intentionally excludes out-of-crop legal moves from policy/MCTS; this froze
+> out-of-rim wins and was the root cause of the main_3 collapse"
+> — `docs/ARCHITECTURE.md:280-283`
 
-**(b) is the recommendation.** The honest caveat: I do not know how far real
-games actually spread. With a frontier rule of 8, the worst case grows fast, but
-the worst case is not the typical case, and the typical case is what sets `R`.
-That number should come from measurement before `R` is fixed — it is a cheap
-statistic to collect from the old repo's existing game records, and worth
-collecting before this is decided.
+Later models abandoned fixed bounds deliberately, and the model spec is explicit
+about why: *"No cap exists anywhere (a cap would be a crop)"*
+(`docs/specs/hexfield_model_spec.md:74-75`). Support-set sizes there run
+600–1500 mid-game and around 3k in long spread games.
+
+So the three options as originally framed collapse: **(a)** changes the rules,
+**(c)** reintroduces index instability, and **(b)** — bound the region and treat
+escape as an error — is the one that has already been run in production and
+caused a training collapse. Picking a larger `R` narrows the failure without
+removing it; the crop is still there, just further out.
+
+### What survives, and what to do instead
+
+The *diagnosis* stands: an implicit, dynamically-rebuilt mapping that lives
+outside the engine can drift between self-play, training, and serving, and it
+fails silently. That is a real defect worth fixing.
+
+But the defect is **implicitness, not dynamism.** Those were conflated in the
+original proposal. The fix does not require a bounded region:
+
+- Make the engine own *one* canonical, documented ordering of legal actions, as
+  a single function everything calls — self-play, training, and serving all read
+  the same source, so drift becomes impossible.
+- Version that ordering and pin it with a golden test, so a change is loud.
+- Leave the region unbounded, and let the policy head be sized by the legal-move
+  set rather than a fixed crop — which is the direction the later models
+  independently arrived at.
+
+The two-encodings insight also survives unchanged and is worth keeping: action
+*identity* (unbounded, for records and validation) and action *index* (for model
+I/O) are different jobs, and the old `pack_coord` was doing both.
+
+For reference, the closest things to measured extent in the old repo are the
+normalizers `min(placements_made, 96) / 96` and `min(spread, 16) / 16`
+(`SPEC_RAYTAP_CONV.md:133-141`) — an author's estimate of typical game length
+and stone-cloud spread, not a bound.
 
 ---
 
