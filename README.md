@@ -3,8 +3,10 @@
 A ground-up rebuild of the Hexo engine and bot-training framework, succeeding
 `Hexo-BotTrainer-hexgt`. The game rules are unchanged; the architecture is not.
 
-> **Status: scaffold.** Both crates are empty. Only the engine and the match
-> runner are in scope right now — no models, no search, no training, no Python.
+> **Status: `hexo-engine` implemented, `hexo-runner` still a scaffold.** The
+> engine ships the full rule machine, make/unmake search, and its test suite;
+> the runner crate is empty. Only the engine and the match runner are in scope
+> right now — no models, no search, no training, no Python.
 
 ## Layout
 
@@ -15,6 +17,8 @@ Hexo-Shrimp-Bot/
     hexo-engine/          authoritative rules and game state
     hexo-runner/          match orchestration and player communication
   docs/
+    ENGINE_SPEC.md        normative implementation target for hexo-engine
+    OPEN_DECISIONS.md     questions that block the engine and the runner
     SUGGESTIONS.md        open design proposals, not yet decided
   .github/workflows/
     ci.yml                fmt, clippy, test on every push
@@ -92,10 +96,15 @@ Requires Rust 1.85+ (edition 2024). Currently on 1.95.
 
 ```sh
 cargo build
-cargo test
+cargo test --workspace
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
+cargo clippy --release --all-targets -- -D warnings
 ```
+
+The release lint is a separate gate: `debug_assertions` is off in release, so
+helpers whose only callers are `#[cfg(debug_assertions)]` become dead code that
+the debug lint cannot see.
 
 Building the same tree from both Windows and WSL collides on `target/`. Set
 `CARGO_TARGET_DIR=target-wsl` on the WSL side; both are gitignored.
@@ -104,5 +113,6 @@ Building the same tree from both Windows and WSL collides on `target/`. Set
 
 | Doc | What it is |
 | --- | --- |
+| [docs/ENGINE_SPEC.md](docs/ENGINE_SPEC.md) | **Normative.** The single implementation target for `crates/hexo-engine`: rules, state, storage, growth policy, error precedence, invariants, and test obligations. |
 | [docs/OPEN_DECISIONS.md](docs/OPEN_DECISIONS.md) | Questions that *must* be answered to build the engine and runner, grouped by what they block. |
 | [docs/SUGGESTIONS.md](docs/SUGGESTIONS.md) | *Optional* design proposals with status, rationale, and trade-offs. Accepted items graduate to this README. |

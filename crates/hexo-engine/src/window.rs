@@ -1,0 +1,209 @@
+//! Six-cell window geometry and the exposed win-detection surface.
+//!
+//! A *window* is six consecutive cells along one of the three axes. A player
+//! wins when any window is completely filled by that player's stones; six **or
+//! more** in a row wins, because a run of seven contains a fully-owned
+//! six-window. There is no overline rule.
+//!
+//! Nothing here is stored by the engine. [`WindowMask`] values are derived on
+//! read from the occupancy planes (spec §6.2), so there is no stored mask table
+//! to grow, to undo, or to disagree with the board.
+//!
+//! Ruling 3: this module exposes *masks*, not predicates. `is_threat_for`,
+//! `threat_player`, and `is_active` are deliberately absent — a mask is
+//! strictly more information, and each of those predicates is a one-liner over
+//! [`WindowMask::mask`] and [`Window::cells`].
+
+use crate::coord::{Axis, HexCoord, WINDOW_LEN};
+use crate::player::Player;
+
+/// Windows touched by one placement: 3 axes × 6 offsets.
+pub const WINDOWS_PER_PLACEMENT: usize = 18;
+
+/// Every bit position inside a window.
+const FULL: u8 = 0x3F;
+
+/// Ownership of one six-cell window, as two six-bit masks.
+///
+/// Bit `i` refers to the window's cell `i`, which is a statement about the
+/// infinite board (`start + axis.vector() * i`) and never about storage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct WindowMask([u8; 2]);
+
+impl WindowMask {
+    /// The empty window.
+    pub const EMPTY: Self = Self([0, 0]);
+
+    /// Build a mask from the two per-player lanes. Internal: the player-to-lane
+    /// mapping is a private convention.
+    #[inline]
+    pub(crate) const fn from_lanes(p0: u8, p1: u8) -> Self {
+        Self([p0 & FULL, p1 & FULL])
+    }
+
+    /// Bit `i` set iff cell `i` of the window holds a stone of `player`. Low six bits.
+    #[inline]
+    #[must_use]
+    pub const fn mask(self, player: Player) -> u8 {
+        self.0[player.index()]
+    }
+
+    /// Stones `player` holds in this window, `0..=6`.
+    #[inline]
+    #[must_use]
+    pub const fn count(self, player: Player) -> u32 {
+        self.0[player.index()].count_ones()
+    }
+
+    /// Either player's stones. `mask(P0) | mask(P1)`.
+    #[inline]
+    #[must_use]
+    pub const fn occupied(self) -> u8 {
+        self.0[0] | self.0[1]
+    }
+
+    /// Complement of [`WindowMask::occupied`] within the low six bits.
+    #[inline]
+    #[must_use]
+    pub const fn empty(self) -> u8 {
+        !self.occupied() & FULL
+    }
+
+    /// Whether `player` owns all six cells — the win condition for this window.
+    #[inline]
+    #[must_use]
+    pub const fn is_full_for(self, player: Player) -> bool {
+        self.0[player.index()] == FULL
+    }
+}
+
+/// Identity of one six-cell window: its first cell and the axis it runs along.
+///
+/// Pure geometry. Constructible and interpretable with no
+/// [`crate::Position`] in hand, and valid forever regardless of how the engine
+/// stores the board.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Window {
+    /// Cell `0` of the window.
+    pub start: HexCoord,
+    /// The direction cells `1..6` run in.
+    pub axis: Axis,
+}
+
+impl Window {
+    /// Coordinate of cell `index`.
+    ///
+    /// # Panics
+    /// Panics if `index >= WINDOW_LEN`. Debug builds also assert
+    /// `self.start.is_valid()`.
+    #[inline]
+    #[must_use]
+    pub const fn cell(self, index: usize) -> HexCoord {
+        assert!(index < WINDOW_LEN, "window cell index out of range");
+        self.start.step(self.axis, index as i16)
+    }
+
+    /// All six coordinates, in bit order.
+    ///
+    /// # Panics
+    /// Debug builds assert `self.start.is_valid()`.
+    #[inline]
+    #[must_use]
+    pub const fn cells(self) -> [HexCoord; WINDOW_LEN] {
+        let mut out = [self.start; WINDOW_LEN];
+        let mut i = 0;
+        while i < WINDOW_LEN {
+            out[i] = self.start.step(self.axis, i as i16);
+            i += 1;
+        }
+        out
+    }
+}
+
+/// A window paired with its current ownership.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct WindowRef {
+    /// Which window.
+    pub window: Window,
+    /// Who owns which of its cells.
+    pub mask: WindowMask,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_mask_algebra() {
+        let m = WindowMask::EMPTY;
+        assert_eq!(m.mask(Player::P0), 0);
+        assert_eq!(m.mask(Player::P1), 0);
+        assert_eq!(m.occupied(), 0);
+        assert_eq!(m.empty(), FULL);
+        assert_eq!(m.count(Player::P0), 0);
+        assert!(!m.is_full_for(Player::P0));
+        assert_eq!(WindowMask::default(), WindowMask::EMPTY);
+    }
+
+    #[test]
+    fn mask_accessor_algebra_over_every_disjoint_pair() {
+        for a in 0u8..64 {
+            for b in 0u8..64 {
+                if a & b != 0 {
+                    continue;
+                }
+                let m = WindowMask::from_lanes(a, b);
+                assert_eq!(m.mask(Player::P0), a);
+                assert_eq!(m.mask(Player::P1), b);
+                assert_eq!(m.occupied(), a | b);
+                assert_eq!(m.empty(), !(a | b) & FULL);
+                assert_eq!(m.count(Player::P0), a.count_ones());
+                assert_eq!(m.count(Player::P1), b.count_ones());
+                assert_eq!(m.is_full_for(Player::P0), a == FULL);
+                assert_eq!(m.is_full_for(Player::P1), b == FULL);
+            }
+        }
+    }
+
+    #[test]
+    fn from_lanes_clamps_to_six_bits() {
+        let m = WindowMask::from_lanes(0xFF, 0xC0);
+        assert_eq!(m.mask(Player::P0), FULL);
+        assert_eq!(m.mask(Player::P1), 0);
+    }
+
+    #[test]
+    fn window_cells_walk_the_axis() {
+        for axis in Axis::ALL {
+            let w = Window {
+                start: HexCoord::new(-4, 6),
+                axis,
+            };
+            let cells = w.cells();
+            assert_eq!(cells[0], w.start);
+            for (i, &cell) in cells.iter().enumerate() {
+                assert_eq!(cell, w.cell(i));
+                assert_eq!(
+                    crate::coord::hex_distance(w.start, cell),
+                    i as u32,
+                    "axis {axis:?} index {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "window cell index out of range")]
+    fn window_cell_panics_past_the_end() {
+        let w = Window {
+            start: HexCoord::ORIGIN,
+            axis: Axis::Q,
+        };
+        let _ = w.cell(WINDOW_LEN);
+    }
+
+    #[test]
+    fn windows_per_placement_is_three_axes_by_six_offsets() {
+        assert_eq!(WINDOWS_PER_PLACEMENT, Axis::ALL.len() * WINDOW_LEN);
+    }
+}

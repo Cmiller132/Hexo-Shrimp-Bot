@@ -26,5 +26,11 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
 
+      # The release profile turns `debug_assertions` off, which deletes the only
+      # callers of several `pub(crate)` helpers. Without this step the crate can
+      # stop compiling warning-free in release while the debug lint stays green.
+      - name: Lint (release profile)
+        run: cargo clippy --release --all-targets -- -D warnings
+
       - name: Test
         run: cargo test --workspace

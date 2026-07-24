@@ -110,6 +110,16 @@ Initial extent, growth trigger, growth factor for the recentred dense grid.
 coordinate-addressed only, so growth is invisible to callers and a player's
 mirror cannot desync from it.
 
+**Implementation note.** Privacy alone does not deliver that.
+`MoveError::BoardExtentExceeded` is public and carries an arena size, so if the
+growth policy reads the *current arena* then the extent ceiling becomes a
+function of search history and a searched mirror starts refusing moves the
+runner's canonical position accepted. The shipped policy therefore sizes and
+refuses from the **live stone bounding box** (ENGINE_SPEC §5.5), which makes
+accept/refuse a function of the position alone. It also grows one dimension at a
+time, so the arena is shaped to the game rather than locked to a fixed aspect
+ratio.
+
 ### A5. Zobrist scope
 
 What is hashed: cells and owners, plus side-to-move and turn phase.
