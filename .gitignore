@@ -1,0 +1,41 @@
+# --- Rust build output -------------------------------------------------------
+target/
+# Building the same tree from both Windows and WSL collides on `target/`:
+# the two toolchains fight over fingerprints and force full rebuilds. Point
+# WSL at CARGO_TARGET_DIR=target-wsl instead.
+target-wsl/
+
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.so
+*.pyd
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Local runtime artifacts -------------------------------------------------
+*.log
+*.out
+*.err
+*.tmp
+*.bak
+_tmp_*
+
+# --- Regenerable outputs, never source ---------------------------------------
+# Run dirs, game records, and model artifacts. Keep these out of the tree
+# entirely; point tooling at an external directory rather than versioning them.
+runs/
+scratch/
+*.hxr
+*.pt
+*.pth
+*.onnx
+*.incomplete
+
+# --- Editors / OS ------------------------------------------------------------
+.DS_Store
+Thumbs.db
+*.swp

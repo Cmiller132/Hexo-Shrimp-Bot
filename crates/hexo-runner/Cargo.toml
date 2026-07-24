@@ -1,0 +1,16 @@
+[package]
+name = "hexo-runner"
+description = "Hexo match orchestration: authoritative game loop and player communication."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "hexo_runner"
+path = "src/lib.rs"
+
+[dependencies]
+hexo-engine.workspace = true
+
+[lints]
+workspace = true

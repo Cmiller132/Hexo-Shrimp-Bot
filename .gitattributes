@@ -1,0 +1,16 @@
+# Normalize all text to LF. The repo is edited on Windows and built from both
+# Windows and WSL; without this, every cross-environment touch rewrites whole
+# files as CRLF<->LF churn and buries real diffs.
+* text=auto eol=lf
+
+# Be explicit about binary types so they are never line-ending-mangled.
+*.png  binary
+*.jpg  binary
+*.gz   binary
+*.zst  binary
+*.bin  binary
+*.hxr  binary
+*.pt   binary
+*.onnx binary
+*.so   binary
+*.pyd  binary

@@ -1,0 +1,15 @@
+[package]
+name = "hexo-engine"
+description = "Authoritative Hexo rules and game state."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "hexo_engine"
+path = "src/lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

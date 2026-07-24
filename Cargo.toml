@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/hexo-engine",
+    "crates/hexo-runner",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+
+[workspace.dependencies]
+hexo-engine = { path = "crates/hexo-engine" }
+thiserror = "2"
+
+# Lint policy is defined once here; every crate opts in with `[lints] workspace = true`.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+# `perf` is the one that earns its keep in a search-heavy engine: needless
+# clones, redundant allocations, and iterator misuse on hot paths.
+perf = { level = "warn", priority = -1 }
+correctness = { level = "deny", priority = -1 }
