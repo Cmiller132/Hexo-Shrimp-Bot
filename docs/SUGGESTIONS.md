@@ -1,8 +1,11 @@
 # Suggestions
 
-Design proposals that are **not** decided. Each carries a status and, where it
-matters, an explicit statement of what would change relative to the previous
-implementation in `Hexo-BotTrainer-hexgt`.
+*Optional* design proposals — things worth doing that nothing forces. Each
+carries a status and, where it matters, an explicit statement of what would
+change relative to the previous implementation in `Hexo-BotTrainer-hexgt`.
+
+Questions that **must** be answered to build at all live in
+[OPEN_DECISIONS.md](OPEN_DECISIONS.md).
 
 Decided items live in the root `README.md`. When a suggestion here is accepted,
 move it there and delete it from this file — this doc should only ever contain

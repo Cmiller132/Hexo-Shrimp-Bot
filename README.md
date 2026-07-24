@@ -104,4 +104,5 @@ Building the same tree from both Windows and WSL collides on `target/`. Set
 
 | Doc | What it is |
 | --- | --- |
-| [docs/SUGGESTIONS.md](docs/SUGGESTIONS.md) | Open design proposals with status, rationale, and trade-offs. Accepted items graduate to this README. |
+| [docs/OPEN_DECISIONS.md](docs/OPEN_DECISIONS.md) | Questions that *must* be answered to build the engine and runner, grouped by what they block. |
+| [docs/SUGGESTIONS.md](docs/SUGGESTIONS.md) | *Optional* design proposals with status, rationale, and trade-offs. Accepted items graduate to this README. |
