@@ -16,6 +16,8 @@ Hexo-Shrimp-Bot/
     hexo-runner/          match orchestration and player communication
   docs/
     SUGGESTIONS.md        open design proposals, not yet decided
+  .github/workflows/
+    ci.yml                fmt, clippy, test on every push
 ```
 
 Each crate carries its own `README.md` with a module table and design notes.
@@ -54,9 +56,31 @@ hashing on every neighbour query, bitboard shifts for window updates, and
 `clone` as a flat memcpy — which matters because copying positions is on the
 critical path of the design above.
 
+**One placement is the atom, not one turn.** A turn is two placements, but a win
+is checked after each, so a turn can end after the first. Making the placement
+the unit keeps that out of the record format, the wire protocol, and every
+future policy head.
+
+**Players are handed a position once, then fed a move stream.** No fresh copy
+per turn: the player keeps its own mirror and applies the moves the runner
+sends. This costs O(1) per ply instead of O(board), it is the only handoff shape
+a container can use, and the move stream *is* the game record, so recording
+falls out for free.
+
+**The position carries an incremental Zobrist hash.** Maintained through the
+same delta stack as `apply` / `undo`. Near-free at runtime, and it is what lets
+the runner catch desync with a remote player by exchanging one number per ply.
+
 **Models are independent and own their own encoding.** A model may be written in
 Rust and depends only on the engine's read surface. Neither the engine nor the
 runner ever learns what a model is.
+
+**The runner is a library, not a service.** A containerised bot carries the
+engine *and* the runner inside it, so it can drive its own self-play games
+without an outside orchestrator, while the same library also backs a host
+orchestrator running matches between containers. One authority implementation,
+two deployment shapes. Exactly one authority exists per game — a container
+answering someone else's protocol runs as a player and does not adjudicate.
 
 **One build backend, one workspace.** Cargo workspace for Rust; when Python
 arrives, a `uv` workspace and maturin — not the three backends and manual

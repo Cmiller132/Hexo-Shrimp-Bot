@@ -33,6 +33,7 @@ board representation and action identity changed (see `docs/SUGGESTIONS.md`).
 | `rules.rs` | Placement validity predicate — the smallest statement of legality. |
 | `state.rs` | Position, turn phase (`Opening` / `FirstStone` / `SecondStone`), and `apply` / `undo` over an explicit delta stack. |
 | `action.rs` | Action identity. Two encodings with separate jobs: unbounded coordinate IDs for records, dense indices for model I/O. |
+| `zobrist.rs` | Incremental 64-bit position hash, maintained through the same delta stack as `apply` / `undo`. |
 | `error.rs` | Error types for illegal placement and malformed state. |
 
 ## Design notes

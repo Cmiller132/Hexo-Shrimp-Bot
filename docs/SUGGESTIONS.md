@@ -15,9 +15,8 @@ open questions.
 | S3 | The evaluator seam | Deferred — explained below |
 | S4 | Differential test against the old engine | Later |
 | S5 | Read-surface contract for model encoders | Open — needed once models start |
-| S6 | Containerised model players | Open — needs planning |
-| S7 | Tooling: CI, linting, formatting, type checking | Proposal below |
-| S8 | Zobrist position hashing | Open — cheap now, awkward later |
+| S6 | Containerised bots | Open — scope set, protocol undecided |
+| S7 | Python-side tooling (ruff, type checking) | Deferred — no Python yet |
 
 ---
 
@@ -244,104 +243,56 @@ the state representation clonable and readable without going through the runner.
 
 ---
 
-## S6. Containerised model players
+## S6. Containerised bots
 
-**Status: open, needs planning. Recording the constraint it puts on the runner.**
+**Status: scope decided, protocol open.**
 
-The requirement — models developed independently, on a shared framework, each
-containerised — mostly lands on the player interface, and it argues for one
-specific decision early:
+A container is a *complete bot*, not a move oracle. It carries `hexo-engine` and
+`hexo-runner` inside it and must cover four jobs:
 
-**The runner should speak "initial position plus move stream", not "full state
-per turn."** A container cannot be handed a Rust struct. If the protocol is a
-move stream, then the same interface serves an in-process player, a subprocess,
-and a container, with no second implementation. It also costs O(1) per ply
-rather than O(board), and the move stream *is* the game record, so recording
-comes free.
+| Job | Who is the authority | What the container does |
+| --- | --- | --- |
+| Self-play | itself | drives whole games internally, emits records |
+| Training | n/a | consumes records, emits checkpoints |
+| Eval | a host orchestrator | plays as one seat |
+| External tournament | the tournament harness | plays as one seat, in *their* protocol |
 
-Consequences worth planning through when this is picked up: how a container gets
-the rules (depend on `hexo-engine` and keep its own mirrored state — with a
-position hash exchanged per ply to catch desync, which is the strongest argument
-for S8); versioning between runner and player; and how model-side resource
-limits interact with the adjudication policy.
+Three consequences fall out of that table.
 
----
+**Exactly one authority per game.** Two containers each running a full runner
+means two authorities, which is a desync waiting to happen. The container needs
+an explicit mode — drive the game, or answer as a seat — and it must never
+adjudicate when it is not the authority.
 
-## S7. Tooling: CI, linting, formatting, type checking
+**Modes imply a binary.** The workspace is libraries only today. A container
+needs an entry point with subcommands along the lines of `selfplay`, `serve`,
+`train`. Worth deciding when that crate appears, and what it is called.
 
-**Status: proposal, answering "what is the benefit?"**
+**External protocols get adapters, not accommodation.** Tournament harnesses
+have their own wire formats. Design the native protocol for this system's needs
+and translate at the edge; letting a foreign protocol's assumptions into the
+runner is how the runner ends up serving two masters.
 
-Taking these one at a time, because they are not equally worth it and the
-generic answer ("code quality") is not a real answer for a solo project.
-
-**Formatter — `cargo fmt`, and `ruff format` later.** Worth it, cost ≈ zero.
-The benefit is not pretty code, it is that diffs contain only semantic changes.
-When you come back to a rewrite after two weeks, `git log -p` is the fastest way
-to remember what you did — and it is useless if half of every diff is whitespace.
-Rust already has one canonical style, so there is nothing to argue about.
-**Recommend: on, from the first commit.**
-
-**Linter — `clippy`.** The highest-value item on this list, and not for style
-reasons. Clippy catches real defects in exactly the code this repo is about:
-needless clones in hot loops, redundant allocation, iterator misuse,
-`unwrap` on paths that can fail, integer-overflow patterns. For a
-performance-sensitive engine where the whole point is avoiding copies, it is a
-second pair of eyes on the thing you care most about. The workspace
-`Cargo.toml` already sets `correctness = deny` and `perf = warn`.
-**Recommend: on, from the first commit.**
-
-**Type checking — mypy or pyright.** Value scales with how much Python exists,
-and right now the answer is none. When the Python boundary lands it will be a
-thin bridge plus glue, where pyright in `basic` mode is enough. Strict typing
-over a few hundred lines of facade is not worth the friction.
-**Recommend: skip for now. Revisit when Python is more than glue.**
-
-**Python linting — `ruff`.** Same reasoning. Cheap to add with the Python
-package; nothing to lint until then.
-**Recommend: add with the first Python code, not before.**
-
-**CI.** The one that sounds like team ceremony but is not. For a solo project on
-this machine, the concrete benefits are:
-
-- *It builds on a clean checkout.* The old repo cannot honestly claim this —
-  packages are not installed, ~120 test files each do their own
-  `sys.path.insert`, and a shell script hand-assembles `PYTHONPATH` from every
-  `packages/*/python` directory. That is a build that works because of the
-  machine it is on. CI is what makes that class of problem impossible to ignore,
-  and it is far cheaper to never acquire it than to unpick it later.
-- *Tests run on every commit, not when you remember.* During a long rewrite,
-  this is the difference between finding a rules regression in the commit that
-  caused it and finding it three weeks later.
-- *It is the enforcement for everything above.* `fmt` and `clippy` configured
-  but not run are decoration.
-
-Cost is one YAML file and a few minutes of GitHub's compute per push.
-
-**Concrete proposal:** one workflow, three steps — `cargo fmt --check`,
-`cargo clippy -- -D warnings`, `cargo test`. Roughly twenty lines. Add the
-Python steps when there is Python. Nothing else, no coverage gates, no release
-automation, no badges.
+Still to decide: transport and wire format (a line-oriented stdio protocol is
+the obvious default — trivial to containerise, trivial to debug by hand, and
+close to what tournament harnesses already expect); the handshake, which should
+pin protocol version, rules version, and action-encoding version before the
+first move; and how model-side resource limits interact with adjudication.
 
 ---
 
-## S8. Zobrist position hashing
+## S7. Python-side tooling
 
-**Status: open. Raised because it is cheap now and awkward later.**
+**Status: deferred. The Rust half is accepted and landed — see the root
+`README.md` and `.github/workflows/ci.yml`.**
 
-An incrementally-maintained 64-bit hash of the position: XOR a random constant
-per (cell, player) on placement, XOR the same one back on undo. A handful of
-lines, essentially free at runtime, and it wants to live inside the same delta
-machinery as `apply`/`undo` — which is why retrofitting it is more annoying than
-it sounds.
+`cargo fmt`, `clippy` (`correctness = deny`, `perf = warn` at the workspace
+root), and a three-step CI workflow are in place. What remains is deferred only
+because there is no Python yet:
 
-What it buys, none of it needed today:
-
-- **Desync detection** between the runner and a remote or containerised player —
-  exchange the hash each ply and a divergence is caught immediately rather than
-  as inexplicable behaviour later. This is the near-term one, and it is the
-  reason S6 points here.
-- **Transposition tables** in a future search.
-- **Repetition and deduplication** across recorded positions.
-
-Worth deciding now only because it is small and touches the undo path. Perfectly
-reasonable to defer if the undo machinery is designed to accommodate it.
+- **`ruff`** for linting and formatting — cheap to add alongside the first
+  Python code, pointless before it.
+- **Type checking** — value scales with how much Python exists. When the
+  boundary lands it will be a thin bridge plus glue, where pyright in `basic`
+  mode is enough; strict typing over a few hundred lines of facade is friction
+  without a payoff. Revisit if Python grows past glue.
