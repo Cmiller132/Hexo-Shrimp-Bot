@@ -411,7 +411,7 @@ A per-node readout dissolves that rather than working around it. No crop, no
 fixed window, no padding, no size bucketing, no maximum. That matters beyond
 convenience: the previous implementation's `main_3` training collapse was caused
 by a fixed radius-20 crop that excluded out-of-crop legal moves from policy and
-MCTS, freezing out-of-rim wins (`SUGGESTIONS.md` S1). A node set derived from the
+MCTS, freezing out-of-rim wins (`crates/hexo-engine/README.md`). A node set derived from the
 position cannot reintroduce that failure mode, because there is no rim.
 
 It also matches the shape of the data. The active region is a stone cluster plus
@@ -652,10 +652,9 @@ cannot report them is not ready to run.
 
 Engine, all additive, none of it touching the rules:
 
-- **Bulk node-feature export.** The read surface is per-cell and scalar today —
-  `Stones::next` maps a bit slot to a coordinate and then maps that coordinate
-  back through the grid to find its owner, and `windows_through` is O(1) but one
-  cell at a time. The benchmarks put numbers on what that costs an encoder:
+- **Bulk node-feature export.** The read surface is per-cell and scalar today:
+  `windows_through` is O(1) but one cell at a time. The benchmarks put numbers on
+  what that costs an encoder:
   `windows_through` is flat at 52–59 ns, so ~2,000 nodes is ~110 µs per position,
   and at ~2M positions per iteration that is a few minutes of single-core CPU per
   iteration before anything else runs. Parallel across cores it is seconds, so
@@ -663,9 +662,10 @@ Engine, all additive, none of it touching the rules:
   caller-provided buffer for a caller-named coordinate set, gathering row runs at
   once — `ENGINE_SPEC.md` §12's sanctioned additive escape hatch, where the
   *caller* names the region in coordinates so no row, word, plane, or stride
-  escapes. `ENGINE_RL_AUDIT.md` independently rates the narrowest piece of this,
-  returning the owner from the bit-scan slot, as worth ~33% of `stones` on every
-  arena.
+  escapes. Deliberately not built yet: its shape is dictated by an encoder that
+  does not exist, and this workspace does not keep two versions of anything. The
+  narrowest piece — returning the owner from the bit-scan slot rather than mapping
+  the coordinate back — has shipped, because it changed no API.
 - **Ragged legal action ids plus offsets**, per `ENGINE_RL_AUDIT.md`, so a batch
   of positions produces one flat id buffer.
 - **An end-to-end throughput benchmark.** The engine-level suite now exists and
@@ -708,7 +708,7 @@ runs on. Still needed:
 | **Turn-commutativity consistency loss** | K8. A real constraint, but a second objective added before the first one works is a way to not know which is broken. |
 | Behaviour cloning from foreign games | §5.2. Breaks on-policy. |
 | Adjudicated or bootstrapped cap values | §5.1. Capped episodes are dropped; no special-case value logic exists. |
-| A win-length curriculum (four, then five, then six) | Would need a generic win fold, a `RULES_VERSION` bump, and regenerated golden vectors — `WINDOW_LEN` is baked into `run6_u16`, `fold6_u16`, and `WINDOWS_PER_PLACEMENT = 18`. |
+| A win-length curriculum (four, then five, then six) | Would need a generic win fold, a `RULES_VERSION` bump, and regenerated golden vectors — `WINDOW_LEN` is baked into `run6`, `fold6`, and `WINDOWS_PER_PLACEMENT = 18`. |
 | Derived window/threat features in the observation | §7. Undecided rather than excluded; resolves as an ablation (O3). |
 
 ---
