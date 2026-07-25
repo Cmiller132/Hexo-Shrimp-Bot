@@ -100,7 +100,16 @@ assuming this design covered it. Separately, there is a dormant serde impl on
 **bypasses turn rules** — exactly the second code path this decision is meant to
 avoid. Do not port it.
 
-**Recommended: move-prefix only, and no board-shaped deserialization at all.**
+**Decided and shipped: move-prefix only, and no board-shaped deserialization at
+all.** `Position::replay(&[Action])` rebuilds from the empty board and
+`Position::replay_from` continues an existing position; both run every placement
+through `advance`, so there is one rule implementation and no second construction
+path. `Position::history()` is the other half — a position now carries the
+sequence that produced it, so "write the game out" and "load it back" are the same
+two functions. `ReplayError` names the failing ply, because a record that will not
+replay is untriageable without knowing where it diverged.
+
+The engine has no `serde` impl on `Position` and will not get one.
 
 ### A4. Grid growth policy
 

@@ -35,7 +35,7 @@ fn drive(choices: &[u32], mut on_ply: impl FnMut(&Position, usize)) -> Vec<Actio
             .advance(a)
             .unwrap_or_else(|e| panic!("ply {i} {a:?} rejected: {e}"));
         assert_eq!(applied.action, a);
-        assert_eq!(applied.outcome.is_some(), applied.winning_windows != 0);
+        assert_eq!(applied.outcome.is_some(), !applied.winning.is_empty());
         moves.push(a);
         on_ply(&pos, moves.len());
     }

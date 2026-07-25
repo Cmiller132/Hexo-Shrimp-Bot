@@ -26,15 +26,16 @@
 
 use crate::action::Action;
 use crate::coord::{
-    Axis, DISK_CELLS, DISK8, HexCoord, LEGAL_RADIUS, WINDOW_LEN, hex_distance, offset,
+    Axis, DISK_CELLS, DISK8, HexCoord, LEGAL_RADIUS, WINDOW_LEN, disk_is_interior, hex_distance,
+    offset,
 };
-use crate::error::{IntegrityCheck, IntegrityError, MoveError};
+use crate::error::{IntegrityCheck, IntegrityError, MoveError, ReplayError};
 use crate::grid::Grid;
 use crate::player::{Player, TurnPhase};
 use crate::search::Undo;
 #[cfg(debug_assertions)]
 use crate::search::UndoAudit;
-use crate::window::{WINDOWS_PER_PLACEMENT, Window, WindowMask, WindowRef};
+use crate::window::{WINDOWS_PER_PLACEMENT, Window, WindowMask, WindowRef, WinningWindows};
 use crate::zobrist::{TURN_KEY, cell_key};
 use core::iter::FusedIterator;
 
@@ -42,14 +43,19 @@ use core::iter::FusedIterator;
 #[path = "position_tests.rs"]
 mod tests;
 
-/// A Hexo position: board, turn phase, mover, hash, terminal status.
+/// A Hexo position: board, move history, turn phase, mover, hash, terminal status.
 ///
-/// Contains no move history (ruling 1) and no undo stack. `clone` is a flat
-/// copy of four arrays and eight scalars.
+/// Carries the placement sequence that produced it, so any position can be
+/// written out as a game and rebuilt with [`Position::replay`]. It holds no
+/// undo stack — that lives in [`crate::Search`].
 ///
-/// `PartialEq` is content-based and deliberately ignores arena geometry: two
-/// positions with the same stones, phase, mover, and terminal status are equal
-/// even if one's arena grew larger getting there.
+/// `PartialEq` is content-based and deliberately ignores **both** arena
+/// geometry and history: two positions with the same stones, phase, mover, and
+/// terminal status are equal even if one's arena grew larger getting there and
+/// even if the two games reached the board by different move orders. Equality
+/// on this type means *same position*, matching [`Position::zobrist`], the
+/// oracles, and [`Position::audit`]. Compare [`Position::history`] explicitly
+/// when *same game* is what you mean.
 ///
 /// This type deliberately does **not** implement [`core::hash::Hash`]. Use
 /// [`Position::zobrist`], which excludes `SecondStone::first` and would
@@ -57,11 +63,22 @@ mod tests;
 #[derive(Clone, Debug)]
 pub struct Position {
     grid: Grid,
+    /// Every placement, oldest first. Pushed by `place`, popped by `unplace`.
+    ///
+    /// Four bytes per ply against an arena that is already tens of kilobytes,
+    /// and `clone` already performs four allocations for the grid planes; this
+    /// is a fifth. Deliberately **not** part of `PartialEq` and **not** hashed
+    /// into [`Position::zobrist`] — see the type docs and spec §8.
+    history: Vec<Action>,
     phase: TurnPhase,
     current: Player,
     terminal: Option<Outcome>,
     /// XOR of cell keys only; the turn key is applied on read.
     hash_cells: u64,
+    /// Redundant with `history.len()`, kept so [`Position::stone_count`] stays
+    /// a `const fn` on the crate's MSRV. Asserted equal on every apply and
+    /// undo rather than derived, per the §7.4 rule that a maintained value is
+    /// snapshot-*asserted*, never snapshot-*restored*.
     stones: u32,
     stones_by: [u32; 2],
 }
@@ -101,10 +118,26 @@ pub struct Applied {
     pub outcome: Option<Outcome>,
     /// Which of the 18 windows through `action` this placement completed.
     ///
-    /// Bit `axis.index() * 6 + offset`, in the canonical slot order of spec
-    /// §6.3. Non-zero iff `outcome.is_some()`. **More than one bit can be set**
-    /// — seven in a row, or two lines crossing at the placed cell.
-    pub winning_windows: u32,
+    /// Non-empty iff `outcome.is_some()`. **More than one can be set** — seven
+    /// in a row, or two lines crossing at the placed cell.
+    ///
+    /// [`Applied::winning_windows`] resolves these into real [`Window`] values.
+    pub winning: WinningWindows,
+}
+
+impl Applied {
+    /// The windows this placement completed, as geometry rather than slots.
+    ///
+    /// Empty unless this placement won. Yielded in the canonical slot order of
+    /// spec §6.3, which is what keeps that order from having to be reproduced
+    /// by every consumer.
+    pub fn winning_windows(&self) -> impl Iterator<Item = Window> + '_ {
+        let start = self.action.coord();
+        self.winning.iter().map(move |(axis, offset)| Window {
+            start: start.step(axis, -(offset as i16)),
+            axis,
+        })
+    }
 }
 
 /// How the game ended. Win only — ruling 6.
@@ -122,11 +155,12 @@ pub struct Outcome {
 
 impl Position {
     /// The empty position: `P0` to move, [`TurnPhase::Opening`], no arena
-    /// allocated.
+    /// allocated and no history.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             grid: Grid::new(),
+            history: Vec::new(),
             phase: TurnPhase::Opening,
             current: Player::P0,
             terminal: None,
@@ -260,6 +294,78 @@ impl Position {
             scan: BitScan::new(&self.grid, ScanPlane::Occupied, self.stones as usize),
         }
     }
+
+    /// Every placement that produced this position, oldest first.
+    ///
+    /// Length is always [`Position::stone_count`]. Feeding this straight back
+    /// to [`Position::replay`] rebuilds an equal position, and any prefix of it
+    /// rebuilds the position at that ply — which is what makes a game record a
+    /// move list rather than a serialised board.
+    ///
+    /// Inside a [`crate::Search`] this includes the speculative plies applied
+    /// above the floor, and each `undo` removes one. That is correct: those are
+    /// real placements in the line currently being examined.
+    ///
+    /// > **Scope.** This exists for records, replay, and debugging. It is not
+    /// > part of the read-surface contract a model encoder should build
+    /// > features on; the engine reserves the right to change how history is
+    /// > represented. Move *identity* is [`crate::ActionId`], which is frozen.
+    #[inline]
+    #[must_use]
+    pub fn history(&self) -> &[Action] {
+        &self.history
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Replay
+// ---------------------------------------------------------------------------
+
+impl Position {
+    /// Rebuild a position by replaying a placement sequence from the empty
+    /// board.
+    ///
+    /// A position is expressible exactly when it is reachable by a legal game.
+    /// There is no board-shaped deserialisation and no `serde` impl, so this is
+    /// the only way to load one — and because it runs every placement through
+    /// [`Position::advance`], there is still exactly one rule implementation.
+    ///
+    /// `Position::replay(p.history())` reproduces `p`.
+    ///
+    /// # Errors
+    /// [`ReplayError`] naming the **ply index** that failed, the placement, and
+    /// the [`MoveError`] it produced. A sequence that continues past a win
+    /// fails with [`MoveError::TerminalState`] at the first surplus ply, which
+    /// is the correct reading of a corrupt record rather than something to
+    /// silently stop at.
+    pub fn replay(actions: &[Action]) -> Result<Self, ReplayError> {
+        let mut pos = Self::new();
+        pos.replay_from(actions)?;
+        Ok(pos)
+    }
+
+    /// Apply a placement sequence to an existing position, continuing its
+    /// history.
+    ///
+    /// This is the catching-up path: a player's mirror consuming a batch of
+    /// buffered moves, or a seat joining a game in progress from the move
+    /// prefix in its handshake.
+    ///
+    /// # Errors
+    /// As [`Position::replay`]. The `ply` field counts from the start of
+    /// `actions`, not from the start of the game — add
+    /// [`Position::stone_count`] for an absolute ply.
+    ///
+    /// **Not atomic.** Placements before the failure have been applied and are
+    /// not rolled back; the position is left at the last good ply, which is the
+    /// state a caller wants for diagnosis. Clone first if you need the original.
+    pub fn replay_from(&mut self, actions: &[Action]) -> Result<(), ReplayError> {
+        for (ply, &action) in actions.iter().enumerate() {
+            self.advance(action)
+                .map_err(|cause| ReplayError { ply, action, cause })?;
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -304,6 +410,54 @@ impl Position {
             ))
         };
         LegalActions { inner }
+    }
+
+    /// Where `action` sits in [`Position::legal_actions`] order, or `None` if
+    /// it is not legal here.
+    ///
+    /// This and [`Position::nth_legal`] are the two directions of the canonical
+    /// ordering, and they are in the engine for one reason: a policy head is
+    /// indexed by this ordering, so self-play, training, and serving must all
+    /// use the *same* mapping. Deriving it separately in each of them makes
+    /// them agree only by coincidence, and a divergence is silent — the network
+    /// keeps training, against scrambled targets. The ordering is pinned by
+    /// [`crate::ACTION_ORDER_VERSION`] and by a golden test.
+    ///
+    /// Computed as a popcount prefix over the frontier plane rather than by
+    /// walking the iterator, so it is `O(arena words)` and independent of the
+    /// rank.
+    #[must_use]
+    pub fn legal_rank(&self, action: Action) -> Option<usize> {
+        if self.terminal.is_some() {
+            return None;
+        }
+        let c = action.coord();
+        match self.phase {
+            TurnPhase::Opening => (c == HexCoord::ORIGIN).then_some(0),
+            TurnPhase::FirstStone => self.grid.frontier_rank(c),
+            TurnPhase::SecondStone { first } => {
+                if c == first {
+                    return None;
+                }
+                self.grid.frontier_rank(c)
+            }
+        }
+    }
+
+    /// The legal placement at `index` in [`Position::legal_actions`] order, or
+    /// `None` if `index >= legal_count()`.
+    ///
+    /// The inverse of [`Position::legal_rank`]: what a policy head's argmax
+    /// needs in order to name a move. `O(arena words)`, not `O(index)`.
+    #[must_use]
+    pub fn nth_legal(&self, index: usize) -> Option<Action> {
+        if self.terminal.is_some() {
+            return None;
+        }
+        match self.phase {
+            TurnPhase::Opening => (index == 0).then(|| Action::new(HexCoord::ORIGIN)),
+            _ => self.grid.nth_frontier(index).map(Action::new),
+        }
     }
 
     /// Whether `action` is legal right now: phase, occupancy, radius, and the
@@ -502,7 +656,10 @@ impl Position {
     /// Six *or more* in a row wins, with no overline rule, because a run of
     /// seven contains a fully-owned six-window and the fold finds it.
     /// **Nothing may assume exactly one bit is set.**
-    fn winning_windows(&self, c: HexCoord, p: Player) -> u32 {
+    ///
+    /// Returns the raw slot mask; [`Position::apply_raw`] wraps it in
+    /// [`WinningWindows`], which is the only type that escapes the crate.
+    fn winning_slots(&self, c: HexCoord, p: Player) -> u32 {
         let s = self.grid.strip11(self.grid.occ_plane(p), c);
         let mut out = 0u32;
 
@@ -593,8 +750,18 @@ impl Position {
         // (b) Occupancy BEFORE the disk loop, so the loop does not re-mark `c`.
         self.grid.set_owner(c, p);
         // (c) Coverage, in DISK8 order.
+        //
+        // Disk cells outside the coordinate domain are skipped, so the frontier
+        // plane holds only valid coordinates and enumeration can never offer a
+        // placement that `advance` would refuse with `CoordOutOfBounds`. The
+        // test is hoisted because it is false for every cell of every position
+        // more than `LEGAL_RADIUS` from the boundary.
+        let interior = disk_is_interior(c);
         for d in DISK8 {
             let cell = offset(c, d);
+            if !interior && !cell.is_valid() {
+                continue;
+            }
             self.grid.inc_cover(cell);
             if self.grid.cover(cell) == 1 && self.grid.is_empty_cell(cell) {
                 self.grid.set_frontier(cell);
@@ -604,16 +771,30 @@ impl Position {
         self.hash_cells ^= cell_key(c, p);
         self.stones += 1;
         self.stones_by[p.index()] += 1;
+        // (f) history. A push is exactly inverted by a pop, so history joins
+        // the involutive class rather than needing a snapshot in `Undo`.
+        self.history.push(Action::new(c));
     }
 
     /// The exact inverse of [`Position::place`], in reverse statement order.
     fn unplace(&mut self, c: HexCoord, p: Player) {
+        let popped = self.history.pop(); // (f')
+        debug_assert_eq!(
+            popped,
+            Some(Action::new(c)),
+            "C15: history top is not the placement being undone"
+        );
         self.stones_by[p.index()] -= 1; // (e')
         self.stones -= 1;
         self.hash_cells ^= cell_key(c, p); // (d')
+        // (c') Same skip as `place`, computed the same way from the same
+        // coordinate, so the two remain exact inverses.
+        let interior = disk_is_interior(c);
         for d in DISK8.iter().rev() {
-            // (c')
             let cell = offset(c, *d);
+            if !interior && !cell.is_valid() {
+                continue;
+            }
             if self.grid.cover(cell) == 1 && self.grid.is_empty_cell(cell) {
                 self.grid.clear_frontier(cell);
             }
@@ -669,7 +850,7 @@ impl Position {
         self.place(c, player_before);
 
         // 4. RULE BRANCH. Reads only what step 3 wrote.
-        let winning = self.winning_windows(c, player_before);
+        let winning = self.winning_slots(c, player_before);
         let outcome = if winning != 0 {
             let o = Outcome {
                 winner: player_before,
@@ -696,7 +877,7 @@ impl Position {
             phase_before,
             phase_after: self.phase,
             outcome,
-            winning_windows: winning,
+            winning: WinningWindows::from_bits(winning),
         };
         let undo = Undo {
             action,
@@ -733,6 +914,11 @@ impl Position {
                 "C14: frontier_cells"
             );
             debug_assert_eq!(self.stones, u.audit.stones_before, "C14: stones");
+            debug_assert_eq!(
+                self.history.len(),
+                self.stones as usize,
+                "C15: history length after undo"
+            );
             self.debug_assert_frontier_around(u.action.coord());
             self.debug_assert_turn_closed_form();
             debug_assert_eq!(
@@ -796,7 +982,13 @@ impl Position {
         };
         check(c);
         for d in DISK8 {
-            check(offset(c, d));
+            let cell = offset(c, d);
+            // Out-of-domain cells are never covered and never in the frontier,
+            // so `expect` would be trivially satisfied; skipping keeps the
+            // assertion aligned with what `place` actually touches.
+            if cell.is_valid() {
+                check(cell);
+            }
         }
     }
 
@@ -816,6 +1008,18 @@ impl Position {
         // C10
         debug_assert_eq!(self.stones, audit.stones_before + 1, "C10: stones");
         debug_assert_eq!(self.get(c), Some(mover), "C10: owner");
+        // C15: history is maintained, so it is asserted against the counter,
+        // never used to restore it.
+        debug_assert_eq!(
+            self.history.len(),
+            self.stones as usize,
+            "C15: history length"
+        );
+        debug_assert_eq!(
+            self.history.last().copied(),
+            Some(Action::new(c)),
+            "C15: history top"
+        );
         debug_assert_eq!(
             self.stones_by[mover.index()],
             audit.stones_by_before + 1,
@@ -1095,7 +1299,9 @@ impl Position {
             for dq in -(pad as i16)..=(pad as i16) {
                 for dr in -(pad as i16)..=(pad as i16) {
                     let cell = HexCoord::new(s.q + dq, s.r + dr);
-                    if hex_distance(s, cell) > LEGAL_RADIUS {
+                    // Cells outside the coordinate domain carry no coverage;
+                    // `place` skips them so enumeration cannot offer them.
+                    if hex_distance(s, cell) > LEGAL_RADIUS || !cell.is_valid() {
                         continue;
                     }
                     let idx = match g.cell_index(cell) {
@@ -1179,6 +1385,25 @@ impl Position {
         match turn_closed_form(self.stones, self.terminal.is_some()) {
             Some((kind, player)) if kind == self.phase.kind_index() && player == self.current => {}
             _ => return fail(IntegrityCheck::TurnClosedForm, None),
+        }
+
+        // A12: history length, and that its entries are exactly the occupied
+        // cells. Compared as a *set* against the independent stone list above,
+        // because order is history's own business and nothing else records it.
+        if self.history.len() != self.stones as usize {
+            return fail(IntegrityCheck::History, None);
+        }
+        let mut replayed: Vec<HexCoord> = self.history.iter().map(|a| a.coord()).collect();
+        replayed.sort_unstable();
+        let mut occupied: Vec<HexCoord> = stones.iter().map(|&(c, _)| c).collect();
+        occupied.sort_unstable();
+        if let Some(bad) = replayed
+            .iter()
+            .zip(&occupied)
+            .find(|(a, b)| a != b)
+            .map(|(a, _)| *a)
+        {
+            return fail(IntegrityCheck::History, Some(bad));
         }
 
         Ok(())

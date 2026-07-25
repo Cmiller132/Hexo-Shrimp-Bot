@@ -56,13 +56,33 @@ fn assert_win_cycle(
         "a winning placement must freeze the phase"
     );
     assert_eq!(
-        applied.winning_windows, expect_window_bits,
+        applied.winning.bits(),
+        expect_window_bits,
         "winning window slots"
     );
     assert!(
-        applied.winning_windows != 0,
-        "outcome is Some, so winning_windows must be non-zero"
+        !applied.winning.is_empty(),
+        "outcome is Some, so winning must be non-empty"
     );
+    assert_eq!(
+        applied.winning.count(),
+        expect_window_bits.count_ones(),
+        "count must agree with the raw mask"
+    );
+    // The resolved windows are the independent reading of the same bits: each
+    // must be fully owned by the winner and must contain the placed stone.
+    let resolved: Vec<_> = applied.winning_windows().collect();
+    assert_eq!(resolved.len(), applied.winning.count() as usize);
+    for w in &resolved {
+        assert!(
+            search.position().window(*w).is_full_for(winner),
+            "resolved window {w:?} is not full for the winner"
+        );
+        assert!(
+            w.cells().contains(&applied.action.coord()),
+            "resolved window {w:?} does not contain the placement"
+        );
+    }
 
     let won = search.position();
     assert!(won.is_terminal());

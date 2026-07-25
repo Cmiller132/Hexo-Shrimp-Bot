@@ -435,7 +435,8 @@ fn opening_is_forced_and_hands_over_to_p1() {
     assert_eq!(applied.phase_before, TurnPhase::Opening);
     assert_eq!(applied.phase_after, TurnPhase::FirstStone);
     assert_eq!(applied.outcome, None);
-    assert_eq!(applied.winning_windows, 0);
+    assert!(applied.winning.is_empty());
+    assert_eq!(applied.winning_windows().count(), 0);
     assert_eq!(p.current_player(), Player::P1);
     assert_eq!(p.legal_count(), DISK_CELLS - 1);
 }
@@ -738,4 +739,244 @@ fn audit_passes_on_a_fresh_and_a_played_position() {
     play(&[(0, 0)]).audit().expect("opening");
     first_stone_win().audit().expect("first-stone win");
     second_stone_win().audit().expect("second-stone win");
+}
+
+// ---------------------------------------------------------------------------
+// History and replay
+// ---------------------------------------------------------------------------
+
+#[test]
+fn history_is_empty_on_a_fresh_position() {
+    let p = Position::new();
+    assert!(p.history().is_empty());
+    assert_eq!(p.stone_count(), 0);
+}
+
+#[test]
+fn history_records_every_placement_in_order() {
+    let moves = [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)];
+    let p = play(&moves);
+    let want: Vec<Action> = moves.iter().map(|&(q, r)| act(q, r)).collect();
+    assert_eq!(p.history(), want.as_slice());
+    assert_eq!(p.history().len(), p.stone_count() as usize);
+}
+
+#[test]
+fn history_length_always_equals_the_stone_count() {
+    let mut p = Position::new();
+    for &(q, r) in &[(0, 0), (1, 0), (2, 0), (3, 0), (0, 1), (0, 2)] {
+        p.advance(act(q, r)).expect("legal");
+        assert_eq!(p.history().len(), p.stone_count() as usize);
+    }
+}
+
+#[test]
+fn replaying_a_history_reproduces_the_position() {
+    for p in [
+        play(&[(0, 0)]),
+        play(&[(0, 0), (1, 0), (2, 0), (0, 1)]),
+        first_stone_win(),
+        second_stone_win(),
+    ] {
+        let rebuilt = Position::replay(p.history()).expect("history must replay");
+        assert_eq!(rebuilt, p);
+        assert_eq!(rebuilt.zobrist(), p.zobrist());
+        assert_eq!(rebuilt.history(), p.history());
+        assert_eq!(rebuilt.phase(), p.phase());
+        assert_eq!(rebuilt.current_player(), p.current_player());
+        assert_eq!(rebuilt.outcome(), p.outcome());
+        rebuilt.audit().expect("a replayed position must audit");
+    }
+}
+
+#[test]
+fn replaying_every_prefix_reproduces_that_ply() {
+    let full = second_stone_win();
+    let history = full.history().to_vec();
+    let mut incremental = Position::new();
+    for k in 0..history.len() {
+        let from_prefix = Position::replay(&history[..k]).expect("prefix replays");
+        assert_eq!(from_prefix, incremental, "prefix of length {k}");
+        assert_eq!(from_prefix.history(), &history[..k]);
+        incremental.advance(history[k]).expect("legal");
+    }
+}
+
+#[test]
+fn replay_of_an_empty_slice_is_the_empty_position() {
+    let p = Position::replay(&[]).expect("empty replays");
+    assert_eq!(p, Position::new());
+    assert!(p.history().is_empty());
+}
+
+#[test]
+fn replay_reports_the_ply_that_failed() {
+    // Ply 2 lands on the opening stone, which is occupied but is not the
+    // first stone of the current turn — so this is `Occupied`, not
+    // `ReusedFirstStone`.
+    let err = Position::replay(&[act(0, 0), act(1, 0), act(0, 0)]).expect_err("must fail");
+    assert_eq!(err.ply, 2);
+    assert_eq!(err.action, act(0, 0));
+    assert_eq!(err.cause, MoveError::Occupied(HexCoord::ORIGIN));
+    assert!(format!("{err}").contains("ply 2"));
+
+    // The same slice one ply earlier reuses the current turn's first stone,
+    // which outranks `Occupied` in the precedence table.
+    let err = Position::replay(&[act(0, 0), act(1, 0), act(1, 0)]).expect_err("must fail");
+    assert_eq!(err.ply, 2);
+    assert_eq!(err.cause, MoveError::ReusedFirstStone(HexCoord::new(1, 0)));
+}
+
+#[test]
+fn replay_rejects_an_illegal_opening_at_ply_zero() {
+    let err = Position::replay(&[act(1, 0)]).expect_err("must fail");
+    assert_eq!(err.ply, 0);
+    assert_eq!(err.cause, MoveError::IllegalOpening);
+}
+
+#[test]
+fn replay_past_a_win_is_a_terminal_error_not_a_silent_stop() {
+    let won = first_stone_win();
+    let mut too_long = won.history().to_vec();
+    too_long.push(act(1, 1));
+    let err = Position::replay(&too_long).expect_err("must fail");
+    assert_eq!(err.ply, won.history().len());
+    assert_eq!(err.cause, MoveError::TerminalState);
+}
+
+#[test]
+fn replay_from_continues_an_existing_position() {
+    let full = play(&[(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)]);
+    let history = full.history().to_vec();
+    let mut partial = Position::replay(&history[..2]).expect("prefix");
+    partial.replay_from(&history[2..]).expect("suffix");
+    assert_eq!(partial, full);
+    assert_eq!(partial.history(), history.as_slice());
+}
+
+#[test]
+fn replay_from_reports_a_ply_relative_to_its_own_slice() {
+    let mut p = play(&[(0, 0), (1, 0)]);
+    // Slice index 1 fails, even though it is ply 3 of the game.
+    let err = p
+        .replay_from(&[act(2, 0), act(2, 0)])
+        .expect_err("must fail");
+    assert_eq!(err.ply, 1);
+    assert_eq!(err.cause, MoveError::Occupied(HexCoord::new(2, 0)));
+    // Not atomic: the good placement before the failure stuck.
+    assert_eq!(p.stone_count(), 3);
+}
+
+#[test]
+fn undo_pops_the_history() {
+    let mut p = play(&[(0, 0), (1, 0)]);
+    let before = p.history().to_vec();
+    {
+        let mut s = crate::search::Search::new(&mut p);
+        s.apply(act(2, 0)).expect("legal");
+        s.apply(act(3, 0)).expect("legal");
+        assert_eq!(s.position().history().len(), 4);
+        assert_eq!(s.position().history()[3], act(3, 0));
+        s.undo();
+        assert_eq!(s.position().history().len(), 3);
+    }
+    assert_eq!(p.history(), before.as_slice());
+}
+
+#[test]
+fn a_rejected_placement_leaves_the_history_untouched() {
+    let mut p = play(&[(0, 0), (1, 0)]);
+    let before = p.history().to_vec();
+    for bad in [act(1, 0), act(400, 400), act(0, 0)] {
+        assert!(p.advance(bad).is_err());
+        assert_eq!(p.history(), before.as_slice(), "{bad:?} mutated history");
+    }
+}
+
+#[test]
+fn equality_ignores_history_order() {
+    // Both stones of P1's first turn, in either order, reach the same position.
+    let a = play(&[(0, 0), (1, 0), (2, 0)]);
+    let b = play(&[(0, 0), (2, 0), (1, 0)]);
+    assert_ne!(a.history(), b.history(), "the two games differ");
+    assert_eq!(a, b, "but the positions are equal");
+    assert_eq!(a.zobrist(), b.zobrist(), "and so are their hashes");
+}
+
+// ---------------------------------------------------------------------------
+// The canonical legal ordering, both directions
+// ---------------------------------------------------------------------------
+
+#[test]
+fn legal_rank_and_nth_legal_agree_with_the_iterator() {
+    for p in [
+        play(&[(0, 0)]),
+        play(&[(0, 0), (1, 0)]),
+        play(&[(0, 0), (1, 0), (2, 0), (0, 1), (5, -3)]),
+    ] {
+        let listed: Vec<Action> = p.legal_actions().collect();
+        assert_eq!(listed.len(), p.legal_count());
+        for (i, &a) in listed.iter().enumerate() {
+            assert_eq!(p.legal_rank(a), Some(i), "rank of {a:?}");
+            assert_eq!(p.nth_legal(i), Some(a), "nth_legal({i})");
+        }
+        assert_eq!(p.nth_legal(listed.len()), None, "past the end");
+    }
+}
+
+#[test]
+fn legal_rank_is_none_for_illegal_actions() {
+    let p = play(&[(0, 0), (1, 0), (2, 0)]);
+    assert_eq!(p.legal_rank(act(0, 0)), None, "occupied");
+    assert_eq!(p.legal_rank(act(1, 0)), None, "occupied");
+    assert_eq!(p.legal_rank(act(400, 400)), None, "far away");
+    assert_eq!(p.legal_rank(act(i16::MAX, i16::MAX)), None, "out of bounds");
+}
+
+#[test]
+fn legal_rank_agrees_with_is_legal_over_a_neighbourhood() {
+    let p = play(&[(0, 0), (1, 0), (2, 0), (0, 1)]);
+    for q in -12i16..=12 {
+        for r in -12i16..=12 {
+            let a = act(q, r);
+            assert_eq!(
+                p.legal_rank(a).is_some(),
+                p.is_legal(a),
+                "disagreement at ({q}, {r})"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_opening_ranks_only_the_origin() {
+    let p = Position::new();
+    assert_eq!(p.legal_rank(Action::new(HexCoord::ORIGIN)), Some(0));
+    assert_eq!(p.nth_legal(0), Some(Action::new(HexCoord::ORIGIN)));
+    assert_eq!(p.nth_legal(1), None);
+    assert_eq!(p.legal_rank(act(1, 0)), None);
+    assert_eq!(p.legal_rank(act(0, 1)), None);
+}
+
+#[test]
+fn the_second_stone_of_a_turn_cannot_rank_the_first() {
+    let p = play(&[(0, 0), (1, 0)]);
+    assert!(matches!(p.phase(), TurnPhase::SecondStone { .. }));
+    assert_eq!(p.legal_rank(act(1, 0)), None, "the first stone is occupied");
+    // Everything the iterator lists still ranks.
+    for (i, a) in p.legal_actions().enumerate() {
+        assert_eq!(p.legal_rank(a), Some(i));
+    }
+}
+
+#[test]
+fn a_terminal_position_ranks_nothing() {
+    for p in [first_stone_win(), second_stone_win()] {
+        assert_eq!(p.legal_count(), 0);
+        assert_eq!(p.nth_legal(0), None);
+        for (c, _) in p.stones() {
+            assert_eq!(p.legal_rank(Action::new(c)), None);
+        }
+        assert_eq!(p.legal_rank(act(3, 3)), None);
+    }
 }

@@ -51,7 +51,44 @@
 //! // Legal moves come out in one canonical order: ascending `(q, r)`.
 //! let first = pos.legal_actions().next().unwrap();
 //! assert_eq!(first.coord(), HexCoord::new(-8, 0));
+//!
+//! // That order has both directions, and they are the mapping a policy head is
+//! // indexed by — which is why the engine owns them rather than each model.
+//! assert_eq!(pos.legal_rank(first), Some(0));
+//! assert_eq!(pos.nth_legal(0), Some(first));
 //! ```
+//!
+//! # History and replay
+//!
+//! A position carries the placements that produced it, so it can be written out
+//! as a game and rebuilt. [`Position::replay`] runs every placement through the
+//! normal rule machine, which is why there is no `serde` impl and no
+//! board-shaped construction path: a position is expressible exactly when it is
+//! reachable by a legal game.
+//!
+//! ```
+//! use hexo_engine::{Action, HexCoord, Position};
+//!
+//! let mut pos = Position::new();
+//! for c in [(0, 0), (1, 0), (2, 0)] {
+//!     pos.advance(Action::new(HexCoord::new(c.0, c.1))).unwrap();
+//! }
+//! assert_eq!(pos.history().len(), 3);
+//!
+//! // The history round-trips, and so does every prefix of it.
+//! assert_eq!(Position::replay(pos.history()).unwrap(), pos);
+//! assert_eq!(Position::replay(&pos.history()[..1]).unwrap().stone_count(), 1);
+//! ```
+//!
+//! [`Position::zobrist`] is **position-only** and does not cover history. That
+//! is deliberate: a turn's two stones are playable in either order and reach the
+//! same position, so every turn is a transposition, and a history-sensitive key
+//! would forfeit that merge. A model whose features depend on move order should
+//! mix [`Position::history`] into its own cache key rather than expect a second
+//! hash from the engine. There is one hash.
+//!
+//! Equality follows the hash, not the history: two games that reach the same
+//! board by different move orders are [`PartialEq`].
 //!
 //! # Searching
 //!
@@ -85,11 +122,13 @@ mod zobrist;
 
 pub use action::{ACTION_ORDER_VERSION, Action, ActionId};
 pub use coord::{Axis, COORD_LIMIT, DISK_CELLS, HexCoord, LEGAL_RADIUS, WINDOW_LEN, hex_distance};
-pub use error::{IntegrityCheck, IntegrityError, MoveError};
+pub use error::{IntegrityCheck, IntegrityError, MoveError, ReplayError};
 pub use player::{Player, TurnPhase};
 pub use position::{Applied, LegalActions, Outcome, Position, Stones};
 pub use search::Search;
-pub use window::{WINDOWS_PER_PLACEMENT, Window, WindowMask, WindowRef};
+pub use window::{
+    WINDOWS_PER_PLACEMENT, Window, WindowMask, WindowRef, WinningSlots, WinningWindows,
+};
 
 /// Version of the rules and of the Zobrist mixing function.
 ///

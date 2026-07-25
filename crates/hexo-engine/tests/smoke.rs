@@ -130,7 +130,19 @@ fn playout(seed: u64, noise: u8) -> Playout {
                 o.winner, applied.mover,
                 "seed {seed}: the winner is not the mover"
             );
-            assert_ne!(applied.winning_windows, 0);
+            assert!(!applied.winning.is_empty());
+            // Every reported slot must resolve to a window the winner owns
+            // outright, and must contain the placed cell.
+            for w in applied.winning_windows() {
+                assert!(
+                    pos.window(w).is_full_for(o.winner),
+                    "seed {seed}: reported window {w:?} is not full for the winner"
+                );
+                assert!(
+                    w.cells().contains(&applied.action.coord()),
+                    "seed {seed}: reported window {w:?} does not contain the placement"
+                );
+            }
             assert_eq!(
                 applied.phase_after, applied.phase_before,
                 "seed {seed}: the winning placement did not freeze the phase"

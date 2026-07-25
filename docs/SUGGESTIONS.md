@@ -13,7 +13,7 @@ open questions.
 
 | # | Suggestion | Status |
 | --- | --- | --- |
-| S1 | Dense action indexing | **Partly retracted** — the diagnosis holds, the bounded-region fix does not |
+| S1 | Dense action indexing | **Closed.** The diagnosis was right, the proposed fix was wrong, and what survived has shipped |
 | S2 | Symmetry operations in the engine | Deferred — probably not yet |
 | S3 | The evaluator seam | Deferred — explained below |
 | S4 | Differential test against the old engine | Later |
@@ -25,7 +25,29 @@ open questions.
 
 ## S1. Dense action indexing
 
-**Status: deferred. This section exists to explain the proposal properly.**
+**Status: closed — shipped, in the form the retraction argued for.**
+
+`Position::legal_rank` and `Position::nth_legal` are the two directions of the
+canonical ordering, owned by the engine, pinned by `ACTION_ORDER_VERSION` and by
+a golden table of the rank of each played move of the frozen game. The region
+stays unbounded, so there is no crop; the policy head is sized by the legal set.
+
+Two things were learned in landing it that the proposal did not anticipate:
+
+- **Both directions are needed, not just one.** Training records "the move played
+  was index *k*"; serving asks "the head's argmax is index *k*, which move is
+  that?". Shipping only the forward map would have left every model to write the
+  inverse itself, which is the same drift in a different place.
+- **The bijection was not actually holding at the coordinate domain boundary.**
+  `legal_actions` offered 136 coordinates that `advance` refused, so `legal_rank`
+  assigned policy indices to unplayable moves. Fixed at the source — `place` no
+  longer writes coverage outside the domain — and pinned by `tests/boundary.rs`.
+  A dense index over a region that does not match the legal set is exactly the
+  silent-wrongness this suggestion was about, so it is worth recording that the
+  first version of the fix had it too.
+
+The rest of this section is kept because the reasoning is the reason the shipped
+design looks the way it does.
 
 ### What the old implementation does
 

@@ -234,6 +234,50 @@ impl Grid {
         Some(w * 64 + b as usize)
     }
 
+    // ---- frontier rank and select -----------------------------------------
+    //
+    // The layout is `q`-major and `r`-minor, so storage order *is* ascending
+    // `(q, r)` — the same order `BitScan` walks. That makes the position of a
+    // frontier cell within the canonical enumeration a plain popcount prefix,
+    // and the inverse a select-the-k-th-bit scan. Both live here rather than in
+    // `position` because both are statements about the bit layout, which is
+    // this module's private business.
+
+    /// How many frontier cells precede `c` in canonical order, or `None` if `c`
+    /// is not itself a frontier cell.
+    ///
+    /// `O(total_words())` and branch-free per word, against `O(rank)` for a
+    /// walk of [`crate::position::LegalActions`].
+    pub(crate) fn frontier_rank(&self, c: HexCoord) -> Option<usize> {
+        let (word, bit) = self.locate(c)?;
+        if (self.frontier[word] >> bit) & 1 == 0 {
+            return None;
+        }
+        let below: u32 = self.frontier[..word].iter().map(|w| w.count_ones()).sum();
+        let within = (self.frontier[word] & ((1u64 << bit) - 1)).count_ones();
+        Some((below + within) as usize)
+    }
+
+    /// The frontier cell at `index` in canonical order, or `None` if `index` is
+    /// past the end.
+    pub(crate) fn nth_frontier(&self, index: usize) -> Option<HexCoord> {
+        let mut remaining = index as u32;
+        for (word, &bits) in self.frontier.iter().enumerate() {
+            let pop = bits.count_ones();
+            if remaining >= pop {
+                remaining -= pop;
+                continue;
+            }
+            // Clear `remaining` set bits, then take the next one.
+            let mut w = bits;
+            for _ in 0..remaining {
+                w &= w - 1;
+            }
+            return Some(self.coord_of(word, w.trailing_zeros()));
+        }
+        None
+    }
+
     /// Whether `c` holds no stone. Total over every coordinate.
     #[inline]
     pub(crate) fn is_empty_cell(&self, c: HexCoord) -> bool {
@@ -605,6 +649,131 @@ mod tests {
 
     fn cells(g: &Grid) -> u64 {
         g.rows() as u64 * g.row_words() as u64 * 64
+    }
+
+    /// Every frontier cell in canonical order, read by walking the whole arena
+    /// coordinate by coordinate — deliberately not the word scan that
+    /// `frontier_rank` and `nth_frontier` use, so the two are a real
+    /// cross-check rather than the same code twice.
+    fn frontier_by_brute_force(g: &Grid) -> Vec<HexCoord> {
+        let mut out = Vec::new();
+        for row in 0..g.rows() {
+            for bit in 0..(64 * g.row_words()) {
+                let c = HexCoord::new(
+                    (g.origin_q() + row as i32) as i16,
+                    (g.origin_r() + bit as i32) as i16,
+                );
+                if g.frontier_bit(c) {
+                    out.push(c);
+                }
+            }
+        }
+        out
+    }
+
+    /// Fix the arena to span both corners by planting a stone at each.
+    ///
+    /// Growth sizes from the **live stone bounding box**, so an arena with no
+    /// stones recentres on whatever cell was last reserved and discards
+    /// everything else. Anchoring first is what makes a sequence of
+    /// `set_frontier` calls survive.
+    fn anchor(g: &mut Grid, lo: (i16, i16), hi: (i16, i16)) {
+        place(g, lo.0, lo.1);
+        place(g, hi.0, hi.1);
+    }
+
+    /// Mark `(q, r)` as a frontier cell directly, bypassing `Position`, so the
+    /// rank/select scan can be tested against arbitrary bit patterns.
+    fn mark_frontier(g: &mut Grid, q: i16, r: i16) {
+        let c = HexCoord::new(q, r);
+        assert!(
+            g.cell_index(c).is_some(),
+            "({q}, {r}) is outside the anchored arena"
+        );
+        g.set_frontier(c);
+    }
+
+    #[test]
+    fn frontier_rank_and_select_are_inverse_over_a_scattered_arena() {
+        let mut g = Grid::new();
+        anchor(&mut g, (-6, -80), (8, 220));
+        // Spread across several rows and across `u64` word boundaries.
+        let marks = [
+            (0i16, 0i16),
+            (0, 1),
+            (0, 63),
+            (0, 64),
+            (0, 65),
+            (1, -1),
+            (1, 0),
+            (-1, 7),
+            (-3, 130),
+            (5, -70),
+            (5, 200),
+        ];
+        for &(q, r) in &marks {
+            mark_frontier(&mut g, q, r);
+        }
+
+        let expected = frontier_by_brute_force(&g);
+        assert_eq!(expected.len(), marks.len(), "every mark must be distinct");
+        assert_eq!(expected.len() as u32, g.frontier_cells());
+
+        for (i, &c) in expected.iter().enumerate() {
+            assert_eq!(g.frontier_rank(c), Some(i), "rank of ({}, {})", c.q, c.r);
+            assert_eq!(g.nth_frontier(i), Some(c), "nth_frontier({i})");
+        }
+        assert_eq!(g.nth_frontier(expected.len()), None);
+        assert_eq!(g.nth_frontier(usize::MAX), None);
+    }
+
+    #[test]
+    fn frontier_rank_is_ascending_and_matches_canonical_order() {
+        let mut g = Grid::new();
+        anchor(&mut g, (-6, -10), (4, 100));
+        for &(q, r) in &[(2i16, 5i16), (-4, 90), (0, 0), (2, 4), (-4, 89)] {
+            mark_frontier(&mut g, q, r);
+        }
+        let listed = frontier_by_brute_force(&g);
+        // Canonical order is ascending `(q, r)`; the scan must produce it.
+        let mut sorted = listed.clone();
+        sorted.sort_unstable();
+        assert_eq!(listed, sorted);
+        let ranks: Vec<usize> = listed
+            .iter()
+            .map(|&c| g.frontier_rank(c).expect("marked"))
+            .collect();
+        assert_eq!(ranks, (0..listed.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn frontier_rank_is_none_off_the_plane() {
+        let mut g = Grid::new();
+        anchor(&mut g, (-4, -4), (4, 4));
+        mark_frontier(&mut g, 0, 0);
+        // Inside the arena but not marked.
+        assert_eq!(g.frontier_rank(HexCoord::new(0, 1)), None);
+        // Outside the arena entirely.
+        assert_eq!(g.frontier_rank(HexCoord::new(9000, 9000)), None);
+        // And on an arena that was never allocated.
+        let empty = Grid::new();
+        assert_eq!(empty.frontier_rank(HexCoord::ORIGIN), None);
+        assert_eq!(empty.nth_frontier(0), None);
+    }
+
+    #[test]
+    fn a_full_word_ranks_every_bit() {
+        let mut g = Grid::new();
+        anchor(&mut g, (-2, -2), (2, 70));
+        for r in 0i16..64 {
+            mark_frontier(&mut g, 0, r);
+        }
+        assert_eq!(g.frontier_cells(), 64);
+        for r in 0i16..64 {
+            assert_eq!(g.frontier_rank(HexCoord::new(0, r)), Some(r as usize));
+            assert_eq!(g.nth_frontier(r as usize), Some(HexCoord::new(0, r)));
+        }
+        assert_eq!(g.nth_frontier(64), None);
     }
 
     #[test]

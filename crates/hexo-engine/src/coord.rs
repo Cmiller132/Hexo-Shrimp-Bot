@@ -201,6 +201,23 @@ pub(crate) const DISK8: [(i8, i8); DISK_CELLS] = {
     out
 };
 
+/// Whether every cell of the radius-[`LEGAL_RADIUS`] disk around `c` is inside
+/// the coordinate domain.
+///
+/// A disk cell displaces each of `q`, `r`, and `s` by at most
+/// [`LEGAL_RADIUS`], so pulling the limit in by that much on all three axes is
+/// exact. Used to hoist the per-cell [`HexCoord::is_valid`] test out of the
+/// coverage loop: true for every position that is not within eight cells of the
+/// domain boundary, which is every position reachable in ordinary play.
+#[inline]
+pub(crate) const fn disk_is_interior(c: HexCoord) -> bool {
+    let lim = COORD_LIMIT as i32 - LEGAL_RADIUS as i32;
+    let q = c.q as i32;
+    let r = c.r as i32;
+    let s = -q - r;
+    q >= -lim && q <= lim && r >= -lim && r <= lim && s >= -lim && s <= lim
+}
+
 /// `c` displaced by a `(dq, dr)` offset from [`DISK8`].
 #[inline]
 pub(crate) const fn offset(c: HexCoord, d: (i8, i8)) -> HexCoord {

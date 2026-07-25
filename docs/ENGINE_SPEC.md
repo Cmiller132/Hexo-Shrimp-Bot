@@ -363,14 +363,17 @@ predicate, and every one of those is a one-liner over `mask()` and `Window::cell
 ### 3.5 `position`
 
 ```rust
-/// A Hexo position: board, turn phase, mover, hash, terminal status.
+/// A Hexo position: board, move history, turn phase, mover, hash, terminal status.
 ///
-/// Contains no move history (ruling 1) and no undo stack (§7). `clone` is a flat
-/// copy of four arrays and eight scalars.
+/// Carries the placement sequence that produced it (ruling 1), so any position can
+/// be written out as a game and rebuilt with `replay`. It holds no undo stack (§7).
 ///
-/// `PartialEq` is content-based and deliberately ignores arena geometry: two
-/// positions with the same stones, phase, mover, and terminal status are equal
-/// even if one's arena grew larger getting there. It is `O(arena extent)`.
+/// `PartialEq` is content-based and deliberately ignores **both** arena geometry
+/// and history: two positions with the same stones, phase, mover, and terminal
+/// status are equal even if one's arena grew larger getting there and even if the
+/// two games reached the board by different move orders. Equality means *same
+/// position*, matching `zobrist`, the oracles, and `audit`. It is
+/// `O(arena extent)`.
 ///
 /// This type deliberately does **not** implement `core::hash::Hash`. Use
 /// [`Position::zobrist`], which excludes `SecondStone::first` and would therefore
@@ -395,10 +398,34 @@ pub struct Applied {
     pub outcome: Option<Outcome>,
     /// Which of the 18 windows through `action` this placement completed.
     ///
-    /// Bit `axis.index() * 6 + offset`, in the canonical slot order of §6.3.
-    /// Non-zero iff `outcome.is_some()`. More than one bit can be set.
-    pub winning_windows: u32,
+    /// Non-empty iff `outcome.is_some()`. More than one can be set.
+    pub winning: WinningWindows,
 }
+
+impl Applied {
+    /// The completed windows as geometry rather than slots, in the canonical
+    /// slot order of §6.3. Empty unless this placement won.
+    pub fn winning_windows(&self) -> impl Iterator<Item = Window> + '_;
+}
+
+/// A set over the 18 window slots of §6.3.
+///
+/// The bit layout is `axis.index() * 6 + offset`, and **nothing outside this type
+/// needs to know that** — which is the reason it is a type rather than a `u32`.
+/// `bits()` is the escape hatch for a record writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct WinningWindows(u32);
+
+impl WinningWindows {
+    pub const EMPTY: Self;
+    pub const fn is_empty(self) -> bool;
+    pub const fn count(self) -> u32;                              // can exceed 1
+    pub const fn contains(self, axis: Axis, offset: usize) -> bool;  // panics past WINDOW_LEN
+    pub const fn bits(self) -> u32;
+    pub const fn iter(self) -> WinningSlots;                      // (Axis, usize), ascending
+}
+
+impl IntoIterator for WinningWindows { /* = iter() */ }
 
 /// How the game ended. Win only — ruling 6.
 ///
@@ -596,8 +623,39 @@ impl Position {
     /// Any [`MoveError`], in the precedence of §3.7. **Atomic:** on `Err` the
     /// position is bit-identical to before the call, including arena geometry.
     pub fn advance(&mut self, action: Action) -> Result<Applied, MoveError>;
+
+    /// Rebuild a position by replaying a placement sequence from the empty board.
+    ///
+    /// `Position::replay(p.history())` reproduces `p`; any prefix reproduces the
+    /// position at that ply.
+    ///
+    /// # Errors
+    /// `ReplayError { ply, action, cause }`. A sequence continuing past a win
+    /// fails with `TerminalState` at the first surplus ply.
+    pub fn replay(actions: &[Action]) -> Result<Self, ReplayError>;
+
+    /// Apply a placement sequence to an existing position, continuing its history.
+    ///
+    /// The catching-up path: a mirror consuming buffered moves, or a seat joining
+    /// from the move prefix in its handshake.
+    ///
+    /// # Errors
+    /// As `replay`, with `ply` relative to `actions`. **Not atomic:** placements
+    /// before the failure are not rolled back.
+    pub fn replay_from(&mut self, actions: &[Action]) -> Result<(), ReplayError>;
 }
 ```
+
+**Replay is the only way to load a position, and it is not a second code path.** Every
+placement goes through `advance`, so a position is expressible exactly when it is
+reachable by a legal game — which is decision A3, finally expressed as an API instead of
+a convention. There is no `serde` impl on `Position` and no board-shaped
+deserialisation; the reference had both, and its `Board` deserialiser bypassed the turn
+rules entirely.
+
+`ReplayError::ply` is the load-bearing field. A record that fails to replay is
+untriageable without knowing *where* it diverged, and "illegal move" alone does not let a
+caller bisect a corrupt game.
 
 A mirror must call `advance` and must never re-derive the phase transition itself. The
 transition is `if won { phase_before } else { advance_turn(phase_before, coord) }`, and
@@ -632,8 +690,32 @@ impl Position {
     /// double-validates on the hot path. To learn *why*, call `advance` and read
     /// the error.
     pub fn is_legal(&self, action: Action) -> bool;
+
+    /// Where `action` sits in `legal_actions()` order, or `None` if it is not
+    /// legal here.
+    pub fn legal_rank(&self, action: Action) -> Option<usize>;
+
+    /// The legal placement at `index` in `legal_actions()` order, or `None` if
+    /// `index >= legal_count()`.
+    pub fn nth_legal(&self, index: usize) -> Option<Action>;
 }
 ```
+
+**`legal_rank` and `nth_legal` are the two directions of the canonical ordering, and they
+are in the engine for one reason.** A policy head is indexed by that ordering, so
+self-play, training, and serving must all use the *same* mapping. Deriving it separately
+in each makes them agree only by coincidence, and a divergence is silent — the network
+keeps training, against scrambled targets. This is the defect `SUGGESTIONS.md` S1
+diagnosed; the fix is that the ordering has exactly one implementation and a golden test
+over the rank of each played move, not that the action space is bounded.
+
+Both are a popcount prefix and a select scan over the `frontier` plane, which the
+`q`-major/`r`-minor layout makes equal to position within the canonical enumeration.
+`O(arena words)` and independent of the rank — cheaper than walking the iterator for a
+normal arena, and worth knowing at an extreme one: a ~16 000-row arena is ~32k words per
+call, so the boundary tests sample rather than sweep. This is the first consumer that
+could put enumeration cost in a profile, which is the waking condition §12 named for the
+deferred `row_any` row-summary bits.
 
 `legal_actions` never special-cases at the call site: callers do not branch on phase to
 generate moves. A caller reusing a buffer writes
@@ -706,10 +788,26 @@ impl Position {
 }
 ```
 
+```rust
+impl Position {
+    /// Every placement that produced this position, oldest first. Length is
+    /// always `stone_count()`. Feeding it to `replay` rebuilds an equal
+    /// position, and any prefix rebuilds the position at that ply.
+    ///
+    /// Inside a `Search` this includes the speculative plies applied above the
+    /// floor, and each `undo` removes one.
+    ///
+    /// Scope: records, replay, and debugging. Not part of the read-surface
+    /// contract a model encoder should build features on — the representation
+    /// may change. Move *identity* is `ActionId`, which is frozen.
+    pub fn history(&self) -> &[Action];
+}
+```
+
 Deliberately absent: `bounds()` (zero callers in the reference; the brief kills it),
-`occupied_cells() -> &[HexCoord]` in placement order (that is history in disguise, and
-ruling 1 forbids history in the state — the runner's move stream is the record), and any
-raw bitboard or plane accessor (§12).
+`occupied_cells() -> &[HexCoord]` in placement order (`history()` is the placement-order
+answer and `stones()` the canonical-order one), and any raw bitboard or plane accessor
+(§12).
 
 ### 4.6 Integrity audit
 
@@ -800,11 +898,12 @@ which is the correct outcome for a corrupted position.
 ```rust
 pub struct Position {
     grid: Grid,                 // §5.2
+    history: Vec<Action>,       // every placement, oldest first (ruling 1)
     phase: TurnPhase,
     current: Player,
     terminal: Option<Outcome>,
     hash_cells: u64,            // XOR of cell keys only; turn key applied on read (§8)
-    stones: u32,
+    stones: u32,                // == history.len(); see below
     stones_by: [u32; 2],
 }
 
@@ -842,9 +941,25 @@ internal write path never sees one, because growth (§5.5) runs first.
 Bit-per-cell layout is `q`-major, `r`-minor because that makes a row scan produce
 ascending `(q, r)` — the canonical order — with no sort.
 
-Memory is 11 bits per cell in the bounding box: 3 planes at 1 bit plus `cover` at 1 byte.
-A realistic 200-stone game inside an 80x80 box is ~8.8 KB; `clone` is four `memcpy`s and
-allocates once.
+**`history` is stored, and `stones` is kept alongside it.** Ruling 1 was reversed: the
+placement sequence is what makes a position writable as a game record and rebuildable by
+`Position::replay` (§4.2), and it is the only thing on the type that is not derivable
+from the board. It costs four bytes per ply. `stones` is redundant with `history.len()`
+and is kept so `stone_count` stays a `const fn` on the crate's MSRV; it is *asserted*
+equal on every apply and undo (C15) and never restored from the history, per the §7.4
+rule that a maintained value is snapshot-asserted rather than snapshot-restored.
+
+History joins the involutive class of §5.4 rather than the delta of §7.2: a push is
+exactly inverted by a pop, so `Undo` carries no history field.
+
+Memory is 11 bits per cell in the bounding box — 3 planes at 1 bit plus `cover` at 1
+byte — plus 4 bytes per ply of history. The first opened position allocates a 32x128
+arena, which is 5,632 bytes of plane payload; a realistic 200-stone game commonly pads
+and rounds to a 128x256 arena, ~45 KB, against 800 bytes of history. **`clone` performs
+five allocations** — the four grid planes plus the history — and copies their contents.
+"Clone is a memcpy" is shorthand for "no pointer chasing and no per-cell work", not a
+literal single `memcpy`; it was never one, because `Grid` has always owned four separate
+buffers.
 
 ### 5.2 Why `cover` is a byte count and not a bit
 
@@ -891,27 +1006,33 @@ fn place(&mut self, c: HexCoord, p: Player) {
     if self.grid.cover(c) > 0 { self.grid.clear_frontier(c); }
     // (b) occupancy BEFORE the disk loop. c is a member of its own disk.
     self.grid.set_owner(c, p);
-    // (c) coverage, in DISK8 order.
+    // (c) coverage, in DISK8 order, skipping cells outside the domain.
+    let interior = disk_is_interior(c);
     for d in DISK8 {
         let cell = c + d;
+        if !interior && !cell.is_valid() { continue; }
         debug_assert!(self.grid.cover(cell) < DISK_CELLS as u8);
         self.grid.bump_cover(cell, 1);
         if self.grid.cover(cell) == 1 && self.grid.is_empty_cell(cell) {
             self.grid.set_frontier(cell);
         }
     }
-    // (d) hash, (e) counters.
+    // (d) hash, (e) counters, (f) history.
     self.hash_cells ^= zobrist::cell_key(c, p);
     self.stones += 1;
     self.stones_by[p.index()] += 1;
+    self.history.push(Action::new(c));
 }
 
 fn unplace(&mut self, c: HexCoord, p: Player) {
+    self.history.pop();                                          // (f')
     self.stones_by[p.index()] -= 1;                              // (e')
     self.stones -= 1;
     self.hash_cells ^= zobrist::cell_key(c, p);                  // (d')
-    for d in DISK8.iter().rev() {                                // (c')
+    let interior = disk_is_interior(c);                          // (c')
+    for d in DISK8.iter().rev() {
         let cell = c + *d;
+        if !interior && !cell.is_valid() { continue; }
         debug_assert!(self.grid.cover(cell) > 0);
         if self.grid.cover(cell) == 1 && self.grid.is_empty_cell(cell) {
             self.grid.clear_frontier(cell);
@@ -933,6 +1054,17 @@ again fails it. Steps (a) and (a') read `cover(c)` at the same value on both sid
 because of that ordering; swapping (b) and (c) independently would corrupt
 `frontier_cells` by exactly one on every ply, in a way that no round-trip test would
 catch, because it would be symmetric.
+
+**Coverage is written only inside the coordinate domain.** `check_placement` refuses a
+coordinate outside `COORD_LIMIT` with `CoordOutOfBounds`, so if the disk loop marked such
+a cell as frontier, `legal_actions` would offer a placement `advance` refuses — and
+`legal_rank` would give it a policy index. That was a real defect: a walk to `q = 16000`
+put 136 unaddressable coordinates into the legal set, all of which `is_legal` rejected.
+Both halves of the pair apply the same `is_valid` filter, computed from the same
+coordinate, so they stay exact inverses. The `disk_is_interior` hoist is a fast path for
+the predicate, not a second implementation of it: it is a sufficient condition for *all*
+217 cells being in-domain, so the per-cell test runs only within `LEGAL_RADIUS` of a face
+— which no ordinary game reaches. Pinned by `tests/boundary.rs` at all six faces.
 
 `place` reads nothing about the win and is called unconditionally (§7.1).
 
@@ -1407,9 +1539,13 @@ debug, at O(1) cost.
 
 ### 7.3 The undo floor
 
-**The undo stack is not in `Position`.** It lives in the borrow-scoped `Search` (§4.7).
-That satisfies ruling 1 — `clone` stays a flat memcpy with no history — *and* delivers
-ruling 4's floor with no extra machinery.
+**The undo stack is not in `Position`.** It lives in the borrow-scoped `Search` (§4.7),
+which delivers ruling 4's floor with no extra machinery.
+
+The stack is *deltas*, not history, and the two are unrelated: `history` records what was
+played and is restored by a pop, while the stack records how to reverse each ply and is
+consumed. A cloned position carries its history and no deltas, which is exactly what a
+player mirror needs — it can name every move of the game so far and undo none of them.
 
 ```rust
 pub struct Search<'p> {
@@ -1665,6 +1801,7 @@ and every property test.
 | C12 | **The two win formulations agree:** `winning_windows(c, mover)` from the bit fold equals the brute-force scan of `windows_through(c)` for `mask.is_full_for(mover)`, slot for slot. | apply |
 | C13 | On entry to `undo_raw`: `zobrist() == audit.zobrist_after` (LIFO / wrong-position detector). | undo |
 | C14 | On exit from `undo_raw`: `zobrist()`, `frontier_cells`, and `stones` equal their pre-apply values. **Asserted, never assigned** (H7). | undo |
+| C15 | `history.len() == stones`, and after an apply `history.last() == Some(placed)`. On undo the popped entry is the placement being undone. **Asserted, never assigned** — `stones` is maintained, not derived from the history. | both |
 
 C12 earns its place because the QR shear (§6.4) is the single most error-prone line in the
 crate and it is a symmetric bug: a wrong shear applies and un-applies identically, so only
@@ -1728,6 +1865,7 @@ Checked in this order, returning the first failure:
 | A9 | `Terminal` | `terminal.is_some()` iff some window is fully owned, by a brute-force scan of `windows_through` over every stone. |
 | A10 | `Winner` | when terminal, the reported winner owns a completed window, and no window is completed by the other player. |
 | A11 | `TurnClosedForm` | the closed form of §10.2. |
+| A12 | `History` | `history.len() == stone_count()`, and the history names exactly the occupied cells — compared as a *set* against the plane scan, because order is history's own business and nothing else records it. |
 
 Note what is *not* here: there is no "the stored window masks agree with the board" check,
 because no window masks are stored (§5.1). That entire invariant class was deleted with
@@ -1790,6 +1928,23 @@ invisible to the debug lint.
 - `search`: floor behaviour — `undo()` at depth 0 returns `None` and leaves `zobrist()`
   unchanged; `commit()` then `unwind()` is a no-op; `Drop` restores the caller's position
   after an early `?`.
+- `window`: additionally, `WinningWindows` — every one of the 18 slots round-trips through
+  `contains` and `iter` one at a time with no leakage into its neighbours, `iter` and
+  `contains` agree over every single- and double-slot mask, and the multi-slot case yields
+  in ascending order.
+- `position`, history and replay: history length tracks `stone_count` at every ply; a
+  rejected placement leaves it untouched; `undo` pops it; `replay` of a history reproduces
+  the position and of every prefix reproduces that ply; `ReplayError.ply` names the failing
+  index for an illegal opening, an occupied cell, and a sequence continuing past a win; and
+  two games reaching the same board by different move orders are `PartialEq` while their
+  histories differ.
+- `position`, the ordering: `legal_rank` and `nth_legal` agree with the iterator at every
+  index, `legal_rank(a).is_some() == is_legal(a)` over a neighbourhood, the opening ranks
+  only the origin, a terminal position ranks nothing, and the second stone of a turn cannot
+  rank the first.
+- `grid`: additionally, `frontier_rank` and `nth_frontier` against a brute-force
+  coordinate-by-coordinate walk of the arena, across `u64` word boundaries and over a full
+  word; `None` off the plane and on an unallocated arena.
 
 **Property tests (`proptest`, dev-dependency only).**
 
@@ -1836,6 +1991,32 @@ invisible to the debug lint.
 8. **Limits are unreachable in normal play.** *Random* legal games of up to a few hundred
    plies never return `CoordOutOfBounds` or `BoardExtentExceeded`. Deliberately
    adversarial spreading is a different claim and is covered by 6b, not here.
+9. **The canonical ordering is a bijection at every ply**, checked inside the same
+   per-ply oracle pass as 2–5: `legal_rank` and `nth_legal` agree with the enumeration at
+   every index, and `nth_legal(legal_count())` is `None`.
+10. **History replays at every ply.** `Position::replay(pos.history())` equals `pos` and
+    has the same `zobrist()` and the same history. This is the only property that crosses
+    the incremental path against a from-scratch replay — property 7 compares two
+    incremental paths with each other.
+
+**Boundary tests (`tests/boundary.rs`), because the properties above never travel far
+enough to reach them.**
+
+The coordinate domain is a hexagon with six faces, and `legal_actions`, `legal_count`,
+`legal_rank`, `nth_legal`, `is_legal`, and `advance` are six implementations of "what may
+be played here" that can only disagree there. The four axis-aligned walks —
+`(1,0)`, `(-1,0)`, `(0,1)`, `(0,-1)`, each ~2000 plies in `LEGAL_RADIUS` steps — reach all
+six faces between them, because each drives two cube coordinates to their limits. At each:
+every enumerated action is `is_valid` and `is_legal`; rank and select agree with the
+enumeration over a sample weighted to the face; advancing an enumerated action never
+yields `CoordOutOfBounds`; `audit()` passes; and an apply/undo taken *at* the face restores
+exactly, which is what pins `place` and `unplace` to the same domain filter.
+
+The two diagonal walks are a separate assertion, not a gap: a diagonal widens both arena
+dimensions, so the padded bounding box grows as an area and `MAX_GRID_CELLS` refuses at
+around `|q| = 1984`, long before `COORD_LIMIT` would. The test asserts that this is what
+happens, that the refusal is a representation limit rather than a rule violation, and that
+the position survives it intact.
 
 **Fixtures, because the property generator will not find these on its own.**
 
@@ -1885,8 +2066,7 @@ Each line is a thing someone will ask for. Each has one reason.
 | `touched_windows()` — every window with a stone | No consumer, and it is the one window accessor that would force a stored index. Derivable as `stones()` crossed with `windows_through`. |
 | A stored window-mask table | Derived on read in O(1) (§6.2), which deletes a growth path, a delta, and an entire invariant class. |
 | A stored legal-move set (`Vec<ActionId>`, `AHashSet`) | The frontier bit plane is the legal set, and the bit scan yields canonical order for free. |
-| Placement history inside the state | Ruling 1. The runner's move stream *is* the record, and history in the state makes `clone` heap-growing. |
-| `occupied_cells() -> &[HexCoord]` in placement order | History in disguise, and it made undo need a `truncate`. `stones()` in canonical order is the position-only answer. |
+| `occupied_cells() -> &[HexCoord]` in placement order | `history()` is the placement-order answer and `stones()` the canonical-order one; a third accessor over the same data earns nothing. |
 | Raw occupancy planes / bitboard slices | A bit layout *is* the origin offset and stride. Exposing it makes growth visible and permanently freezes the arena. If profiling ever demands it, add `copy_planes_into(&self, out, origin, radius)` where the *caller* names the region in coordinates — additive, and it never leaks geometry. |
 | `Position` as a trait | Dynamic dispatch or generic infection on the hottest path in the system for the benefit of a second implementer that should not exist. Every method above is inherent and non-conflicting, so a trait with a blanket impl can be added later at zero cost. |
 | A draw / non-win `Outcome` variant | Ruling 6. Ply caps and adjudication are match rules; the runner owns them and needs its own result type regardless. |
@@ -1894,6 +2074,8 @@ Each line is a thing someone will ask for. Each has one reason.
 | `row_any` row-summary bits for skipping empty rows in enumeration | A mitigation for an `O(arena)` enumeration cost that does not bite at realistic board widths. Add it if p99 enumeration ever shows up in a profile. |
 | The 64x64 tiled arena | Unjustified complexity until the p99 bounding box exceeds `2^18` cells; specified in advance (§5.8) so it stays a swap rather than a rewrite. |
 | A `Scoped<'s, 'p>` RAII guard for recursive search | `&mut Search` down the call chain already covers recursive alpha-beta and iterative MCTS, with fewer public items and the same guarantees. |
+| A second, history-sensitive hash | One hash. `zobrist()` is position-only, which is what makes transposition tables merge — every turn's two stones are playable in either order and reach the same position, so a history-sensitive key would forfeit a 2x merge per turn. A model whose features depend on move order has `history()` and hashes it into its own cache key. |
+| `serde` on `history()` | It is `&[Action]`, and `Action` is `ActionId` in a newtype. A record writer emits `u32`s; that is the whole format. |
 | Runtime `Undo`-token validation | The debug `zobrist_after` check catches misuse at 1-in-2^64; making `undo` fallible would force every search to handle an impossible case in its hot loop. |
 | Every PyO3 type (`PythonBoard`, `PythonHexoState`, the dict marshalling, the lazy action view) | Ruling 8. Bindings live in a leaf crate that depends on this one. |
 
@@ -1948,3 +2130,30 @@ Where the three input designs disagreed, this is what was chosen and why. One li
 15. **`audit()` is a normal public method, not a cargo feature.** Feature unification makes
     `cfg`-gated correctness machinery unreliable, and symmetric bugs (§7.4 H8) have no
     other detector.
+16. **Placement history lives in `Position` (reverses ruling 1's original form).** A
+    position that cannot name the game that produced it is not writable as a record, and
+    every consumer would otherwise carry a parallel move list that can drift from the
+    board. It costs four bytes per ply against an arena already tens of kilobytes, on a
+    type whose `clone` was never a single `memcpy` — `Grid` has always owned four
+    buffers, so history is a fifth. Push/pop is involutive, so it needs no delta.
+17. **One hash, and it stays position-only.** `zobrist()` covers stones, owners, mover,
+    phase kind, and the terminal bit — not history. Hexo transposes structurally: a
+    turn's two stones are playable in either order and reach the same position, so a
+    history-sensitive key forfeits a 2x merge per turn of search. A model whose features
+    depend on move order reads `history()` and mixes it into its own cache key. The
+    reference conflated these — `hexo_utils/rust/src/state_hash.rs` hashes placement
+    order *because* dense-cnn used recency planes, and is explicitly process-internal and
+    never persisted, while this hash crosses the container boundary.
+18. **`PartialEq` stays positional and excludes history.** The type is called `Position`;
+    its equality matches `zobrist`, `audit`, and the oracles. Two games that reach the
+    same board by different move orders compare equal. Compare `history()` explicitly
+    when *same game* is the question.
+19. **Coverage is written only inside the coordinate domain (§5.4).** Otherwise
+    `legal_actions` offers placements `advance` refuses with `CoordOutOfBounds` and
+    `legal_rank` assigns them a policy index — measured at 136 such coordinates after a
+    walk to `q = 16000`. The alternative, filtering at every read, would cost `legal_count`
+    its `O(1)` and leave four accessors to keep in agreement instead of one writer.
+20. **`WinningWindows` is a type, not a `u32`.** The §6.3 slot layout was documented and
+    then reproduced by hand at every call site. A newtype with `iter()`, plus
+    `Applied::winning_windows()` resolving slots into real `Window`s, means no consumer
+    needs the layout at all.

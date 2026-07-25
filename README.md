@@ -56,24 +56,40 @@ never as a mutable handle.
 **The board is a recentred dense grid.** Play is local and contiguous even
 though the board is unbounded, so a dense array with an origin offset that grows
 and recentres replaces the previous sparse hash map. Array indexing instead of
-hashing on every neighbour query, bitboard shifts for window updates, and
-`clone` as a flat memcpy — which matters because copying positions is on the
-critical path of the design above.
+hashing on every neighbour query, and bitboard shifts for window updates.
+`clone` copies five flat buffers — four grid planes and the move history — with
+no pointer chasing and no per-cell work.
 
 **One placement is the atom, not one turn.** A turn is two placements, but a win
 is checked after each, so a turn can end after the first. Making the placement
 the unit keeps that out of the record format, the wire protocol, and every
 future policy head.
 
-**Players are handed a position once, then fed a move stream.** No fresh copy
-per turn: the player keeps its own mirror and applies the moves the runner
-sends. This costs O(1) per ply instead of O(board), it is the only handoff shape
-a container can use, and the move stream *is* the game record, so recording
-falls out for free.
+**Players are handed a move prefix once, then fed a move stream.** No fresh copy
+per turn: the player replays the prefix into its own mirror and applies the moves
+the runner sends. This costs O(1) per ply instead of O(board), and it is a move
+list rather than a serialised position because a container cannot be handed one —
+`Position` has no `serde` impl, deliberately, since board-shaped construction is
+what re-opens the rule-bypass hole. The old engine had exactly that and its
+`Board` deserialiser skipped the turn rules.
 
-**The position carries an incremental Zobrist hash.** Maintained through the
-same delta stack as `apply` / `undo`. Near-free at runtime, and it is what lets
-the runner catch desync with a remote player by exchanging one number per ply.
+**The position carries its move history, and there is exactly one hash.**
+`history()` is what makes a position writable as a record and rebuildable by
+`replay()`. The Zobrist hash stays *position-only* — it covers stones, owners,
+mover, phase, and the terminal bit, not move order. Hexo transposes
+structurally, since a turn's two stones are playable in either order and reach
+the same position, so a history-sensitive key would forfeit a 2x merge per turn
+of search. A model whose features depend on move order reads `history()` and
+mixes it into its own cache key. The old repo kept a separate, history-sensitive
+hash for exactly that reason and had to document it as process-internal and
+never persisted; this one crosses the container boundary and is what lets the
+runner catch desync by exchanging one number per ply.
+
+**One canonical action ordering, owned by the engine, in both directions.**
+`legal_rank` and `nth_legal` are the mapping a policy head is indexed by. If
+self-play, training, and serving each derive it themselves they agree only by
+coincidence, and a divergence is silent — the network keeps training, against
+scrambled targets.
 
 **Models are independent and own their own encoding.** A model may be written in
 Rust and depends only on the engine's read surface. Neither the engine nor the
@@ -100,11 +116,17 @@ cargo test --workspace
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --release --all-targets -- -D warnings
+cargo build -p hexo-engine --target wasm32-unknown-unknown
 ```
 
 The release lint is a separate gate: `debug_assertions` is off in release, so
 helpers whose only callers are `#[cfg(debug_assertions)]` become dead code that
 the debug lint cannot see.
+
+The `wasm32` build is a gate too. Nothing in the native build would catch a
+`std::time` call, a threading primitive, or a PyO3 dependency creeping into
+`hexo-engine`, and any of those costs the crate its ability to run the real
+rules in a browser. `rustup target add wasm32-unknown-unknown` first.
 
 Building the same tree from both Windows and WSL collides on `target/`. Set
 `CARGO_TARGET_DIR=target-wsl` on the WSL side; both are gitignored.

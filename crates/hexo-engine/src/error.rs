@@ -91,6 +91,41 @@ impl core::fmt::Display for MoveError {
 
 impl core::error::Error for MoveError {}
 
+/// A placement sequence that stopped being legal partway through.
+///
+/// The `ply` field is the load-bearing one: a record that fails to replay is
+/// untriageable without knowing *where* it diverged, and "illegal move" on its
+/// own does not let a caller bisect a corrupt game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayError {
+    /// Index into the replayed slice, counting from zero.
+    ///
+    /// For [`crate::Position::replay_from`] this is relative to the slice, not
+    /// to the start of the game.
+    pub ply: usize,
+    /// The placement that was refused.
+    pub action: crate::action::Action,
+    /// Why it was refused.
+    pub cause: MoveError,
+}
+
+impl core::fmt::Display for ReplayError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let c = self.action.coord();
+        write!(
+            f,
+            "replay failed at ply {}: ({}, {}): {}",
+            self.ply, c.q, c.r, self.cause
+        )
+    }
+}
+
+impl core::error::Error for ReplayError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 /// A failed [`crate::Position::audit`] check.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IntegrityError {
@@ -141,6 +176,9 @@ pub enum IntegrityCheck {
     TurnClosedForm,
     /// A stone lies within `LEGAL_RADIUS` of the arena boundary.
     ArenaMargin,
+    /// The move history disagrees with the occupancy planes, in length or in
+    /// which cells it names.
+    History,
 }
 
 #[cfg(test)]

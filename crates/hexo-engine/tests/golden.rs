@@ -229,6 +229,53 @@ fn zobrist_stream_matches_the_independent_oracle() {
     }
 }
 
+/// [`Position::legal_rank`] of each played move of [`GAME`], at the ply it was
+/// played.
+///
+/// This is the quantity a policy target is recorded against, so every trained
+/// checkpoint is permanently married to it. It is pinned separately from
+/// [`ORDER_DIGEST_BY_PLY`] because a digest over the whole legal list and the
+/// index of one move inside that list can move independently — a bug in the
+/// rank scan alone would leave the digest untouched.
+const PLAYED_RANK_BY_PLY: [usize; GAME.len()] = [
+    0, 184, 279, 330, 56, 220, 375, 16, 477, 809, 660, 429, 973, 764, 989, 148, 771, 1236, 398,
+    1150, 884, 505, 262, 251, 806, 1496, 1083, 453, 41, 1501, 668, 1996, 1845, 1373, 1715, 1705,
+    1440, 355, 1346, 756,
+];
+
+#[test]
+fn played_move_ranks_match_the_frozen_table() {
+    let mut pos = Position::new();
+    let mut ranks = Vec::new();
+    for &(q, r) in &GAME {
+        ranks.push(pos.legal_rank(act(q, r)).expect("the played move is legal"));
+        pos.advance(act(q, r)).expect("legal");
+    }
+    assert_eq!(
+        ranks.as_slice(),
+        PLAYED_RANK_BY_PLY.as_slice(),
+        "ACTION_ORDER_VERSION {ACTION_ORDER_VERSION}: the action index moved. \
+         Every existing checkpoint's policy head is now wrong. Regenerate \
+         deliberately and bump the version.\nactual: {ranks:?}"
+    );
+}
+
+#[test]
+fn nth_legal_inverts_the_frozen_ranks() {
+    // The inverse direction is what serving uses to turn a head's argmax back
+    // into a move, so it is pinned against the same table.
+    let mut pos = Position::new();
+    for (ply, &(q, r)) in GAME.iter().enumerate() {
+        let rank = PLAYED_RANK_BY_PLY[ply];
+        assert_eq!(
+            pos.nth_legal(rank),
+            Some(act(q, r)),
+            "ply {ply}: nth_legal({rank}) is not the played move"
+        );
+        pos.advance(act(q, r)).expect("legal");
+    }
+}
+
 #[test]
 fn the_canonical_ordering_is_ascending_action_ids_at_every_ply() {
     let mut pos = Position::new();
