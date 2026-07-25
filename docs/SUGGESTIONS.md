@@ -16,7 +16,7 @@ open questions.
 | S1 | Dense action indexing | **Closed.** The diagnosis was right, the proposed fix was wrong, and what survived has shipped |
 | S2 | Symmetry operations in the engine | Deferred — probably not yet |
 | S3 | The evaluator seam | Deferred — explained below |
-| S4 | Differential test against the old engine | Later |
+| S4 | Differential test against the old engine | **Closed.** Built, and it agrees |
 | S5 | Read-surface contract for model encoders | Open — needed once models start |
 | S6 | Containerised bots | Open — scope set, protocol undecided |
 | S7 | Python-side tooling (ruff, type checking) | Deferred — no Python yet |
@@ -257,7 +257,38 @@ encoding, the engine exposes state and nothing more.
 
 ## S4. Differential test against the old engine
 
-**Status: later, per your call. Noting the expiry date.**
+**Status: closed — built, and the two engines agree.**
+
+`crates/hexo-reference` is a frozen, dependency-free copy of the old rules crate
+(PyO3 bridge and `snapshot.rs` dropped, 48 KB from 93 KB), and
+`tests/differential.rs` drives the same random legal games through both engines.
+Compared per ply: the legal move *set*, terminal status and winner, mover, turn
+phase including its `first` payload, stone counts, the 18 windows through the
+placed cell with both ownership masks, which windows a placement completed, and
+the legality predicate on cells outside the enumerated set.
+
+**Zero divergences over 1.35 M plies** in the opt-in sweep; the default sweep
+runs 620 games inside `cargo test --workspace` in about two seconds. A mutation
+check confirms it has teeth: changing the vendored `LEGAL_RADIUS` from 8 to 7
+fails five of its six tests.
+
+Three findings worth keeping:
+
+- **The enumeration order is identical**, which was not expected. The old engine
+  sorts by `pack_coord`; the rewrite scans a `q`-major/`r`-minor bit plane. Both
+  come out ascending lexicographic `(q, r)`. The test asserts the *set* and only
+  reports order, so a future reordering is a note rather than a failure.
+- **`ActionId` is bit-identical to the old `pack_coord`** over the whole `i16`
+  domain. That matters beyond this test: the old encoding is persisted in `.hxr`
+  records and `.npz` training shards, so stored records still decode.
+- **The old engine has an unchecked `i16` overflow.** `coords_within_radius` does
+  `center.q + dq` in `i16`, so its "unlimited" board panics in debug and wraps
+  silently in release at around 32 759. `COORD_LIMIT` is therefore a documented
+  and checked version of a boundary the old engine already had and handled
+  unsafely — the rewrite is strictly better here, not divergent.
+
+The original argument for doing it early is kept below, because the expiry it
+warned about was real.
 
 `Hexo-BotTrainer-hexgt` contains a working, battle-tested implementation of
 exactly these rules. A property test that drives random legal move sequences

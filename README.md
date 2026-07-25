@@ -15,13 +15,16 @@ Hexo-Shrimp-Bot/
   Cargo.toml              workspace root; shared version, edition, lint policy
   crates/
     hexo-engine/          authoritative rules and game state
-    hexo-runner/          match orchestration and player communication
+    hexo-runner/          the authoritative game and adjudication policy
+    hexo-reference/       frozen copy of the previous engine; a test oracle only
   docs/
     ENGINE_SPEC.md        normative implementation target for hexo-engine
+    ENGINE_RL_AUDIT.md    review findings on readiness for parallel self-play
     OPEN_DECISIONS.md     questions that block the engine and the runner
     SUGGESTIONS.md        open design proposals, not yet decided
   .github/workflows/
-    ci.yml                fmt, clippy, test on every push
+    ci.yml                fmt, clippy, msrv, docs, test, wasm32 on every push
+    nightly-smoke.yml     the deep smoke run, scheduled
 ```
 
 Each crate carries its own `README.md` with a module table and design notes.
@@ -106,9 +109,18 @@ answering someone else's protocol runs as a player and does not adjudicate.
 arrives, a `uv` workspace and maturin — not the three backends and manual
 `PYTHONPATH` assembly of the previous repo.
 
+**The previous engine is kept as a test oracle.** `hexo-reference` is a frozen,
+dependency-free copy of `Hexo-BotTrainer-hexgt`'s rules crate, and
+`cargo test --workspace` drives random legal games through both engines and
+compares legality, terminal results, turn state, and window ownership ply by
+ply. It exists so "the rules are unchanged" is a checked property rather than a
+claim, and it must never be edited to make a test pass — a divergence is a
+finding, and the rewrite is not automatically the correct side.
+
 ## Build
 
-Requires Rust 1.85+ (edition 2024). Currently on 1.95.
+Requires Rust 1.88+ (let chains). Developed on 1.95, and the floor is gated by
+the `msrv` CI job rather than declared and hoped for.
 
 ```sh
 cargo build

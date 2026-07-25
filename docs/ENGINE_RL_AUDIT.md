@@ -315,16 +315,36 @@ The primary acceptance metric should be end-to-end generated training positions
 per second at a fixed search budget and identical outputs, not isolated engine
 placements alone.
 
+## Measured verdicts on the P1 list
+
+The benchmark suite (`crates/hexo-engine/benches/`) now exists, and it settles most
+of the recommendations above. The snapshot at the bottom of this document
+reproduced almost exactly on the same CPU family, so nothing in it needs
+retracting — but several of the conclusions drawn *from* it do.
+
+| Proposal | Verdict | Evidence |
+| --- | --- | --- |
+| Restructure the 217-cell disk walk into 17 row spans | **Worth doing. The right target.** | The walk is ~75% of an interior `apply`+`undo` pair and ~84% of an edge one — ~1.1 ns (~4 cycles) per disk cell, matching the audit's "2–4 mappings per cell". Ceiling on the win looks like 2–3x on the pair. Optimise against the *edge* number (976 ns), since real games play rim placements. |
+| Buffer-reusing clone / consolidating planes into one slab | **Not worth it on latency.** | A 44 KiB ply-256 clone is 794 ns, of which allocation is only ~50–100 ns (6–13%); the rest is the copy at ~65 GB/s. Consolidating planes buys ~7%, full reuse ~13%. More telling: copy-on-descend is 1,213 ns against make/unmake's 613 ns — only **2.0x**, so the lever is cloning *less often*, not cheaper. Justified only by allocator contention and RSS at high actor counts, which this suite does not measure. |
+| `row_any` row-summary bits | **Not worth it.** | Enumeration is item-bound: throughput is flat at 326–338 M items/s across every ply and both arenas, and tripling the empty words costs `legal_actions` **3.0%**. |
+| Return the owner from the bit-scan slot (read surface) | **Worth doing, and more than `row_any`.** | `stones` costs 4.3 ns per stone against `legal_actions`' 2.9 ns per action; the 1.4 ns delta is the second `owner()` lookup. Worth ~33% of `stones` on every arena. |
+| Search excursions permanently inflating a worker | **Real, but it is an RSS problem, not a latency one.** | An unwound excursion costs `legal_actions` 3% and `stones` 70%, but 4x the memory — 22 → 88 KiB for the same position. Compaction should be argued from footprint, not speed. |
+| `legal_rank` / `nth_legal` are "much worse at extreme arena sizes" | **Does not hold.** | Quadrupling the words slowed the prefix 97% and the walk 2% — and the prefix still won by 67x. It loses only below ~0.13 legal cells per word; measured densities are 3.3 to 14.4. |
+
+Two things the numbers say that nobody asked about:
+
+- **`advance` does not scale with board size at all** — 377–419 ns across a 256x range
+  in stones and an 8x range in arena words, and `windows_through` is flat at 52–59 ns.
+- **Arena growth is amortized to nothing.** Replaying 256 plies from empty, including
+  every reallocation and recentring copy, is 437 ns/ply — 4% above steady-state
+  `advance`.
+
 ## Recommended order of work
 
 1. ~~Fix the coordinate-limit enumeration contract and add boundary properties.~~
    Done — see the P0 section.
-2. Add benchmarks and preserve representative performance fixtures. **This is now
-   the blocking item**: every remaining recommendation here is a performance claim
-   with no number in the repository, and the snapshot below was taken outside it.
-   `legal_rank` and `nth_legal` are new hot-path candidates worth including — both
-   are `O(arena words)`, which is cheaper than walking the iterator at ordinary
-   arena sizes and much worse at extreme ones.
+2. ~~Add benchmarks and preserve representative performance fixtures.~~ Done — see
+   the verdicts above.
 3. Implement the 17-row disk update and small iterator optimizations.
 4. Add clone/reset reuse and a search-root compaction policy.
 5. Add bulk encoder-facing read APIs.

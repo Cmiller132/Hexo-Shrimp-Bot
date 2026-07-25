@@ -710,12 +710,18 @@ diagnosed; the fix is that the ordering has exactly one implementation and a gol
 over the rank of each played move, not that the action space is bounded.
 
 Both are a popcount prefix and a select scan over the `frontier` plane, which the
-`q`-major/`r`-minor layout makes equal to position within the canonical enumeration.
-`O(arena words)` and independent of the rank — cheaper than walking the iterator for a
-normal arena, and worth knowing at an extreme one: a ~16 000-row arena is ~32k words per
-call, so the boundary tests sample rather than sweep. This is the first consumer that
-could put enumeration cost in a profile, which is the waking condition §12 named for the
-deferred `row_any` row-summary bits.
+`q`-major/`r`-minor layout makes equal to position within the canonical enumeration. Each
+touches only the words up to its target, so the cost is `O(word index)` — it *does* grow
+with the rank, roughly 1.6 ns per 64-cell word against 3.0 ns per item for a walk of
+`legal_actions`.
+
+Measured at 256 stones (7,349 legal): `legal_rank` is 5.6 ns at rank 0, 106 ns at the
+middle, 195 ns at the last, against 5.4 ns / 11.0 us / 22.2 us for the walk — **34x to
+129x**. The two cross over only at rank ~0. Quadrupling the arena words behind the same
+legal set slows the prefix by 97% and the walk by 2%, and the prefix still wins by 67x;
+the real crossover is a frontier density below about 0.13 legal cells per word, against
+3.3 to 14.4 measured. The boundary tests sample rather than sweep because a ~16,000-row
+arena makes the *walk* expensive, not the prefix.
 
 `legal_actions` never special-cases at the call site: callers do not branch on phase to
 generate moves. A caller reusing a buffer writes
@@ -2071,7 +2077,7 @@ Each line is a thing someone will ask for. Each has one reason.
 | `Position` as a trait | Dynamic dispatch or generic infection on the hottest path in the system for the benefit of a second implementer that should not exist. Every method above is inherent and non-conflicting, so a trait with a blanket impl can be added later at zero cost. |
 | A draw / non-win `Outcome` variant | Ruling 6. Ply caps and adjudication are match rules; the runner owns them and needs its own result type regardless. |
 | A ply cap inside the engine | Same. |
-| `row_any` row-summary bits for skipping empty rows in enumeration | A mitigation for an `O(arena)` enumeration cost that does not bite at realistic board widths. Add it if p99 enumeration ever shows up in a profile. |
+| `row_any` row-summary bits for skipping empty rows in enumeration | **Measured, and it does not pay.** Enumeration is item-bound, not word-bound: `legal_actions` holds 326–338 M items/s across every ply and both a compact and a 4x-inflated arena, and tripling the empty words costs it **3.0%**. `stones` is more sensitive (+70%) only because it has 35x fewer items — but its real cost is `Stones::next` looking the owner up a second time after the bit scan already located the cell, worth ~33% on *every* arena against `row_any`'s 3% on an inflated one. If one of the two gets built, it is the owner lookup. |
 | The 64x64 tiled arena | Unjustified complexity until the p99 bounding box exceeds `2^18` cells; specified in advance (§5.8) so it stays a swap rather than a rewrite. |
 | A `Scoped<'s, 'p>` RAII guard for recursive search | `&mut Search` down the call chain already covers recursive alpha-beta and iterative MCTS, with fewer public items and the same guarantees. |
 | A second, history-sensitive hash | One hash. `zobrist()` is position-only, which is what makes transposition tables merge — every turn's two stones are playable in either order and reach the same position, so a history-sensitive key would forfeit a 2x merge per turn. A model whose features depend on move order has `history()` and hashes it into its own cache key. |
