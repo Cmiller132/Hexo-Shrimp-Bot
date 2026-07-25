@@ -35,6 +35,44 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # `rust-version` is a promise to anyone who depends on these crates, and CI
+  # otherwise only ever sees current stable — so the promise drifts silently.
+  # It had already: the declared floor was 1.85 (the edition-2024 minimum, taken
+  # as a default) while `Position::audit` uses a let-chain, which is 1.88.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `--all-targets` so tests and benches are held to the floor too, not just
+      # the library.
+      - name: Check at the declared MSRV
+        run: cargo check --workspace --all-targets
+
+  # `cargo clippy` does not check rustdoc: a broken intra-doc link like
+  # [`Position::advance`] compiles fine and silently stops resolving. This
+  # crate leans on that link syntax heavily (module docs cross-reference
+  # specific methods and private-but-documented internals), so treat any
+  # rustdoc warning — broken link, private-item link from a public path, bare
+  # URL, and so on — as a build failure rather than a note nobody reads.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Docs
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --workspace
+
   # `hexo-engine` is required to stay `wasm32`-compilable, which is what would
   # let a web frontend run the real rules instead of a reimplementation. Nothing
   # in the native build enforces it: a `std::time` call, a threading primitive,

@@ -2,13 +2,18 @@
 resolver = "3"
 members = [
     "crates/hexo-engine",
+    "crates/hexo-reference",
     "crates/hexo-runner",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.85 is the floor for edition 2024 and was declared for that reason alone, but
+# it was never true and never checked: `Position::audit` uses a let-chain, which
+# is 1.88. Verified, and gated by the `msrv` CI job — a declared MSRV nothing
+# tests is worth less than none, because it reads as a promise.
+rust-version = "1.88"
 
 [workspace.dependencies]
 hexo-engine = { path = "crates/hexo-engine" }
