@@ -1,8 +1,12 @@
 # Engine and Runner Audit for Massively Parallel RL
 
-Status: review findings. The P0 has since been fixed and is kept below as a
-record of what was wrong and how it was closed; everything marked P1 is still
-open and still unmeasured.
+Status: review findings, each annotated with what happened to it. The P0 and the
+coverage-update P1 are fixed, and are kept below as a record of what was wrong
+and how it was closed. The other three P1s are still open — but no longer
+unmeasured, which is what *Measured verdicts on the P1 list* settles.
+
+This is a snapshot with annotations, not a live plan. A finding stays here once
+it is closed; what it decided lives with the thing it decided.
 
 ## Verdict
 
@@ -15,6 +19,10 @@ incremental, and `Search` provides safe make/unmake. However, the runner is stil
 an empty scaffold, one engine correctness issue can produce unusable "legal"
 actions, and several hot paths need measurement and optimization before the
 engine is used at large rollout scale.
+
+**Since the review**, the correctness issue is fixed, the runner is implemented,
+and the hot paths are measured — so what is left of this verdict is the last
+clause, narrowed to the three P1s below.
 
 ## P0: Legal action enumeration disagrees with validation — FIXED
 
@@ -234,7 +242,13 @@ arena origin or stride. Examples include:
 
 Do not queue or serialize `Position` clones for inference.
 
-## Runner integration
+## Runner integration — SHIPPED
+
+Built as recommended: `Game` is a nonblocking state machine privately owning the
+canonical `Position`, results and aborts are separate types, and the annotation
+blob is opaque to the runner. `crates/hexo-runner/README.md` is the live
+statement of it; the recommendation is kept below as the record of what was
+asked for.
 
 Keep `hexo-runner` synchronous and deterministic at its core, but do not build
 massive self-play as one blocking OS thread per game.

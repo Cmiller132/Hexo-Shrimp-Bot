@@ -25,6 +25,9 @@ reused, because other documents cite it.
 | B2 | What is recorded per move | `PlyRecord::diagnostics` — an opaque seat-owned blob, and this one is actually persisted |
 | B3 | Search budget | `Budget`, stated and recorded by the game, never enforced by it |
 | B5 | Adjudication policy | `MatchResult`, `FailurePolicy`, `NoContest` |
+| C3 | The binary crate, and its modes | `CONTAINER_SPEC.md` §3: `hexo-bot`, with `train`, `serve`, and `play`. Self-play is not a mode — it is the first phase of `train`, because one loop cannot be split into pieces that could drift from it |
+| C5 | ~~`R` for dense action indexing~~ — **withdrawn**, not answered: a fixed radius-20 crop is what caused the `main_3` training collapse | `crates/hexo-engine/README.md`; the canonical unbounded ordering replaced it |
+| C6 | One image or two | `CONTAINER_SPEC.md` §2. One: a play-only image would need a second implementation of the model's forward pass, which the no-dual-paths rule forbids and which could silently disagree with the first |
 
 ---
 
@@ -63,7 +66,7 @@ that scheduling cannot change a run.
 | --- | --- |
 | C1 | Transport and wire format. A line-oriented stdio protocol is the default: trivial to containerise, debuggable by hand, close to what tournament harnesses expect. |
 | C2 | Handshake fields: protocol version, rules version, action-encoding version, seat, seed, budget. |
-| C3 | The binary crate — its name, and its subcommands (`selfplay`, `serve`, `train`). |
 | C4 | On-disk record format. |
-| C5 | ~~`R` for dense action indexing~~ — **withdrawn.** A fixed radius-20 crop caused the `main_3` training collapse; the canonical unbounded ordering replaced it, and the reasoning is in `crates/hexo-engine/README.md`. |
-| C6 | **One image or two.** Training is a far heavier image than play: a play-only bot is a static Rust binary, while a training image carries a deep-learning stack and GPU runtime, and is the likely re-entry point for Python. Whether one image serves all four container jobs or a play image is split from a train image changes the base image, its size, and where the Rust/Python line falls. |
+
+`CONTAINER_SPEC.md` §9 is the same list from the other side, and adds B4 to it:
+`train` needs seeds the moment self-play samples rather than maximises.

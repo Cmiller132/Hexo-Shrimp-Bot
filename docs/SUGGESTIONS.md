@@ -19,7 +19,7 @@ stable: a closed item's number is not reused, because other documents cite it.
 | S3 | The evaluator seam | Deferred — explained below |
 | S4 | Differential test against the old engine | **Closed.** Built, and it agrees; findings are in [crates/hexo-reference/README.md](../crates/hexo-reference/README.md) |
 | S5 | Read-surface contract for model encoders | Open — needed once models start |
-| S6 | Containerised bots | Open — scope set, protocol undecided |
+| S6 | Containerised bots | **Closed.** Accepted and specified in [CONTAINER_SPEC.md](CONTAINER_SPEC.md); the wire format it leaves open is `OPEN_DECISIONS.md` C1/C2 |
 | S7 | Python-side tooling (ruff, type checking) | Deferred — no Python yet |
 
 ---
@@ -141,44 +141,6 @@ Expressed as a Rust trait in the engine, so a model crate depends on
 `hexo-engine` and never on `hexo-runner`. Worth designing when the first model
 lands, not before — but worth *not foreclosing* now, which mostly means keeping
 the state representation clonable and readable without going through the runner.
-
----
-
-## S6. Containerised bots
-
-**Status: scope decided, protocol open.**
-
-A container is a *complete bot*, not a move oracle. It carries `hexo-engine` and
-`hexo-runner` inside it and must cover four jobs:
-
-| Job | Who is the authority | What the container does |
-| --- | --- | --- |
-| Self-play | itself | drives whole games internally, emits records |
-| Training | n/a | consumes records, emits checkpoints |
-| Eval | a host orchestrator | plays as one seat |
-| External tournament | the tournament harness | plays as one seat, in *their* protocol |
-
-Three consequences fall out of that table.
-
-**Exactly one authority per game.** Two containers each running a full runner
-means two authorities, which is a desync waiting to happen. The container needs
-an explicit mode — drive the game, or answer as a seat — and it must never
-adjudicate when it is not the authority.
-
-**Modes imply a binary.** The workspace is libraries only today. A container
-needs an entry point with subcommands along the lines of `selfplay`, `serve`,
-`train`. Worth deciding when that crate appears, and what it is called.
-
-**External protocols get adapters, not accommodation.** Tournament harnesses
-have their own wire formats. Design the native protocol for this system's needs
-and translate at the edge; letting a foreign protocol's assumptions into the
-runner is how the runner ends up serving two masters.
-
-Still to decide: transport and wire format (a line-oriented stdio protocol is
-the obvious default — trivial to containerise, trivial to debug by hand, and
-close to what tournament harnesses already expect); the handshake, which should
-pin protocol version, rules version, and action-encoding version before the
-first move; and how model-side resource limits interact with adjudication.
 
 ---
 

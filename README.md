@@ -3,10 +3,11 @@
 A ground-up rebuild of the Hexo engine and bot-training framework, succeeding
 `Hexo-BotTrainer-hexgt`. The game rules are unchanged; the architecture is not.
 
-> **Status: `hexo-engine` implemented, `hexo-runner` still a scaffold.** The
-> engine ships the full rule machine, make/unmake search, and its test suite;
-> the runner crate is empty. Only the engine and the match runner are in scope
-> right now — no models, no search, no training, no Python.
+> **Status: `hexo-engine` and `hexo-runner` implemented.** The engine ships the
+> full rule machine, make/unmake search, and its test suite; the runner ships
+> the nonblocking game state machine, the result and adjudication model, and
+> its own. The container design is written but not built. No models, no tree
+> search, no training, no Python.
 
 ## Layout
 
@@ -21,7 +22,8 @@ Hexo-Shrimp-Bot/
   docs/
     ENGINE_SPEC.md        normative implementation target for hexo-engine
     ENGINE_RL_AUDIT.md    review findings on readiness for parallel self-play
-    OPEN_DECISIONS.md     questions that block the engine and the runner
+    CONTAINER_SPEC.md     how a bot is packaged, deployed, and run
+    OPEN_DECISIONS.md     what is still undecided, and where the settled answers went
     SUGGESTIONS.md        open design proposals, not yet decided
   .github/workflows/      which runner executes which gate, and nothing more
 ```
@@ -131,5 +133,7 @@ Building the same tree from both Windows and WSL collides on `target/`. Set
 | Doc | What it is |
 | --- | --- |
 | [docs/ENGINE_SPEC.md](docs/ENGINE_SPEC.md) | **Normative.** The single implementation target for `crates/hexo-engine`: rules, state, storage, growth policy, error precedence, invariants, and test obligations. |
-| [docs/OPEN_DECISIONS.md](docs/OPEN_DECISIONS.md) | Questions that *must* be answered to build the engine and runner, grouped by what they block. |
-| [docs/SUGGESTIONS.md](docs/SUGGESTIONS.md) | *Optional* design proposals with status, rationale, and trade-offs. Accepted items graduate to this README. |
+| [docs/ENGINE_RL_AUDIT.md](docs/ENGINE_RL_AUDIT.md) | Review findings on readiness for massively parallel self-play, with each one's resolution recorded next to it. A snapshot with annotations, not a live plan. |
+| [docs/CONTAINER_SPEC.md](docs/CONTAINER_SPEC.md) | How a bot is packaged, deployed, and run: one image, one binary with three modes, where state lives, and what a long-lived training process has to guarantee. Design spec, not yet built. |
+| [docs/OPEN_DECISIONS.md](docs/OPEN_DECISIONS.md) | Questions that *must* be answered before the code depending on them exists. A settled one leaves, and the file records where its answer went — the engine's and the runner's are all settled; seeds and the wire protocol are not. |
+| [docs/SUGGESTIONS.md](docs/SUGGESTIONS.md) | *Optional* design proposals with status, rationale, and trade-offs. Accepted items graduate to the `README.md` of whatever they decided. |
