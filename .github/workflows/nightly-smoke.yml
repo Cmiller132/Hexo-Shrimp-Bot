@@ -1,13 +1,9 @@
 name: Nightly Smoke
 
-# `crates/hexo-engine/README.md` documents a heavier, release-profile smoke
-# run — an order of magnitude more games than the debug-profile defaults
-# `cargo test --workspace` uses in `ci.yml` — but nothing ever ran it. A
-# regression that only shows up over thousands of playouts (a rare board
-# shape, a growth-policy edge, a symmetric bug the golden vectors don't
-# happen to cover) would sit invisible between the doc comment and whoever
-# next thought to paste the command by hand. This runs it nightly, plus on
-# demand.
+# The deep smoke run, which is too slow to gate every push. It catches the
+# regressions that only appear over thousands of playouts: a rare board shape,
+# a growth-policy edge, a symmetric bug the golden vectors do not happen to
+# cover. Nightly, plus on demand.
 
 on:
   schedule:
@@ -29,16 +25,9 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Release profile, not debug: every placement in a debug build runs the
-      # full Tier-C assertion set (a 217-cell coverage recheck plus a second,
-      # independent win computation on every ply, per the smoke test's own
-      # doc comment), which is what keeps the `ci.yml` defaults small. The
-      # env vars are the exact invocation `crates/hexo-engine/README.md`
-      # documents; HEXO_SMOKE_UNIFORM is the one that matters here, since it
-      # is 30 by default and full-length uniform games are the expensive
-      # case.
-      - name: Smoke (release, scaled)
-        env:
-          HEXO_SMOKE_GAMES: 10000
-          HEXO_SMOKE_UNIFORM: 500
-        run: cargo test --release -p hexo-engine --test smoke
+      # Profile and scale live with the gate definition in `xtask/src/main.rs`,
+      # not here. In short: release, because a debug build runs the full
+      # tier-C assertion set on every placement, and `HEXO_SMOKE_UNIFORM` is
+      # the knob that matters, since full-length uniform games are the
+      # expensive case.
+      - run: cargo xtask smoke

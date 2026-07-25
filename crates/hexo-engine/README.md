@@ -109,28 +109,21 @@ stored, so neither gets a module.
 
 ## Testing
 
-```
-cargo test --workspace                       # ~20 s, debug profile
-cargo clippy --all-targets -- -D warnings
-cargo clippy --release --all-targets -- -D warnings
-cargo fmt --all --check
-cargo build -p hexo-engine --target wasm32-unknown-unknown
-```
+`cargo xtask verify` runs every gate, and `cargo xtask` says what each one
+catches; they are defined in `xtask/src/main.rs`. The whole set takes well under
+a minute, of which `cargo xtask test` is about 20 seconds.
 
-The `wasm32` build is a real gate, not a formality: nothing in the native build
-would catch a `std::time` call, a threading primitive, or a PyO3 dependency
-creeping in, and any of those would silently cost this crate its ability to run
-the real rules in a browser.
+Four of them exist for this crate specifically — the release lint, the rustdoc
+gate, and the two `wasm32` gates each see a class the debug test run cannot.
 
-The release lint is a separate gate, not a duplicate: `debug_assertions` is off in
-release, which deletes the only callers of the helpers the tier-C assertions use, so
-the debug lint cannot see a dead-code regression there.
+The deep smoke run is `cargo xtask smoke`: an order of magnitude more games,
+release profile, scheduled nightly rather than per-push. Worth running by hand
+after a change to hashing, ordering, growth, or win detection.
 
-The smoke test scales via the environment for a nightly or release run:
+The suite is also driven by the environment for a one-off:
 
 ```
-HEXO_SMOKE_GAMES=10000 HEXO_SMOKE_UNIFORM=500 \
-    cargo test --release -p hexo-engine --test smoke
+HEXO_SMOKE_GAMES=200000 cargo test --release -p hexo-engine --test smoke
 ```
 
 ## Benchmarks

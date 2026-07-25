@@ -17,14 +17,13 @@ Hexo-Shrimp-Bot/
     hexo-engine/          authoritative rules and game state
     hexo-runner/          the authoritative game and adjudication policy
     hexo-reference/       frozen copy of the previous engine; a test oracle only
+  xtask/                  the verification gates, defined once; `cargo xtask`
   docs/
     ENGINE_SPEC.md        normative implementation target for hexo-engine
     ENGINE_RL_AUDIT.md    review findings on readiness for parallel self-play
     OPEN_DECISIONS.md     questions that block the engine and the runner
     SUGGESTIONS.md        open design proposals, not yet decided
-  .github/workflows/
-    ci.yml                fmt, clippy, msrv, docs, test, wasm32 on every push
-    nightly-smoke.yml     the deep smoke run, scheduled
+  .github/workflows/      which runner executes which gate, and nothing more
 ```
 
 Each crate carries its own `README.md` with a module table and design notes.
@@ -56,17 +55,14 @@ and search it with make/unmake. Enforced by ownership rather than convention:
 the canonical state is private, handed out as an owned copy or a shared borrow,
 never as a mutable handle.
 
-**The board is a recentred dense grid.** Play is local and contiguous even
-though the board is unbounded, so a dense array with an origin offset that grows
-and recentres replaces the previous sparse hash map. Array indexing instead of
-hashing on every neighbour query, and bitboard shifts for window updates.
-`clone` copies five flat buffers — four grid planes and the move history — with
-no pointer chasing and no per-cell work.
-
-**One placement is the atom, not one turn.** A turn is two placements, but a win
-is checked after each, so a turn can end after the first. Making the placement
-the unit keeps that out of the record format, the wire protocol, and every
-future policy head.
+**The engine's internal design is settled, and recorded with the engine.** Four
+decisions constrain how `hexo-engine` is built rather than how the workspace is
+shaped, so [crates/hexo-engine/README.md](crates/hexo-engine/README.md) argues
+them and this list only names them: the board is a recentred dense grid, not a
+sparse map; one placement is the atom, not one turn; the position carries its
+move history and there is exactly one, position-only, Zobrist hash; and the
+engine owns one canonical action ordering in both directions, `legal_rank` and
+`nth_legal`. The invariants that protect each of them are documented there too.
 
 **Players are handed a move prefix once, then fed a move stream.** No fresh copy
 per turn: the player replays the prefix into its own mirror and applies the moves
@@ -76,23 +72,11 @@ list rather than a serialised position because a container cannot be handed one 
 what re-opens the rule-bypass hole. The old engine had exactly that and its
 `Board` deserialiser skipped the turn rules.
 
-**The position carries its move history, and there is exactly one hash.**
-`history()` is what makes a position writable as a record and rebuildable by
-`replay()`. The Zobrist hash stays *position-only* — it covers stones, owners,
-mover, phase, and the terminal bit, not move order. Hexo transposes
-structurally, since a turn's two stones are playable in either order and reach
-the same position, so a history-sensitive key would forfeit a 2x merge per turn
-of search. A model whose features depend on move order reads `history()` and
-mixes it into its own cache key. The old repo kept a separate, history-sensitive
-hash for exactly that reason and had to document it as process-internal and
-never persisted; this one crosses the container boundary and is what lets the
-runner catch desync by exchanging one number per ply.
-
-**One canonical action ordering, owned by the engine, in both directions.**
-`legal_rank` and `nth_legal` are the mapping a policy head is indexed by. If
-self-play, training, and serving each derive it themselves they agree only by
-coincidence, and a divergence is silent — the network keeps training, against
-scrambled targets.
+**The hash crosses the container boundary.** `zobrist()` is position-only, which
+is an engine decision argued with the engine — but it is what lets the runner
+catch desync by exchanging one number per ply. The previous repo's
+history-sensitive hash had to be documented as process-internal and never
+persisted; this one does not.
 
 **Models are independent and own their own encoding.** A model may be written in
 Rust and depends only on the engine's read surface. Neither the engine nor the
@@ -119,26 +103,25 @@ finding, and the rewrite is not automatically the correct side.
 
 ## Build
 
-Requires Rust 1.88+ (let chains). Developed on 1.95, and the floor is gated by
-the `msrv` CI job rather than declared and hoped for.
+Requires Rust 1.88+ (let chains) — the floor is declared in `Cargo.toml` and
+gated rather than hoped for. Developed on 1.95.
 
 ```sh
-cargo build
-cargo test --workspace
-cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo clippy --release --all-targets -- -D warnings
-cargo build -p hexo-engine --target wasm32-unknown-unknown
+cargo xtask verify     # every gate CI runs, in the order CI runs it
+cargo xtask            # list the gates and what each one catches
+cargo xtask lint       # just one
 ```
 
-The release lint is a separate gate: `debug_assertions` is off in release, so
-helpers whose only callers are `#[cfg(debug_assertions)]` become dead code that
-the debug lint cannot see.
+The gates are defined in `xtask/src/main.rs` and nowhere else, so a local run
+and CI cannot disagree about what they are. Several are not redundant with
+`cargo test` in ways that are easy to assume away — the release profile sees
+dead code the debug profile deletes, rustdoc is not checked by clippy, the MSRV
+floor is a promise nothing else tests, and the `wasm32` target is what keeps a
+`std::time` call or a PyO3 dependency out of `hexo-engine`. Each gate explains
+itself when it fails.
 
-The `wasm32` build is a gate too. Nothing in the native build would catch a
-`std::time` call, a threading primitive, or a PyO3 dependency creeping into
-`hexo-engine`, and any of those costs the crate its ability to run the real
-rules in a browser. `rustup target add wasm32-unknown-unknown` first.
+Two need a toolchain you may not have: `rustup target add
+wasm32-unknown-unknown`, and the MSRV toolchain named in `Cargo.toml`.
 
 Building the same tree from both Windows and WSL collides on `target/`. Set
 `CARGO_TARGET_DIR=target-wsl` on the WSL side; both are gitignored.

@@ -1,5 +1,13 @@
 name: CI
 
+# The gates themselves live in `xtask/src/main.rs`, which is the only place
+# that spells out a command line or explains why a gate is not redundant. This
+# file decides only which runner executes which gate — split into jobs because
+# they run in parallel and because `msrv` and `wasm` need their own toolchains.
+#
+# Adding a gate means adding it to `GATES` with `on_every_push: true` *and*
+# giving it a step here. `cargo xtask` with no argument lists the full set.
+
 on:
   push:
     branches: [main]
@@ -20,45 +28,33 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Format
-        run: cargo fmt --all --check
+      - run: cargo xtask fmt
+      - run: cargo xtask lint
+      - run: cargo xtask lint-release
+      - run: cargo xtask test
 
-      - name: Lint
-        run: cargo clippy --all-targets -- -D warnings
-
-      # The release profile turns `debug_assertions` off, which deletes the only
-      # callers of several `pub(crate)` helpers. Without this step the crate can
-      # stop compiling warning-free in release while the debug lint stays green.
-      - name: Lint (release profile)
-        run: cargo clippy --release --all-targets -- -D warnings
-
-      - name: Test
-        run: cargo test --workspace
-
-  # `rust-version` is a promise to anyone who depends on these crates, and CI
-  # otherwise only ever sees current stable — so the promise drifts silently.
-  # It had already: the declared floor was 1.85 (the edition-2024 minimum, taken
-  # as a default) while `Position::audit` uses a let-chain, which is 1.88.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.88
+      # The floor is read from the workspace manifest here and again inside
+      # `cargo xtask msrv`, so bumping `rust-version` moves both at once. This
+      # job installs *only* the floor toolchain, which also proves xtask itself
+      # builds there.
+      - name: Read the declared MSRV
+        id: msrv
+        run: |
+          echo "version=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
 
       - uses: Swatinem/rust-cache@v2
 
-      # `--all-targets` so tests and benches are held to the floor too, not just
-      # the library.
-      - name: Check at the declared MSRV
-        run: cargo check --workspace --all-targets
+      - run: cargo xtask msrv
 
-  # `cargo clippy` does not check rustdoc: a broken intra-doc link like
-  # [`Position::advance`] compiles fine and silently stops resolving. This
-  # crate leans on that link syntax heavily (module docs cross-reference
-  # specific methods and private-but-documented internals), so treat any
-  # rustdoc warning — broken link, private-item link from a public path, bare
-  # URL, and so on — as a build failure rather than a note nobody reads.
   docs:
     runs-on: ubuntu-latest
     steps:
@@ -68,15 +64,8 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Docs
-        env:
-          RUSTDOCFLAGS: -D warnings
-        run: cargo doc --no-deps --workspace
+      - run: cargo xtask docs
 
-  # `hexo-engine` is required to stay `wasm32`-compilable, which is what would
-  # let a web frontend run the real rules instead of a reimplementation. Nothing
-  # in the native build enforces it: a `std::time` call, a threading primitive,
-  # or a PyO3 dependency would all compile fine on the host and only fail here.
   wasm:
     runs-on: ubuntu-latest
     steps:
@@ -89,8 +78,5 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Build (wasm32)
-        run: cargo build -p hexo-engine --target wasm32-unknown-unknown
-
-      - name: Lint (wasm32)
-        run: cargo clippy -p hexo-engine --target wasm32-unknown-unknown -- -D warnings
+      - run: cargo xtask wasm
+      - run: cargo xtask wasm-lint

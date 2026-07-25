@@ -10,12 +10,46 @@ checked after *every* placement — so a turn can end on its first stone. No
 draws, passes, or captures, and stones are permanent. `hexo-engine` is
 authoritative; `docs/ENGINE_SPEC.md` is the normative target.
 
+## Verifying
+
+`cargo xtask verify` runs every gate CI runs. `cargo xtask` with no argument
+lists them and says what each one catches; `xtask/src/main.rs` is where they are
+defined. Nothing else states a gate's command line, so do not assemble one from
+a README — that drift is exactly what the xtask exists to prevent.
+
+## Gotchas
+
+**A green `cargo test` is not a green build.** Four of the eight gates catch a
+class the test run cannot see at all. Report work as verified only after
+`cargo xtask verify`.
+
+**Symmetric bugs are the hazard that matters here.** A wrong disk offset, a
+wrong shear in the QR fold, a wrong hash constant, or a growth copy with the
+same wrong index on both sides all apply and un-apply identically — so no
+round-trip or invariant test can see them. `Position::audit()`, the independent
+oracles in `crates/hexo-engine/tests/common`, and the frozen golden vectors are
+the only detectors. They are not redundant with each other, and making one of
+them agree with the implementation *by construction* silently deletes a
+detector rather than fixing anything.
+
+**`crates/hexo-reference` is a photograph, not a dependency.** It is a frozen
+copy of the previous engine and the only independent evidence in the workspace.
+A differential failure is a finding to report, not a thing to patch — see the
+`reference-divergence` skill before touching anything.
+
+**`docs/ENGINE_SPEC.md` is normative for `hexo-engine`.** Where the code and the
+spec disagree, that is a finding to raise, not a discrepancy to quietly resolve
+in whichever direction is less work.
+
+**`target/` collides between Windows and WSL.** Set
+`CARGO_TARGET_DIR=target-wsl` on the WSL side; both are gitignored.
+
 ## How to write code here
 
-Keep it simple, and keep it consistent with what is already there. Simple means
-not building for requirements that don't exist yet; it does not mean the cheap
-version of the work in front of you. Where the harder approach is genuinely more
-robust, take it — and finish it, rather than leaving a half-implementation.
+Simple means not building for requirements that don't exist yet; it does not
+mean the cheap version of the work in front of you. Where the harder approach is
+genuinely more robust, take it — and finish it, rather than leaving a
+half-implementation.
 
 Trim as you go. When something is upgraded the old version comes out in the same
 change — no dual paths, no compatibility shims, no deprecated names kept alive.

@@ -1894,12 +1894,11 @@ they exist to disagree with the implementation.
 
 ## 11. Test obligations
 
-All of these must pass from the workspace root: `cargo build`, `cargo test --workspace`,
-`cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, and
-`cargo clippy --release --all-targets -- -D warnings`. The release lint is a separate
-obligation, not a duplicate: `debug_assertions` is off in release, which deletes the only
-callers of the helpers the tier-C assertions use, so a dead-code regression there is
-invisible to the debug lint.
+`cargo xtask verify` must pass. It is the whole obligation, and the gates it runs are
+defined in `xtask/src/main.rs` — including the ones that are easy to mistake for
+duplicates, such as the release-profile lint, which sees dead code the debug profile
+deletes. This section does not restate them; a list here would drift from the one CI
+runs, which is what it did before.
 
 **Unit tests, per module.**
 

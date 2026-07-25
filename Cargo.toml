@@ -4,6 +4,11 @@ members = [
     "crates/hexo-engine",
     "crates/hexo-reference",
     "crates/hexo-runner",
+    # Not a crate of the project: `cargo xtask` defines the verification gates
+    # so that CI and a local run cannot disagree about what they are. It is a
+    # workspace member so the lint, format, and MSRV gates hold it to the same
+    # standard as everything else.
+    "xtask",
 ]
 
 [workspace.package]
