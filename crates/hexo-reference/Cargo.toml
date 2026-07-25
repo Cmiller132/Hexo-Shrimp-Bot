@@ -1,0 +1,42 @@
+[package]
+name = "hexo-reference"
+description = "Frozen copy of the previous Hexo rules engine, used only as a differential-test oracle."
+version.workspace = true
+# Deliberately NOT `edition.workspace = true`. This is a frozen 2021-edition
+# copy of another repository's crate; pinning the edition it was written for is
+# part of keeping it verbatim.
+edition = "2021"
+rust-version.workspace = true
+publish = false
+
+[lib]
+name = "hexo_reference"
+path = "src/lib.rs"
+
+[dependencies]
+
+# NOT `workspace = true`. The vendored sources predate this workspace's lint
+# policy and do not document every public item, so `missing_docs` is relaxed for
+# this crate alone rather than weakening the policy for the engine. See README.
+# `unsafe_code = "forbid"` is kept: the old engine has no `unsafe` and must not
+# grow any.
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "allow"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+# Style lints that the vendored prose and code trip. Silencing them beats
+# editing a frozen copy for cosmetics; none of them is a correctness lint.
+doc_lazy_continuation = "allow"
+
+# The vendored module docs mention `#[path]` and other bracketed Rust syntax in
+# prose, which rustdoc reads as intra-doc links to items that do not exist here.
+# The workspace `docs` CI job denies rustdoc warnings, so without this the gate
+# fails on a frozen copy nobody may edit. Scoped to this crate; the engine and
+# the runner are still held to it.
+[lints.rustdoc]
+broken_intra_doc_links = "allow"
+
+[dev-dependencies]
+hexo-engine = { workspace = true }
