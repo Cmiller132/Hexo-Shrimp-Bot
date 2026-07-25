@@ -133,3 +133,4 @@ Building the same tree from both Windows and WSL collides on `target/`. Set
 | [docs/ENGINE_SPEC.md](docs/ENGINE_SPEC.md) | **Normative.** The single implementation target for `crates/hexo-engine`: rules, state, storage, growth policy, error precedence, invariants, and test obligations. |
 | [docs/OPEN_DECISIONS.md](docs/OPEN_DECISIONS.md) | Questions that *must* be answered to build the engine and runner, grouped by what they block. |
 | [docs/SUGGESTIONS.md](docs/SUGGESTIONS.md) | *Optional* design proposals with status, rationale, and trade-offs. Accepted items graduate to this README. |
+| [docs/KLENT_DESIGN.md](docs/KLENT_DESIGN.md) | How the KLENT algorithm (Ota et al., ICML 2026) would work on Hexo: the placement-level MDP, the value target, the action space, the training corpus, and what it asks of the engine and runner. Specification sketch, not normative. |
