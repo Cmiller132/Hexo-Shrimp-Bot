@@ -49,15 +49,14 @@ action the engine immediately rejects.
 Reproduced exactly: at `q = 16000`, `legal_count()` was 270,216 with 136
 enumerated actions invalid, the first being `(15993, 8)` at `s = -16001`.
 
-Fixed at the source rather than by filtering at each read. `Position::place` and
-`Position::unplace` now skip disk cells outside the coordinate domain, so the
-frontier plane holds only valid coordinates and every accessor over it inherits
-the guarantee — `legal_count()` keeps its `O(1)`, and there is one writer to keep
-correct instead of four readers. Both halves compute the same predicate from the
-same coordinate, so they remain exact inverses; the `disk_is_interior` hoist is a
-sufficient condition for all 217 cells being in-domain, not a second
-implementation of the test. Post-fix count is 270,080, and no golden vector
-moved, confirming the region is unreachable in ordinary play.
+Fixed at the source rather than by filtering at each read. The disk update skips
+cells outside the coordinate domain, so the frontier plane holds only valid
+coordinates and every accessor over it inherits the guarantee — `legal_count()`
+keeps its `O(1)`, and there is one writer to keep correct instead of four
+readers. Both halves derive the same predicate from the same coordinate, so they
+remain exact inverses. Post-fix count is 270,080, and no golden vector moved,
+confirming the region is unreachable in ordinary play. (The filter has since
+moved into `Grid` and become a per-row clip; see the P1 section below.)
 
 `tests/boundary.rs` covers all six faces via the four axis-aligned walks — each
 drives two cube coordinates to their limits — and asserts (1) every enumerated
@@ -75,32 +74,60 @@ not a rule violation, with the position intact afterwards.
 `BoardExtentExceeded` remains a separate representation-limit case because the
 `is_legal` contract deliberately does not allocate or test arena growth.
 
-## P1: The 217-cell coverage update is the main scalar hot path
+## P1: The 217-cell coverage update is the main scalar hot path — FIXED
 
-Every placement and undo walks all 217 cells in `DISK8`:
+Every placement and undo walked all 217 cells in `DISK8`, and for each cell
+mapped the same coordinate through `locate` three or four times: once to
+increment coverage, once to read it back, once to test occupancy, and once more
+to set the frontier bit. Doubled by undo, that was roughly 75% of an interior
+`apply`+`undo` pair and 84% of an edge one.
 
-- `crates/hexo-engine/src/position.rs:583-625`
+### Resolution as shipped
 
-For each cell, the code repeatedly maps the same coordinate through `locate`
-while incrementing coverage, reading coverage, checking occupancy, and updating
-the frontier:
-
-- `crates/hexo-engine/src/grid.rs:171-188`
-- `crates/hexo-engine/src/grid.rs:262-323`
-
-This produces roughly 2-4 coordinate mappings per disk cell on apply and again
-on undo.
-
-### Recommended first optimization
-
-Move the disk update into `Grid`:
+The recommended first optimization, essentially unchanged:
 
 1. map the placed coordinate once;
-2. represent the radius-8 disk as 17 contiguous row spans;
+2. represent the radius-8 disk as 17 contiguous row runs;
 3. update coverage directly through slices;
 4. update frontier words with masks and popcounts.
 
-This can remain safe Rust and preserves the current representation.
+`Grid::disk_runs` produces the runs and `Grid::add_cover_disk` /
+`Grid::remove_cover_disk` are now the only writers of coverage, so `position` no
+longer knows the disk is a disk. Safe Rust, and the representation is unchanged.
+
+Two things fell out that the recommendation did not anticipate.
+
+**The per-cell domain filter became a per-row clip, and got more exact rather
+than less.** `place` used to test `is_valid()` on each cell behind a
+`disk_is_interior` fast path. At a fixed `q`, `is_valid` reduces to `r` lying in
+`[max(-LIM, -LIM - q), min(LIM, LIM - q)]`, so the clip is now two `min`/`max`
+pairs per row and the fast path is gone — one predicate rather than a predicate
+plus a sufficient condition for it.
+
+**`DISK8` is worth more now than when it was load-bearing.** It is no longer the
+thing the machine follows, so it survives as an *independent* statement of the
+same cell set: the tier-C frontier assertion walks it offset by offset on every
+apply and undo, and `grid`'s tests compare the two formulations directly. A wrong
+row run and a wrong offset are both symmetric bugs, so neither can be checked
+against itself.
+
+Measured against the pre-change baseline, at plies 1 / 32 / 96 / 256:
+
+| Benchmark | Change |
+| --- | ---: |
+| `apply_undo/edge` | **−45.1% / −58.2% / −58.8% / −60.4%** |
+| `apply_undo/interior` | −37.7% / −38.4% / −42.8% / −42.2% |
+| `advance` | −35.4% / −14.9% / −36.4% / −34.0% |
+| `replay/256` | −45.2% |
+
+The edge case is the one to read, since real games play rim placements: an edge
+`apply`+`undo` pair went from 1.09 us to 432 ns at ply 256. That is at the top of
+the 2–3x ceiling the first measurement predicted. `replay` halving is the same
+win seen end to end, since replaying 256 plies is 256 disk updates and their
+growth events.
+
+The golden vectors, the boundary tests, the property suite, and the differential
+test against `hexo-reference` are all unmoved.
 
 ### Higher-upside prototype
 
@@ -273,6 +300,9 @@ Important constraints:
 
 ## Current performance snapshot
 
+**These predate the 17-row disk update.** They are kept as the "before" side of
+that change; the deltas are in the P1 section above.
+
 Read-only release microbenchmarks were run on a Ryzen 9 7950X with Rust 1.95.
 For a random 200-stone position with 6,525 legal actions:
 
@@ -324,12 +354,37 @@ retracting — but several of the conclusions drawn *from* it do.
 
 | Proposal | Verdict | Evidence |
 | --- | --- | --- |
-| Restructure the 217-cell disk walk into 17 row spans | **Worth doing. The right target.** | The walk is ~75% of an interior `apply`+`undo` pair and ~84% of an edge one — ~1.1 ns (~4 cycles) per disk cell, matching the audit's "2–4 mappings per cell". Ceiling on the win looks like 2–3x on the pair. Optimise against the *edge* number (976 ns), since real games play rim placements. |
+| Restructure the 217-cell disk walk into 17 row spans | **Done.** The right target, and it paid. | The walk was ~75% of an interior `apply`+`undo` pair and ~84% of an edge one — ~1.1 ns (~4 cycles) per disk cell, matching the audit's "2–4 mappings per cell". See the P0/P1 section above for what shipped. |
 | Buffer-reusing clone / consolidating planes into one slab | **Not worth it on latency.** | A 44 KiB ply-256 clone is 794 ns, of which allocation is only ~50–100 ns (6–13%); the rest is the copy at ~65 GB/s. Consolidating planes buys ~7%, full reuse ~13%. More telling: copy-on-descend is 1,213 ns against make/unmake's 613 ns — only **2.0x**, so the lever is cloning *less often*, not cheaper. Justified only by allocator contention and RSS at high actor counts, which this suite does not measure. |
 | `row_any` row-summary bits | **Not worth it.** | Enumeration is item-bound: throughput is flat at 326–338 M items/s across every ply and both arenas, and tripling the empty words costs `legal_actions` **3.0%**. |
-| Return the owner from the bit-scan slot (read surface) | **Worth doing, and more than `row_any`.** | `stones` costs 4.3 ns per stone against `legal_actions`' 2.9 ns per action; the 1.4 ns delta is the second `owner()` lookup. Worth ~33% of `stones` on every arena. |
+| Return the owner from the bit-scan slot (read surface) | **Done, and it is a trade rather than a free win.** | `stones` cost 4.3 ns per stone against `legal_actions`' 2.9 ns per action; the 1.4 ns delta was a second `owner()` lookup re-deriving what the scan had already located. `BitScan::next_slot` now yields the `(word, bit)` slot and `Grid::owner_at` reads the owner out of it. `stones` improves 14–57% (42.9% on the inflated arena, where the exhaustion early-out below also lands) — but routing both iterators through a slot-returning scan costs `legal_actions` **3–6%**. See the note below the table. |
 | Search excursions permanently inflating a worker | **Real, but it is an RSS problem, not a latency one.** | An unwound excursion costs `legal_actions` 3% and `stones` 70%, but 4x the memory — 22 → 88 KiB for the same position. Compaction should be argued from footprint, not speed. |
 | `legal_rank` / `nth_legal` are "much worse at extreme arena sizes" | **Does not hold.** | Quadrupling the words slowed the prefix 97% and the walk 2% — and the prefix still won by 67x. It loses only below ~0.13 legal cells per word; measured densities are 3.3 to 14.4. |
+
+### The enumeration trade, stated plainly
+
+`stones` and `legal_actions` share one bit scan, and making it hand back the
+`(word, bit)` slot is what lets `stones` stop looking the owner up twice. The
+same change costs `legal_actions` 3–6%, and **that is not obviously a good deal
+in absolute terms**: at ply 256 a full `legal_actions` walk is 22 us against
+`stones`' 1.3 us, because there are twenty times more legal cells than stones. If
+an encoder calls both once per position, +6% on the larger one outweighs −14% on
+the smaller.
+
+It is shipped anyway, for two reasons. The gap closes on the arena shape that
+actually hurts — inflated, `stones` is −42.9% against `legal_actions`' +3.7% —
+and the alternative is two bit scans, which is the duplication this crate refuses
+everywhere else. Worth revisiting if a real encoder's call ratio turns out to be
+anywhere near 1:1.
+
+Three placements of the exhaustion early-out were measured and they are not
+close: at function entry costs `legal_actions` 3–6%; inside the loop after the
+yield costs it 11–48%, despite being one branch per *word* rather than per item;
+and omitting it entirely still leaves 5–15%, so the early-out was never the source
+of that cost. Likewise `LegalActions` calling `next_slot` directly rather than
+through the coordinate wrapper measures 11.09 us against 10.48 us at ply 96. The
+loop body staying in the shape the optimiser already chose dominates the branch
+arithmetic in every one of these, which is the general lesson.
 
 Two things the numbers say that nobody asked about:
 
@@ -345,9 +400,17 @@ Two things the numbers say that nobody asked about:
    Done — see the P0 section.
 2. ~~Add benchmarks and preserve representative performance fixtures.~~ Done — see
    the verdicts above.
-3. Implement the 17-row disk update and small iterator optimizations.
-4. Add clone/reset reuse and a search-root compaction policy.
-5. Add bulk encoder-facing read APIs.
+3. ~~Implement the 17-row disk update and small iterator optimizations.~~ Done —
+   the row runs, the owner-from-slot read, and an exhaustion early-out in
+   `BitScan` so a spent iterator stops scanning trailing empty words.
+4. Add clone/reset reuse and a search-root compaction policy. Still open, and
+   still the right framing: this is an RSS problem, not a latency one, so it
+   should be argued from footprint. There is no `Search::compact` today, and
+   `reserve_around` only re-shapes on a growth event — so an unwound excursion
+   holds its arena until something forces a reallocation.
+5. Add bulk encoder-facing read APIs. Deliberately still open: the shape is
+   dictated by an encoder that does not exist yet, and the workspace does not
+   keep two versions of anything.
 6. Implement the deterministic runner state machine and result model.
 7. Add bounded actor, evaluator, and record pipelines.
 8. Prototype bit-covered storage or a batched SoA engine only if end-to-end

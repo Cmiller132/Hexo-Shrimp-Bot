@@ -1,11 +1,12 @@
 //! Deterministic fixtures for the engine benchmarks.
 //!
 //! A bench is a separate target from an integration test, so this cannot `use`
-//! the oracles in `tests/common`. It deliberately uses the *same* splitmix64
-//! with the same constants and the same uniform-over-the-legal-set driver, so a
-//! fixture named by ply here is the position the test corpus builds at that
-//! ply. Nothing here re-implements a rule: every placement goes through
-//! `Position::advance`.
+//! the oracles in `tests/common`. It shares the *one* splitmix64 in
+//! `testkit/rng.rs` and drives it uniformly over the legal set exactly as the
+//! test corpus does, so a fixture named by ply here **is** the position that
+//! corpus builds at that ply — a shared file rather than two hand-matched
+//! copies, because that claim has to be structural to be worth making. Nothing
+//! here re-implements a rule: every placement goes through `Position::advance`.
 //!
 //! Uniform random play is the fixture policy because it is what the audit's
 //! out-of-tree snapshot used, so the numbers are comparable. It is also the
@@ -26,30 +27,10 @@ pub const PLIES: [usize; 4] = [1, 32, 96, 256];
 /// the position.
 pub const SEED: u64 = 0x1234_5678_9abc_def0;
 
-/// splitmix64. Deterministic, seedable, and dependency-free — the generator
-/// `tests/common` uses, with the same constants.
-pub struct Rng(u64);
+#[path = "../../testkit/rng.rs"]
+mod rng;
 
-impl Rng {
-    /// Seed the generator.
-    pub const fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    /// Next 64 bits.
-    pub fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    /// Uniform-ish value in `0..n`. `n` must be non-zero.
-    pub fn below(&mut self, n: usize) -> usize {
-        (self.next_u64() % n as u64) as usize
-    }
-}
+pub use rng::Rng;
 
 /// The move list of a `plies`-ply game of uniformly random legal placements.
 ///

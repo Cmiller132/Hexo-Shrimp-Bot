@@ -2,10 +2,10 @@
 //!
 //! # Where incremental-versus-recomputed divergence hides
 //!
-//! Several hazards in this module are **symmetric bugs**: a wrong `DISK8`
-//! offset, a wrong shear in the QR fold, a wrong `cell_key` constant, or a
-//! growth copy that uses the same wrong index for read and write all apply and
-//! un-apply identically. Round-trip tests cannot see them. [`Position::audit`],
+//! Several hazards in this module are **symmetric bugs**: a wrong disk row run,
+//! a wrong shear in the QR fold, a wrong `cell_key` constant, or a growth copy
+//! that uses the same wrong index for read and write all apply and un-apply
+//! identically. Round-trip tests cannot see them. [`Position::audit`],
 //! the brute-force oracles in `tests/`, and the frozen golden vectors in
 //! `zobrist` are the only detectors — **do not delete them as redundant**.
 //!
@@ -25,14 +25,16 @@
 //! - The win check must not gate the class-I mutation.
 
 use crate::action::Action;
-use crate::coord::{
-    Axis, DISK_CELLS, DISK8, HexCoord, LEGAL_RADIUS, WINDOW_LEN, disk_is_interior, hex_distance,
-    offset,
-};
+use crate::coord::{Axis, DISK_CELLS, HexCoord, LEGAL_RADIUS, WINDOW_LEN, hex_distance};
 use crate::error::{IntegrityCheck, IntegrityError, MoveError, ReplayError};
 use crate::grid::Grid;
 use crate::player::{Player, TurnPhase};
 use crate::search::Undo;
+// The offset table is no longer how the disk is *written* — `Grid` walks it as
+// contiguous row runs — so it survives only as the tier-C assertion's second,
+// independent statement of the same cell set.
+#[cfg(debug_assertions)]
+use crate::coord::{DISK8, offset};
 #[cfg(debug_assertions)]
 use crate::search::UndoAudit;
 use crate::window::{WINDOWS_PER_PLACEMENT, Window, WindowMask, WindowRef, WinningWindows};
@@ -65,6 +67,11 @@ pub struct Position {
     grid: Grid,
     /// Every placement, oldest first. Pushed by `place`, popped by `unplace`.
     ///
+    /// Also the ply counter: [`Position::stone_count`] is its length, so there is
+    /// no second field that could disagree with it (ruling 14). A push is exactly
+    /// inverted by a pop, which puts it in the involutive class and keeps it out
+    /// of [`crate::search::Undo`].
+    ///
     /// Four bytes per ply against an arena that is already tens of kilobytes,
     /// and `clone` already performs four allocations for the grid planes; this
     /// is a fifth. Deliberately **not** part of `PartialEq` and **not** hashed
@@ -75,17 +82,6 @@ pub struct Position {
     terminal: Option<Outcome>,
     /// XOR of cell keys only; the turn key is applied on read.
     hash_cells: u64,
-    /// Redundant with `history.len()`, and asserted equal to it on every apply
-    /// and undo (C15) rather than derived, per the §7.4 rule that a maintained
-    /// value is snapshot-*asserted*, never snapshot-*restored*.
-    ///
-    /// It was kept because `Vec::len` is not a `const fn` before Rust 1.87 and
-    /// [`Position::stone_count`] is one. That reason has expired — the crate's
-    /// real floor is 1.88, because `audit` uses a let-chain — so this field is
-    /// now removable, and ruling 14 says a redundant field pair should go.
-    /// Deliberately not removed yet: `stone_count` is on the search hot path and
-    /// there is no benchmark baseline to compare against. Revisit once there is.
-    stones: u32,
     stones_by: [u32; 2],
 }
 
@@ -97,7 +93,7 @@ impl Default for Position {
 
 impl PartialEq for Position {
     fn eq(&self, other: &Self) -> bool {
-        self.stones == other.stones
+        self.stone_count() == other.stone_count()
             && self.stones_by == other.stones_by
             && self.phase == other.phase
             && self.current == other.current
@@ -171,7 +167,6 @@ impl Position {
             current: Player::P0,
             terminal: None,
             hash_cells: 0,
-            stones: 0,
             stones_by: [0, 0],
         }
     }
@@ -275,11 +270,12 @@ impl Position {
         self.grid.is_empty_cell(coord)
     }
 
-    /// Total stones placed. Equals the ply count.
+    /// Total stones placed. Equals the ply count, and the length of
+    /// [`Position::history`].
     #[inline]
     #[must_use]
     pub const fn stone_count(&self) -> u32 {
-        self.stones
+        self.history.len() as u32
     }
 
     /// Stones held by one player.
@@ -297,7 +293,7 @@ impl Position {
     #[must_use]
     pub fn stones(&self) -> Stones<'_> {
         Stones {
-            scan: BitScan::new(&self.grid, ScanPlane::Occupied, self.stones as usize),
+            scan: BitScan::new(&self.grid, ScanPlane::Occupied, self.history.len()),
         }
     }
 
@@ -607,39 +603,21 @@ impl Position {
 
 /// Bit `t` set iff bits `t..t+6` of `x` are all set.
 #[inline]
-const fn run6_u16(x: u16) -> u16 {
+const fn run6(x: u32) -> u32 {
     let a = x & (x >> 1);
     let b = a & (a >> 2);
     b & (b >> 2)
 }
 
 /// `out[i]` bit `j` set iff rows `i..i+6` all have bit `j` set.
+///
+/// One implementation, at one width, for both the plain strip and the sheared
+/// one. The shear pushes the top row up by 10 bits, so `u16` will not hold it —
+/// and a second copy of this fold differing only in width is exactly the kind of
+/// duplication the QR shear already makes dangerous, since the two would drift
+/// silently and symmetrically.
 #[inline]
-const fn fold6_u16(s: &[u16; 11]) -> [u16; 6] {
-    let mut a = [0u16; 10];
-    let mut i = 0;
-    while i < 10 {
-        a[i] = s[i] & s[i + 1];
-        i += 1;
-    }
-    let mut b = [0u16; 8];
-    i = 0;
-    while i < 8 {
-        b[i] = a[i] & a[i + 2];
-        i += 1;
-    }
-    let mut c = [0u16; 6];
-    i = 0;
-    while i < 6 {
-        c[i] = b[i] & b[i + 2];
-        i += 1;
-    }
-    c
-}
-
-/// Identical shape over `u32`, for the sheared plane.
-#[inline]
-const fn fold6_u32(s: &[u32; 11]) -> [u32; 6] {
+const fn fold6(s: &[u32; 11]) -> [u32; 6] {
     let mut a = [0u32; 10];
     let mut i = 0;
     while i < 10 {
@@ -675,19 +653,27 @@ impl Position {
     /// Returns the raw slot mask; [`Position::apply_raw`] wraps it in
     /// [`WinningWindows`], which is the only type that escapes the crate.
     fn winning_slots(&self, c: HexCoord, p: Player) -> u32 {
-        let s = self.grid.strip11(self.grid.occ_plane(p), c);
+        let strip = self.grid.strip11(self.grid.occ_plane(p), c);
+        // Widened once, so the plain fold and the sheared fold are the same
+        // function rather than two copies of it at different widths.
+        let mut s = [0u32; 11];
+        let mut i = 0;
+        while i < 11 {
+            s[i] = strip[i] as u32;
+            i += 1;
+        }
         let mut out = 0u32;
 
         // Axis Q (1, 0): six consecutive rows at column 5.
-        let cq = fold6_u16(&s);
+        let cq = fold6(&s);
         for k in 0..WINDOW_LEN {
-            out |= (((cq[5 - k] >> 5) & 1) as u32) << k;
+            out |= ((cq[5 - k] >> 5) & 1) << k;
         }
 
         // Axis R (0, 1): six consecutive bits inside row 5.
-        let cr = run6_u16(s[5]);
+        let cr = run6(s[5]);
         for k in 0..WINDOW_LEN {
-            out |= (((cr >> (5 - k)) & 1) as u32) << (6 + k);
+            out |= ((cr >> (5 - k)) & 1) << (6 + k);
         }
 
         // Axis QR (1, -1): shear so anti-diagonals become columns, then fold.
@@ -696,10 +682,10 @@ impl Position {
         let mut sh = [0u32; 11];
         let mut i = 0;
         while i < 11 {
-            sh[i] = (s[i] as u32) << i;
+            sh[i] = s[i] << i;
             i += 1;
         }
-        let cd = fold6_u32(&sh);
+        let cd = fold6(&sh);
         for k in 0..WINDOW_LEN {
             out |= ((cd[5 - k] >> 10) & 1) << (12 + k);
         }
@@ -762,29 +748,18 @@ impl Position {
         if self.grid.cover(c) > 0 {
             self.grid.clear_frontier(c);
         }
-        // (b) Occupancy BEFORE the disk loop, so the loop does not re-mark `c`.
+        // (b) Occupancy BEFORE the disk update, so the update does not re-mark
+        // `c`: it reads the occupancy planes to decide which newly-covered cells
+        // become frontier, and `c` is now among the occupied.
         self.grid.set_owner(c, p);
-        // (c) Coverage, in DISK8 order.
+        // (c) Coverage and the frontier bits it creates, in `DISK8` order.
         //
         // Disk cells outside the coordinate domain are skipped, so the frontier
         // plane holds only valid coordinates and enumeration can never offer a
-        // placement that `advance` would refuse with `CoordOutOfBounds`. The
-        // test is hoisted because it is false for every cell of every position
-        // more than `LEGAL_RADIUS` from the boundary.
-        let interior = disk_is_interior(c);
-        for d in DISK8 {
-            let cell = offset(c, d);
-            if !interior && !cell.is_valid() {
-                continue;
-            }
-            self.grid.inc_cover(cell);
-            if self.grid.cover(cell) == 1 && self.grid.is_empty_cell(cell) {
-                self.grid.set_frontier(cell);
-            }
-        }
+        // placement that `advance` would refuse with `CoordOutOfBounds`.
+        self.grid.add_cover_disk(c);
         // (d) hash, (e) counters.
         self.hash_cells ^= cell_key(c, p);
-        self.stones += 1;
         self.stones_by[p.index()] += 1;
         // (f) history. A push is exactly inverted by a pop, so history joins
         // the involutive class rather than needing a snapshot in `Undo`.
@@ -800,21 +775,10 @@ impl Position {
             "C15: history top is not the placement being undone"
         );
         self.stones_by[p.index()] -= 1; // (e')
-        self.stones -= 1;
         self.hash_cells ^= cell_key(c, p); // (d')
-        // (c') Same skip as `place`, computed the same way from the same
-        // coordinate, so the two remain exact inverses.
-        let interior = disk_is_interior(c);
-        for d in DISK8.iter().rev() {
-            let cell = offset(c, *d);
-            if !interior && !cell.is_valid() {
-                continue;
-            }
-            if self.grid.cover(cell) == 1 && self.grid.is_empty_cell(cell) {
-                self.grid.clear_frontier(cell);
-            }
-            self.grid.dec_cover(cell);
-        }
+        // (c') The same runs walked in reverse, derived the same way from the
+        // same coordinate, so the two remain exact inverses.
+        self.grid.remove_cover_disk(c);
         self.grid.clear_owner(c, p); // (b')
         if self.grid.cover(c) > 0 {
             self.grid.set_frontier(c); // (a')
@@ -928,12 +892,7 @@ impl Position {
                 u.audit.frontier_before,
                 "C14: frontier_cells"
             );
-            debug_assert_eq!(self.stones, u.audit.stones_before, "C14: stones");
-            debug_assert_eq!(
-                self.history.len(),
-                self.stones as usize,
-                "C15: history length after undo"
-            );
+            debug_assert_eq!(self.stone_count(), u.audit.stones_before, "C14: stones");
             self.debug_assert_frontier_around(u.action.coord());
             self.debug_assert_turn_closed_form();
             debug_assert_eq!(
@@ -977,7 +936,7 @@ impl Position {
 impl Position {
     /// C5: the turn closed form. The most valuable assert in the crate.
     fn debug_assert_turn_closed_form(&self) {
-        let form = turn_closed_form(self.stones, self.terminal.is_some());
+        let form = turn_closed_form(self.stone_count(), self.terminal.is_some());
         let (kind, player) = form.expect("C5: unreachable stones/terminal combination");
         debug_assert_eq!(self.phase.kind_index(), kind, "C5: phase kind");
         debug_assert_eq!(self.current, player, "C5: mover");
@@ -1021,15 +980,13 @@ impl Position {
         // C3: never double-owned.
         debug_assert!(!self.grid.is_double_owned(c), "C3: double-owned cell");
         // C10
-        debug_assert_eq!(self.stones, audit.stones_before + 1, "C10: stones");
+        debug_assert_eq!(self.stone_count(), audit.stones_before + 1, "C10: stones");
         debug_assert_eq!(self.get(c), Some(mover), "C10: owner");
-        // C15: history is maintained, so it is asserted against the counter,
-        // never used to restore it.
-        debug_assert_eq!(
-            self.history.len(),
-            self.stones as usize,
-            "C15: history length"
-        );
+        // C15: history is the ply counter, so what is left to check is that the
+        // placement it just recorded is the one that was made. The old pairing of
+        // `history.len()` against a separate `stones` field went away with the
+        // field (ruling 14); `audit()` now compares that length straight against
+        // the occupancy planes, which is a stronger statement than either.
         debug_assert_eq!(
             self.history.last().copied(),
             Some(Action::new(c)),
@@ -1131,21 +1088,82 @@ impl<'a> BitScan<'a> {
         }
     }
 
-    fn next_coord(&mut self) -> Option<HexCoord> {
+    /// The next set bit, as the `(word, bit)` slot that holds it.
+    ///
+    /// Returning the slot rather than only the coordinate is what lets
+    /// [`Stones`] read the owner out of the plane it has already indexed,
+    /// instead of converting to a coordinate and mapping it back.
+    ///
+    /// `#[inline]` is load-bearing, not decoration: both iterators are consumed
+    /// in tight folds, and leaving this as an out-of-line call costs enumeration
+    /// roughly a fifth of its throughput.
+    #[inline]
+    fn next_slot(&mut self) -> Option<(usize, u32)> {
+        // Every set bit has been yielded, so the rest of the plane is empty and
+        // there is nothing left to scan for. Without this the last `next` walks
+        // every trailing word — on an arena inflated by a rewound search that is
+        // most of the arena, and it is what `stones` there was paying: 889 ns
+        // against 529 ns for the same 96 stones.
+        //
+        // Tested at entry, deliberately, and not inside the loop where it would
+        // be one branch per exhausted word instead of one per item. That looks
+        // like the cheaper placement and measures far worse — `legal_actions`
+        // loses 11-48% to it against 3-6% here — because the loop body is what
+        // has to stay in the shape the optimiser already likes.
+        if self.remaining == 0 {
+            #[cfg(debug_assertions)]
+            self.debug_assert_plane_exhausted();
+            return None;
+        }
         loop {
             if self.cur != 0 {
                 let b = self.cur.trailing_zeros();
                 self.cur &= self.cur - 1;
-                self.remaining = self.remaining.saturating_sub(1);
-                return Some(self.grid.coord_of(self.word, b));
+                self.remaining -= 1;
+                return Some((self.word, b));
             }
             self.word += 1;
             if self.word >= self.grid.total_words() {
+                // `remaining` is non-zero here, so this is only reachable if the
+                // maintained count over-states the plane. Loud in debug, and a
+                // clean end of iteration rather than a panic in release.
+                debug_assert!(false, "the maintained population count exceeds the plane");
                 self.remaining = 0;
                 return None;
             }
             self.cur = Self::word_at(self.grid, self.plane, self.word);
         }
+    }
+
+    /// The next set bit as a coordinate, for the consumer that does not need the
+    /// slot.
+    ///
+    /// Keeping this wrapper rather than having [`LegalActions`] call
+    /// [`BitScan::next_slot`] itself is measured, not stylistic: the flatter form
+    /// is consistently *slower*, 11.09 us against 10.48 us over 3,373 actions at
+    /// ply 96.
+    #[inline]
+    fn next_coord(&mut self) -> Option<HexCoord> {
+        let (word, bit) = self.next_slot()?;
+        Some(self.grid.coord_of(word, bit))
+    }
+
+    /// The plane really is exhausted when `remaining` says so.
+    ///
+    /// The early-out above trusts a maintained count to decide there is nothing
+    /// left; were that count ever short, enumeration would silently truncate,
+    /// which is the one failure mode here worth paying for. `O(words)`, once per
+    /// exhausted iterator, and out of line so its body cannot weigh on the
+    /// inlining of the scan itself.
+    #[cfg(debug_assertions)]
+    #[cold]
+    fn debug_assert_plane_exhausted(&self) {
+        debug_assert_eq!(self.cur, 0, "unyielded bits in the current word");
+        debug_assert!(
+            (self.word + 1..self.grid.total_words())
+                .all(|i| Self::word_at(self.grid, self.plane, i) == 0),
+            "the maintained population count is short of the plane"
+        );
     }
 }
 
@@ -1159,13 +1177,9 @@ impl Iterator for Stones<'_> {
     type Item = (HexCoord, Player);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let c = self.scan.next_coord()?;
-        let p = self
-            .scan
-            .grid
-            .owner(c)
-            .expect("an occupancy bit without an owner");
-        Some((c, p))
+        let (word, bit) = self.scan.next_slot()?;
+        let grid = self.scan.grid;
+        Some((grid.coord_of(word, bit), grid.owner_at(word, bit)))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1256,10 +1270,11 @@ impl Position {
         let occ0 = g.occ_plane(Player::P0);
         let occ1 = g.occ_plane(Player::P1);
 
-        // A1
+        // A1. `stone_count()` is `history.len()`, so this is also the length half
+        // of A12 — and a stronger statement of it than a separate counter was.
         let pop0: u32 = occ0.iter().map(|w| w.count_ones()).sum();
         let pop1: u32 = occ1.iter().map(|w| w.count_ones()).sum();
-        if self.stones != pop0 + pop1 {
+        if self.stone_count() != pop0 + pop1 {
             return fail(IntegrityCheck::StoneCount, None);
         }
 
@@ -1280,7 +1295,7 @@ impl Position {
         }
 
         // Independent stone list, read straight out of the planes.
-        let mut stones: Vec<(HexCoord, Player)> = Vec::with_capacity(self.stones as usize);
+        let mut stones: Vec<(HexCoord, Player)> = Vec::with_capacity(self.history.len());
         for i in 0..total {
             let mut w = occ0[i] | occ1[i];
             while w != 0 {
@@ -1397,17 +1412,16 @@ impl Position {
         }
 
         // A11
-        match turn_closed_form(self.stones, self.terminal.is_some()) {
+        match turn_closed_form(self.stone_count(), self.terminal.is_some()) {
             Some((kind, player)) if kind == self.phase.kind_index() && player == self.current => {}
             _ => return fail(IntegrityCheck::TurnClosedForm, None),
         }
 
-        // A12: history length, and that its entries are exactly the occupied
-        // cells. Compared as a *set* against the independent stone list above,
-        // because order is history's own business and nothing else records it.
-        if self.history.len() != self.stones as usize {
-            return fail(IntegrityCheck::History, None);
-        }
+        // A12: history's entries are exactly the occupied cells. Compared as a
+        // *set* against the independent stone list above, because order is
+        // history's own business and nothing else records it. Its length was
+        // already checked against the planes by A1, which is where the ply
+        // counter lives now.
         let mut replayed: Vec<HexCoord> = self.history.iter().map(|a| a.coord()).collect();
         replayed.sort_unstable();
         let mut occupied: Vec<HexCoord> = stones.iter().map(|&(c, _)| c).collect();

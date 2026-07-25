@@ -30,6 +30,32 @@ test go green destroys the only independent evidence in the workspace.
 Nothing outside `tests/` may depend on this crate, and nothing here should be
 "improved", reformatted for style, or refactored. It is a photograph.
 
+## What it has found
+
+**Zero divergences over 1.35 M plies** in the opt-in sweep. A mutation check
+confirms the test has teeth: changing the vendored `LEGAL_RADIUS` from 8 to 7
+fails five of its six cases.
+
+Compared per ply: the legal move *set*, terminal status and winner, mover, turn
+phase including its `first` payload, stone counts, the 18 windows through the
+placed cell with both ownership masks, which windows a placement completed, and
+the legality predicate on cells outside the enumerated set.
+
+Three findings are worth keeping:
+
+- **The enumeration order is identical**, which was not expected. The old engine
+  sorts by `pack_coord`; the rewrite scans a `q`-major/`r`-minor bit plane. Both
+  come out ascending lexicographic `(q, r)`. The test asserts the *set* and only
+  reports order, so a future reordering is a note rather than a failure.
+- **`ActionId` is bit-identical to the old `pack_coord`** over the whole `i16`
+  domain. That matters beyond this test: the old encoding is persisted in `.hxr`
+  records and `.npz` training shards, so stored records still decode.
+- **The old engine has an unchecked `i16` overflow.** `coords_within_radius`
+  computes `center.q + dq` in `i16`, so its "unlimited" board panics in debug and
+  wraps silently in release at around 32,759. `COORD_LIMIT` is therefore a
+  documented and checked version of a boundary the old engine already had and
+  handled unsafely — the rewrite is strictly better here, not divergent.
+
 ## Exactly what was changed from the original
 
 Only mechanical stripping — no rule, no control flow, and no data structure was
@@ -40,7 +66,7 @@ affects.
 | --- | --- |
 | `pybridge.rs` deleted | PyO3 bridge; the crate's `python` feature was off by default anyway, and the bindings are not rules. |
 | `snapshot.rs` deleted, with `HexoState::snapshot`, `load_state`, and `StateLoadError` | Serialisation of a move list. Dormant in the original ("No production code serializes snapshots today"), and the differential test replays move lists itself. |
-| `serde` derives and the `Board` `Serialize`/`Deserialize` impls deleted | Drops the `serde` dependency. The `Board` impls were the dormant board-shaped deserialisation path that `docs/OPEN_DECISIONS.md` A3 says not to port. |
+| `serde` derives and the `Board` `Serialize`/`Deserialize` impls deleted | Drops the `serde` dependency. The `Board` impls were the dormant board-shaped deserialisation path that the rewrite deliberately does not have — it deserialised a bare cell list and skipped the turn rules. |
 | `Board::place` and `Board::debug_stones` deleted | Only the deleted serde impl and the deleted unit tests called them. `place_with_delta`, which does the work, is untouched. |
 | `ahash::AHashMap`/`AHashSet` → `std::collections::HashMap`/`HashSet` | Drops the `ahash` dependency. A hasher swap only: no public output depends on hash iteration order (legal-move enumeration reads the sorted `LegalMoveStore::ordered` vector, and the differential test never iterates `WindowStore::entries`). |
 | `thiserror` derive on `MoveError` → hand-written `Display`/`Error` | Drops the last dependency. The message strings are reproduced character for character. |

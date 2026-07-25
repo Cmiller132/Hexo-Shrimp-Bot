@@ -340,6 +340,17 @@ impl Window {
     /// # Panics
     /// Debug builds assert `self.start.is_valid()`.
     pub const fn cells(self) -> [HexCoord; WINDOW_LEN];
+    /// Which of the six cells `coord` is, or `None`. The inverse of `cell`.
+    /// Total, and computed in `i32` rather than by walking `cells`.
+    pub const fn cell_index(self, coord: HexCoord) -> Option<usize>;
+    /// Whether `coord` is one of this window's six cells.
+    pub const fn contains(self, coord: HexCoord) -> bool;
+    /// Whether the two windows share at least one cell. Symmetric.
+    pub const fn intersects(self, other: Self) -> bool;
+    /// Whether the two windows are disjoint but have a pair of adjacent cells.
+    /// **Exclusive of overlap**, so `intersects` / `touches` / neither partition
+    /// every pair.
+    pub const fn touches(self, other: Self) -> bool;
 }
 
 /// A window paired with its current ownership.
@@ -355,10 +366,25 @@ pub struct WindowRef {
 `WindowMask`'s inner `[u8; 2]` is private: the player-to-lane mapping is an internal
 convention, and `mask(Player::P1)` is the contract.
 
-There is no `is_win_for`, no `threat_player`, no `is_active`, no `intersects`, no
+There is no `is_win_for`, no `threat_player`, no `is_active`, no
 `stone_cells() -> Vec<_>`. Ruling 3: masks are strictly more information than any
 predicate, and every one of those is a one-liner over `mask()` and `Window::cells()`. The
 `Vec`-returning ones were actively harmful — they allocated inside a search loop.
+
+`contains`, `intersects`, and `touches` were on that exclusion list and are now built —
+on `Window`, which is where they always belonged, not on the ownership-carrying
+`WindowEntry` the reference put them on. Ruling 3 is about *ownership*: a predicate that
+collapses a mask is strictly less than the mask. These collapse no mask. They are
+statements about six coordinates on the infinite board, in the same category as `cell` and
+`cells`, and they read no `Position` at all. The real reason they were out was that
+nothing called them; a cell/window incidence graph does — window nodes need identity
+arithmetic and no board access. `cell_index` is the primitive
+and `contains` is its `is_some()`, because an incidence edge has to carry *which* bit of
+the mask a cell is; the mask is positional, so "somewhere in this window" cannot be read
+back. `intersects_or_touches` stays out: it is a union of two answers, not a third fact.
+`intersects` is six `contains` calls rather than a closed form over the parallel and
+crossing cases, because two branches of a case analysis that could be wrong in the same
+way is exactly hazard H8, and the price of avoiding it is six cheap tests.
 
 ### 3.5 `position`
 
@@ -705,9 +731,10 @@ impl Position {
 are in the engine for one reason.** A policy head is indexed by that ordering, so
 self-play, training, and serving must all use the *same* mapping. Deriving it separately
 in each makes them agree only by coincidence, and a divergence is silent — the network
-keeps training, against scrambled targets. This is the defect `SUGGESTIONS.md` S1
-diagnosed; the fix is that the ordering has exactly one implementation and a golden test
-over the rank of each played move, not that the action space is bounded.
+keeps training, against scrambled targets. The fix is that the ordering has exactly one
+implementation and a golden test over the rank of each played move, **not** that the action
+space is bounded — a bounded one has already been tried and collapsed a training run. That
+argument is recorded in full in `crates/hexo-engine/README.md`.
 
 Both are a popcount prefix and a select scan over the `frontier` plane, which the
 `q`-major/`r`-minor layout makes equal to position within the canonical enumeration. Each
@@ -909,7 +936,6 @@ pub struct Position {
     current: Player,
     terminal: Option<Outcome>,
     hash_cells: u64,            // XOR of cell keys only; turn key applied on read (§8)
-    stones: u32,                // == history.len(); see below
     stones_by: [u32; 2],
 }
 
@@ -947,13 +973,18 @@ internal write path never sees one, because growth (§5.5) runs first.
 Bit-per-cell layout is `q`-major, `r`-minor because that makes a row scan produce
 ascending `(q, r)` — the canonical order — with no sort.
 
-**`history` is stored, and `stones` is kept alongside it.** Ruling 1 was reversed: the
+**`history` is stored, and it is also the ply counter.** Ruling 1 was reversed: the
 placement sequence is what makes a position writable as a game record and rebuildable by
 `Position::replay` (§4.2), and it is the only thing on the type that is not derivable
-from the board. It costs four bytes per ply. `stones` is redundant with `history.len()`
-and is kept so `stone_count` stays a `const fn` on the crate's MSRV; it is *asserted*
-equal on every apply and undo (C15) and never restored from the history, per the §7.4
-rule that a maintained value is snapshot-asserted rather than snapshot-restored.
+from the board. It costs four bytes per ply.
+
+`stone_count()` is `history.len()`, not a second field. An earlier version kept a `stones:
+u32` alongside it, because `Vec::len` was not a `const fn` before Rust 1.87 and
+`stone_count` is one; the crate's real floor is 1.88, so that reason expired, and ruling 14
+says a redundant field pair should go. What the pair used to check — `history.len()` against
+`stones` on every apply and undo — is not lost but strengthened: A1 now compares that same
+length straight against the popcount of the occupancy planes, which is a claim about the
+board rather than about two copies of one number.
 
 History joins the involutive class of §5.4 rather than the delta of §7.2: a push is
 exactly inverted by a pop, so `Undo` carries no history field.
@@ -1010,22 +1041,12 @@ fn place(&mut self, c: HexCoord, p: Player) {
     debug_assert!(self.grid.is_empty_cell(c));
     // (a) c is about to stop being a frontier cell, if it was one.
     if self.grid.cover(c) > 0 { self.grid.clear_frontier(c); }
-    // (b) occupancy BEFORE the disk loop. c is a member of its own disk.
+    // (b) occupancy BEFORE the disk update. c is a member of its own disk.
     self.grid.set_owner(c, p);
     // (c) coverage, in DISK8 order, skipping cells outside the domain.
-    let interior = disk_is_interior(c);
-    for d in DISK8 {
-        let cell = c + d;
-        if !interior && !cell.is_valid() { continue; }
-        debug_assert!(self.grid.cover(cell) < DISK_CELLS as u8);
-        self.grid.bump_cover(cell, 1);
-        if self.grid.cover(cell) == 1 && self.grid.is_empty_cell(cell) {
-            self.grid.set_frontier(cell);
-        }
-    }
+    self.grid.add_cover_disk(c);
     // (d) hash, (e) counters, (f) history.
     self.hash_cells ^= zobrist::cell_key(c, p);
-    self.stones += 1;
     self.stones_by[p.index()] += 1;
     self.history.push(Action::new(c));
 }
@@ -1033,44 +1054,48 @@ fn place(&mut self, c: HexCoord, p: Player) {
 fn unplace(&mut self, c: HexCoord, p: Player) {
     self.history.pop();                                          // (f')
     self.stones_by[p.index()] -= 1;                              // (e')
-    self.stones -= 1;
     self.hash_cells ^= zobrist::cell_key(c, p);                  // (d')
-    let interior = disk_is_interior(c);                          // (c')
-    for d in DISK8.iter().rev() {
-        let cell = c + *d;
-        if !interior && !cell.is_valid() { continue; }
-        debug_assert!(self.grid.cover(cell) > 0);
-        if self.grid.cover(cell) == 1 && self.grid.is_empty_cell(cell) {
-            self.grid.clear_frontier(cell);
-        }
-        self.grid.bump_cover(cell, -1);
-    }
+    self.grid.remove_cover_disk(c);                              // (c')
     self.grid.clear_owner(c, p);                                 // (b')
     if self.grid.cover(c) > 0 { self.grid.set_frontier(c); }     // (a')
 }
 ```
 
-`set_frontier` / `clear_frontier` also maintain `frontier_cells`.
-
 **`c` is a member of its own disk**, so (a)/(b) and (c) interact. In `place`, occupancy is
-set *before* the disk loop, so when the loop reaches `c` it fails `is_empty_cell` and does
-not mark `c` as frontier. In `unplace`, the disk loop runs *before* `clear_owner`, so `c`
-again fails it. Steps (a) and (a') read `cover(c)` at the same value on both sides
-(pre-increment on the way in, post-decrement on the way out). The mirror is exact only
-because of that ordering; swapping (b) and (c) independently would corrupt
-`frontier_cells` by exactly one on every ply, in a way that no round-trip test would
-catch, because it would be symmetric.
+set *before* the disk update, so when that update decides which newly-covered cells become
+frontier, `c` is already among the occupied and is not marked. In `unplace`, the disk
+update runs *before* `clear_owner`, so `c` is still occupied and is again not marked. Steps
+(a) and (a') read `cover(c)` at the same value on both sides (pre-increment on the way in,
+post-decrement on the way out). The mirror is exact only because of that ordering; swapping
+(b) and (c) independently would corrupt `frontier_cells` by exactly one on every ply, in a
+way that no round-trip test would catch, because it would be symmetric.
+
+**The disk itself is walked as 17 contiguous row runs, inside `Grid`.** `DISK8` is
+`dq`-major and `dr`-minor, so each `dq` is one run of consecutive cells in storage order —
+contiguous bytes of `cover`, and one or two words of `frontier` and of each occupancy
+plane. `Grid::disk_runs` produces those runs, and `add_cover_disk` / `remove_cover_disk`
+are the only writers of coverage. The earlier per-cell form mapped every one of the 217
+cells through `locate` three or four times; this maps 17 row bases. Within a run the cells
+are mutually independent, so the run walk visits exactly the `DISK8` cells in exactly the
+`DISK8` order and the pair remains an exact mirror.
+
+That leaves `DISK8` as a genuinely **independent** statement of the same cell set rather
+than the one the machine follows, which is worth more than it cost: the tier-C frontier
+assertion (C2) walks it offset by offset on every apply and undo, and `grid`'s own tests
+compare the two formulations directly. A wrong row run and a wrong offset are both
+symmetric bugs, so neither can be checked against itself.
 
 **Coverage is written only inside the coordinate domain.** `check_placement` refuses a
-coordinate outside `COORD_LIMIT` with `CoordOutOfBounds`, so if the disk loop marked such
+coordinate outside `COORD_LIMIT` with `CoordOutOfBounds`, so if the disk update marked such
 a cell as frontier, `legal_actions` would offer a placement `advance` refuses — and
 `legal_rank` would give it a policy index. That was a real defect: a walk to `q = 16000`
 put 136 unaddressable coordinates into the legal set, all of which `is_legal` rejected.
-Both halves of the pair apply the same `is_valid` filter, computed from the same
-coordinate, so they stay exact inverses. The `disk_is_interior` hoist is a fast path for
-the predicate, not a second implementation of it: it is a sufficient condition for *all*
-217 cells being in-domain, so the per-cell test runs only within `LEGAL_RADIUS` of a face
-— which no ordinary game reaches. Pinned by `tests/boundary.rs` at all six faces.
+The clip is applied once per row rather than once per cell, and it is **exact rather than a
+fast path**: at a fixed `q`, `is_valid` reduces to `r` lying in
+`[max(-LIM, -LIM - q), min(LIM, LIM - q)]`, because `s = -q - r` is the only one of the
+three axes whose bound depends on both. Both halves derive it the same way from the same
+coordinate, so they stay exact inverses. Pinned by `tests/boundary.rs` at all six faces,
+and compared against `DISK8` plus a per-cell `is_valid` in `grid`'s tests.
 
 `place` reads nothing about the win and is called unconditionally (§7.1).
 
@@ -1235,7 +1260,7 @@ box itself; the engine will not, because a ply cap and a board cap are both matc
 trap, not a comment: a future `#[derive(PartialEq)]` on `Position` fails to build, forcing
 whoever adds it to write the content-based impl.
 
-`PartialEq for Position` compares `stones`, `stones_by`, `phase` (including
+`PartialEq for Position` compares `stone_count()`, `stones_by`, `phase` (including
 `SecondStone::first`), `current`, `terminal`, `zobrist()`, and then zips `self.stones()`
 with `other.stones()`. It ignores `rows`, `row_words`, `origin_q`, `origin_r`, and the
 `cover` plane — `cover` is a pure function of the stones, so comparing it would be
@@ -1334,49 +1359,56 @@ masks in `audit()` and in a Tier-C debug assert (§10.1). They must agree.
 
 ```rust
 /// Bit `t` set iff bits `t..t+6` of `x` are all set.
-const fn run6_u16(x: u16) -> u16 {
+const fn run6(x: u32) -> u32 {
     let a = x & (x >> 1);      // runs of 2
     let b = a & (a >> 2);      // runs of 4
     b & (b >> 2)               // runs of 6
 }
 
 /// `out[i]` bit `j` set iff rows `i..i+6` all have bit `j` set.
-fn fold6_u16(s: &[u16; 11]) -> [u16; 6] {
-    let mut a = [0u16; 10];
+const fn fold6(s: &[u32; 11]) -> [u32; 6] {
+    let mut a = [0u32; 10];
     for i in 0..10 { a[i] = s[i] & s[i + 1]; }
-    let mut b = [0u16; 8];
+    let mut b = [0u32; 8];
     for i in 0..8 { b[i] = a[i] & a[i + 2]; }
-    let mut c = [0u16; 6];
+    let mut c = [0u32; 6];
     for i in 0..6 { c[i] = b[i] & b[i + 2]; }
     c
 }
-/// Identical shape over `u32`, for the sheared plane.
-fn fold6_u32(s: &[u32; 11]) -> [u32; 6];
 
 /// Bitmask over the 18 slots of §6.3: which windows through `c` are fully `p`'s.
 fn winning_windows(&self, c: HexCoord, p: Player) -> u32 {
-    let s = strip11(self.grid.occ_plane(p), c);
+    let strip = strip11(self.grid.occ_plane(p), c);
+    let mut s = [0u32; 11];
+    for i in 0..11 { s[i] = strip[i] as u32; }
     let mut out = 0u32;
 
     // Axis Q (1, 0): six consecutive rows at column 5.
-    let cq = fold6_u16(&s);
+    let cq = fold6(&s);
     for k in 0..6 { if (cq[5 - k] >> 5) & 1 == 1 { out |= 1 << k; } }
 
     // Axis R (0, 1): six consecutive bits inside row 5.
-    let cr = run6_u16(s[5]);
+    let cr = run6(s[5]);
     for k in 0..6 { if (cr >> (5 - k)) & 1 == 1 { out |= 1 << (6 + k); } }
 
     // Axis QR (1, -1): shear so anti-diagonals become columns, then fold.
     // Cell (i, j) moves to bit j + i; a QR line has i + j constant, and the
     // window through `c` at offset k lands on bit 10 of rows 5-k ..= 10-k.
     let mut sh = [0u32; 11];
-    for i in 0..11 { sh[i] = (s[i] as u32) << i; }
-    let cd = fold6_u32(&sh);
+    for i in 0..11 { sh[i] = s[i] << i; }
+    let cd = fold6(&sh);
     for k in 0..6 { if (cd[5 - k] >> 10) & 1 == 1 { out |= 1 << (12 + k); } }
 
     out
 }
 ```
+
+**One fold, at one width.** The strip is widened to `u32` once, up front, so the plain fold
+and the sheared fold are the same function rather than two copies of it differing only in
+their integer type. The shear pushes the top row up by 10 bits and will not fit in `u16`,
+which is what made a second copy look necessary; a second copy is exactly the wrong answer
+here, because the QR shear is already the most symmetric-bug-prone arithmetic in the crate
+and two versions of it would drift silently and in step.
 
 A player wins iff `winning_windows(c, mover) != 0`. Six *or more* in a row wins, with no
 overline rule, because a run of seven contains a fully-owned six-window and the fold finds
@@ -1397,7 +1429,7 @@ stone, so the winner is always the mover.
 
 | Class | Mechanism | Fields |
 | --- | --- | --- |
-| **I — involutive** | re-run a self-inverse operation | `occ` bits (set/clear), `cover` (+1/-1), `frontier` bits (set/clear), `frontier_cells` (+-1), `hash_cells` (xor/xor), `stones` (+-1), `stones_by` (+-1) |
+| **I — involutive** | re-run a self-inverse operation | `occ` bits (set/clear), `cover` (+1/-1), `frontier` bits (set/clear), `frontier_cells` (+-1), `hash_cells` (xor/xor), `history` (push/pop, and with it `stone_count()`), `stones_by` (+-1) |
 | **II — snapshot** | verbatim copy out of the delta | `phase`, `current` |
 | **III — not restored** | unobservable *by construction*, not by privacy: the growth policy sizes and refuses from the live stone box (§5.5), so a rewound arena behaves exactly like a freshly grown one and only its size differs | arena `rows`, `row_words`, `origin_q`, `origin_r`, allocation |
 
@@ -1533,7 +1565,7 @@ fn undo_raw(&mut self, u: Undo) {
     #[cfg(debug_assertions)] {
         debug_assert_eq!(self.zobrist(), u.audit.zobrist_before);
         debug_assert_eq!(self.grid.frontier_cells(), u.audit.frontier_before);
-        debug_assert_eq!(self.stones, u.audit.stones_before);
+        debug_assert_eq!(self.stone_count(), u.audit.stones_before);
         self.debug_assert_turn_closed_form();
     }
 }
@@ -1617,7 +1649,7 @@ Nine places. Every one of them is a bug that a naive round-trip test cannot see.
   bits in `winning_windows`. Nothing may assume exactly one.
 - **H7 — snapshot-restore hides forward drift.** Any field both maintained forward and
   snapshot-restored backward has its forward bug erased by `undo`. That is why
-  `frontier_cells`, `stones`, and `stones_by` are class I with debug *assertions* rather
+  `frontier_cells`, `stone_count()`, and `stones_by` are class I with debug *assertions* rather
   than class II with assignments, and why `phase` and `current` — which have no involutive
   form — are covered instead by the closed form of §10.2.
 - **H8 — symmetric bugs are invisible to the entire round-trip machinery.** A wrong
@@ -1802,12 +1834,12 @@ and every property test.
 | C7 | **P1:** `terminal.is_none()` on entry to `apply_raw`. Structural, from the first check. | apply |
 | C8 | The placed cell is at least `LEGAL_RADIUS` from every arena boundary. | after growth |
 | C9 | The reserve-around containment check after every growth (§5.5). | growth |
-| C10 | `stones == before + 1`; `stones_by[mover] == before + 1`; `get(placed) == Some(mover)`; `hash_cells == before ^ cell_key(placed, mover)`. | apply |
+| C10 | `stone_count() == before + 1`; `stones_by[mover] == before + 1`; `get(placed) == Some(mover)`; `hash_cells == before ^ cell_key(placed, mover)`. | apply |
 | C11 | `outcome.is_some()` iff `winning_windows != 0`; `outcome.winner == mover`; `outcome.is_some()` implies `(phase, current)` unchanged, else `(phase, current) == advance_turn(phase_before, placed)`. | apply |
 | C12 | **The two win formulations agree:** `winning_windows(c, mover)` from the bit fold equals the brute-force scan of `windows_through(c)` for `mask.is_full_for(mover)`, slot for slot. | apply |
 | C13 | On entry to `undo_raw`: `zobrist() == audit.zobrist_after` (LIFO / wrong-position detector). | undo |
-| C14 | On exit from `undo_raw`: `zobrist()`, `frontier_cells`, and `stones` equal their pre-apply values. **Asserted, never assigned** (H7). | undo |
-| C15 | `history.len() == stones`, and after an apply `history.last() == Some(placed)`. On undo the popped entry is the placement being undone. **Asserted, never assigned** — `stones` is maintained, not derived from the history. | both |
+| C14 | On exit from `undo_raw`: `zobrist()`, `frontier_cells`, and `stone_count()` equal their pre-apply values. **Asserted, never assigned** (H7). | undo |
+| C15 | After an apply `history.last() == Some(placed)`; on undo the popped entry is the placement being undone. **Asserted, never assigned.** History *is* the ply counter, so the length half of this check moved to A1, where the length is compared against the occupancy planes rather than against a second copy of itself. | both |
 
 C12 earns its place because the QR shear (§6.4) is the single most error-prone line in the
 crate and it is a symmetric bug: a wrong shear applies and un-applies identically, so only
@@ -1815,7 +1847,7 @@ a second, independent computation can catch it.
 
 ### 10.2 The turn closed form (C5)
 
-Let `n = stones` and `m = n - (terminal.is_some() as u32)`.
+Let `n = stone_count()` and `m = n - (terminal.is_some() as u32)`.
 
 ```
 n == 0                 <=>  phase == Opening && current == P0
@@ -1860,7 +1892,7 @@ Checked in this order, returning the first failure:
 
 | # | `IntegrityCheck` | Recomputation |
 | --- | --- | --- |
-| A1 | `StoneCount` | `stones` equals the total popcount of both occupancy planes. |
+| A1 | `StoneCount` | `stone_count()` — that is, `history.len()` — equals the total popcount of both occupancy planes. This is also the length half of A12. |
 | A2 | `DoubleOwned` | `occ[0] & occ[1] == 0` in every word. |
 | A3 | `StoneCountForPlayer` | `stones_by[p]` equals the popcount of plane `p`. |
 | A4 | `ArenaMargin` | every stone is at least `LEGAL_RADIUS` from every arena boundary. |
@@ -1937,6 +1969,16 @@ runs, which is what it did before.
   `contains` and `iter` one at a time with no leakage into its neighbours, `iter` and
   `contains` agree over every single- and double-slot mask, and the multi-slot case yields
   in ascending order.
+- `window` geometry: `cell_index` inverts `cell` on every window of a corpus spanning all
+  three axes; `contains`, `intersects`, and `touches` each agree with a **brute-force walk
+  of the materialised `cells()` arrays** over that corpus — the closed-form index
+  arithmetic and a linear scan being two independent statements of the same geometry, which
+  is the only reason comparing them detects anything. A QR window whose off-line constraint
+  read `dq - dr` instead of `dq + dr` is an H8-class bug: self-consistent, invisible to any
+  round trip, and caught only here. Additionally: `intersects` and `touches` are symmetric
+  and never both true; same-axis windows overlap exactly when their starts are within six
+  steps (a property the cell walk does not state); and the corpus is checked to contain all
+  three of overlapping, touching, and disjoint pairs, so the partition claim is not vacuous.
 - `position`, history and replay: history length tracks `stone_count` at every ply; a
   rejected placement leaves it untouched; `undo` pops it; `replay` of a history reproduces
   the position and of every prefix reproduces that ply; `ReplayError.ply` names the failing
@@ -2076,7 +2118,7 @@ Each line is a thing someone will ask for. Each has one reason.
 | `Position` as a trait | Dynamic dispatch or generic infection on the hottest path in the system for the benefit of a second implementer that should not exist. Every method above is inherent and non-conflicting, so a trait with a blanket impl can be added later at zero cost. |
 | A draw / non-win `Outcome` variant | Ruling 6. Ply caps and adjudication are match rules; the runner owns them and needs its own result type regardless. |
 | A ply cap inside the engine | Same. |
-| `row_any` row-summary bits for skipping empty rows in enumeration | **Measured, and it does not pay.** Enumeration is item-bound, not word-bound: `legal_actions` holds 326–338 M items/s across every ply and both a compact and a 4x-inflated arena, and tripling the empty words costs it **3.0%**. `stones` is more sensitive (+70%) only because it has 35x fewer items — but its real cost is `Stones::next` looking the owner up a second time after the bit scan already located the cell, worth ~33% on *every* arena against `row_any`'s 3% on an inflated one. If one of the two gets built, it is the owner lookup. |
+| `row_any` row-summary bits for skipping empty rows in enumeration | **Measured, and it does not pay.** Enumeration is item-bound, not word-bound: `legal_actions` holds 326–338 M items/s across every ply and both a compact and a 4x-inflated arena, and tripling the empty words costs it **3.0%**. `stones` looked more sensitive (+70%) only because it has 35x fewer items, and its real cost was `Stones::next` looking the owner up a second time after the bit scan had already located the cell. That was the one worth building, and it is built: `BitScan::next_slot` hands back the `(word, bit)` slot and `Grid::owner_at` reads the owner straight out of it, alongside an early-out when the maintained population count is spent. `stones` improves 14–57%, at a measured 3–6% cost to `legal_actions` for sharing the scan — the trade is argued in `ENGINE_RL_AUDIT.md`. `row_any` itself stays unbuilt. |
 | The 64x64 tiled arena | Unjustified complexity until the p99 bounding box exceeds `2^18` cells; specified in advance (§5.8) so it stays a swap rather than a rewrite. |
 | A `Scoped<'s, 'p>` RAII guard for recursive search | `&mut Search` down the call chain already covers recursive alpha-beta and iterative MCTS, with fewer public items and the same guarantees. |
 | A second, history-sensitive hash | One hash. `zobrist()` is position-only, which is what makes transposition tables merge — every turn's two stones are playable in either order and reach the same position, so a history-sensitive key would forfeit a 2x merge per turn. A model whose features depend on move order has `history()` and hashes it into its own cache key. |

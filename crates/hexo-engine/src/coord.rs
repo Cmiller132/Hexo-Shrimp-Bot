@@ -175,13 +175,21 @@ pub const fn hex_distance(a: HexCoord, b: HexCoord) -> u32 {
 
 /// Offsets of the radius-[`LEGAL_RADIUS`] disk, `dq`-major and `dr`-minor.
 ///
-/// The order is fixed and load-bearing: `unplace` walks it in reverse to invert
-/// `place` exactly (spec §5.4), and the `dq`-major layout makes the coverage
-/// loop touch contiguous byte runs.
-///
 /// ```text
 /// for dq in -8..=8 { for dr in max(-8, -dq - 8) ..= min(8, -dq + 8) { yield (dq, dr) } }
 /// ```
+///
+/// The `dq`-major layout means each `dq` is one contiguous run of cells in
+/// storage order, which is what `Grid::disk_runs` walks instead of this table.
+/// The table therefore survives as the **independent** statement of the same
+/// cell set: the tier-C frontier assertion walks it, offset by offset, on every
+/// apply and undo, and the two are compared directly in `grid`'s own tests. A
+/// wrong row run and a wrong offset are both symmetric bugs, so neither
+/// formulation can be checked against itself.
+///
+/// Read only by the tier-C debug assertions and by tests, so it is dead code in
+/// a release build — which `cargo clippy --release` reports.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) const DISK8: [(i8, i8); DISK_CELLS] = {
     let mut out = [(0i8, 0i8); DISK_CELLS];
     let mut n = 0usize;
@@ -201,25 +209,12 @@ pub(crate) const DISK8: [(i8, i8); DISK_CELLS] = {
     out
 };
 
-/// Whether every cell of the radius-[`LEGAL_RADIUS`] disk around `c` is inside
-/// the coordinate domain.
-///
-/// A disk cell displaces each of `q`, `r`, and `s` by at most
-/// [`LEGAL_RADIUS`], so pulling the limit in by that much on all three axes is
-/// exact. Used to hoist the per-cell [`HexCoord::is_valid`] test out of the
-/// coverage loop: true for every position that is not within eight cells of the
-/// domain boundary, which is every position reachable in ordinary play.
-#[inline]
-pub(crate) const fn disk_is_interior(c: HexCoord) -> bool {
-    let lim = COORD_LIMIT as i32 - LEGAL_RADIUS as i32;
-    let q = c.q as i32;
-    let r = c.r as i32;
-    let s = -q - r;
-    q >= -lim && q <= lim && r >= -lim && r <= lim && s >= -lim && s <= lim
-}
-
 /// `c` displaced by a `(dq, dr)` offset from [`DISK8`].
+///
+/// Read only by the tier-C debug assertions and by tests, so it is dead code in
+/// a release build — which `cargo clippy --release` reports.
 #[inline]
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) const fn offset(c: HexCoord, d: (i8, i8)) -> HexCoord {
     HexCoord {
         q: c.q.wrapping_add(d.0 as i16),

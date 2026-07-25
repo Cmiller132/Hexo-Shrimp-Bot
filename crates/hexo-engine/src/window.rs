@@ -14,7 +14,7 @@
 //! strictly more information, and each of those predicates is a one-liner over
 //! [`WindowMask::mask`] and [`Window::cells`].
 
-use crate::coord::{Axis, HexCoord, WINDOW_LEN};
+use crate::coord::{Axis, HexCoord, WINDOW_LEN, hex_distance};
 use crate::player::Player;
 
 /// Windows touched by one placement: 3 axes × 6 offsets.
@@ -117,6 +117,98 @@ impl Window {
             i += 1;
         }
         out
+    }
+
+    /// Which of the six cells `coord` is, or `None` if it is not one of them.
+    ///
+    /// The inverse of [`Window::cell`], and strictly more information than
+    /// [`Window::contains`] — which is why it is the one that composes. An
+    /// incidence edge in a cell/window graph has to carry *which* bit of
+    /// [`WindowMask`] the cell is, because the mask is positional; "somewhere in
+    /// this window" would not be enough to read the mask back.
+    ///
+    /// Total, and computed in `i32` rather than by walking [`Window::cells`], so
+    /// a coordinate arbitrarily far from `start` answers `None` instead of
+    /// wrapping.
+    #[inline]
+    #[must_use]
+    pub const fn cell_index(self, coord: HexCoord) -> Option<usize> {
+        let dq = coord.q as i32 - self.start.q as i32;
+        let dr = coord.r as i32 - self.start.r as i32;
+        // `coord == start + axis.vector() * i`, split into the constraint that
+        // pins `coord` to the line and the index along it.
+        let (off_line, i) = match self.axis {
+            Axis::Q => (dr, dq),
+            Axis::R => (dq, dr),
+            Axis::QR => (dq + dr, dq),
+        };
+        if off_line != 0 || i < 0 || i >= WINDOW_LEN as i32 {
+            return None;
+        }
+        Some(i as usize)
+    }
+
+    /// Whether `coord` is one of this window's six cells.
+    #[inline]
+    #[must_use]
+    pub const fn contains(self, coord: HexCoord) -> bool {
+        self.cell_index(coord).is_some()
+    }
+
+    /// Whether the two windows share at least one cell. Symmetric.
+    ///
+    /// Six [`Window::contains`] calls rather than a closed form over the
+    /// parallel and crossing cases. Two windows on the same axis overlap when
+    /// their starts are within six steps; on different axes they meet in at most
+    /// one cell, found by solving the two lines. That is two branches of a case
+    /// analysis that could be wrong in the same way — the exact hazard this crate
+    /// treats as the one that matters — for six cheap tests.
+    ///
+    /// # Panics
+    /// Debug builds assert `self.start.is_valid()`.
+    #[inline]
+    #[must_use]
+    pub const fn intersects(self, other: Self) -> bool {
+        let mut i = 0;
+        while i < WINDOW_LEN {
+            if other.contains(self.cell(i)) {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }
+
+    /// Whether the two windows are disjoint but have a pair of adjacent cells.
+    ///
+    /// **Exclusive of overlap.** Two windows that share a cell do *not* touch, so
+    /// `intersects`, `touches`, and neither partition every pair of windows.
+    /// "Overlapping or adjacent" is `a.intersects(b) || a.touches(b)`, which is
+    /// left to the caller because it is a union of two answers rather than a
+    /// third fact.
+    ///
+    /// # Panics
+    /// Debug builds assert both starts are valid.
+    #[inline]
+    #[must_use]
+    pub const fn touches(self, other: Self) -> bool {
+        if self.intersects(other) {
+            return false;
+        }
+        let mine = self.cells();
+        let theirs = other.cells();
+        let mut i = 0;
+        while i < WINDOW_LEN {
+            let mut j = 0;
+            while j < WINDOW_LEN {
+                if hex_distance(mine[i], theirs[j]) == 1 {
+                    return true;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        false
     }
 }
 
@@ -297,6 +389,187 @@ mod tests {
                     "axis {axis:?} index {i}"
                 );
             }
+        }
+    }
+
+    /// Every window whose start lies in a small box, on all three axes.
+    ///
+    /// Small because the relation tests are quadratic in it; wide enough that
+    /// every pair of axes is represented at every relative offset that can
+    /// overlap, touch, or miss.
+    fn corpus() -> Vec<Window> {
+        let mut out = Vec::new();
+        for q in -3..=3 {
+            for r in -3..=3 {
+                for axis in Axis::ALL {
+                    out.push(Window {
+                        start: HexCoord::new(q, r),
+                        axis,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// The same three relations read off the materialised cell arrays.
+    ///
+    /// Deliberately *not* written in terms of `cell_index`: the shipped versions
+    /// are closed-form index arithmetic, and a brute-force walk of `cells()` is
+    /// the only independent statement of the same geometry. A wrong off-line
+    /// constraint — `dq - dr` where the QR axis needs `dq + dr` — is symmetric
+    /// under any round trip, so this comparison is the detector.
+    fn brute_contains(w: Window, c: HexCoord) -> bool {
+        w.cells().contains(&c)
+    }
+
+    fn brute_intersects(a: Window, b: Window) -> bool {
+        let (x, y) = (a.cells(), b.cells());
+        x.iter().any(|c| y.contains(c))
+    }
+
+    fn brute_touches(a: Window, b: Window) -> bool {
+        if brute_intersects(a, b) {
+            return false;
+        }
+        let (x, y) = (a.cells(), b.cells());
+        x.iter()
+            .any(|p| y.iter().any(|q| hex_distance(*p, *q) == 1))
+    }
+
+    #[test]
+    fn cell_index_inverts_cell() {
+        for w in corpus() {
+            for i in 0..WINDOW_LEN {
+                assert_eq!(w.cell_index(w.cell(i)), Some(i), "{w:?} cell {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn contains_agrees_with_a_cell_walk_over_a_whole_neighbourhood() {
+        for w in corpus() {
+            for q in -9..=9 {
+                for r in -9..=9 {
+                    let c = HexCoord::new(q, r);
+                    assert_eq!(w.contains(c), brute_contains(w, c), "{w:?} vs {c:?}");
+                    assert_eq!(w.contains(c), w.cell_index(c).is_some());
+                }
+            }
+        }
+    }
+
+    /// A coordinate on the window's line but past either end is not in it, and
+    /// one step off the line never is. Named separately from the sweep because
+    /// these are the two ways `cell_index` can be wrong per axis.
+    #[test]
+    fn contains_rejects_off_line_and_past_the_ends() {
+        for axis in Axis::ALL {
+            let w = Window {
+                start: HexCoord::ORIGIN,
+                axis,
+            };
+            assert!(!w.contains(w.start.step(axis, -1)), "{axis:?} before start");
+            assert!(
+                !w.contains(w.start.step(axis, WINDOW_LEN as i16)),
+                "{axis:?} past end"
+            );
+            for off in Axis::ALL {
+                if off.index() == axis.index() {
+                    continue;
+                }
+                for i in 0..WINDOW_LEN {
+                    let beside = w.cell(i).step(off, 1);
+                    assert_eq!(
+                        w.contains(beside),
+                        brute_contains(w, beside),
+                        "{axis:?} cell {i} stepped along {off:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn intersects_agrees_with_a_cell_walk_and_is_symmetric() {
+        let all = corpus();
+        for &a in &all {
+            for &b in &all {
+                assert_eq!(a.intersects(b), brute_intersects(a, b), "{a:?} vs {b:?}");
+                assert_eq!(a.intersects(b), b.intersects(a), "asymmetric {a:?} {b:?}");
+            }
+        }
+    }
+
+    /// A property the cell walk does not state: two windows on the same axis and
+    /// the same line overlap exactly when their starts are within six steps.
+    #[test]
+    fn same_axis_windows_overlap_within_six_steps() {
+        for axis in Axis::ALL {
+            let a = Window {
+                start: HexCoord::ORIGIN,
+                axis,
+            };
+            for k in -8..=8i16 {
+                let b = Window {
+                    start: HexCoord::ORIGIN.step(axis, k),
+                    axis,
+                };
+                assert_eq!(
+                    a.intersects(b),
+                    k.abs() < WINDOW_LEN as i16,
+                    "{axis:?} offset {k}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn touches_agrees_with_a_cell_walk_and_excludes_overlap() {
+        let all = corpus();
+        for &a in &all {
+            for &b in &all {
+                assert_eq!(a.touches(b), brute_touches(a, b), "{a:?} vs {b:?}");
+                assert_eq!(a.touches(b), b.touches(a), "asymmetric {a:?} {b:?}");
+                assert!(
+                    !(a.intersects(b) && a.touches(b)),
+                    "{a:?} and {b:?} both overlap and touch"
+                );
+            }
+        }
+        // The partition is not vacuous: the corpus contains all three cases.
+        assert!(all.iter().any(|&a| all.iter().any(|&b| a.intersects(b))));
+        assert!(all.iter().any(|&a| all.iter().any(|&b| a.touches(b))));
+        assert!(
+            all.iter()
+                .any(|&a| all.iter().any(|&b| !a.intersects(b) && !a.touches(b)))
+        );
+    }
+
+    /// A window always overlaps itself and never touches itself.
+    #[test]
+    fn a_window_intersects_itself() {
+        for w in corpus() {
+            assert!(w.intersects(w));
+            assert!(!w.touches(w));
+        }
+    }
+
+    /// Two windows six apart along the same axis are the adjacent-but-disjoint
+    /// case by construction: cell 5 of the first neighbours cell 0 of the second.
+    #[test]
+    fn consecutive_collinear_windows_touch() {
+        for axis in Axis::ALL {
+            let a = Window {
+                start: HexCoord::ORIGIN,
+                axis,
+            };
+            let b = Window {
+                start: HexCoord::ORIGIN.step(axis, WINDOW_LEN as i16),
+                axis,
+            };
+            assert!(!a.intersects(b), "{axis:?}");
+            assert!(a.touches(b), "{axis:?}");
         }
     }
 

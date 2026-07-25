@@ -36,8 +36,10 @@ crates/hexo-engine/
     properties.rs       # proptest properties
     smoke.rs            # random playouts
   benches/
-    common/mod.rs       # deterministic fixtures, same PRNG as tests/common
+    common/mod.rs       # deterministic fixtures, over the shared PRNG
     engine.rs           # the criterion suite
+  testkit/
+    rng.rs              # the one splitmix64, `#[path]`-included by both of the above
 ```
 
 ## Module map
@@ -47,8 +49,8 @@ crates/hexo-engine/
 | `coord` | yes | Axial `HexCoord` (`q`, `r`, derived `s`), the three line `Axis` values, `hex_distance`, the radius-8 disk table, and the coordinate domain bound. |
 | `player` | yes | `Player` and `TurnPhase` — who moves and where they are inside the two-placement turn. |
 | `action` | yes | `Action` (the move atom), `ActionId` (the unbounded, exactly invertible record encoding), and `ACTION_ORDER_VERSION`. |
-| `window` | yes | `Window` (pure six-cell line geometry), `WindowMask`, `WindowRef`, `WinningWindows` — the exposed win-detection surface. |
-| `grid` | **no** | The dense recentred arena: two occupancy bit planes, one frontier bit plane, one coverage byte plane, the frontier rank/select scan, and the growth policy. **Zero items escape the crate.** |
+| `window` | yes | `Window` (pure six-cell line geometry, including the `cell_index` / `contains` / `intersects` / `touches` relations), `WindowMask`, `WindowRef`, `WinningWindows` — the exposed win-detection surface. |
+| `grid` | **no** | The dense recentred arena: two occupancy bit planes, one frontier bit plane, one coverage byte plane, the row-run disk update, the frontier rank/select scan, and the growth policy. **Zero items escape the crate.** |
 | `position` | yes | `Position`, `Applied`, `Outcome`, `Stones`, `LegalActions`, the rule machine, replay, every read accessor, and `audit`. |
 | `search` | yes | `Search<'p>` — the borrow-scoped make/unmake session — and the crate-private `Undo` token. |
 | `zobrist` | **no** | The `const` mixing function and the twelve turn keys. Reachable only through `Position::zobrist()`. |
@@ -75,9 +77,33 @@ stored, so neither gets a module.
   count is a maintained `u32`, and enumeration is a bit scan that produces the
   canonical `(q, r)` order for free. `cover` is a byte count rather than a bit
   because an OR of radius-8 disks cannot be undone.
+
+- **The disk is written as 17 row runs, not 217 coordinates.** A radius-8 disk is
+  `dq`-major, so each of its rows is one contiguous run: contiguous bytes of
+  `cover`, one or two words of every bit plane. `Grid::disk_runs` produces them
+  and one placement maps 17 row bases, where the per-cell form mapped each of the
+  217 cells three or four times. It lives in `grid` because it is a claim about
+  the layout, and it is the only writer of coverage.
+
+  The `DISK8` offset table is still there, and is worth more now than when it was
+  load-bearing: it is the *independent* statement of the same cell set, walked
+  offset by offset by the tier-C frontier assertion on every apply and undo, and
+  compared against the runs directly in `grid`'s tests. A wrong run and a wrong
+  offset are both symmetric, so neither can check itself.
+
+  Worth 45–60% of an edge `apply`+`undo` pair and 45% of a full `replay` —
+  `docs/ENGINE_RL_AUDIT.md` has the table.
 - **Window masks are derived on read**, by an O(1) bit gather over an 11x11
   strip. Nothing about windows is stored, so there is no growth path, no delta,
   and no "stored mask disagrees with the board" bug class.
+
+  Window *identity* is separate from that and reads nothing: `Window` is
+  `(start, axis)`, and `cell`, `cells`, `cell_index`, `contains`, `intersects`,
+  and `touches` are arithmetic on six coordinates with no `Position` in hand. A
+  consumer building a cell/window incidence graph therefore pays the engine
+  nothing for structure — only for the masks of windows that actually hold a
+  stone, which it can enumerate exactly once each with no hash set by keeping a
+  window only from the stone at the lowest set bit of `mask.occupied()`.
 - **One placement is the atom, not one turn.** A turn is two placements, but a
   win is checked after each, so a turn can end after the first — and when it
   does, the phase and the mover *freeze*.
@@ -100,7 +126,30 @@ stored, so neither gets a module.
 - **One canonical action ordering, owned here, in both directions.** `legal_rank`
   and `nth_legal` exist so self-play, training, and serving cannot each derive a
   private copy of the mapping a policy head is indexed by. A divergence there is
-  silent: the network keeps training, against scrambled targets.
+  silent: the network keeps training, against scrambled targets. Both directions
+  are needed, not one — training records "the move played was index *k*", serving
+  asks "the argmax is index *k*, which move is that?" — and shipping only the
+  forward map would leave every model to write the inverse, which is the same
+  drift in a different place.
+
+- **The action region is unbounded, and that is load-bearing.** The obvious
+  alternative is to index a fixed hex disk around the origin, since the opening is
+  always at the centre. That has already been run in production and failed: a
+  radius-20 crop excluded out-of-crop legal moves from policy and search, froze
+  out-of-rim wins, and caused the previous repo's `main_3` training collapse. A
+  larger radius narrows the failure without removing it, because the crop is still
+  there. So the policy head is sized by the legal set instead, and the two jobs get
+  two encodings — `ActionId` is action *identity*, unbounded and exactly
+  invertible, for records and validation; this ordering is the *index*, for model
+  I/O. The previous `pack_coord` was doing both, and could not do the second.
+
+  The bijection did not hold at first: `legal_actions` offered 136 coordinates
+  that `advance` refused, so `legal_rank` was assigning policy indices to
+  unplayable moves. Fixed at the source — `place` no longer writes coverage
+  outside the coordinate domain — and pinned by `tests/boundary.rs`. A dense index
+  over a region that does not match the legal set is exactly the failure this
+  design exists to prevent, so it is worth recording that the first version of the
+  fix had it too.
 - **Symmetric bugs are the real hazard.** A wrong disk offset, a wrong shear in
   the QR fold, a wrong hash constant, or a growth copy with the same wrong index
   on both sides all apply and un-apply identically, so round-trip tests are blind
@@ -160,9 +209,11 @@ Three fixture choices carry the weight:
   times the words. It is the only fixture that separates "cost per item" from
   "cost per arena word".
 
-Benches are separate targets from tests and cannot `use` `tests/common`, so
-`benches/common/mod.rs` carries its own copy of the same splitmix64 with the
-same constants.
+Benches are separate targets from tests and cannot `use` `tests/common`, so both
+`#[path]`-include `testkit/rng.rs`. That file exists rather than a copy on each
+side because "a fixture named by ply here is the position the test corpus builds
+at that ply" is only true while the two generators agree constant for constant,
+and two hand-matched copies would make it a coincidence.
 
 ## Connections
 

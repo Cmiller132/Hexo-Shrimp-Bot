@@ -19,6 +19,11 @@
 //! > **The frontier invariant.** `frontier[c] == 1` if and only if
 //! > `cover[c] > 0 && occ[0][c] == 0 && occ[1][c] == 0`.
 //!
+//! The disk update that maintains both lives here rather than in `position`,
+//! because it is a statement about the layout: a radius-8 disk is 17 contiguous
+//! row runs (`disk_runs`), so one placement maps 17 row bases instead of mapping
+//! 217 coordinates three or four times each.
+//!
 //! Cell `(q, r)` maps to row `q - origin_q` and bit `r - origin_r`. The layout
 //! is `q`-major and `r`-minor, so **storage order is ascending `(q, r)`** — the
 //! canonical order of spec §9 — and enumeration needs no sort.
@@ -27,12 +32,15 @@
 //! `i16` range produces an in-range-or-out-of-range answer and never wraps.
 
 use crate::MAX_GRID_CELLS;
-use crate::coord::{HexCoord, LEGAL_RADIUS};
+use crate::coord::{COORD_LIMIT, DISK_CELLS, HexCoord, LEGAL_RADIUS};
 use crate::error::MoveError;
 use crate::player::Player;
 
 /// Rows the arena starts with: `q` spans 32 values.
 const MIN_ROWS: usize = 32;
+
+/// Rows a radius-[`LEGAL_RADIUS`] disk spans, and the length of its longest row.
+const DISK_ROWS: usize = 2 * LEGAL_RADIUS as usize + 1;
 
 /// Words per row the arena starts with: `r` spans 128 values.
 const MIN_ROW_WORDS: usize = 2;
@@ -48,6 +56,22 @@ const PAD: i32 = LEGAL_RADIUS as i32;
 #[inline]
 const fn floor64(x: i32) -> i32 {
     x & !63
+}
+
+/// Bits `start .. start + n` of `plane`, as a mask whose bit `k` is cell
+/// `start + k`.
+///
+/// The run must lie inside one arena row, so it touches one word or two
+/// adjacent ones — never a bit-shifted gather across a row boundary.
+#[inline]
+fn gather_run(plane: &[u64], start: usize, n: usize) -> u64 {
+    debug_assert!(n > 0 && n <= DISK_ROWS, "run of {n} cells");
+    let (w, sh) = (start >> 6, (start & 63) as u32);
+    let mut v = plane[w] >> sh;
+    if sh + n as u32 > 64 {
+        v |= plane[w + 1] << (64 - sh);
+    }
+    v & ((1u64 << n) - 1)
 }
 
 /// The dense recentred arena.
@@ -213,6 +237,27 @@ impl Grid {
         }
     }
 
+    /// Owner of the stone at a `(word, bit)` slot of the occupancy planes.
+    ///
+    /// The bit scan that produced the slot has already located the cell, so this
+    /// reads the answer out of the slot rather than converting to a coordinate
+    /// and mapping it back through [`Grid::locate`].
+    ///
+    /// # Panics
+    /// Debug builds assert the slot holds a stone.
+    #[inline]
+    pub(crate) fn owner_at(&self, word: usize, bit: u32) -> Player {
+        debug_assert!(
+            (self.occupied_word(word) >> bit) & 1 == 1,
+            "an occupancy slot without a stone"
+        );
+        if (self.occ[0][word] >> bit) & 1 == 1 {
+            Player::P0
+        } else {
+            Player::P1
+        }
+    }
+
     /// Whether both occupancy planes claim `c`. Always false in a sound arena.
     ///
     /// Read only by the tier-C debug assertions and by tests, so it is dead
@@ -316,25 +361,144 @@ impl Grid {
         }
     }
 
-    /// `cover(c) += 1`.
-    #[inline]
-    pub(crate) fn inc_cover(&mut self, c: HexCoord) {
-        let (w, b) = self.locate_written(c);
-        let i = w * 64 + b as usize;
-        debug_assert!(
-            (self.cover[i] as usize) < crate::coord::DISK_CELLS,
-            "C1: coverage overflow"
-        );
-        self.cover[i] += 1;
+    /// The radius-[`LEGAL_RADIUS`] disk around `c` as one contiguous cell run
+    /// per `q` row: `(first cell index, length)`, rows ascending in `q` and each
+    /// run ascending in `r`. A length of `0` marks a row the coordinate domain
+    /// clipped away entirely.
+    ///
+    /// This is the same cell set in the same order as a walk of
+    /// [`crate::coord::DISK8`] — that table is `dq`-major and `dr`-minor, so its
+    /// rows *are* these runs. Walking runs rather than offsets is what removes
+    /// the repeated address arithmetic: the per-cell walk mapped each of the 217
+    /// cells through [`Grid::locate`] three or four times, and this maps 17 row
+    /// bases. `DISK8` plus a per-cell [`HexCoord::is_valid`] therefore remains an
+    /// **independent** statement of the same set, which is what the tier-C
+    /// frontier assertion walks on every apply and undo.
+    ///
+    /// The domain clip is exact rather than a per-cell test: at a fixed `q`,
+    /// `is_valid` reduces to `r` lying in
+    /// `[max(-LIM, -LIM - q), min(LIM, LIM - q)]`, because `s = -q - r` is the
+    /// only one of the three axes whose bound depends on both.
+    ///
+    /// # Panics
+    /// Debug builds assert `c`'s padded box is inside the arena, which
+    /// `reserve_around` guarantees on the write path.
+    fn disk_runs(&self, c: HexCoord) -> [(usize, usize); DISK_ROWS] {
+        debug_assert!(self.contains_padded(c), "disk outside the reserved region");
+        let lim = COORD_LIMIT as i32;
+        let rad = LEGAL_RADIUS as i32;
+        let (cq, cr) = (c.q as i32, c.r as i32);
+        let mut out = [(0usize, 0usize); DISK_ROWS];
+        for (i, run) in out.iter_mut().enumerate() {
+            let dq = i as i32 - rad;
+            let q = cq + dq;
+            if q < -lim || q > lim {
+                continue;
+            }
+            // The disk: `|dr| <= rad` and `|dq + dr| <= rad`.
+            let lo = (cr - rad).max(cr - dq - rad);
+            let hi = (cr + rad).min(cr - dq + rad);
+            // The coordinate domain at this `q`.
+            let lo = lo.max(-lim).max(-lim - q);
+            let hi = hi.min(lim).min(lim - q);
+            if lo > hi {
+                continue;
+            }
+            let row = (q - self.origin_q) as usize;
+            let bit = (lo - self.origin_r) as usize;
+            *run = (row * self.row_words * 64 + bit, (hi - lo + 1) as usize);
+        }
+        out
     }
 
-    /// `cover(c) -= 1`.
+    /// `cover += 1` across the disk around `c`, setting the frontier bit of
+    /// every empty cell the increment brought to coverage `1`.
+    ///
+    /// The arena's half of a placement. Exactly inverted by
+    /// [`Grid::remove_cover_disk`].
+    pub(crate) fn add_cover_disk(&mut self, c: HexCoord) {
+        for (start, n) in self.disk_runs(c) {
+            if n == 0 {
+                continue;
+            }
+            let mut fresh = 0u64;
+            for (k, cell) in self.cover[start..start + n].iter_mut().enumerate() {
+                debug_assert!((*cell as usize) < DISK_CELLS, "C1: coverage overflow");
+                *cell += 1;
+                if *cell == 1 {
+                    fresh |= 1 << k;
+                }
+            }
+            let occupied = gather_run(&self.occ[0], start, n) | gather_run(&self.occ[1], start, n);
+            self.set_frontier_run(start, fresh & !occupied);
+        }
+    }
+
+    /// The exact inverse of [`Grid::add_cover_disk`]: rows in reverse order, and
+    /// each frontier bit cleared *before* the decrement that justifies it.
+    pub(crate) fn remove_cover_disk(&mut self, c: HexCoord) {
+        for (start, n) in self.disk_runs(c).into_iter().rev() {
+            if n == 0 {
+                continue;
+            }
+            let mut falling = 0u64;
+            for (k, &cell) in self.cover[start..start + n].iter().enumerate() {
+                if cell == 1 {
+                    falling |= 1 << k;
+                }
+            }
+            let occupied = gather_run(&self.occ[0], start, n) | gather_run(&self.occ[1], start, n);
+            self.clear_frontier_run(start, falling & !occupied);
+            for cell in &mut self.cover[start..start + n] {
+                debug_assert!(*cell > 0, "C1: coverage underflow");
+                *cell -= 1;
+            }
+        }
+    }
+
+    /// Set the frontier bits named by `bits`, where bit `k` is cell `start + k`,
+    /// maintaining [`Grid::frontier_cells`].
+    ///
+    /// Every named bit must currently be clear, which the frontier invariant
+    /// guarantees: a cell whose coverage just rose to `1` had none.
     #[inline]
-    pub(crate) fn dec_cover(&mut self, c: HexCoord) {
-        let (w, b) = self.locate_written(c);
-        let i = w * 64 + b as usize;
-        debug_assert!(self.cover[i] > 0, "C1: coverage underflow");
-        self.cover[i] -= 1;
+    fn set_frontier_run(&mut self, start: usize, bits: u64) {
+        if bits == 0 {
+            return;
+        }
+        let (w, sh) = (start >> 6, (start & 63) as u32);
+        debug_assert_eq!(self.frontier[w] & (bits << sh), 0, "C2: bit already set");
+        self.frontier[w] |= bits << sh;
+        if sh != 0 {
+            let high = bits >> (64 - sh);
+            if high != 0 {
+                debug_assert_eq!(self.frontier[w + 1] & high, 0, "C2: bit already set");
+                self.frontier[w + 1] |= high;
+            }
+        }
+        self.frontier_cells += bits.count_ones();
+    }
+
+    /// Clear the frontier bits named by `bits`, as [`Grid::set_frontier_run`].
+    ///
+    /// Every named bit must currently be set, by the same invariant.
+    #[inline]
+    fn clear_frontier_run(&mut self, start: usize, bits: u64) {
+        if bits == 0 {
+            return;
+        }
+        let (w, sh) = (start >> 6, (start & 63) as u32);
+        let low = bits << sh;
+        debug_assert_eq!(self.frontier[w] & low, low, "C2: bit not set");
+        self.frontier[w] &= !low;
+        if sh != 0 {
+            let high = bits >> (64 - sh);
+            if high != 0 {
+                debug_assert_eq!(self.frontier[w + 1] & high, high, "C2: bit not set");
+                self.frontier[w + 1] &= !high;
+            }
+        }
+        self.frontier_cells -= bits.count_ones();
     }
 
     /// Whether `c`'s frontier bit is set. Total: `false` outside the arena.
@@ -640,6 +804,7 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coord::{DISK8, offset};
 
     fn grow(g: &mut Grid, q: i16, r: i16) {
         g.reserve_around(HexCoord::new(q, r)).expect("growth");
@@ -814,8 +979,7 @@ mod tests {
             let mut g = Grid::new();
             grow(&mut g, 0, 0);
             g.set_owner(HexCoord::ORIGIN, Player::P0);
-            g.inc_cover(HexCoord::ORIGIN);
-            g.set_frontier(HexCoord::new(1, 0));
+            g.add_cover_disk(HexCoord::ORIGIN);
             grow(&mut g, dq, dr);
             assert_eq!(g.origin_r() % 64, 0, "origin_r misaligned for {dq},{dr}");
             assert_eq!(g.owner(HexCoord::ORIGIN), Some(Player::P0));
@@ -834,25 +998,120 @@ mod tests {
             grow(&mut g, q, r);
             let c = HexCoord::new(q, r);
             g.set_owner(c, if q % 2 == 0 { Player::P0 } else { Player::P1 });
-            g.inc_cover(c);
-            g.inc_cover(c);
+            g.add_cover_disk(c);
         }
+        // Snapshot what each written cell reads before any reshaping. The disks
+        // overlap, so the coverage counts are not all equal — which is the point:
+        // whatever growth moves, it must move unchanged.
+        let expect: Vec<(HexCoord, Option<Player>, u8)> = written
+            .iter()
+            .map(|&(q, r)| {
+                let c = HexCoord::new(q, r);
+                (c, g.owner(c), g.cover(c))
+            })
+            .collect();
+        assert!(
+            expect
+                .iter()
+                .all(|&(_, owner, cover)| owner.is_some() && cover > 0)
+        );
+
         // Force several reallocations in both directions.
         for &(q, r) in &[(300i16, 300i16), (-300, -300), (300, -300), (-300, 300)] {
             grow(&mut g, q, r);
-            for &(wq, wr) in &written {
-                let c = HexCoord::new(wq, wr);
-                assert_eq!(
-                    g.owner(c),
-                    Some(if wq % 2 == 0 { Player::P0 } else { Player::P1 })
-                );
-                assert_eq!(g.cover(c), 2);
+            for &(c, owner, cover) in &expect {
+                assert_eq!(g.owner(c), owner, "owner lost at {c:?}");
+                assert_eq!(g.cover(c), cover, "coverage lost at {c:?}");
             }
             // Newly reachable territory is zeroed.
             assert_eq!(g.cover(HexCoord::new(q, r)), 0);
             assert!(g.is_empty_cell(HexCoord::new(q, r)));
             assert!(!g.frontier_bit(HexCoord::new(q, r)));
         }
+    }
+
+    /// Every cell index a walk of the row runs touches, in order.
+    fn cells_by_runs(g: &Grid, c: HexCoord) -> Vec<usize> {
+        g.disk_runs(c)
+            .into_iter()
+            .flat_map(|(start, n)| start..start + n)
+            .collect()
+    }
+
+    /// The same set read through the `DISK8` offset table and `locate`.
+    fn cells_by_table(g: &Grid, c: HexCoord) -> Vec<usize> {
+        DISK8
+            .iter()
+            .map(|&d| offset(c, d))
+            .filter(|cell| cell.is_valid())
+            .map(|cell| g.cell_index(cell).expect("inside the reserved region"))
+            .collect()
+    }
+
+    /// The row runs and the `DISK8` table are two independent statements of the
+    /// same cell set: `add_cover_disk` walks the runs, and the tier-C frontier
+    /// assertion walks the table on every apply and undo. A disagreement between
+    /// them is a symmetric bug neither could catch alone, so they are compared
+    /// directly.
+    #[test]
+    fn disk_runs_visit_exactly_the_disk8_cells_in_disk8_order() {
+        for &(q, r) in &[(0i16, 0i16), (5, -3), (-7, 11), (40, 40), (-40, 13)] {
+            let mut g = Grid::new();
+            let c = HexCoord::new(q, r);
+            grow(&mut g, q, r);
+            let by_runs = cells_by_runs(&g, c);
+            assert_eq!(by_runs, cells_by_table(&g, c), "at ({q}, {r})");
+            assert_eq!(by_runs.len(), DISK_CELLS, "at ({q}, {r})");
+        }
+    }
+
+    /// The per-row domain clip must agree cell for cell with `is_valid`, which is
+    /// only observable within `LEGAL_RADIUS` of a face. The arena recentres on the
+    /// stone box, so a disk at the far corner of the domain still fits in 4,096
+    /// cells.
+    #[test]
+    fn disk_runs_clip_exactly_what_the_coordinate_domain_excludes() {
+        for &(q, r) in &[
+            (COORD_LIMIT, -COORD_LIMIT),
+            (COORD_LIMIT, 0),
+            (0, COORD_LIMIT),
+            (-COORD_LIMIT, 0),
+        ] {
+            let mut g = Grid::new();
+            let c = HexCoord::new(q, r);
+            assert!(c.is_valid());
+            grow(&mut g, q, r);
+            let by_runs = cells_by_runs(&g, c);
+            assert_eq!(by_runs, cells_by_table(&g, c), "at ({q}, {r})");
+            assert!(
+                by_runs.len() < DISK_CELLS,
+                "({q}, {r}) is on a face; the domain must clip part of its disk"
+            );
+        }
+    }
+
+    /// Applying and removing the same disk restores every plane exactly, at a
+    /// coordinate whose disk the domain clips — the case where the two halves
+    /// could disagree about which cells to skip.
+    #[test]
+    fn a_clipped_disk_round_trips() {
+        let mut g = Grid::new();
+        let c = HexCoord::new(COORD_LIMIT, -COORD_LIMIT + 3);
+        grow(&mut g, c.q, c.r);
+        g.set_owner(c, Player::P0);
+        g.add_cover_disk(c);
+        let covered = g.cover_plane().iter().filter(|&&v| v > 0).count();
+        assert!(covered > 0 && covered < DISK_CELLS);
+        assert_eq!(
+            g.frontier_cells(),
+            covered as u32 - 1,
+            "the stone is not free"
+        );
+
+        g.remove_cover_disk(c);
+        assert_eq!(g.frontier_cells(), 0);
+        assert!(g.cover_plane().iter().all(|&v| v == 0));
+        assert!(g.frontier_plane().iter().all(|&w| w == 0));
     }
 
     #[test]
