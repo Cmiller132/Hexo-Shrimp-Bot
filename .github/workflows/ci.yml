@@ -34,3 +34,25 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+  # `hexo-engine` is required to stay `wasm32`-compilable, which is what would
+  # let a web frontend run the real rules instead of a reimplementation. Nothing
+  # in the native build enforces it: a `std::time` call, a threading primitive,
+  # or a PyO3 dependency would all compile fine on the host and only fail here.
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (wasm32)
+        run: cargo build -p hexo-engine --target wasm32-unknown-unknown
+
+      - name: Lint (wasm32)
+        run: cargo clippy -p hexo-engine --target wasm32-unknown-unknown -- -D warnings
