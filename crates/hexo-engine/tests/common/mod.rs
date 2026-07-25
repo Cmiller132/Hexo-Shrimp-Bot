@@ -176,12 +176,12 @@ pub fn turn_oracle(ply: usize) -> (Player, TurnPhase) {
     }
     // Plies 1.. are grouped in pairs: (1,2) -> P1, (3,4) -> P0, (5,6) -> P1 ...
     let pair = (ply - 1) / 2;
-    let mover = if pair % 2 == 0 {
+    let mover = if pair.is_multiple_of(2) {
         Player::P1
     } else {
         Player::P0
     };
-    let phase = if (ply - 1) % 2 == 0 {
+    let phase = if (ply - 1).is_multiple_of(2) {
         TurnPhase::FirstStone
     } else {
         // The caller checks the kind only; the payload is position-dependent.

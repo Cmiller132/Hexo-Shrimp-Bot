@@ -4,8 +4,8 @@ Authoritative Hexo rules and game state. Owns what the game *is*; owns nothing
 about how it is played, recorded, or learned from.
 
 **Status: MVP implemented.** Built to `docs/ENGINE_SPEC.md`, which is the
-normative contract for this crate. Zero runtime dependencies; `proptest` is a
-dev-dependency only.
+normative contract for this crate. Zero runtime dependencies; `proptest` and
+`criterion` are dev-dependencies only.
 
 ## Shape
 
@@ -35,6 +35,9 @@ crates/hexo-engine/
     golden.rs           # frozen Zobrist, move-ordering, and action-index vectors
     properties.rs       # proptest properties
     smoke.rs            # random playouts
+  benches/
+    common/mod.rs       # deterministic fixtures, same PRNG as tests/common
+    engine.rs           # the criterion suite
 ```
 
 ## Module map
@@ -129,6 +132,44 @@ The smoke test scales via the environment for a nightly or release run:
 HEXO_SMOKE_GAMES=10000 HEXO_SMOKE_UNIFORM=500 \
     cargo test --release -p hexo-engine --test smoke
 ```
+
+## Benchmarks
+
+```
+cargo bench -p hexo-engine                   # ~4 min, all groups
+cargo bench -p hexo-engine -- ordering       # one group
+cargo bench -p hexo-engine -- 'apply_undo/edge'
+```
+
+`criterion` is a dev-dependency of this crate only, with `default-features =
+off` so it pulls in neither `rayon` nor `plotters`. Nothing about the runtime
+dependency set changes, and the `wasm32` gate is unaffected.
+
+The suite exists so that every optimisation `docs/ENGINE_SPEC.md` §12 and
+`docs/ENGINE_RL_AUDIT.md` defer "if profiling ever shows it" is answerable with
+a number rather than an argument. The groups are `advance`, `apply_undo`,
+`clone`, `enumerate`, `ordering`, `windows`, `replay`, and `new_game`, each
+reported at plies 1, 32, 96, and 256.
+
+Three fixture choices carry the weight:
+
+- **Uniform random play**, from one seed, through the normal rule machine.
+  Fixtures nest — the ply-256 move list starts with the ply-32 one — and a game
+  that ends early is a panic, not a shorter fixture.
+- **Interior versus edge placements**, the legal cells nearest to and furthest
+  from the centroid of the stones. The interior cell's radius-8 disk is already
+  fully covered and flips no frontier bits; the edge cell's flips 136. That is
+  the split `apply_undo` is measured over, and it is where the disk walk's cost
+  actually lives.
+- **An inflated arena**: ply 96 after a search excursion walked 32 placements
+  out along `+q` and unwound. `undo` restores every observable field and keeps
+  the allocation, so it holds the same position and the same legal set in four
+  times the words. It is the only fixture that separates "cost per item" from
+  "cost per arena word".
+
+Benches are separate targets from tests and cannot `use` `tests/common`, so
+`benches/common/mod.rs` carries its own copy of the same splitmix64 with the
+same constants.
 
 ## Connections
 

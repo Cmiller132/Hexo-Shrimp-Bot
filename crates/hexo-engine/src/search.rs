@@ -6,7 +6,7 @@
 //!
 //! Five layers of enforcement, none of them by convention:
 //!
-//! 1. [`Undo`] is `pub(crate)` and unforgeable. There is no public
+//! 1. `Undo` is `pub(crate)` and unforgeable. There is no public
 //!    `undo(token)`. Undo count `<=` apply count *by construction of the
 //!    `Vec`*. Undoing past the floor is not discouraged, it is
 //!    **inexpressible**.

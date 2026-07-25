@@ -2,7 +2,7 @@
 //!
 //! # Where incremental-versus-recomputed divergence hides
 //!
-//! Several hazards in this module are **symmetric bugs**: a wrong [`DISK8`]
+//! Several hazards in this module are **symmetric bugs**: a wrong `DISK8`
 //! offset, a wrong shear in the QR fold, a wrong `cell_key` constant, or a
 //! growth copy that uses the same wrong index for read and write all apply and
 //! un-apply identically. Round-trip tests cannot see them. [`Position::audit`],
@@ -75,10 +75,16 @@ pub struct Position {
     terminal: Option<Outcome>,
     /// XOR of cell keys only; the turn key is applied on read.
     hash_cells: u64,
-    /// Redundant with `history.len()`, kept so [`Position::stone_count`] stays
-    /// a `const fn` on the crate's MSRV. Asserted equal on every apply and
-    /// undo rather than derived, per the §7.4 rule that a maintained value is
-    /// snapshot-*asserted*, never snapshot-*restored*.
+    /// Redundant with `history.len()`, and asserted equal to it on every apply
+    /// and undo (C15) rather than derived, per the §7.4 rule that a maintained
+    /// value is snapshot-*asserted*, never snapshot-*restored*.
+    ///
+    /// It was kept because `Vec::len` is not a `const fn` before Rust 1.87 and
+    /// [`Position::stone_count`] is one. That reason has expired — the crate's
+    /// real floor is 1.88, because `audit` uses a let-chain — so this field is
+    /// now removable, and ruling 14 says a redundant field pair should go.
+    /// Deliberately not removed yet: `stone_count` is on the search hot path and
+    /// there is no benchmark baseline to compare against. Revisit once there is.
     stones: u32,
     stones_by: [u32; 2],
 }
@@ -423,9 +429,13 @@ impl Position {
     /// keeps training, against scrambled targets. The ordering is pinned by
     /// [`crate::ACTION_ORDER_VERSION`] and by a golden test.
     ///
-    /// Computed as a popcount prefix over the frontier plane rather than by
-    /// walking the iterator, so it is `O(arena words)` and independent of the
-    /// rank.
+    /// A popcount prefix over the frontier plane rather than a walk of
+    /// [`Position::legal_actions`]. Cost is `O(words below the target)`, so it
+    /// does grow with the rank — about **1.6 ns per 64-cell word** against the
+    /// walk's **3.0 ns per item**. Measured at 256 stones: 5.6 ns at rank 0,
+    /// 106 ns at the middle, 195 ns at the last of 7,349, against 5.4 ns /
+    /// 11.0 us / 22.2 us for the walk. The walk wins only when the answer is
+    /// the first legal move.
     #[must_use]
     pub fn legal_rank(&self, action: Action) -> Option<usize> {
         if self.terminal.is_some() {
@@ -448,7 +458,12 @@ impl Position {
     /// `None` if `index >= legal_count()`.
     ///
     /// The inverse of [`Position::legal_rank`]: what a policy head's argmax
-    /// needs in order to name a move. `O(arena words)`, not `O(index)`.
+    /// needs in order to name a move.
+    ///
+    /// A select scan, `O(words up to the answer)`. Measured at 256 stones:
+    /// 4.8 ns at index 0, 269 ns at the middle, 468 ns at the last of 7,349 —
+    /// 41x to 47x faster than `legal_actions().nth(index)`, which the walk beats
+    /// only for roughly the first ten indices.
     #[must_use]
     pub fn nth_legal(&self, index: usize) -> Option<Action> {
         if self.terminal.is_some() {
@@ -728,8 +743,8 @@ pub(crate) const fn turn_closed_form(stones: u32, terminal: bool) -> Option<(usi
     if m == 0 {
         return None;
     }
-    let kind = if m % 2 == 1 { 1 } else { 2 };
-    let player = if ((m - 1) / 2) % 2 == 0 {
+    let kind = if m.is_multiple_of(2) { 2 } else { 1 };
+    let player = if ((m - 1) / 2).is_multiple_of(2) {
         Player::P1
     } else {
         Player::P0

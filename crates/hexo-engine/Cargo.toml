@@ -15,4 +15,14 @@ path = "src/lib.rs"
 workspace = true
 
 [dev-dependencies]
+# `cargo_bench_support` is the only feature the suite needs. `plotters` and
+# `rayon` are off because the numbers are read from the terminal, and a smaller
+# dev tree keeps `cargo bench --no-run` close to a plain `cargo test` build.
+criterion = { version = "0.7.0", default-features = false, features = [
+    "cargo_bench_support",
+] }
 proptest = "1"
+
+[[bench]]
+name = "engine"
+harness = false
