@@ -1,18 +1,6 @@
 //! The deterministic PRNG shared by `tests/common` and `benches/common`.
-//!
-//! Neither of those is a module of the other — a bench and an integration test
-//! are separate targets and cannot `use` each other — so both pull this file in
-//! with `#[path]`. It lives outside `src/` because it is not part of the crate,
-//! and outside both `tests/` and `benches/` because it belongs to neither.
-//!
-//! Having one copy is the point rather than a tidiness preference. The bench
-//! fixtures are documented as being *the same positions* the test corpus builds
-//! at a given ply, and that is only true while the two generators agree
-//! constant for constant. Two hand-matched copies of splitmix64 would make that
-//! claim a coincidence, and a divergence would show up as benchmark numbers
-//! quietly measuring a different board.
 
-/// splitmix64. Deterministic, seedable, and dependency-free.
+/// splitmix64.
 #[derive(Clone, Debug)]
 pub struct Rng(u64);
 
@@ -31,7 +19,7 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    /// Uniform-ish value in `0..n`. `n` must be non-zero.
+    /// Uniform-ish value in `0..n`.
     pub fn below(&mut self, n: usize) -> usize {
         (self.next_u64() % n as u64) as usize
     }

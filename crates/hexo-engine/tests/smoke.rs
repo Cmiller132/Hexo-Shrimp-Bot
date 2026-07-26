@@ -1,41 +1,11 @@
 //! Random-playout smoke test.
-//!
-//! Many full games driven to termination or to a test-local ply bound, with no
-//! panics, an `audit()` on every final position, and a check that the terminal
-//! ply and the winner agree with the brute-force win oracle.
-//!
-//! The ply bound is a **test** artefact. The engine has no ply cap; that is a
-//! match rule owned by the runner.
-//!
-//! # Why the games are biased
-//!
-//! Uniformly random play essentially never produces six in a row: a 512-ply
-//! uniform playout terminates roughly never, so a purely uniform smoke test
-//! exercises the *rules* at volume but the *win and freeze* paths not at all.
-//! Most games here therefore run a line-building driver with a tunable amount
-//! of noise, which terminates in tens of plies and hammers the terminal
-//! transition; a slice of pure-uniform full-length games runs alongside it to
-//! keep the deep, wide-arena case covered.
-//!
-//! # Scale
-//!
-//! The defaults keep a debug-profile `cargo test --workspace` inside a few tens
-//! of seconds. Every placement in a debug build runs the full Tier-C assertion
-//! set — a 217-cell coverage recheck plus a second, independent win computation
-//! on every ply — so a playout here costs far more than a release one. Raise
-//! the counts for a nightly or release-profile run:
-//!
-//! ```text
-//! HEXO_SMOKE_GAMES=10000 HEXO_SMOKE_UNIFORM=500 \
-//!     cargo test --release -p hexo-engine --test smoke
-//! ```
 
 mod common;
 
 use common::{Rng, check_all_oracles, nth_legal, winners_oracle};
 use hexo_engine::{Action, Axis, HexCoord, Player, Position};
 
-/// Test-local ply bound. Not a rule.
+/// Test-local ply bound.
 const PLY_BOUND: usize = 512;
 
 /// Line-building games played when `HEXO_SMOKE_GAMES` is unset.
@@ -75,8 +45,7 @@ struct Playout {
     winner: Option<Player>,
 }
 
-/// Play one game. `noise` in `0..=255` is the chance of ignoring the line and
-/// playing uniformly; `0` is a pure line builder, `255` is pure uniform play.
+/// Play one game.
 fn playout(seed: u64, noise: u8) -> Playout {
     let mut rng = Rng::new(seed);
     let mut pos = Position::new();
@@ -111,15 +80,12 @@ fn playout(seed: u64, noise: u8) -> Playout {
             .unwrap_or_else(|e| panic!("seed {seed} ply {plies}: {e}"));
         plies += 1;
 
-        // Adopt the placed cell as this player's anchor once it has one.
         let line = &mut lines[mover.index()];
         if !line.started {
             line.anchor = action.coord();
             line.started = true;
         }
 
-        // `Applied` and the position must agree on termination at the same
-        // moment.
         assert_eq!(
             applied.outcome.is_some(),
             pos.is_terminal(),
@@ -131,8 +97,6 @@ fn playout(seed: u64, noise: u8) -> Playout {
                 "seed {seed}: the winner is not the mover"
             );
             assert!(!applied.winning.is_empty());
-            // Every reported slot must resolve to a window the winner owns
-            // outright, and must contain the placed cell.
             for w in applied.winning_windows() {
                 assert!(
                     pos.window(w).is_full_for(o.winner),
@@ -153,7 +117,6 @@ fn playout(seed: u64, noise: u8) -> Playout {
         }
     }
 
-    // T3 agreement on the final position.
     let oracle = winners_oracle(&pos);
     match winner {
         Some(w) => assert_eq!(oracle, vec![w], "seed {seed}: T3 winner disagreement"),
@@ -199,8 +162,6 @@ fn line_building_playouts_terminate_and_never_panic() {
     let mut wins = [0usize; 2];
 
     for seed in 0..games as u64 {
-        // Sweep the noise level so the sample spans clean line races and messy
-        // interrupted ones.
         let noise = ((seed % 16) * 14) as u8;
         let p = playout(seed, noise);
         total_plies += p.plies;
@@ -247,10 +208,6 @@ fn uniform_playouts_never_panic() {
 }
 
 /// A handful of playouts with the *full* oracle set on every single ply.
-///
-/// Far more expensive per ply than the bulk playouts above, so it runs over few
-/// games and a short bound; the point is coverage of the oracle comparison
-/// across a whole game rather than volume.
 #[test]
 fn a_few_playouts_are_checked_against_every_oracle_at_every_ply() {
     for seed in 0..12u64 {
@@ -269,8 +226,8 @@ fn a_few_playouts_are_checked_against_every_oracle_at_every_ply() {
     }
 }
 
-/// The engine imposes no ply cap: a game that reaches the test bound is still a
-/// live, legal, auditable position with legal moves available.
+/// The engine imposes no ply cap: a game that reaches the test bound is still a live,
+/// legal, auditable position with legal moves available.
 #[test]
 fn the_engine_has_no_ply_cap() {
     let mut rng = Rng::new(0x1234_5678);

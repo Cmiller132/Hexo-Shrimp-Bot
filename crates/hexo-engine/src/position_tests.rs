@@ -1,6 +1,5 @@
-//! Unit tests for the rule machine: every [`MoveError`] variant, the
-//! precedence table, atomicity on rejection, the turn machine, windows, the
-//! legal set, and hashing.
+//! Unit tests for the rule machine: every [`MoveError`] variant, the precedence table,
+//! atomicity on rejection, the turn machine, windows, the legal set, and hashing.
 
 use super::*;
 use crate::action::ActionId;
@@ -20,8 +19,7 @@ fn play(moves: &[(i16, i16)]) -> Position {
     p
 }
 
-/// P0's filler ladder: `(0, 1), (0, 3), (0, 5), ...`. Spaced two apart, so P0
-/// never gets more than two consecutive cells on any axis.
+/// P0's filler ladder: `(0, 1), (0, 3), (0, 5), ...`.
 const P0_LADDER: [(i16, i16); 8] = [
     (0, 1),
     (0, 3),
@@ -50,8 +48,7 @@ pub(super) fn second_stone_win() -> Position {
     ])
 }
 
-/// P1 wins with the **first** stone of a turn, filling a gap to make seven in a
-/// row.
+/// P1 wins with the **first** stone of a turn, filling a gap to make seven in a row.
 pub(super) fn first_stone_win() -> Position {
     play(&[
         (0, 0),
@@ -70,8 +67,6 @@ pub(super) fn first_stone_win() -> Position {
         (5, 0),
     ])
 }
-
-// ---- one test per `MoveError` variant -------------------------------------
 
 #[test]
 fn error_illegal_opening() {
@@ -97,7 +92,6 @@ fn error_too_far_from_stones() {
         p.advance(act(9, 0)),
         Err(MoveError::TooFarFromStones(HexCoord::new(9, 0)))
     );
-    // Exactly at the radius is legal.
     assert!(p.advance(act(8, 0)).is_ok());
 }
 
@@ -135,17 +129,13 @@ fn error_terminal_state() {
 
 #[test]
 fn error_board_extent_exceeded() {
-    // Walk deliberately outward until the arena refuses to grow. Stones are
-    // eight apart, so no six-in-a-row can form and no cell is ever reused.
     let mut p = Position::new();
     p.advance(act(0, 0)).expect("opening");
-    // First widen `r` so the arena needs several words per row.
     let mut r = 0i16;
     for _ in 0..70 {
         r += 8;
         p.advance(act(0, r)).expect("r walk");
     }
-    // Then push `q` out until the next doubling would exceed the ceiling.
     let mut q = 0i16;
     let err = loop {
         q += 8;
@@ -165,14 +155,13 @@ fn error_board_extent_exceeded() {
         }
         other => panic!("wrong error: {other:?}"),
     }
-    // The refusal is atomic and the position is still usable.
     assert!(p.advance(act(q - 8, 1)).is_ok());
 }
 
-/// Regression: the growth policy grew both arena dimensions on every growth
-/// event, so a straight walk along `q` — every ply exactly [`LEGAL_RADIUS`]
-/// from the last stone, so every ply legal — was refused at ply 65 with
-/// `BoardExtentExceeded { cells: 16777216 }` while `is_legal` still said yes.
+/// Regression: the growth policy grew both arena dimensions on every growth event, so a
+/// straight walk along `q` â€” every ply exactly [`LEGAL_RADIUS`] from the last stone,
+/// so every ply legal â€” was refused at ply 65 with `BoardExtentExceeded { cells:
+/// 16777216 }` while `is_legal` still said yes.
 #[test]
 fn a_straight_q_walk_is_never_refused_by_the_arena() {
     let mut p = play(&[(0, 0)]);
@@ -184,15 +173,12 @@ fn a_straight_q_walk_is_never_refused_by_the_arena() {
         p.advance(a)
             .unwrap_or_else(|e| panic!("ply {ply} at ({q}, 0) refused: {e}"));
     }
-    // The arena stayed one word wide: `r` never left 0, so it never grew.
     assert_eq!(p.grid.row_words(), 2, "a q-only walk widened r");
     assert!(p.grid.rows() as u64 * p.grid.row_words() as u64 * 64 <= crate::MAX_GRID_CELLS);
 }
 
-/// `(q, r) -> (r, q)` is a symmetry of the rules: it maps axis `Q` to `R`,
-/// fixes `QR` up to sign, preserves `hex_distance`, and fixes the origin. The
-/// arena must not break it — the old policy refused the `q` walk 4.5x sooner
-/// than the identical `r` walk.
+/// `(q, r) -> (r, q)` is a symmetry of the rules: it maps axis `Q` to `R`, fixes `QR`
+/// up to sign, preserves `hex_distance`, and fixes the origin.
 #[test]
 fn walks_along_q_and_r_reach_the_same_ply() {
     fn walk(along_q: bool) -> (usize, Option<MoveError>) {
@@ -213,20 +199,13 @@ fn walks_along_q_and_r_reach_the_same_ply() {
     assert_eq!(walk(true), (400, None), "an axis walk was refused");
 }
 
-/// Hazard H9, the sharp form: a `Search` that grows the arena and then unwinds
-/// must not consume the position's extent budget.
-///
-/// Regression: geometry is not restored by `undo`, and the ceiling used to be
-/// tested against the *doubled allocation*, so a fully rewound position — equal
-/// under `PartialEq`, equal `zobrist`, equal `legal_actions`, passing `audit` —
-/// refused a placement its freshly replayed twin accepted.
+/// Hazard H9, the sharp form: a `Search` that grows the arena and then unwinds must not
+/// consume the position's extent budget.
 #[test]
 fn a_rewound_search_does_not_consume_the_extent_budget() {
     let mut searched = play(&[(0, 0)]);
     let flat = play(&[(0, 0)]);
     {
-        // Deliberately asymmetric: a balanced excursion re-centres the arena
-        // and hides the leak, which is why property 6a used to miss it.
         let mut s = crate::Search::new(&mut searched);
         let mut q = 0i16;
         for _ in 0..60 {
@@ -244,8 +223,6 @@ fn a_rewound_search_does_not_consume_the_extent_budget() {
     );
     searched.audit().expect("audit after the excursion");
 
-    // Now drive both to the ceiling in lockstep along a spreading diagonal and
-    // require them to agree on every single accept and refusal.
     let mut a = searched;
     let mut b = flat;
     let (mut q, mut r) = (0i16, 0i16);
@@ -275,13 +252,8 @@ fn a_rewound_search_does_not_consume_the_extent_budget() {
     assert_eq!(a, b);
 }
 
-/// The sharper form of the same hazard: an excursion that widens `r` must not
-/// shorten a later walk along `q`.
-///
-/// This is what a *balanced* pre-growth cannot expose — and what a growth
-/// policy that merely stops over-allocating still gets wrong, because the
-/// budget has to be computed from the stones rather than from whatever the
-/// arena happens to hold.
+/// The sharper form of the same hazard: an excursion that widens `r` must not shorten a
+/// later walk along `q`.
 #[test]
 fn an_excursion_along_r_does_not_shorten_a_later_q_walk() {
     let mut searched = play(&[(0, 0)]);
@@ -314,11 +286,8 @@ fn an_excursion_along_r_does_not_shorten_a_later_q_walk() {
     assert_eq!(a.grid.row_words(), b.grid.row_words());
 }
 
-// ---- precedence, one test per ordered pair ---------------------------------
-
 #[test]
 fn precedence_terminal_beats_everything_reachable() {
-    // Terminal + occupied, terminal + too far, terminal + out of bounds.
     let mut p = second_stone_win();
     assert_eq!(p.advance(act(0, 0)), Err(MoveError::TerminalState));
     assert_eq!(p.advance(act(300, 300)), Err(MoveError::TerminalState));
@@ -326,8 +295,6 @@ fn precedence_terminal_beats_everything_reachable() {
         p.advance(Action::new(HexCoord::new(crate::COORD_LIMIT + 1, 0))),
         Err(MoveError::TerminalState)
     );
-    // Terminal + reused-first-stone: a second-stone win freezes at
-    // `SecondStone { first }` with `first` pointing at a live stone.
     let first = match p.phase() {
         TurnPhase::SecondStone { first } => first,
         other => panic!("expected a frozen SecondStone, got {other:?}"),
@@ -354,7 +321,6 @@ fn precedence_illegal_opening_beats_too_far_from_stones() {
 #[test]
 fn precedence_reused_first_stone_beats_occupied() {
     let mut p = play(&[(0, 0), (1, 0)]);
-    // `first` is by construction occupied; the reuse rule must win.
     assert_eq!(
         p.advance(act(1, 0)),
         Err(MoveError::ReusedFirstStone(HexCoord::new(1, 0)))
@@ -375,14 +341,11 @@ fn precedence_coord_out_of_bounds_beats_too_far_from_stones() {
 #[test]
 fn precedence_too_far_from_stones_beats_board_extent_exceeded() {
     let mut p = play(&[(0, 0)]);
-    // Enormously distant *and* would blow the arena: the rule wins.
     assert_eq!(
         p.advance(act(9000, 0)),
         Err(MoveError::TooFarFromStones(HexCoord::new(9000, 0)))
     );
 }
-
-// ---- atomicity (H10) ------------------------------------------------------
 
 #[test]
 fn every_rejection_is_atomic() {
@@ -411,14 +374,11 @@ fn every_rejection_is_atomic() {
                 assert_eq!(p.zobrist(), z);
                 p.audit().expect("audit after a rejection");
             } else {
-                // Undo the accidental success so the loop keeps its subject.
                 *p = before;
             }
         }
     }
 }
-
-// ---- turn machine ---------------------------------------------------------
 
 #[test]
 fn opening_is_forced_and_hands_over_to_p1() {
@@ -499,8 +459,6 @@ fn second_stone_win_freezes_at_second_stone_with_first_occupied() {
     p.audit().expect("audit");
 }
 
-// ---- windows --------------------------------------------------------------
-
 #[test]
 fn windows_through_puts_the_query_cell_at_its_offset() {
     let p = play(&[(0, 0), (1, 0), (2, 0)]);
@@ -565,8 +523,6 @@ fn window_masks_report_ownership() {
     assert_eq!(m.empty(), 0b111000);
     assert!(!m.is_full_for(Player::P0));
 }
-
-// ---- legal set ------------------------------------------------------------
 
 #[test]
 fn legal_actions_are_strictly_ascending_action_ids() {
@@ -636,13 +592,8 @@ fn stones_iterate_in_canonical_order_regardless_of_play_order() {
     assert_eq!(a.stone_count_for(Player::P1), 2);
 }
 
-// ---- hashing and equality -------------------------------------------------
-
 #[test]
 fn zobrist_ignores_second_stone_first_but_partial_eq_does_not() {
-    // No legal game reaches two positions differing *only* in `first` — it is
-    // always the last stone played — so this pins the documented consequence
-    // directly, using the module-private field.
     let a = play(&[(0, 0), (1, 0)]);
     assert_eq!(
         a.phase(),
@@ -656,7 +607,6 @@ fn zobrist_ignores_second_stone_first_but_partial_eq_does_not() {
     };
     assert_ne!(a, b, "PartialEq must include SecondStone::first");
     assert_eq!(a.zobrist(), b.zobrist(), "zobrist must exclude it");
-    // Which is exactly why `Position` must not implement `core::hash::Hash`.
 }
 
 #[test]
@@ -688,8 +638,6 @@ fn turn_slot_covers_kind_mover_and_terminal() {
 
 #[test]
 fn partial_eq_ignores_arena_growth() {
-    // Grow one position's arena far out, then rewind it. The two must be equal
-    // even though one owns a much bigger allocation.
     let mut grown = play(&[(0, 0)]);
     let flat = play(&[(0, 0)]);
     {
@@ -710,7 +658,6 @@ fn turn_closed_form_matches_the_documented_pattern() {
     assert_eq!(turn_closed_form(0, false), Some((0, Player::P0)));
     assert_eq!(turn_closed_form(0, true), None);
     assert_eq!(turn_closed_form(1, true), None);
-    // ply 0 placed -> FirstStone / P1; ply 1 -> SecondStone / P1; ...
     let want = [
         (1usize, Player::P1),
         (2, Player::P1),
@@ -729,7 +676,6 @@ fn turn_closed_form_matches_the_documented_pattern() {
             i + 1
         );
     }
-    // Freeze: `m = n - 1` reports the pre-move state.
     assert_eq!(turn_closed_form(6, true), turn_closed_form(5, false));
 }
 
@@ -740,10 +686,6 @@ fn audit_passes_on_a_fresh_and_a_played_position() {
     first_stone_win().audit().expect("first-stone win");
     second_stone_win().audit().expect("second-stone win");
 }
-
-// ---------------------------------------------------------------------------
-// History and replay
-// ---------------------------------------------------------------------------
 
 #[test]
 fn history_is_empty_on_a_fresh_position() {
@@ -811,17 +753,12 @@ fn replay_of_an_empty_slice_is_the_empty_position() {
 
 #[test]
 fn replay_reports_the_ply_that_failed() {
-    // Ply 2 lands on the opening stone, which is occupied but is not the
-    // first stone of the current turn — so this is `Occupied`, not
-    // `ReusedFirstStone`.
     let err = Position::replay(&[act(0, 0), act(1, 0), act(0, 0)]).expect_err("must fail");
     assert_eq!(err.ply, 2);
     assert_eq!(err.action, act(0, 0));
     assert_eq!(err.cause, MoveError::Occupied(HexCoord::ORIGIN));
     assert!(format!("{err}").contains("ply 2"));
 
-    // The same slice one ply earlier reuses the current turn's first stone,
-    // which outranks `Occupied` in the precedence table.
     let err = Position::replay(&[act(0, 0), act(1, 0), act(1, 0)]).expect_err("must fail");
     assert_eq!(err.ply, 2);
     assert_eq!(err.cause, MoveError::ReusedFirstStone(HexCoord::new(1, 0)));
@@ -857,13 +794,11 @@ fn replay_from_continues_an_existing_position() {
 #[test]
 fn replay_from_reports_a_ply_relative_to_its_own_slice() {
     let mut p = play(&[(0, 0), (1, 0)]);
-    // Slice index 1 fails, even though it is ply 3 of the game.
     let err = p
         .replay_from(&[act(2, 0), act(2, 0)])
         .expect_err("must fail");
     assert_eq!(err.ply, 1);
     assert_eq!(err.cause, MoveError::Occupied(HexCoord::new(2, 0)));
-    // Not atomic: the good placement before the failure stuck.
     assert_eq!(p.stone_count(), 3);
 }
 
@@ -895,17 +830,12 @@ fn a_rejected_placement_leaves_the_history_untouched() {
 
 #[test]
 fn equality_ignores_history_order() {
-    // Both stones of P1's first turn, in either order, reach the same position.
     let a = play(&[(0, 0), (1, 0), (2, 0)]);
     let b = play(&[(0, 0), (2, 0), (1, 0)]);
     assert_ne!(a.history(), b.history(), "the two games differ");
     assert_eq!(a, b, "but the positions are equal");
     assert_eq!(a.zobrist(), b.zobrist(), "and so are their hashes");
 }
-
-// ---------------------------------------------------------------------------
-// The canonical legal ordering, both directions
-// ---------------------------------------------------------------------------
 
 #[test]
 fn legal_rank_and_nth_legal_agree_with_the_iterator() {
@@ -963,7 +893,6 @@ fn the_second_stone_of_a_turn_cannot_rank_the_first() {
     let p = play(&[(0, 0), (1, 0)]);
     assert!(matches!(p.phase(), TurnPhase::SecondStone { .. }));
     assert_eq!(p.legal_rank(act(1, 0)), None, "the first stone is occupied");
-    // Everything the iterator lists still ranks.
     for (i, a) in p.legal_actions().enumerate() {
         assert_eq!(p.legal_rank(a), Some(i));
     }

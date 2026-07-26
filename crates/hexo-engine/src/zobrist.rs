@@ -1,23 +1,9 @@
 //! The deterministic Zobrist mixing function and the turn-key table.
-//!
-//! Private: reachable only through [`crate::Position::zobrist`].
-//!
-//! The board is unbounded, so a per-cell lookup table is wrong. Instead every
-//! cell key is a `const` mixing function of `(q, r, player)`. Only wrapping
-//! `u64` arithmetic over an explicitly packed key is used — no float, no
-//! pointer, no `Hasher`, no RNG, no startup generation, no endianness
-//! dependence — so the hash is identical across builds, machines, and
-//! processes for a given [`crate::RULES_VERSION`]. That is the
-//! container-boundary requirement.
-//!
-//! **The golden vectors in this module's tests are not optional.** A wrong
-//! `cell_key` is a symmetric bug: it applies and un-applies identically, so no
-//! round-trip or invariant test can see it (spec §7.4 H8).
 
 use crate::coord::HexCoord;
 use crate::player::Player;
 
-/// splitmix64 finalizer. A bijection on `u64`; wrapping arithmetic only.
+/// splitmix64 finalizer.
 #[inline]
 const fn mix64(mut x: u64) -> u64 {
     x ^= x >> 30;
@@ -28,37 +14,28 @@ const fn mix64(mut x: u64) -> u64 {
     x
 }
 
-/// Domain tag bit for cell keys. Disjoint from [`TURN_DOMAIN`].
+/// Domain tag bit for cell keys.
 const CELL_DOMAIN: u64 = 1 << 16;
 
-/// Domain tag bit for turn keys. Disjoint from [`CELL_DOMAIN`].
+/// Domain tag bit for turn keys.
 const TURN_DOMAIN: u64 = 1 << 17;
 
 /// Hash contribution of one stone.
-///
-/// Input layout: `q` in bits 48..64, `r` in bits 32..48, [`CELL_DOMAIN`] at bit
-/// 16, owner at bit 0. Every other bit is zero, so no two `(q, r, player)`
-/// triples share an input, and `mix64` is injective, so no two share a key.
 #[inline]
 pub(crate) const fn cell_key(c: HexCoord, p: Player) -> u64 {
     mix64(((c.q as u16 as u64) << 48) | ((c.r as u16 as u64) << 32) | CELL_DOMAIN | (p as u64))
 }
 
-/// Hash contribution of the turn state. `slot` is `0..12`.
-///
-/// Input layout: `slot` in bits 1..5, [`TURN_DOMAIN`] at bit 17. Bit 16 is
-/// clear, so no turn-key input can collide with a cell-key input.
+/// Hash contribution of the turn state.
 #[inline]
 const fn turn_key_of(slot: usize) -> u64 {
     mix64(TURN_DOMAIN | ((slot as u64) << 1))
 }
 
-/// Number of distinct turn slots: 3 phase kinds × 2 players × 2 terminal states.
+/// Number of distinct turn slots: 3 phase kinds Ã— 2 players Ã— 2 terminal states.
 pub(crate) const TURN_SLOTS: usize = 12;
 
 /// The twelve turn keys, baked at compile time.
-///
-/// No startup generation, no RNG, no endianness dependence.
 pub(crate) const TURN_KEY: [u64; TURN_SLOTS] = {
     let mut t = [0u64; TURN_SLOTS];
     let mut i = 0;
@@ -73,13 +50,8 @@ pub(crate) const TURN_KEY: [u64; TURN_SLOTS] = {
 mod tests {
     use super::*;
 
-    /// Frozen golden vectors: sixteen `(q, r, player) -> u64` cell keys spanning
-    /// all four sign quadrants and both players.
-    ///
-    /// **Do not "fix" these by re-deriving them from the implementation.** If
-    /// this test fails, the mixing function changed and every stored game
-    /// record and every cross-process hash agreement broke with it; the correct
-    /// response is to bump `RULES_VERSION` deliberately.
+    /// Frozen golden vectors: sixteen `(q, r, player) -> u64` cell keys spanning all
+    /// four sign quadrants and both players.
     #[test]
     fn cell_key_golden_vectors() {
         const GOLDEN: [(i16, i16, Player, u64); 16] = [

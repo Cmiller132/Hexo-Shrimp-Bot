@@ -1,13 +1,4 @@
 //! Axial coordinates, the three line axes, hex distance, and the radius-8 disk.
-//!
-//! Everything in this module is pure geometry over the unbounded hex board. It
-//! knows nothing about storage, legality, or turns, and every function here is
-//! total over the documented domain.
-//!
-//! Coordinates are axial `(q, r)` held as [`i16`]; the third cube axis is
-//! derived as `s = -q - r`. Index and distance arithmetic is performed in
-//! [`i32`] because `-q - r` overflows `i16` at the extremes and these are
-//! public total functions (spec §13.9).
 
 /// Cells in a win window.
 pub const WINDOW_LEN: usize = 6;
@@ -19,21 +10,9 @@ pub const LEGAL_RADIUS: u32 = 8;
 pub const DISK_CELLS: usize = 217;
 
 /// Largest magnitude allowed for any of `q`, `r`, `s` on a placed or queried cell.
-///
-/// A representation bound, not a rule. It is chosen so that every internal
-/// coordinate walk (`±8` for the disk, `±5` for a window) stays inside `i16`
-/// with room to spare, and so that no legal game ever reaches it: spreading is
-/// capped at 8 cells per ply, so the first placement that could violate it is
-/// ply ~2000.
 pub const COORD_LIMIT: i16 = 16_000;
 
 /// One cell on the unbounded hex board, in axial coordinates.
-///
-/// The third cube axis is derived: `s = -q - r`.
-///
-/// `Ord` is load-bearing: it is lexicographic `(q, r)`, which is the canonical
-/// ordering of spec §9, and it agrees with [`crate::ActionId`] ordering by
-/// construction.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HexCoord {
     /// Axial `q` coordinate. Ordered first by `Ord`.
@@ -54,9 +33,6 @@ impl HexCoord {
     }
 
     /// The derived cube axis `-q - r`.
-    ///
-    /// Returns `i32`, not `i16`: `-q - r` overflows `i16` for extreme inputs,
-    /// and this function is total over every `(i16, i16)` pair.
     #[inline]
     #[must_use]
     pub const fn s(self) -> i32 {
@@ -64,8 +40,6 @@ impl HexCoord {
     }
 
     /// Whether `q`, `r`, and `s` all lie within [`COORD_LIMIT`].
-    ///
-    /// The documented domain of every geometry function in this crate.
     #[inline]
     #[must_use]
     pub const fn is_valid(self) -> bool {
@@ -77,11 +51,6 @@ impl HexCoord {
     }
 
     /// This coordinate stepped `n` cells along `axis`.
-    ///
-    /// # Panics
-    /// Debug builds assert `self.is_valid()` and `|n| <= 8`. In release the
-    /// arithmetic wraps; the crate forbids `unsafe`, so this is memory-safe but
-    /// meaningless. No reachable engine state can supply an invalid coordinate.
     #[inline]
     #[must_use]
     pub const fn step(self, axis: Axis, n: i16) -> Self {
@@ -158,9 +127,6 @@ impl Axis {
 }
 
 /// Distance in hex steps between two cells.
-///
-/// Total over every pair of `i16` coordinates; computed in `i32` and returned
-/// as `u32`, because the maximum representable separation exceeds `i16::MAX`.
 #[inline]
 #[must_use]
 pub const fn hex_distance(a: HexCoord, b: HexCoord) -> u32 {
@@ -174,21 +140,6 @@ pub const fn hex_distance(a: HexCoord, b: HexCoord) -> u32 {
 }
 
 /// Offsets of the radius-[`LEGAL_RADIUS`] disk, `dq`-major and `dr`-minor.
-///
-/// ```text
-/// for dq in -8..=8 { for dr in max(-8, -dq - 8) ..= min(8, -dq + 8) { yield (dq, dr) } }
-/// ```
-///
-/// The `dq`-major layout means each `dq` is one contiguous run of cells in
-/// storage order, which is what `Grid::disk_runs` walks instead of this table.
-/// The table therefore survives as the **independent** statement of the same
-/// cell set: the tier-C frontier assertion walks it, offset by offset, on every
-/// apply and undo, and the two are compared directly in `grid`'s own tests. A
-/// wrong row run and a wrong offset are both symmetric bugs, so neither
-/// formulation can be checked against itself.
-///
-/// Read only by the tier-C debug assertions and by tests, so it is dead code in
-/// a release build — which `cargo clippy --release` reports.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) const DISK8: [(i8, i8); DISK_CELLS] = {
     let mut out = [(0i8, 0i8); DISK_CELLS];
@@ -210,9 +161,6 @@ pub(crate) const DISK8: [(i8, i8); DISK_CELLS] = {
 };
 
 /// `c` displaced by a `(dq, dr)` offset from [`DISK8`].
-///
-/// Read only by the tier-C debug assertions and by tests, so it is dead code in
-/// a release build — which `cargo clippy --release` reports.
 #[inline]
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) const fn offset(c: HexCoord, d: (i8, i8)) -> HexCoord {
@@ -238,7 +186,6 @@ mod tests {
     fn hex_distance_is_total_at_i16_extremes() {
         let a = HexCoord::new(i16::MIN, i16::MIN);
         let b = HexCoord::new(i16::MAX, i16::MAX);
-        // Just needs to not overflow and to be symmetric.
         assert_eq!(hex_distance(a, b), hex_distance(b, a));
         assert_eq!(hex_distance(a, a), 0);
         assert_eq!(hex_distance(HexCoord::ORIGIN, HexCoord::new(1, 0)), 1);
@@ -297,7 +244,6 @@ mod tests {
         assert!(HexCoord::new(0, COORD_LIMIT).is_valid());
         assert!(!HexCoord::new(COORD_LIMIT + 1, 0).is_valid());
         assert!(!HexCoord::new(0, COORD_LIMIT + 1).is_valid());
-        // s = -q - r goes out of range before q or r does.
         assert!(HexCoord::new(COORD_LIMIT, -COORD_LIMIT).is_valid());
         assert!(!HexCoord::new(COORD_LIMIT, 1).is_valid());
         assert!(!HexCoord::new(-COORD_LIMIT, -1).is_valid());

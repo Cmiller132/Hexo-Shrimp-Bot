@@ -1,13 +1,8 @@
 //! Who moves, and where they are inside the two-placement turn.
-//!
-//! The turn structure is: ply 0 is [`TurnPhase::Opening`] and belongs to
-//! [`Player::P0`] at [`HexCoord::ORIGIN`]; after that each player places two
-//! stones per turn, and a win is checked after each of them. The resulting ply
-//! pattern is `P0; P1 P1; P0 P0; P1 P1; ...`.
 
 use crate::coord::HexCoord;
 
-/// One of the two players. `P0` places the opening stone.
+/// One of the two players.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum Player {
@@ -37,12 +32,9 @@ impl Player {
 }
 
 /// Where the mover is inside the two-placement turn.
-///
-/// A terminal position freezes whichever phase it reached, so **every branch on
-/// a phase must test [`crate::Position::is_terminal`] first** (spec §7.4 H2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TurnPhase {
-    /// Ply 0 only. `P0` must place at [`HexCoord::ORIGIN`].
+    /// Ply 0 only.
     Opening,
     /// The mover places the first stone of its turn.
     FirstStone,
@@ -55,8 +47,6 @@ pub enum TurnPhase {
 
 impl TurnPhase {
     /// Canonical kind index: `Opening = 0`, `FirstStone = 1`, `SecondStone = 2`.
-    ///
-    /// Ignores the `first` payload; used by the Zobrist turn key (spec §8).
     #[inline]
     #[must_use]
     pub const fn kind_index(self) -> usize {

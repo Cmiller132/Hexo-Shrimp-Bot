@@ -1,12 +1,4 @@
-//! Brute-force oracles and a deterministic driver, shared by the integration
-//! tests.
-//!
-//! Everything here is written to **disagree** with the engine. The oracles are
-//! `O(stones^2)` or worse, they never touch a crate-private helper, and the
-//! Zobrist oracle re-implements the mixing function from the specification
-//! rather than calling the crate's. That independence is the whole point:
-//! symmetric bugs — a wrong disk offset, a wrong shear, a wrong key constant —
-//! apply and un-apply identically, so only a second formulation can catch them.
+//! Brute-force oracles and a deterministic driver, shared by the integration tests.
 
 #![allow(dead_code)]
 
@@ -14,22 +6,14 @@ use hexo_engine::{
     Action, Axis, HexCoord, LEGAL_RADIUS, Player, Position, TurnPhase, WINDOW_LEN, hex_distance,
 };
 
-// ---------------------------------------------------------------------------
-// Deterministic PRNG (no dependencies)
-// ---------------------------------------------------------------------------
-
 #[path = "../../testkit/rng.rs"]
 mod rng;
 
 pub use rng::Rng;
 
-// ---------------------------------------------------------------------------
-// T1 — the legal-set oracle
-// ---------------------------------------------------------------------------
-
-/// The brute-force union of radius-8 disks over all occupied cells, minus
-/// occupied cells, minus (in `Opening`) everything but the origin, minus (when
-/// terminal) everything. In canonical `(q, r)` order.
+/// The brute-force union of radius-8 disks over all occupied cells, minus occupied
+/// cells, minus (in `Opening`) everything but the origin, minus (when terminal)
+/// everything.
 pub fn legal_set_oracle(pos: &Position) -> Vec<HexCoord> {
     if pos.is_terminal() {
         return Vec::new();
@@ -56,10 +40,6 @@ pub fn legal_set_oracle(pos: &Position) -> Vec<HexCoord> {
     }
     out.into_iter().collect()
 }
-
-// ---------------------------------------------------------------------------
-// T2 — the Zobrist oracle, re-derived from the specification
-// ---------------------------------------------------------------------------
 
 /// splitmix64 finalizer, transcribed from the specification.
 const fn mix64(mut x: u64) -> u64 {
@@ -103,12 +83,7 @@ pub fn zobrist_oracle(pos: &Position) -> u64 {
     h ^ oracle_turn_key(kind * 4 + mover * 2 + usize::from(pos.is_terminal()))
 }
 
-// ---------------------------------------------------------------------------
-// T3 — the win oracle
-// ---------------------------------------------------------------------------
-
-/// Brute-force six-in-a-row scan over every stone, every axis, and every
-/// offset. Returns every player with a completed window.
+/// Brute-force six-in-a-row scan over every stone, every axis, and every offset.
 pub fn winners_oracle(pos: &Position) -> Vec<Player> {
     let mut found = [false; 2];
     for (c, p) in pos.stones() {
@@ -144,17 +119,12 @@ pub fn winners_oracle(pos: &Position) -> Vec<Player> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// T4 — the turn-sequence oracle
-// ---------------------------------------------------------------------------
-
-/// The literal documented pattern `P0; P1 P1; P0 P0; P1 P1; ...`: who moves at
-/// ply `n`, and what phase they are in.
+/// The literal documented pattern `P0; P1 P1; P0 P0; P1 P1; ...`: who moves at ply `n`,
+/// and what phase they are in.
 pub fn turn_oracle(ply: usize) -> (Player, TurnPhase) {
     if ply == 0 {
         return (Player::P0, TurnPhase::Opening);
     }
-    // Plies 1.. are grouped in pairs: (1,2) -> P1, (3,4) -> P0, (5,6) -> P1 ...
     let pair = (ply - 1) / 2;
     let mover = if pair.is_multiple_of(2) {
         Player::P1
@@ -164,7 +134,6 @@ pub fn turn_oracle(ply: usize) -> (Player, TurnPhase) {
     let phase = if (ply - 1).is_multiple_of(2) {
         TurnPhase::FirstStone
     } else {
-        // The caller checks the kind only; the payload is position-dependent.
         TurnPhase::SecondStone {
             first: HexCoord::ORIGIN,
         }
@@ -181,10 +150,6 @@ pub fn phase_kind(phase: TurnPhase) -> usize {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Drivers
-// ---------------------------------------------------------------------------
-
 /// Pick the `k`-th legal action, wrapping. Returns `None` when terminal.
 pub fn nth_legal(pos: &Position, k: usize) -> Option<Action> {
     let n = pos.legal_count();
@@ -195,8 +160,6 @@ pub fn nth_legal(pos: &Position, k: usize) -> Option<Action> {
 }
 
 /// Play a random legal game and return the move list.
-///
-/// Stops at termination or at `max_plies`.
 pub fn random_game(seed: u64, max_plies: usize) -> Vec<Action> {
     let mut rng = Rng::new(seed);
     let mut pos = Position::new();
@@ -221,10 +184,8 @@ pub fn replay(moves: &[Action]) -> Position {
     pos
 }
 
-/// Every per-ply invariant the oracles can check, run against `pos` at ply
-/// `ply`.
+/// Every per-ply invariant the oracles can check, run against `pos` at ply `ply`.
 pub fn check_all_oracles(pos: &Position, ply: usize) {
-    // T1
     let listed: Vec<HexCoord> = pos.legal_actions().map(Action::coord).collect();
     assert_eq!(
         listed,
@@ -237,14 +198,12 @@ pub fn check_all_oracles(pos: &Position, ply: usize) {
         "legal_count disagrees with the iterator at ply {ply}"
     );
 
-    // T2
     assert_eq!(
         pos.zobrist(),
         zobrist_oracle(pos),
         "T2: zobrist mismatch at ply {ply}"
     );
 
-    // T3
     let winners = winners_oracle(pos);
     assert_eq!(
         pos.is_terminal(),
@@ -255,8 +214,6 @@ pub fn check_all_oracles(pos: &Position, ply: usize) {
         assert_eq!(winners, vec![o.winner], "T3: winner mismatch at ply {ply}");
     }
 
-    // T4. `stone_count` is the ply count; a terminal position froze one ply
-    // back, which is exactly what the closed form of the pattern reports.
     let n = pos.stone_count() as usize;
     let (mover, phase) = turn_oracle(n - usize::from(pos.is_terminal()));
     assert_eq!(
@@ -270,17 +227,12 @@ pub fn check_all_oracles(pos: &Position, ply: usize) {
         "T4: phase mismatch at ply {ply}"
     );
 
-    // Structural: zero legal moves iff terminal.
     assert_eq!(
         pos.legal_count() == 0,
         pos.is_terminal(),
         "legal_count/terminal disagree at ply {ply}"
     );
 
-    // T6: the canonical ordering is a bijection, and both directions agree
-    // with the iterator. `legal_rank` is a popcount prefix over the frontier
-    // plane and `nth_legal` is a select scan; neither shares code with the
-    // enumeration they are checked against.
     for (i, a) in pos.legal_actions().enumerate() {
         assert_eq!(
             pos.legal_rank(a),
@@ -299,8 +251,6 @@ pub fn check_all_oracles(pos: &Position, ply: usize) {
         "T6: nth_legal ran past the end at ply {ply}"
     );
 
-    // T7: history length is the ply count, and every recorded placement names
-    // an occupied cell.
     assert_eq!(
         pos.history().len(),
         pos.stone_count() as usize,
@@ -313,9 +263,6 @@ pub fn check_all_oracles(pos: &Position, ply: usize) {
         );
     }
 
-    // T8: replaying the history from scratch reproduces the position. This
-    // crosses the incremental path against a fresh replay, which no other
-    // oracle here does.
     let rebuilt = Position::replay(pos.history())
         .unwrap_or_else(|e| panic!("T8: history failed to replay at ply {ply}: {e}"));
     assert_eq!(&rebuilt, pos, "T8: replayed position differs at ply {ply}");
@@ -330,7 +277,6 @@ pub fn check_all_oracles(pos: &Position, ply: usize) {
         "T8: replayed history differs at ply {ply}"
     );
 
-    // The full Tier-A audit.
     pos.audit()
         .unwrap_or_else(|e| panic!("audit failed at ply {ply}: {e}"));
 }

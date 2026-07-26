@@ -1,18 +1,4 @@
 //! Six-cell window geometry and the exposed win-detection surface.
-//!
-//! A *window* is six consecutive cells along one of the three axes. A player
-//! wins when any window is completely filled by that player's stones; six **or
-//! more** in a row wins, because a run of seven contains a fully-owned
-//! six-window. There is no overline rule.
-//!
-//! Nothing here is stored by the engine. [`WindowMask`] values are derived on
-//! read from the occupancy planes (spec §6.2), so there is no stored mask table
-//! to grow, to undo, or to disagree with the board.
-//!
-//! Ruling 3: this module exposes *masks*, not predicates. `is_threat_for`,
-//! `threat_player`, and `is_active` are deliberately absent — a mask is
-//! strictly more information, and each of those predicates is a one-liner over
-//! [`WindowMask::mask`] and [`Window::cells`].
 
 use crate::coord::{Axis, HexCoord, WINDOW_LEN, hex_distance};
 use crate::player::Player;
@@ -24,9 +10,6 @@ pub const WINDOWS_PER_PLACEMENT: usize = 18;
 const FULL: u8 = 0x3F;
 
 /// Ownership of one six-cell window, as two six-bit masks.
-///
-/// Bit `i` refers to the window's cell `i`, which is a statement about the
-/// infinite board (`start + axis.vector() * i`) and never about storage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct WindowMask([u8; 2]);
 
@@ -34,8 +17,7 @@ impl WindowMask {
     /// The empty window.
     pub const EMPTY: Self = Self([0, 0]);
 
-    /// Build a mask from the two per-player lanes. Internal: the player-to-lane
-    /// mapping is a private convention.
+    /// Build a mask from the two per-player lanes.
     #[inline]
     pub(crate) const fn from_lanes(p0: u8, p1: u8) -> Self {
         Self([p0 & FULL, p1 & FULL])
@@ -78,10 +60,6 @@ impl WindowMask {
 }
 
 /// Identity of one six-cell window: its first cell and the axis it runs along.
-///
-/// Pure geometry. Constructible and interpretable with no
-/// [`crate::Position`] in hand, and valid forever regardless of how the engine
-/// stores the board.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Window {
     /// Cell `0` of the window.
@@ -92,10 +70,6 @@ pub struct Window {
 
 impl Window {
     /// Coordinate of cell `index`.
-    ///
-    /// # Panics
-    /// Panics if `index >= WINDOW_LEN`. Debug builds also assert
-    /// `self.start.is_valid()`.
     #[inline]
     #[must_use]
     pub const fn cell(self, index: usize) -> HexCoord {
@@ -104,9 +78,6 @@ impl Window {
     }
 
     /// All six coordinates, in bit order.
-    ///
-    /// # Panics
-    /// Debug builds assert `self.start.is_valid()`.
     #[inline]
     #[must_use]
     pub const fn cells(self) -> [HexCoord; WINDOW_LEN] {
@@ -120,23 +91,11 @@ impl Window {
     }
 
     /// Which of the six cells `coord` is, or `None` if it is not one of them.
-    ///
-    /// The inverse of [`Window::cell`], and strictly more information than
-    /// [`Window::contains`] — which is why it is the one that composes. An
-    /// incidence edge in a cell/window graph has to carry *which* bit of
-    /// [`WindowMask`] the cell is, because the mask is positional; "somewhere in
-    /// this window" would not be enough to read the mask back.
-    ///
-    /// Total, and computed in `i32` rather than by walking [`Window::cells`], so
-    /// a coordinate arbitrarily far from `start` answers `None` instead of
-    /// wrapping.
     #[inline]
     #[must_use]
     pub const fn cell_index(self, coord: HexCoord) -> Option<usize> {
         let dq = coord.q as i32 - self.start.q as i32;
         let dr = coord.r as i32 - self.start.r as i32;
-        // `coord == start + axis.vector() * i`, split into the constraint that
-        // pins `coord` to the line and the index along it.
         let (off_line, i) = match self.axis {
             Axis::Q => (dr, dq),
             Axis::R => (dq, dr),
@@ -156,16 +115,6 @@ impl Window {
     }
 
     /// Whether the two windows share at least one cell. Symmetric.
-    ///
-    /// Six [`Window::contains`] calls rather than a closed form over the
-    /// parallel and crossing cases. Two windows on the same axis overlap when
-    /// their starts are within six steps; on different axes they meet in at most
-    /// one cell, found by solving the two lines. That is two branches of a case
-    /// analysis that could be wrong in the same way — the exact hazard this crate
-    /// treats as the one that matters — for six cheap tests.
-    ///
-    /// # Panics
-    /// Debug builds assert `self.start.is_valid()`.
     #[inline]
     #[must_use]
     pub const fn intersects(self, other: Self) -> bool {
@@ -180,15 +129,6 @@ impl Window {
     }
 
     /// Whether the two windows are disjoint but have a pair of adjacent cells.
-    ///
-    /// **Exclusive of overlap.** Two windows that share a cell do *not* touch, so
-    /// `intersects`, `touches`, and neither partition every pair of windows.
-    /// "Overlapping or adjacent" is `a.intersects(b) || a.touches(b)`, which is
-    /// left to the caller because it is a union of two answers rather than a
-    /// third fact.
-    ///
-    /// # Panics
-    /// Debug builds assert both starts are valid.
     #[inline]
     #[must_use]
     pub const fn touches(self, other: Self) -> bool {
@@ -222,19 +162,6 @@ pub struct WindowRef {
 }
 
 /// Which of the 18 windows through a placement that placement completed.
-///
-/// A set over the canonical slot order of spec §6.3: axis-major (`Q`, `R`,
-/// `QR`), then offset `0..6`, where offset `k` means the placed cell sits at
-/// bit `k` of the window. The bit layout is `axis.index() * 6 + offset`, but
-/// **nothing outside this type needs to know that** — that is the point of the
-/// type. [`WinningWindows::bits`] is the escape hatch for a record writer.
-///
-/// **More than one slot can be set.** Seven in a row contains two fully-owned
-/// six-windows, and two lines crossing at the placed cell complete both. Code
-/// that assumes exactly one is wrong (spec §7.4 H6).
-///
-/// [`crate::Applied::winning_windows`] resolves these slots into real
-/// [`Window`] values, which is the accessor most consumers want.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
 pub struct WinningWindows(u32);
 
@@ -248,8 +175,7 @@ impl WinningWindows {
         Self(bits)
     }
 
-    /// Whether no window was completed. Equivalent to `count() == 0`, and
-    /// exactly the negation of "this placement won".
+    /// Whether no window was completed.
     #[inline]
     #[must_use]
     pub const fn is_empty(self) -> bool {
@@ -264,9 +190,6 @@ impl WinningWindows {
     }
 
     /// Whether the window at `offset` along `axis` was completed.
-    ///
-    /// # Panics
-    /// Panics if `offset >= WINDOW_LEN`.
     #[inline]
     #[must_use]
     pub const fn contains(self, axis: Axis, offset: usize) -> bool {
@@ -275,9 +198,6 @@ impl WinningWindows {
     }
 
     /// The raw slot mask, for a record writer that persists it verbatim.
-    ///
-    /// Reading individual bits out of this is what [`WinningWindows::iter`]
-    /// exists to make unnecessary.
     #[inline]
     #[must_use]
     pub const fn bits(self) -> u32 {
@@ -393,10 +313,6 @@ mod tests {
     }
 
     /// Every window whose start lies in a small box, on all three axes.
-    ///
-    /// Small because the relation tests are quadratic in it; wide enough that
-    /// every pair of axes is represented at every relative offset that can
-    /// overlap, touch, or miss.
     fn corpus() -> Vec<Window> {
         let mut out = Vec::new();
         for q in -3..=3 {
@@ -413,12 +329,6 @@ mod tests {
     }
 
     /// The same three relations read off the materialised cell arrays.
-    ///
-    /// Deliberately *not* written in terms of `cell_index`: the shipped versions
-    /// are closed-form index arithmetic, and a brute-force walk of `cells()` is
-    /// the only independent statement of the same geometry. A wrong off-line
-    /// constraint — `dq - dr` where the QR axis needs `dq + dr` — is symmetric
-    /// under any round trip, so this comparison is the detector.
     fn brute_contains(w: Window, c: HexCoord) -> bool {
         w.cells().contains(&c)
     }
@@ -459,9 +369,8 @@ mod tests {
         }
     }
 
-    /// A coordinate on the window's line but past either end is not in it, and
-    /// one step off the line never is. Named separately from the sweep because
-    /// these are the two ways `cell_index` can be wrong per axis.
+    /// A coordinate on the window's line but past either end is not in it, and one step
+    /// off the line never is.
     #[test]
     fn contains_rejects_off_line_and_past_the_ends() {
         for axis in Axis::ALL {
@@ -501,8 +410,8 @@ mod tests {
         }
     }
 
-    /// A property the cell walk does not state: two windows on the same axis and
-    /// the same line overlap exactly when their starts are within six steps.
+    /// A property the cell walk does not state: two windows on the same axis and the
+    /// same line overlap exactly when their starts are within six steps.
     #[test]
     fn same_axis_windows_overlap_within_six_steps() {
         for axis in Axis::ALL {
@@ -537,7 +446,6 @@ mod tests {
                 );
             }
         }
-        // The partition is not vacuous: the corpus contains all three cases.
         assert!(all.iter().any(|&a| all.iter().any(|&b| a.intersects(b))));
         assert!(all.iter().any(|&a| all.iter().any(|&b| a.touches(b))));
         assert!(
@@ -555,8 +463,8 @@ mod tests {
         }
     }
 
-    /// Two windows six apart along the same axis are the adjacent-but-disjoint
-    /// case by construction: cell 5 of the first neighbours cell 0 of the second.
+    /// Two windows six apart along the same axis are the adjacent-but-disjoint case by
+    /// construction: cell 5 of the first neighbours cell 0 of the second.
     #[test]
     fn consecutive_collinear_windows_touch() {
         for axis in Axis::ALL {
@@ -598,8 +506,8 @@ mod tests {
         assert_eq!(w.iter().next(), None);
     }
 
-    /// `contains` and `iter` must agree with the documented bit layout over
-    /// every one of the 18 slots, one slot at a time.
+    /// `contains` and `iter` must agree with the documented bit layout over every one
+    /// of the 18 slots, one slot at a time.
     #[test]
     fn each_slot_round_trips_through_contains_and_iter() {
         for axis in Axis::ALL {
@@ -610,7 +518,6 @@ mod tests {
                 assert_eq!(w.count(), 1);
                 assert!(w.contains(axis, offset), "{axis:?}+{offset}");
                 assert_eq!(w.iter().collect::<Vec<_>>(), vec![(axis, offset)]);
-                // Every other slot must read false.
                 for other in Axis::ALL {
                     for k in 0..WINDOW_LEN {
                         if other.index() * WINDOW_LEN + k == slot {
@@ -623,8 +530,8 @@ mod tests {
         }
     }
 
-    /// The multi-window case (H6): seven in a row and crossing lines both set
-    /// more than one bit, and `iter` must yield them all in ascending order.
+    /// The multi-window case (H6): seven in a row and crossing lines both set more than
+    /// one bit, and `iter` must yield them all in ascending order.
     #[test]
     fn iter_yields_every_set_slot_in_ascending_order() {
         let bits = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 17);
@@ -643,9 +550,8 @@ mod tests {
         assert_eq!(w.into_iter().count(), 4);
     }
 
-    /// `iter` and `contains` are two independent readings of the same bit
-    /// layout, so they are only a cross-check if they are compared. Every
-    /// single- and double-slot mask across all three axes, plus the extremes.
+    /// `iter` and `contains` are two independent readings of the same bit layout, so
+    /// they are only a cross-check if they are compared.
     #[test]
     fn iter_agrees_with_contains_over_every_mask() {
         let mut masks: Vec<u32> = vec![0, (1 << WINDOWS_PER_PLACEMENT) - 1];

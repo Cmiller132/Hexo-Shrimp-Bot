@@ -4,9 +4,6 @@ Questions that must be answered to build the engine and the runner. Distinct
 from `SUGGESTIONS.md`, which holds *optional* improvements — everything here has
 to be decided one way or another before the code that depends on it exists.
 
-Facts cited from the previous implementation were read from
-`Hexo-BotTrainer-hexgt` and are quoted with file references.
-
 A settled question leaves this file. Its answer moves to the `README.md` of
 whatever it decided, so this doc stays a list of what is *not* known rather than
 a changelog of what is. Numbering is stable — a closed item's number is not
@@ -26,33 +23,25 @@ reused, because other documents cite it.
 | B3 | Search budget | `Budget`, stated and recorded by the game, never enforced by it |
 | B5 | Adjudication policy | `MatchResult`, `FailurePolicy`, `NoContest` |
 | C3 | The binary crate, and its modes | `CONTAINER_SPEC.md` §3: `hexo-bot`, with `train`, `serve`, and `play`. Self-play is not a mode — it is the first phase of `train`, because one loop cannot be split into pieces that could drift from it |
-| C5 | ~~`R` for dense action indexing~~ — **withdrawn**, not answered: a fixed radius-20 crop is what caused the `main_3` training collapse | `crates/hexo-engine/README.md`; the canonical unbounded ordering replaced it |
+| C5 | ~~`R` for dense action indexing~~ — **withdrawn**, not answered: a fixed radius-20 crop makes wins outside the crop unrepresentable, so the action space silently stops matching the game | `crates/hexo-engine/README.md`; the canonical unbounded ordering replaced it |
 | C6 | One image or two | `CONTAINER_SPEC.md` §2. One: a play-only image would need a second implementation of the model's forward pass, which the no-dual-paths rule forbids and which could silently disagree with the first |
 
 ---
 
-## B4. Seed ownership — currently vestigial end to end
+## B4. Seed ownership — deliberately absent until it is real
 
-For byte-reproducible self-play the runner should mint and record a seed and
-hand per-seat seeds to players.
+For byte-reproducible self-play the runner would mint and record a seed and hand
+per-seat seeds to players.
 
-In the previous implementation the plumbing exists and does nothing. The engine
-discards the seed outright:
+Nothing in the workspace needs one yet. The engine has no randomness at all, and
+replay determinism comes from the stored action list rather than from a seed: a
+game is reproduced by replaying its moves. A seed field would therefore be
+carried, persisted, and read by nobody.
 
-```rust
-/// `seed` and `scenario` are accepted for API-shape stability but DISCARDED:
-/// the engine has no randomness and no scenario loader...
-```
-— `pybridge.rs:62-76`. The runner does not generate seeds, only forwards a
-caller-supplied one, persists it in the record, and passes it to players via
-`GameContext.seed`. **No shipped player reads it** — each carries its own RNG
-(hexgt derives `eval_seed * 1_000_003 + move_index` internally). Replay
-determinism comes from the stored action list, not from the seed.
-
-So the seed field is currently decorative. Either wire it end to end or do not
-carry it — a recorded seed that does not reproduce the game is worse than none.
-`hexo-runner` therefore ships with **no seed field at all**, deliberately, rather
-than inheriting a decorative one.
+Either wire a seed end to end or do not carry it — a recorded seed that does not
+reproduce the game is worse than none, because it reads as a reproducibility
+guarantee that was never checked. `hexo-runner` therefore ships with **no seed
+field at all**, deliberately.
 
 This stops being optional the moment a player samples rather than maximising:
 seeds must then be minted and recorded, derived from stable game and seat ids so

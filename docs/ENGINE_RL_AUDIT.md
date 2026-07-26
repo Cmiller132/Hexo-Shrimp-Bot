@@ -134,8 +134,7 @@ the 2–3x ceiling the first measurement predicted. `replay` halving is the same
 win seen end to end, since replaying 256 plies is 256 disk updates and their
 growth events.
 
-The golden vectors, the boundary tests, the property suite, and the differential
-test against `hexo-reference` are all unmoved.
+The golden vectors, the boundary tests, and the property suite are all unmoved.
 
 ### Higher-upside prototype
 
