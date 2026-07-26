@@ -1,28 +1,4 @@
 //! How a match ends, and the adjudication policy that decides it.
-//!
-//! The engine models exactly one ending: a player completed a six-window
-//! ([`hexo_engine::Outcome`]). Everything else a real match can do — running
-//! long, a seat resigning, a seat sending nonsense, a seat dying, the engine
-//! running out of arena — is a rule of the *match*, and lives here.
-//!
-//! # The distinction that matters
-//!
-//! The previous implementation had two statuses, `COMPLETED` and `ABORTED`, and
-//! a game that legitimately reached its 1024-action cap was recorded as
-//! `ABORTED` — the same value as a segfaulted player. Both were equally unusable
-//! as training signal and neither was distinguishable from the other.
-//!
-//! So there are three arms here, not two, and the split is by **whose fault it
-//! was**:
-//!
-//! - [`MatchResult::Decisive`] — someone won. Including by the other seat
-//!   forfeiting, which is still a result.
-//! - [`MatchResult::Drawn`] — nobody won and nothing went wrong.
-//! - [`MatchResult::NoContest`] — nobody won and something *did* go wrong. The
-//!   game is not evidence about either player's strength.
-//!
-//! A consumer that wants "games I can learn from" takes the first two and drops
-//! the third. That query was impossible before.
 
 use hexo_engine::{MoveError, Player};
 
@@ -47,9 +23,6 @@ pub enum MatchResult {
 
 impl MatchResult {
     /// Whether this result is evidence about how well the seats played.
-    ///
-    /// `false` for [`MatchResult::NoContest`]. The one query the previous
-    /// implementation could not answer.
     #[inline]
     #[must_use]
     pub const fn is_contested(self) -> bool {
@@ -70,18 +43,11 @@ impl MatchResult {
 /// How a seat won.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WinReason {
-    /// Six or more of the winner's stones in a row. The only ending the engine
-    /// knows about.
+    /// Six or more of the winner's stones in a row.
     SixInARow,
     /// The other seat resigned.
     Resignation,
     /// The other seat submitted a placement that broke the rules.
-    ///
-    /// A rule violation is a *loss*, not a crashed game — a seat that cannot
-    /// play legally has lost. This is distinct from the engine being unable to
-    /// represent a legal placement, which is [`NoContest::EngineLimit`]; the two
-    /// are told apart by [`MoveError::is_rule_violation`], which exists for
-    /// exactly this decision.
     IllegalMove,
     /// The other seat did not answer within its budget.
     Timeout,
@@ -95,34 +61,20 @@ pub enum WinReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DrawReason {
     /// The game reached [`crate::GameSpec::ply_cap`].
-    ///
-    /// Hexo has no natural draw: stones are only added, on an unbounded board,
-    /// so no position repeats and no stalemate exists. A cap is therefore a
-    /// *match* rule with no engine counterpart, and a capped game is a
-    /// representable result rather than an error.
     PlyCap,
 }
 
 /// Why a game produced no usable result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NoContest {
-    /// The engine could not represent the board a legal placement would
-    /// produce.
-    ///
-    /// Not the seat's fault: the placement broke no rule, and the engine said
-    /// so. Carries the seat only to say where it happened, not to blame it.
+    /// The engine could not represent the board a legal placement would produce.
     EngineLimit {
         /// The seat whose placement could not be represented.
         seat: Player,
-        /// The refusal. Always satisfies `!error.is_rule_violation()`.
+        /// The refusal.
         error: MoveError,
     },
     /// The driver reported a failure that belongs to neither seat.
-    ///
-    /// The `&'static str` is a stage label, in the spirit of the previous
-    /// implementation's `AbortRecord.stage` — the one part of its blunt
-    /// everything-is-an-abort policy worth keeping. Keep these stable; they are
-    /// a triage contract.
     Harness {
         /// Where it happened.
         stage: &'static str,
@@ -177,9 +129,7 @@ mod tests {
         );
     }
 
-    /// A capped game and a crashed game must not compare equal. This is the
-    /// whole point of the three-arm split; the previous implementation
-    /// collapsed both to `ABORTED`.
+    /// A capped game and a crashed game must not compare equal.
     #[test]
     fn a_capped_game_is_distinguishable_from_a_broken_one() {
         let capped = MatchResult::Drawn {

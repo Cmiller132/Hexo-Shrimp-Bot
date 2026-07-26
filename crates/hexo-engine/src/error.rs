@@ -1,21 +1,8 @@
 //! Rejection and integrity error types.
-//!
-//! Two of the seven [`MoveError`] variants are **representation limits, not
-//! rules**: [`MoveError::CoordOutOfBounds`] and
-//! [`MoveError::BoardExtentExceeded`]. [`MoveError::is_rule_violation`]
-//! distinguishes them so a runner adjudicating an illegal move can tell a
-//! player fault from an engine fault.
 
 use crate::coord::HexCoord;
 
-/// Why a placement was rejected. On `Err` the position is bit-identical to before.
-///
-/// Precedence is observable and pinned by tests, in this exact order:
-///
-/// ```text
-/// TerminalState -> IllegalOpening -> ReusedFirstStone -> CoordOutOfBounds
-///   -> Occupied -> TooFarFromStones -> BoardExtentExceeded
-/// ```
+/// Why a placement was rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MoveError {
     /// The game is over; no placement is legal.
@@ -25,17 +12,12 @@ pub enum MoveError {
     /// The second stone of a turn may not reuse the first.
     ReusedFirstStone(HexCoord),
     /// The coordinate is outside [`crate::COORD_LIMIT`].
-    ///
-    /// A representation limit, not a rule. See [`MoveError::is_rule_violation`].
     CoordOutOfBounds(HexCoord),
     /// The cell already holds a stone.
     Occupied(HexCoord),
     /// The cell is empty but further than [`crate::LEGAL_RADIUS`] from every stone.
     TooFarFromStones(HexCoord),
     /// The dense arena would exceed [`crate::MAX_GRID_CELLS`].
-    ///
-    /// A representation limit, not a rule: the placement is legal and the
-    /// engine cannot represent the board it would produce.
     BoardExtentExceeded {
         /// Cells the arena would have needed.
         cells: u64,
@@ -44,11 +26,6 @@ pub enum MoveError {
 
 impl MoveError {
     /// Whether this rejection is a rule violation rather than an engine limit.
-    ///
-    /// `false` for [`MoveError::CoordOutOfBounds`] and
-    /// [`MoveError::BoardExtentExceeded`], `true` for the rest. A runner
-    /// adjudicating an illegal move should treat `false` as an engine fault,
-    /// not as a player fault.
     #[inline]
     #[must_use]
     pub const fn is_rule_violation(self) -> bool {
@@ -92,16 +69,9 @@ impl core::fmt::Display for MoveError {
 impl core::error::Error for MoveError {}
 
 /// A placement sequence that stopped being legal partway through.
-///
-/// The `ply` field is the load-bearing one: a record that fails to replay is
-/// untriageable without knowing *where* it diverged, and "illegal move" on its
-/// own does not let a caller bisect a corrupt game.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReplayError {
     /// Index into the replayed slice, counting from zero.
-    ///
-    /// For [`crate::Position::replay_from`] this is relative to the slice, not
-    /// to the start of the game.
     pub ply: usize,
     /// The placement that was refused.
     pub action: crate::action::Action,
@@ -150,7 +120,7 @@ impl core::fmt::Display for IntegrityError {
 
 impl core::error::Error for IntegrityError {}
 
-/// The invariant that [`crate::Position::audit`] found broken. See spec §10.4.
+/// The invariant that [`crate::Position::audit`] found broken.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum IntegrityCheck {
@@ -172,12 +142,12 @@ pub enum IntegrityCheck {
     Terminal,
     /// The reported winner is not the owner of the completed window.
     Winner,
-    /// Phase or mover disagrees with the closed form of spec §10.2.
+    /// Phase or mover disagrees with the closed form of spec Â§10.2.
     TurnClosedForm,
     /// A stone lies within `LEGAL_RADIUS` of the arena boundary.
     ArenaMargin,
-    /// The move history disagrees with the occupancy planes, in length or in
-    /// which cells it names.
+    /// The move history disagrees with the occupancy planes, in length or in which
+    /// cells it names.
     History,
 }
 

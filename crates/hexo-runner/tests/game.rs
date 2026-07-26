@@ -30,13 +30,8 @@ fn play(game: &mut Game, action: Action) -> Result<Option<MatchResult>, SubmitEr
         .map(|t| t.result)
 }
 
-/// Drive until the game ends, with `P1` building a six-line along axis `Q` and
-/// `P0` taking the lowest-ranked legal move.
-///
-/// A driver that always takes the lowest-ranked move never wins: uniform-ish
-/// play essentially never produces six in a row, which is why the engine's own
-/// smoke test uses a line-building driver too. `P1` moves on plies 1-2, 5-6, and
-/// 9-10, so it completes the line on the second stone of its third turn.
+/// Drive until the game ends, with `P1` building a six-line along axis `Q` and `P0`
+/// taking the lowest-ranked legal move.
 fn drive_to_a_p1_win(game: &mut Game) -> MatchResult {
     const LINE: [(i16, i16); 6] = [(0, 1), (1, 1), (2, 1), (3, 1), (4, 1), (5, 1)];
     let mut next = 0;
@@ -81,10 +76,6 @@ fn drive_to_the_end(game: &mut Game) -> MatchResult {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The machine itself
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_new_game_asks_p0_to_open() {
     let game = Game::new(GameSpec::default());
@@ -108,8 +99,6 @@ fn a_new_game_asks_p0_to_open() {
 
 #[test]
 fn step_is_pure() {
-    // Asking is free and idempotent: the whole point of separating the question
-    // from the answer.
     let mut game = Game::new(GameSpec::default());
     assert_eq!(game.step(), game.step());
     play(&mut game, act(0, 0)).expect("opening");
@@ -123,21 +112,18 @@ fn generation_advances_only_on_an_accepted_placement() {
     let (_, g0, z0) = need(&game);
     assert_eq!(g0, 0);
 
-    // Rejected: wrong generation.
     assert!(
         game.submit(99, Reply::Place(Decision::new(act(0, 0), z0)))
             .is_err()
     );
     assert_eq!(need(&game).1, 0, "a refusal must not advance the token");
 
-    // Rejected: wrong hash.
     assert!(
         game.submit(0, Reply::Place(Decision::new(act(0, 0), z0 ^ 1)))
             .is_err()
     );
     assert_eq!(need(&game).1, 0);
 
-    // Accepted.
     let t = game
         .submit(0, Reply::Place(Decision::new(act(0, 0), z0)))
         .expect("legal");
@@ -193,7 +179,6 @@ fn a_drifted_mirror_is_refused_and_changes_nothing() {
     assert_eq!(game.position(), &before);
     assert!(game.result().is_none());
 
-    // The same placement with the right hash goes through.
     play(&mut game, act(1, 0)).expect("legal");
     assert_eq!(game.position().stone_count(), 2);
 }
@@ -225,10 +210,6 @@ fn nothing_is_accepted_after_the_game_ends() {
     assert_eq!(game.position().stone_count(), 3);
 }
 
-// ---------------------------------------------------------------------------
-// Adjudication
-// ---------------------------------------------------------------------------
-
 #[test]
 fn six_in_a_row_is_a_decisive_win() {
     let mut game = Game::new(GameSpec::default());
@@ -246,16 +227,12 @@ fn six_in_a_row_is_a_decisive_win() {
         game.position().outcome().expect("terminal").winner,
         Player::P1
     );
-    // The win landed on the second stone of a turn, so the game ended mid-turn
-    // and the engine's phase and mover froze there.
     assert_eq!(game.position().current_player(), Player::P1);
     assert_eq!(game.plies().len(), game.position().stone_count() as usize);
 }
 
 #[test]
 fn the_ply_cap_is_a_draw_and_not_an_abort() {
-    // The defect this whole three-arm result model exists to fix: a game that
-    // legitimately ran long must not look like a crashed one.
     let mut game = Game::new(GameSpec {
         ply_cap: 12,
         ..GameSpec::default()
@@ -298,7 +275,6 @@ fn an_illegal_placement_loses_rather_than_aborting() {
     play(&mut game, act(0, 0)).expect("opening");
     play(&mut game, act(1, 0)).expect("legal");
 
-    // Occupied: a rule violation, so the seat that sent it has lost.
     let (seat, generation, zobrist) = need(&game);
     assert_eq!(seat, Player::P1);
     let t = game
@@ -338,10 +314,6 @@ fn a_far_placement_also_loses() {
 
 #[test]
 fn an_engine_limit_is_a_no_contest_and_blames_nobody() {
-    // The payoff of `MoveError::is_rule_violation`. A diagonal walk widens both
-    // arena dimensions, so `MAX_GRID_CELLS` refuses a placement that breaks no
-    // rule. That is the engine's limit, not the seat's fault, so it must not be
-    // recorded as a loss.
     let mut game = Game::new(GameSpec {
         ply_cap: u32::MAX,
         ..GameSpec::default()
@@ -429,14 +401,8 @@ fn every_failure_kind_maps_to_its_own_reason() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The record
-// ---------------------------------------------------------------------------
-
 #[test]
 fn diagnostics_are_persisted_verbatim() {
-    // The previous runner dropped these on the floor, which is why every model
-    // package wrote its own training shards on a path that bypassed it.
     let mut game = Game::new(GameSpec {
         budget: Budget::Visits(800),
         ..GameSpec::default()
@@ -471,9 +437,6 @@ fn the_record_tracks_the_position_ply_for_ply() {
     let history: Vec<_> = game.position().history().iter().map(|a| a.id()).collect();
     assert_eq!(actions, history);
 
-    // Every recorded hash must be the position at that ply, which is what makes
-    // a divergence locatable to an exact ply rather than to a whole game. And
-    // the recorded seat must be whoever was actually on turn.
     let mut replay = Position::new();
     for (i, ply) in game.plies().iter().enumerate() {
         assert_eq!(replay.current_player(), ply.seat, "ply {i}: recorded seat");
@@ -486,7 +449,6 @@ fn the_record_tracks_the_position_ply_for_ply() {
 
 #[test]
 fn the_prefix_replays_into_the_canonical_position() {
-    // The mirror handoff: a seat gets a move list, not a serialised position.
     let mut game = Game::new(GameSpec {
         ply_cap: 15,
         ..GameSpec::default()
@@ -498,15 +460,8 @@ fn the_prefix_replays_into_the_canonical_position() {
     assert_eq!(mirror.zobrist(), game.position().zobrist());
 }
 
-// ---------------------------------------------------------------------------
-// The shape that motivated the design
-// ---------------------------------------------------------------------------
-
 #[test]
 fn many_games_interleave_on_one_thread() {
-    // The reason this is a state machine and not a callback loop: a single
-    // caller advances hundreds of games in lockstep, holding no threads and
-    // blocking on nothing. A batched evaluator sits where the move choice is.
     const GAMES: usize = 200;
     let mut games: Vec<Game> = (0..GAMES)
         .map(|i| {
@@ -520,7 +475,6 @@ fn many_games_interleave_on_one_thread() {
     let mut finished = 0;
     let mut rounds = 0;
     while finished < GAMES {
-        // One sweep: collect everyone waiting, then answer them all.
         let pending: Vec<(usize, u64, u64)> = games
             .iter()
             .enumerate()

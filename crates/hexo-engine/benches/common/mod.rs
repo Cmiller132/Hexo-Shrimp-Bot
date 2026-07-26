@@ -1,18 +1,4 @@
 //! Deterministic fixtures for the engine benchmarks.
-//!
-//! A bench is a separate target from an integration test, so this cannot `use`
-//! the oracles in `tests/common`. It shares the *one* splitmix64 in
-//! `testkit/rng.rs` and drives it uniformly over the legal set exactly as the
-//! test corpus does, so a fixture named by ply here **is** the position that
-//! corpus builds at that ply — a shared file rather than two hand-matched
-//! copies, because that claim has to be structural to be worth making. Nothing
-//! here re-implements a rule: every placement goes through `Position::advance`.
-//!
-//! Uniform random play is the fixture policy because it is what the audit's
-//! out-of-tree snapshot used, so the numbers are comparable. It is also the
-//! adversarial case for everything measured here: a uniform choice over the
-//! frontier spreads outward, which makes the arena as wide and as sparse as
-//! honest play ever gets.
 
 use hexo_engine::{Action, HexCoord, LEGAL_RADIUS, Position, Search, hex_distance};
 
@@ -21,10 +7,6 @@ use hexo_engine::{Action, HexCoord, LEGAL_RADIUS, Position, Search, hex_distance
 pub const PLIES: [usize; 4] = [1, 32, 96, 256];
 
 /// The one seed every fixture is built from.
-///
-/// Fixtures nest: the move list for a longer game has the shorter game's move
-/// list as its prefix, because the driver is a pure function of the seed and
-/// the position.
 pub const SEED: u64 = 0x1234_5678_9abc_def0;
 
 #[path = "../../testkit/rng.rs"]
@@ -33,10 +15,6 @@ mod rng;
 pub use rng::Rng;
 
 /// The move list of a `plies`-ply game of uniformly random legal placements.
-///
-/// # Panics
-/// If the game ends before `plies` — a fixture that quietly returned a shorter
-/// game would silently change what every benchmark measures.
 pub fn game(plies: usize) -> Vec<Action> {
     let mut rng = Rng::new(SEED);
     let mut pos = Position::new();
@@ -74,16 +52,8 @@ fn centroid(pos: &Position) -> HexCoord {
     HexCoord::new((q / n) as i16, (r / n) as i16)
 }
 
-/// The legal placements nearest to and furthest from the centroid of the
-/// stones, as `(interior, edge)`.
-///
-/// The two are the extremes the audit claims differ. The interior cell sits
-/// among stones, so most of its radius-8 disk is already covered and the
-/// placement flips few frontier bits. The edge cell sits on the outer rim, so
-/// most of its disk is at coverage zero, every one of those cells becomes a new
-/// frontier bit, and the write reaches into the arena's padding rows.
-///
-/// Ties go to the first placement in canonical order.
+/// The legal placements nearest to and furthest from the centroid of the stones, as
+/// `(interior, edge)`.
 pub fn interior_and_edge(pos: &Position) -> (Action, Action) {
     let mid = centroid(pos);
     let mut interior: Option<(u32, Action)> = None;
@@ -102,18 +72,9 @@ pub fn interior_and_edge(pos: &Position) -> (Action, Action) {
     (interior, edge)
 }
 
-/// The same position after a search excursion that grew the arena and never
-/// gave it back: `steps` placements walking [`LEGAL_RADIUS`] at a time along
-/// `+q`, then unwound.
-///
-/// `Search::undo` restores every observable field and deliberately keeps the
-/// allocation, so the result is `PartialEq` to the input and scans a much
-/// larger arena. This is the worker-inflation case in the audit, and it is what
-/// separates "enumeration is O(legal count)" from "enumeration is O(arena
-/// words)".
-///
-/// # Panics
-/// If the excursion did not round-trip.
+/// The same position after a search excursion that grew the arena and never gave it
+/// back: `steps` placements walking [`LEGAL_RADIUS`] at a time along `+q`, then
+/// unwound.
 pub fn inflated(pos: &Position, steps: usize) -> Position {
     let mut out = pos.clone();
     {
@@ -125,14 +86,12 @@ pub fn inflated(pos: &Position, steps: usize) -> Position {
             .max_by_key(|c| c.q)
             .expect("a position with at least one stone");
         for _ in 0..steps {
-            // Exactly LEGAL_RADIUS from the previous stone, so every step is
-            // legal, lands on empty space, and cannot complete a six-run.
             c = HexCoord::new(c.q + LEGAL_RADIUS as i16, c.r);
             search
                 .apply(Action::new(c))
                 .expect("a legal excursion step");
         }
-    } // Drop unwinds to the floor.
+    }
     assert_eq!(
         &out, pos,
         "the excursion changed the position, not just its arena"

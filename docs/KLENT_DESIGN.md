@@ -91,8 +91,8 @@ prediction:
 
 Hexo sits one to two orders of magnitude past the far end of that trend, on the
 exact axis the paper credits for its gains. 216 legal placements at ply 1;
-600–1500 mid-game in the previous implementation's measurements; 6,525 in a
-measured random 200-stone position.
+600–1500 through a typical mid-game; 6,525 in a measured random 200-stone
+position.
 
 A second, quieter benefit: KLENT does no search during training, so the training
 loop calls `Position::advance` and never `Search::apply`/`undo`. Two of the three
@@ -121,7 +121,7 @@ entirely**. They return only at test time (§14).
 | `(τ, λ, λ_ret) = (0.03, 0.1, 0.883)` | **Starting values, expected to move** (§8). |
 | Adam, lr 1e-3, batch 4096 | **Unchanged as starting values.** |
 | Evaluate with `argmax π_θ`, no search | **Unchanged** (§11). |
-| Anchored pretrained opponent | **strix**, from `Hexo-BotTrainer-hexgt` (§11). |
+| Anchored pretrained opponent | **Unchanged** — a fixed pretrained checkpoint (§11). |
 | Test-time Gumbel MCTS | **Unchanged in intent**, outside the baseline (§14). |
 
 Nothing else changes. In particular there is no reward shaping, no adjudication,
@@ -364,9 +364,9 @@ hand control to `π′` and continue to a win or the cap. `OPEN_DECISIONS.md` A3
 already settled that a start position *is* a move list and that there is no
 board-shaped construction path to abuse, so this costs no engine change.
 
-Sources: the previous implementation's trained bots in
-`Hexo-BotTrainer-hexgt`, which plays real Hexo and produces real terminations;
-the line-building driver already in `crates/hexo-engine/tests/smoke.rs`, which
+Sources: an existing trained Hexo bot, which plays real Hexo and produces real
+terminations; the line-building driver already in
+`crates/hexo-engine/tests/smoke.rs`, which
 terminates games in tens of plies at a swept noise level and needs no checkpoint;
 and earlier checkpoints of the agent itself once any exist.
 
@@ -409,10 +409,11 @@ is the whole `i16` lattice, and its legal set runs to thousands.
 
 A per-node readout dissolves that rather than working around it. No crop, no
 fixed window, no padding, no size bucketing, no maximum. That matters beyond
-convenience: the previous implementation's `main_3` training collapse was caused
-by a fixed radius-20 crop that excluded out-of-crop legal moves from policy and
-MCTS, freezing out-of-rim wins (`crates/hexo-engine/README.md`). A node set derived from the
-position cannot reintroduce that failure mode, because there is no rim.
+convenience: a fixed radius-20 crop excludes out-of-crop legal moves from policy
+and MCTS and freezes out-of-rim wins (`crates/hexo-engine/README.md`), which
+trains an agent against an action space that is not the game's. A node set
+derived from the position cannot reintroduce that failure mode, because there is
+no rim.
 
 It also matches the shape of the data. The active region is a stone cluster plus
 a thin frontier shell — `O(stones + frontier)`, roughly 1,000–3,500 nodes — inside
@@ -567,9 +568,9 @@ scope here. Outside the baseline either way (§15).
 
 ## 11. Evaluation
 
-The anchor is **strix**, from `Hexo-BotTrainer-hexgt`: a fixed checkpoint, never
-retrained, never used as a training opponent, wrapped as a player through the
-runner's transport-agnostic seam (`OPEN_DECISIONS.md` B1, `SUGGESTIONS.md` S6).
+The anchor is **a fixed pretrained checkpoint**: never retrained, never used as
+a training opponent, wrapped as a player through the runner's
+transport-agnostic seam (`OPEN_DECISIONS.md` B1, `SUGGESTIONS.md` S6).
 Its own stochasticity setting must be pinned as part of the anchor definition —
 the paper's anchored opponent "selects actions stochastically based on its
 policy", and an anchor whose randomness drifts is not an anchor.
@@ -613,9 +614,9 @@ made:
 - **The record and the training sample are one artefact.**
   `OPEN_DECISIONS.md` B2 asks the runner to persist a per-move blob it does not
   interpret; that blob *is* `(ragged π′, G)`. No second shard writer — which is
-  exactly the duplication B2 exists to remove, since the previous implementation
-  dropped `decision.diagnostics` on the floor and every model package wrote its
-  own `.npz` files on a path that bypassed the runner.
+  exactly the duplication B2 exists to remove: a dropped `decision.diagnostics`
+  puts every model package on its own `.npz` writing path that bypasses the
+  runner.
 - **`π′` is sharply peaked** by construction (`exp(Q/0.13)`), so a top-k plus
   residual-mass form is likely to capture nearly all of it. That is a measurement
   (§13), not an assumption.
@@ -690,11 +691,10 @@ runs on. Still needed:
 - Per-move blob persistence (B2) — the buffer sample of §12.
 - Seeds minted and recorded, derived from stable game and seat ids so scheduling
   cannot change a run (B4). `π′` is sampled, so this is load-bearing for
-  reproducibility rather than decorative as it was in the previous
-  implementation.
+  reproducibility rather than decorative.
 - Replay of a seeded prefix as a first-class start condition, with prefix plies
   marked so they stay out of the buffer.
-- An external-process player adapter, for strix as the anchored opponent (§11).
+- An external-process player adapter, for the anchored opponent (§11).
 
 ---
 
@@ -735,9 +735,9 @@ runs on. Still needed:
    paper's own backward-induction mechanism, and costs no engine change because a
    start position is already a move list (A3).
 8. **Prefix plies are excluded from the buffer.** They were not drawn from `π′`.
-9. **Per-node ragged heads over a graph: no crop, no bucket, no maximum.** The
-   `main_3` collapse came from excluding out-of-crop legal moves; a
-   position-derived node set cannot reintroduce it.
+9. **Per-node ragged heads over a graph: no crop, no bucket, no maximum.** A
+   crop excludes out-of-crop legal moves and collapses training; a
+   position-derived node set cannot reintroduce that.
 10. **The engine's canonical action ordering is the node ordering.** One mapping,
     versioned by `ACTION_ORDER_VERSION`, shared by self-play, training, and
     serving — a divergence there is silent and trains against scrambled targets.
@@ -749,10 +749,11 @@ runs on. Still needed:
 13. **No V head. Dueling is outside the baseline.** Faithful to the paper's
     Table 4, with the `1/b` coverage problem documented in §9 instead.
 14. **Records and training samples are one artefact.** B2's opaque per-move blob
-    *is* the buffer sample; the previous implementation's parallel shard writers
-    are the thing being deleted.
-15. **strix is the anchor, and is never a training opponent.** Fixed checkpoint,
-    pinned stochasticity, seat-balanced matches, `argmax π_θ` with no search.
+    *is* the buffer sample; a parallel shard writer alongside it is the thing
+    being ruled out.
+15. **The anchor is a fixed pretrained checkpoint, and is never a training
+    opponent.** Pinned stochasticity, seat-balanced matches, `argmax π_θ` with
+    no search.
 
 ---
 

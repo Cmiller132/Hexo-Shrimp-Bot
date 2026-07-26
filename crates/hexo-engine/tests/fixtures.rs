@@ -1,11 +1,4 @@
 //! Hand-built win fixtures the property generator will not find on its own.
-//!
-//! Four shapes, each apply-audit-undo-audit-reapply-hash-compared:
-//! a first-stone win (frozen at `FirstStone`), a second-stone win (frozen at
-//! `SecondStone { first }` with `first` occupied), seven in a row and two
-//! crossing lines (both setting more than one bit in `winning_windows`, which
-//! is hazard H6), and a win that completes a window the placed stone is not at
-//! the end of.
 
 mod common;
 
@@ -30,8 +23,8 @@ fn setup(moves: &[(i16, i16)]) -> (Position, Action) {
     (pos, act(last.0, last.1))
 }
 
-/// Apply the winning move, audit, undo it, audit, re-apply, and require the
-/// hash and the whole position to come back identical.
+/// Apply the winning move, audit, undo it, audit, re-apply, and require the hash and
+/// the whole position to come back identical.
 fn assert_win_cycle(
     moves: &[(i16, i16)],
     winner: Player,
@@ -43,7 +36,6 @@ fn assert_win_cycle(
     let zobrist_before = pos.zobrist();
     assert!(!pos.is_terminal(), "the setup must not already be won");
 
-    // -- apply through a Search so the move is reversible ------------------
     let mut search = Search::new(&mut pos);
     let applied = search
         .apply(winning_move)
@@ -69,8 +61,6 @@ fn assert_win_cycle(
         expect_window_bits.count_ones(),
         "count must agree with the raw mask"
     );
-    // The resolved windows are the independent reading of the same bits: each
-    // must be fully owned by the winner and must contain the placed stone.
     let resolved: Vec<_> = applied.winning_windows().collect();
     assert_eq!(resolved.len(), applied.winning.count() as usize);
     for w in &resolved {
@@ -95,14 +85,12 @@ fn assert_win_cycle(
     let zobrist_won = won.zobrist();
     assert_ne!(zobrist_won, zobrist_before);
 
-    // Nothing is legal in a terminal position, whatever the reason would be.
     let mut terminal_probe = won.clone();
     assert_eq!(
         terminal_probe.advance(act(0, 0)),
         Err(MoveError::TerminalState)
     );
 
-    // -- undo, audit -------------------------------------------------------
     assert_eq!(search.undo(), Some(winning_move));
     assert!(search.at_floor());
     search
@@ -113,13 +101,11 @@ fn assert_win_cycle(
     assert_eq!(search.position().zobrist(), zobrist_before);
     assert!(!search.position().is_terminal(), "undo must un-freeze");
 
-    // -- re-apply, hash-compare -------------------------------------------
     let again = search.apply(winning_move).expect("still legal");
     assert_eq!(again, applied, "re-applying must be identical");
     assert_eq!(search.position().zobrist(), zobrist_won);
     drop(search);
 
-    // A fresh replay of the whole game must equal the searched position.
     let mut fresh = Position::new();
     for &(q, r) in moves {
         fresh.advance(act(q, r)).expect("replay");
@@ -136,8 +122,6 @@ const fn slot(axis_index: usize, offset: usize) -> u32 {
 
 #[test]
 fn second_stone_win_freezes_mid_turn() {
-    // P1 completes `(1, 0)..(6, 0)` with the second stone of its turn.
-    // The placed cell `(6, 0)` sits at bit 5 of the window starting at (1, 0).
     assert_win_cycle(
         &[
             (0, 0),
@@ -157,7 +141,6 @@ fn second_stone_win_freezes_mid_turn() {
         slot(Axis::Q.index(), 5),
     );
 
-    // And `first` points at a live stone in the frozen phase.
     let mut pos = Position::new();
     for &(q, r) in &[
         (0, 0),
@@ -185,9 +168,6 @@ fn second_stone_win_freezes_mid_turn() {
 
 #[test]
 fn first_stone_win_with_seven_in_a_row_sets_two_window_bits() {
-    // P1 fills the gap at `(5, 0)` inside `(1, 0)..(7, 0)`, making seven in a
-    // row. Two six-windows are completed: starts (1, 0) and (2, 0), i.e. the
-    // placed cell at offsets 4 and 3. This is hazard H6.
     assert_win_cycle(
         &[
             (0, 0),
@@ -213,10 +193,6 @@ fn first_stone_win_with_seven_in_a_row_sets_two_window_bits() {
 
 #[test]
 fn two_crossing_lines_set_two_window_bits() {
-    // P1 owns `(1, 0)..(5, 0)` on the Q axis and `(6, 1)..(6, 5)` on the R
-    // axis. Placing `(6, 0)` completes both at once: the Q window starting at
-    // (1, 0) with the placed cell at offset 5, and the R window starting at
-    // (6, 0) with the placed cell at offset 0.
     assert_win_cycle(
         &[
             (0, 0),
@@ -250,9 +226,6 @@ fn two_crossing_lines_set_two_window_bits() {
 
 #[test]
 fn win_completed_away_from_the_window_ends() {
-    // P1 owns `(1, 0), (2, 0), (4, 0), (5, 0), (6, 0)` and plays `(3, 0)`,
-    // which sits at **offset 2** of the completed window starting at (1, 0) —
-    // away from both boundaries of the offset arithmetic.
     assert_win_cycle(
         &[
             (0, 0),
@@ -275,10 +248,6 @@ fn win_completed_away_from_the_window_ends() {
 
 #[test]
 fn win_on_the_qr_axis_exercises_the_shear() {
-    // The QR shear is the single most error-prone line in the crate, and it is
-    // a symmetric bug, so it gets its own fixture at an offset in the middle.
-    // P1 owns (1, -1), (2, -2), (4, -4), (5, -5), (6, -6) and plays (3, -3),
-    // which sits at offset 2 of the window starting at (1, -1).
     assert_win_cycle(
         &[
             (0, 0),
@@ -301,8 +270,6 @@ fn win_on_the_qr_axis_exercises_the_shear() {
 
 #[test]
 fn win_on_the_r_axis() {
-    // P1 owns (1, 0)..(1, 4) and plays (1, 5): the R window starting at (1, 0),
-    // placed cell at offset 5.
     assert_win_cycle(
         &[
             (0, 0),
@@ -325,10 +292,6 @@ fn win_on_the_r_axis() {
 
 #[test]
 fn p0_can_win_too() {
-    // Nothing about the win path is player-specific, but the fixtures above all
-    // have P1 winning, so pin the other side once. P0 owns the opening stone
-    // plus (-1, 0)..(-4, 0) and completes `(-5, 0)..(0, 0)` with the first
-    // stone of its sixth turn, at offset 0 of the window starting at (-5, 0).
     assert_win_cycle(
         &[
             (0, 0),

@@ -1,55 +1,29 @@
 //! The coordinate-domain contract at all six faces of the cube.
-//!
-//! [`COORD_LIMIT`] bounds `q`, `r`, and `s`, so the domain is a hexagon with six
-//! faces, and a game can be walked into any of them. Every read that names a
-//! legal placement must agree with every check that validates one:
-//! `legal_actions`, `legal_count`, `legal_rank`, `nth_legal`, `is_legal`, and
-//! `advance` are six different implementations of "what may be played here", and
-//! the boundary is the only place they can disagree.
-//!
-//! They did. Coverage was written over the whole radius-8 disk without testing
-//! the domain, so a stone placed on a face marked out-of-domain cells as
-//! frontier: at `q = 16000` the frontier held 136 coordinates that
-//! `legal_actions` offered and `advance` refused with `CoordOutOfBounds`. A
-//! sampler reading the legal set would pick one; a policy head indexed by
-//! `legal_rank` would score one. `place` now skips those cells.
-//!
-//! Ordinary play is nowhere near this — the walks below are ~2000 plies of
-//! deliberate travel in one direction — so nothing here is reachable by
-//! accident. That is exactly why it needs a test that goes looking.
 
 use hexo_engine::{Action, COORD_LIMIT, HexCoord, LEGAL_RADIUS, MoveError, Position, Search};
 
-/// Cube distance from the coordinate domain's boundary that counts as "at the
-/// face": within one legal radius, so a placement's disk crosses it.
+/// Cube distance from the coordinate domain's boundary that counts as "at the face":
+/// within one legal radius, so a placement's disk crosses it.
 const NEAR: i32 = COORD_LIMIT as i32 - LEGAL_RADIUS as i32;
 
-/// The four directions that widen only one arena dimension, so the walk is
-/// bounded by [`COORD_LIMIT`] rather than by the arena ceiling.
-///
-/// Between them they reach all six faces: `(1, 0)` drives `q` to `+lim` and `s`
-/// to `-lim`, `(-1, 0)` the reverse, `(0, 1)` drives `r` to `+lim` and `s` to
-/// `-lim`, and `(0, -1)` the reverse.
+/// The four directions that widen only one arena dimension, so the walk is bounded by
+/// [`COORD_LIMIT`] rather than by the arena ceiling.
 const AXIS_DIRECTIONS: [(i32, i32); 4] = [(1, 0), (-1, 0), (0, 1), (0, -1)];
 
 /// The two directions that widen both dimensions at once.
-///
-/// These never reach a face: a diagonal walk squares the padded bounding box,
-/// so `MAX_GRID_CELLS` refuses first, at roughly `|q| = 1984`.
 const DIAGONAL_DIRECTIONS: [(i32, i32); 2] = [(1, -1), (-1, 1)];
 
 /// Why a walk stopped.
 #[derive(Debug, PartialEq, Eq)]
 enum Stop {
-    /// The next step would have left the coordinate domain. The walk reached a
-    /// face.
+    /// The next step would have left the coordinate domain.
     DomainEdge,
     /// The engine refused the next step.
     Refused(MoveError),
 }
 
-/// Walk from the origin along `dir` in [`LEGAL_RADIUS`] steps for as far as the
-/// engine allows.
+/// Walk from the origin along `dir` in [`LEGAL_RADIUS`] steps for as far as the engine
+/// allows.
 fn walk(dir: (i32, i32)) -> (Position, Stop) {
     let step = LEGAL_RADIUS as i32;
     let mut pos = Position::new();
@@ -85,11 +59,6 @@ fn at_the_face(c: HexCoord) -> bool {
 }
 
 /// Every way of naming a legal placement must name the same set.
-///
-/// The full enumeration is scanned for validity and legality, which are `O(1)`
-/// each. `legal_rank` and `nth_legal` are `O(arena words)`, which at these arena
-/// sizes is ~32k words per call, so they are checked over a bounded sample
-/// weighted to the boundary — the only place they can differ.
 fn assert_the_legal_set_is_self_consistent(pos: &Position, label: &str) {
     let listed: Vec<Action> = pos.legal_actions().collect();
 
@@ -116,8 +85,6 @@ fn assert_the_legal_set_is_self_consistent(pos: &Position, label: &str) {
         );
     }
 
-    // Indices to check both directions of the ordering on: the two ends, and
-    // every action at the face.
     let mut sample: Vec<usize> = (0..listed.len().min(32)).collect();
     sample.extend(listed.len().saturating_sub(32)..listed.len());
     sample.extend(
@@ -153,8 +120,6 @@ fn assert_the_legal_set_is_self_consistent(pos: &Position, label: &str) {
 
 #[test]
 fn the_four_axis_walks_reach_the_domain_boundary() {
-    // Guards every test below: if a walk stopped early they would pass
-    // vacuously.
     for dir in AXIS_DIRECTIONS {
         let (pos, stop) = walk(dir);
         assert_eq!(stop, Stop::DomainEdge, "direction {dir:?} stopped early");
@@ -180,8 +145,6 @@ fn enumeration_agrees_with_validation_at_every_face() {
 
 #[test]
 fn no_enumerated_action_can_be_refused_for_naming_an_unaddressable_cell() {
-    // The whole point of the fix: advancing an enumerated action may run out of
-    // arena, but must never come back with `CoordOutOfBounds`.
     for dir in AXIS_DIRECTIONS {
         let (pos, _) = walk(dir);
         let near: Vec<Action> = pos
@@ -216,10 +179,6 @@ fn a_position_on_a_face_still_audits() {
 
 #[test]
 fn undo_restores_a_boundary_position_exactly() {
-    // `place` skips out-of-domain disk cells and `unplace` must skip the same
-    // ones. A mismatch would leave coverage or the frontier count wrong after an
-    // undo taken at the boundary, which round-trip tests in the interior cannot
-    // see.
     for dir in AXIS_DIRECTIONS {
         let (mut pos, _) = walk(dir);
         let before = pos.clone();
@@ -246,10 +205,6 @@ fn undo_restores_a_boundary_position_exactly() {
 
 #[test]
 fn a_diagonal_walk_is_stopped_by_the_arena_ceiling_not_the_domain() {
-    // A diagonal widens both arena dimensions, so the padded bounding box grows
-    // as an area and `MAX_GRID_CELLS` refuses long before `COORD_LIMIT` would.
-    // The refusal must be a clean representation limit, not a rule violation,
-    // and the position must survive it intact.
     for dir in DIAGONAL_DIRECTIONS {
         let (pos, stop) = walk(dir);
         match stop {

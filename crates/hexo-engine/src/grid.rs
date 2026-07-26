@@ -1,35 +1,4 @@
 //! The dense recentred arena. **Private: zero items escape the crate.**
-//!
-//! Ruling 2's "grid geometry is entirely private" is enforced by the module
-//! system, not by discipline: this module is `mod grid;`, and **no public item
-//! in this crate may ever expose a row, a word, a plane, a stride, or an
-//! index.** That constraint is what makes the arena replaceable (spec §5.8)
-//! without touching a caller.
-//!
-//! Four planes over the same `rows × row_words × 64` cell box:
-//!
-//! - `occ[0]`, `occ[1]` — one bit per cell, stones of `P0` / `P1`.
-//! - `frontier`         — one bit per cell, empty cells with `cover > 0`.
-//! - `cover`            — one **byte** per cell, stones within `LEGAL_RADIUS`.
-//!
-//! `cover` is a count, not a bit, because it is the only structure that makes
-//! the frontier exactly invertible: an OR of radius-8 disks cannot be undone,
-//! but `+1` on apply and `-1` on undo is self-inverse by construction.
-//!
-//! > **The frontier invariant.** `frontier[c] == 1` if and only if
-//! > `cover[c] > 0 && occ[0][c] == 0 && occ[1][c] == 0`.
-//!
-//! The disk update that maintains both lives here rather than in `position`,
-//! because it is a statement about the layout: a radius-8 disk is 17 contiguous
-//! row runs (`disk_runs`), so one placement maps 17 row bases instead of mapping
-//! 217 coordinates three or four times each.
-//!
-//! Cell `(q, r)` maps to row `q - origin_q` and bit `r - origin_r`. The layout
-//! is `q`-major and `r`-minor, so **storage order is ascending `(q, r)`** — the
-//! canonical order of spec §9 — and enumeration needs no sort.
-//!
-//! All index arithmetic is performed in `i32`, so a coordinate anywhere in the
-//! `i16` range produces an in-range-or-out-of-range answer and never wraps.
 
 use crate::MAX_GRID_CELLS;
 use crate::coord::{COORD_LIMIT, DISK_CELLS, HexCoord, LEGAL_RADIUS};
@@ -46,10 +15,6 @@ const DISK_ROWS: usize = 2 * LEGAL_RADIUS as usize + 1;
 const MIN_ROW_WORDS: usize = 2;
 
 /// Margin, in cells, kept between any written cell and the arena boundary.
-///
-/// 8, not 5, because the coverage disk — not the win strip — is the widest
-/// write. Padding by 8 also guarantees every window containing an occupied cell
-/// is fully in-arena.
 const PAD: i32 = LEGAL_RADIUS as i32;
 
 /// Round down to a multiple of 64. Two's complement: `-1 -> -64`, `63 -> 0`.
@@ -58,11 +23,7 @@ const fn floor64(x: i32) -> i32 {
     x & !63
 }
 
-/// Bits `start .. start + n` of `plane`, as a mask whose bit `k` is cell
-/// `start + k`.
-///
-/// The run must lie inside one arena row, so it touches one word or two
-/// adjacent ones — never a bit-shifted gather across a row boundary.
+/// Bits `start .. start + n` of `plane`, as a mask whose bit `k` is cell `start + k`.
 #[inline]
 fn gather_run(plane: &[u64], start: usize, n: usize) -> u64 {
     debug_assert!(n > 0 && n <= DISK_ROWS, "run of {n} cells");
@@ -75,11 +36,6 @@ fn gather_run(plane: &[u64], start: usize, n: usize) -> u64 {
 }
 
 /// The dense recentred arena.
-///
-/// Deliberately implements **neither `PartialEq` nor `Hash`**. That is a
-/// compile-time trap, not a comment: a future `#[derive(PartialEq)]` on
-/// `Position` fails to build, forcing whoever adds it to write the
-/// content-based impl (spec §5.7).
 #[derive(Clone, Debug)]
 pub(crate) struct Grid {
     /// Extent along `q`.
@@ -97,15 +53,11 @@ pub(crate) struct Grid {
     /// Stones within [`LEGAL_RADIUS`], `rows * row_words * 64` bytes.
     cover: Vec<u8>,
     /// Maintained `popcount(frontier)`.
-    ///
-    /// Purely **geometric**: it is emphatically not zero in a terminal
-    /// position. `Position::legal_count` is the rule-level answer.
     frontier_cells: u32,
 }
 
 impl Grid {
-    /// The empty arena. Allocates nothing; every read is out of range and
-    /// answers empty.
+    /// The empty arena.
     pub(crate) const fn new() -> Self {
         Self {
             rows: 0,
@@ -118,8 +70,6 @@ impl Grid {
             frontier_cells: 0,
         }
     }
-
-    // ---- geometry, crate-private -----------------------------------------
 
     /// Rows currently allocated.
     #[inline]
@@ -212,8 +162,7 @@ impl Grid {
         ))
     }
 
-    /// `locate`, panicking. Only ever called on the write path, which runs
-    /// after `reserve_around`.
+    /// `locate`, panicking.
     #[inline]
     fn locate_written(&self, c: HexCoord) -> (usize, u32) {
         match self.locate(c) {
@@ -221,8 +170,6 @@ impl Grid {
             None => unreachable!("arena write outside the reserved region"),
         }
     }
-
-    // ---- occupancy --------------------------------------------------------
 
     /// Owner of `c`, or `None`. Total over every coordinate.
     #[inline]
@@ -238,13 +185,6 @@ impl Grid {
     }
 
     /// Owner of the stone at a `(word, bit)` slot of the occupancy planes.
-    ///
-    /// The bit scan that produced the slot has already located the cell, so this
-    /// reads the answer out of the slot rather than converting to a coordinate
-    /// and mapping it back through [`Grid::locate`].
-    ///
-    /// # Panics
-    /// Debug builds assert the slot holds a stone.
     #[inline]
     pub(crate) fn owner_at(&self, word: usize, bit: u32) -> Player {
         debug_assert!(
@@ -259,9 +199,6 @@ impl Grid {
     }
 
     /// Whether both occupancy planes claim `c`. Always false in a sound arena.
-    ///
-    /// Read only by the tier-C debug assertions and by tests, so it is dead
-    /// code in a release build — which `cargo clippy --release` reports.
     #[inline]
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn is_double_owned(&self, c: HexCoord) -> bool {
@@ -272,31 +209,13 @@ impl Grid {
     }
 
     /// Flat cell index of `c` within the byte-per-cell planes, or `None` if `c`
-    /// is outside the arena.
     #[inline]
     pub(crate) fn cell_index(&self, c: HexCoord) -> Option<usize> {
         let (w, b) = self.locate(c)?;
         Some(w * 64 + b as usize)
     }
 
-    // ---- frontier rank and select -----------------------------------------
-    //
-    // The layout is `q`-major and `r`-minor, so storage order *is* ascending
-    // `(q, r)` — the same order `BitScan` walks. That makes the position of a
-    // frontier cell within the canonical enumeration a plain popcount prefix,
-    // and the inverse a select-the-k-th-bit scan. Both live here rather than in
-    // `position` because both are statements about the bit layout, which is
-    // this module's private business.
-
     /// How many frontier cells precede `c` in canonical order, or `None` if `c`
-    /// is not itself a frontier cell.
-    ///
-    /// Sums only the words *below* the target, so the cost is
-    /// `O(word index of c)` — it grows with the rank, but at roughly 1.6 ns per
-    /// word against 3.0 ns per item for a walk of
-    /// [`crate::position::LegalActions`]. The two cross over at a frontier
-    /// density below about 0.13 legal cells per word; measured positions run
-    /// 3.3 to 14.4, so the prefix wins by 30x to 130x everywhere reachable.
     pub(crate) fn frontier_rank(&self, c: HexCoord) -> Option<usize> {
         let (word, bit) = self.locate(c)?;
         if (self.frontier[word] >> bit) & 1 == 0 {
@@ -307,8 +226,8 @@ impl Grid {
         Some((below + within) as usize)
     }
 
-    /// The frontier cell at `index` in canonical order, or `None` if `index` is
-    /// past the end.
+    /// The frontier cell at `index` in canonical order, or `None` if `index` is past
+    /// the end.
     pub(crate) fn nth_frontier(&self, index: usize) -> Option<HexCoord> {
         let mut remaining = index as u32;
         for (word, &bits) in self.frontier.iter().enumerate() {
@@ -317,7 +236,6 @@ impl Grid {
                 remaining -= pop;
                 continue;
             }
-            // Clear `remaining` set bits, then take the next one.
             let mut w = bits;
             for _ in 0..remaining {
                 w &= w - 1;
@@ -350,8 +268,6 @@ impl Grid {
         self.occ[p.index()][w] &= !(1u64 << b);
     }
 
-    // ---- coverage and frontier -------------------------------------------
-
     /// Stones within [`LEGAL_RADIUS`] of `c`. Total: `0` outside the arena.
     #[inline]
     pub(crate) fn cover(&self, c: HexCoord) -> u8 {
@@ -361,28 +277,9 @@ impl Grid {
         }
     }
 
-    /// The radius-[`LEGAL_RADIUS`] disk around `c` as one contiguous cell run
-    /// per `q` row: `(first cell index, length)`, rows ascending in `q` and each
-    /// run ascending in `r`. A length of `0` marks a row the coordinate domain
-    /// clipped away entirely.
-    ///
-    /// This is the same cell set in the same order as a walk of
-    /// [`crate::coord::DISK8`] — that table is `dq`-major and `dr`-minor, so its
-    /// rows *are* these runs. Walking runs rather than offsets is what removes
-    /// the repeated address arithmetic: the per-cell walk mapped each of the 217
-    /// cells through [`Grid::locate`] three or four times, and this maps 17 row
-    /// bases. `DISK8` plus a per-cell [`HexCoord::is_valid`] therefore remains an
-    /// **independent** statement of the same set, which is what the tier-C
-    /// frontier assertion walks on every apply and undo.
-    ///
-    /// The domain clip is exact rather than a per-cell test: at a fixed `q`,
-    /// `is_valid` reduces to `r` lying in
-    /// `[max(-LIM, -LIM - q), min(LIM, LIM - q)]`, because `s = -q - r` is the
-    /// only one of the three axes whose bound depends on both.
-    ///
-    /// # Panics
-    /// Debug builds assert `c`'s padded box is inside the arena, which
-    /// `reserve_around` guarantees on the write path.
+    /// The radius-[`LEGAL_RADIUS`] disk around `c` as one contiguous cell run per `q`
+    /// row: `(first cell index, length)`, rows ascending in `q` and each run ascending
+    /// in `r`.
     fn disk_runs(&self, c: HexCoord) -> [(usize, usize); DISK_ROWS] {
         debug_assert!(self.contains_padded(c), "disk outside the reserved region");
         let lim = COORD_LIMIT as i32;
@@ -395,10 +292,8 @@ impl Grid {
             if q < -lim || q > lim {
                 continue;
             }
-            // The disk: `|dr| <= rad` and `|dq + dr| <= rad`.
             let lo = (cr - rad).max(cr - dq - rad);
             let hi = (cr + rad).min(cr - dq + rad);
-            // The coordinate domain at this `q`.
             let lo = lo.max(-lim).max(-lim - q);
             let hi = hi.min(lim).min(lim - q);
             if lo > hi {
@@ -411,11 +306,8 @@ impl Grid {
         out
     }
 
-    /// `cover += 1` across the disk around `c`, setting the frontier bit of
-    /// every empty cell the increment brought to coverage `1`.
-    ///
-    /// The arena's half of a placement. Exactly inverted by
-    /// [`Grid::remove_cover_disk`].
+    /// `cover += 1` across the disk around `c`, setting the frontier bit of every empty
+    /// cell the increment brought to coverage `1`.
     pub(crate) fn add_cover_disk(&mut self, c: HexCoord) {
         for (start, n) in self.disk_runs(c) {
             if n == 0 {
@@ -434,8 +326,8 @@ impl Grid {
         }
     }
 
-    /// The exact inverse of [`Grid::add_cover_disk`]: rows in reverse order, and
-    /// each frontier bit cleared *before* the decrement that justifies it.
+    /// The exact inverse of [`Grid::add_cover_disk`]: rows in reverse order, and each
+    /// frontier bit cleared *before* the decrement that justifies it.
     pub(crate) fn remove_cover_disk(&mut self, c: HexCoord) {
         for (start, n) in self.disk_runs(c).into_iter().rev() {
             if n == 0 {
@@ -458,9 +350,6 @@ impl Grid {
 
     /// Set the frontier bits named by `bits`, where bit `k` is cell `start + k`,
     /// maintaining [`Grid::frontier_cells`].
-    ///
-    /// Every named bit must currently be clear, which the frontier invariant
-    /// guarantees: a cell whose coverage just rose to `1` had none.
     #[inline]
     fn set_frontier_run(&mut self, start: usize, bits: u64) {
         if bits == 0 {
@@ -480,8 +369,6 @@ impl Grid {
     }
 
     /// Clear the frontier bits named by `bits`, as [`Grid::set_frontier_run`].
-    ///
-    /// Every named bit must currently be set, by the same invariant.
     #[inline]
     fn clear_frontier_run(&mut self, start: usize, bits: u64) {
         if bits == 0 {
@@ -502,9 +389,6 @@ impl Grid {
     }
 
     /// Whether `c`'s frontier bit is set. Total: `false` outside the arena.
-    ///
-    /// Read only by the tier-C debug assertions and by tests, so it is dead
-    /// code in a release build — which `cargo clippy --release` reports.
     #[inline]
     #[cfg_attr(not(debug_assertions), allow(dead_code))]
     pub(crate) fn frontier_bit(&self, c: HexCoord) -> bool {
@@ -534,14 +418,8 @@ impl Grid {
         }
     }
 
-    // ---- the 11x11 strip --------------------------------------------------
-
-    /// `strip[i]` bit `j` = `plane` bit at `(c.q - 5 + i, c.r - 5 + j)`, for
-    /// `i, j` in `0..11`. Bits 11..16 are always zero; `c` is at row 5, bit 5.
-    ///
-    /// Total: rows and bits outside the arena read as zero, which is what makes
-    /// the public window queries total. On the internal path the padding-8
-    /// invariant guarantees everything is in-arena and the fast path is taken.
+    /// `strip[i]` bit `j` = `plane` bit at `(c.q - 5 + i, c.r - 5 + j)`, for `i, j` in
+    /// `0..11`.
     pub(crate) fn strip11(&self, plane: &[u64], c: HexCoord) -> [u16; 11] {
         let mut out = [0u16; 11];
         if self.rows == 0 {
@@ -558,7 +436,6 @@ impl Grid {
             let row_base = row as usize * self.row_words;
             let bit = base_r - self.origin_r;
             *slot = if bit >= 0 && bit + 11 <= total_bits {
-                // Fast path: one or two word loads.
                 let w = (bit >> 6) as usize;
                 let sh = (bit & 63) as u32;
                 let mut v = plane[row_base + w] >> sh;
@@ -567,7 +444,6 @@ impl Grid {
                 }
                 (v & 0x7FF) as u16
             } else {
-                // Clamped path: the strip hangs off an arena edge.
                 let mut v = 0u16;
                 for j in 0..11i32 {
                     let b = bit + j;
@@ -585,8 +461,6 @@ impl Grid {
         out
     }
 
-    // ---- growth -----------------------------------------------------------
-
     /// Whether `[c.q ± PAD] × [c.r ± PAD]` is already inside the arena.
     #[inline]
     pub(crate) fn contains_padded(&self, c: HexCoord) -> bool {
@@ -602,17 +476,6 @@ impl Grid {
 
     /// Bounding box of the stones actually on the board, `(lo_q, hi_q, lo_r,
     /// hi_r)`, or `None` when no stone has been placed.
-    ///
-    /// **This is the only input the growth policy takes from the arena**, and
-    /// it is *content*, not geometry: it is unchanged by how large the arena
-    /// happens to have grown. That is what makes capacity decisions — and
-    /// therefore [`MoveError::BoardExtentExceeded`] — a function of the
-    /// position rather than of its search history.
-    ///
-    /// Recomputed from the occupancy planes rather than cached, because a cache
-    /// would have to be restored by `undo` to preserve exactly the property
-    /// this function exists to provide. It is read only on the growth path,
-    /// which runs a logarithmic number of times per game.
     fn stone_bounds(&self) -> Option<(i32, i32, i32, i32)> {
         let (mut lo_q, mut hi_q) = (i32::MAX, i32::MIN);
         let (mut lo_r, mut hi_r) = (i32::MAX, i32::MIN);
@@ -643,35 +506,6 @@ impl Grid {
     }
 
     /// Grow, if needed, so `[c.q ± PAD] × [c.r ± PAD]` is inside the arena.
-    ///
-    /// Class III (spec §7.1): reallocation only, no observable change.
-    ///
-    /// > **The shape is a function of the stones, never of the allocation
-    /// > history.** The required box is the live stone box padded by `PAD`,
-    /// > unioned with the requested cell padded by `PAD`. The refusal predicate
-    /// > is "the smallest arena holding that box is over
-    /// > [`crate::MAX_GRID_CELLS`]". Two positions with the same stones
-    /// > therefore accept and refuse exactly the same placements, however much
-    /// > either one's arena grew getting there — a search that applies a wide
-    /// > line and unwinds it does not consume the position's extent budget.
-    ///
-    /// Each dimension is sized independently: a dimension with enough capacity
-    /// is left alone, so a straight walk along `q` keeps `row_words` at its
-    /// minimum instead of quadrupling the arena on every step. The deficient
-    /// dimension doubles, which keeps growth amortised O(1) per ply.
-    ///
-    /// `origin_r` only ever moves by multiples of 64, so **every row copy is a
-    /// word-aligned `memcpy`; there is never a bit-shifted copy.** That
-    /// eliminates the entire class of off-by-one-bit growth bugs, which are
-    /// symmetric and therefore invisible to round-trip tests.
-    ///
-    /// The arena may be *re-shaped* rather than merely extended, so the copy
-    /// moves the live region — the padded stone box, outside which every plane
-    /// is zero — and not the whole old allocation.
-    ///
-    /// # Errors
-    /// [`MoveError::BoardExtentExceeded`] — checked **before** allocating, so a
-    /// refusal leaves the arena untouched.
     pub(crate) fn reserve_around(&mut self, c: HexCoord) -> Result<(), MoveError> {
         if self.contains_padded(c) {
             return Ok(());
@@ -679,9 +513,6 @@ impl Grid {
         let (cq, cr) = (c.q as i32, c.r as i32);
         let bounds = self.stone_bounds();
 
-        // 1. The required box: the requested cell padded by PAD, unioned with
-        //    the live stone box padded by PAD. Content only — the current
-        //    arena extent is deliberately not part of this.
         let (mut lo_q, mut hi_q) = (cq - PAD, cq + PAD);
         let (mut lo_r, mut hi_r) = (cr - PAD, cr + PAD);
         if let Some((sq0, sq1, sr0, sr1)) = bounds {
@@ -691,15 +522,9 @@ impl Grid {
             hi_r = hi_r.max(sr1 + PAD);
         }
         let need_rows = (hi_q - lo_q + 1) as usize;
-        // Exact, not slack: `origin_r` is a multiple of 64, so the box starts
-        // at `floor64(lo_r)` and needs exactly this many words to reach `hi_r`.
         let base_r = floor64(lo_r);
         let need_words = ((hi_r - base_r) as usize / 64) + 1;
 
-        // 2. Refuse before allocating, on the *smallest* arena that could hold
-        //    the required box. Any arena holding that box is at least this
-        //    large, so no reachable geometry can accept a placement this test
-        //    refuses, nor refuse one it accepts.
         let least_rows = MIN_ROWS.max(need_rows);
         let least_words = MIN_ROW_WORDS.max(need_words);
         let least_cells = least_rows as u64 * least_words as u64 * 64;
@@ -707,18 +532,11 @@ impl Grid {
             return Err(MoveError::BoardExtentExceeded { cells: least_cells });
         }
 
-        // 3. Size each dimension independently, doubling only where capacity is
-        //    actually short.
         let fits = |rows: usize, words: usize| rows as u64 * words as u64 * 64 <= MAX_GRID_CELLS;
         let bump = |have: usize, need: usize, min: usize| {
             let want = if need > have {
-                // Short: double, so growth stays amortised O(1) per ply.
                 (2 * have).max(need).next_power_of_two()
             } else {
-                // Not short: keep what is already allocated, but never more
-                // than 4x what the content needs. A search that reached far out
-                // and was rewound therefore cannot leave the position holding a
-                // permanently oversized arena — `clone` has to stay cheap.
                 have.min(need.next_power_of_two().saturating_mul(4))
             };
             min.max(want)
@@ -726,9 +544,6 @@ impl Grid {
         let mut new_rows = bump(self.rows, need_rows, MIN_ROWS);
         let mut new_words = bump(self.row_words, need_words, MIN_ROW_WORDS);
         if !fits(new_rows, new_words) {
-            // Near the ceiling the slack has to come from somewhere: give `r`
-            // only what the content needs, then spend the rest of the budget on
-            // `q`. Never below `least_*`, which step 2 proved fits.
             new_words = MIN_ROW_WORDS.max(need_words.next_power_of_two());
             if !fits(least_rows, new_words) {
                 new_words = least_words;
@@ -739,14 +554,9 @@ impl Grid {
         debug_assert!(fits(new_rows, new_words), "chosen shape breaks the ceiling");
         debug_assert!(new_rows >= need_rows && new_words >= need_words);
 
-        // 4. Re-centre the required box. `origin_r` stays a multiple of 64.
         let new_origin_q = lo_q - ((new_rows - need_rows) / 2) as i32;
         let new_origin_r = base_r - 64 * ((new_words - need_words) / 2) as i32;
 
-        // 5. Allocate zeroed, then copy the live region. Every plane is zero
-        //    outside the padded stone box, so that box is the whole of what has
-        //    to move — and copying it, rather than the old allocation, is what
-        //    lets step 3 hand a dimension back its unused capacity.
         let words = new_rows * new_words;
         let mut occ0 = vec![0u64; words];
         let mut occ1 = vec![0u64; words];
@@ -754,10 +564,6 @@ impl Grid {
         let mut cover = vec![0u8; words * 64];
 
         if let Some((sq0, sq1, sr0, sr1)) = bounds {
-            // Clamped to the old arena. The padding invariant makes the clamp a
-            // no-op for any position the rule machine can produce; clamping
-            // anyway keeps the copy in bounds unconditionally rather than by
-            // appeal to an invariant enforced somewhere else.
             let live_lo_q = (sq0 - PAD).max(self.origin_q);
             let live_hi_q = (sq1 + PAD).min(self.origin_q + self.rows as i32 - 1);
             let live_base_r = floor64((sr0 - PAD).max(self.origin_r));
@@ -792,7 +598,6 @@ impl Grid {
         self.frontier = frontier;
         self.cover = cover;
 
-        // C9: containment must hold after every growth.
         debug_assert!(
             self.contains_padded(c),
             "C9: reserve_around failed to contain the requested cell"
@@ -821,9 +626,9 @@ mod tests {
     }
 
     /// Every frontier cell in canonical order, read by walking the whole arena
-    /// coordinate by coordinate — deliberately not the word scan that
-    /// `frontier_rank` and `nth_frontier` use, so the two are a real
-    /// cross-check rather than the same code twice.
+    /// coordinate by coordinate â€” deliberately not the word scan that `frontier_rank`
+    /// and `nth_frontier` use, so the two are a real cross-check rather than the same
+    /// code twice.
     fn frontier_by_brute_force(g: &Grid) -> Vec<HexCoord> {
         let mut out = Vec::new();
         for row in 0..g.rows() {
@@ -841,11 +646,6 @@ mod tests {
     }
 
     /// Fix the arena to span both corners by planting a stone at each.
-    ///
-    /// Growth sizes from the **live stone bounding box**, so an arena with no
-    /// stones recentres on whatever cell was last reserved and discards
-    /// everything else. Anchoring first is what makes a sequence of
-    /// `set_frontier` calls survive.
     fn anchor(g: &mut Grid, lo: (i16, i16), hi: (i16, i16)) {
         place(g, lo.0, lo.1);
         place(g, hi.0, hi.1);
@@ -866,7 +666,6 @@ mod tests {
     fn frontier_rank_and_select_are_inverse_over_a_scattered_arena() {
         let mut g = Grid::new();
         anchor(&mut g, (-6, -80), (8, 220));
-        // Spread across several rows and across `u64` word boundaries.
         let marks = [
             (0i16, 0i16),
             (0, 1),
@@ -904,7 +703,6 @@ mod tests {
             mark_frontier(&mut g, q, r);
         }
         let listed = frontier_by_brute_force(&g);
-        // Canonical order is ascending `(q, r)`; the scan must produce it.
         let mut sorted = listed.clone();
         sorted.sort_unstable();
         assert_eq!(listed, sorted);
@@ -920,11 +718,8 @@ mod tests {
         let mut g = Grid::new();
         anchor(&mut g, (-4, -4), (4, 4));
         mark_frontier(&mut g, 0, 0);
-        // Inside the arena but not marked.
         assert_eq!(g.frontier_rank(HexCoord::new(0, 1)), None);
-        // Outside the arena entirely.
         assert_eq!(g.frontier_rank(HexCoord::new(9000, 9000)), None);
-        // And on an arena that was never allocated.
         let empty = Grid::new();
         assert_eq!(empty.frontier_rank(HexCoord::ORIGIN), None);
         assert_eq!(empty.nth_frontier(0), None);
@@ -1000,9 +795,6 @@ mod tests {
             g.set_owner(c, if q % 2 == 0 { Player::P0 } else { Player::P1 });
             g.add_cover_disk(c);
         }
-        // Snapshot what each written cell reads before any reshaping. The disks
-        // overlap, so the coverage counts are not all equal — which is the point:
-        // whatever growth moves, it must move unchanged.
         let expect: Vec<(HexCoord, Option<Player>, u8)> = written
             .iter()
             .map(|&(q, r)| {
@@ -1016,14 +808,12 @@ mod tests {
                 .all(|&(_, owner, cover)| owner.is_some() && cover > 0)
         );
 
-        // Force several reallocations in both directions.
         for &(q, r) in &[(300i16, 300i16), (-300, -300), (300, -300), (-300, 300)] {
             grow(&mut g, q, r);
             for &(c, owner, cover) in &expect {
                 assert_eq!(g.owner(c), owner, "owner lost at {c:?}");
                 assert_eq!(g.cover(c), cover, "coverage lost at {c:?}");
             }
-            // Newly reachable territory is zeroed.
             assert_eq!(g.cover(HexCoord::new(q, r)), 0);
             assert!(g.is_empty_cell(HexCoord::new(q, r)));
             assert!(!g.frontier_bit(HexCoord::new(q, r)));
@@ -1048,11 +838,9 @@ mod tests {
             .collect()
     }
 
-    /// The row runs and the `DISK8` table are two independent statements of the
-    /// same cell set: `add_cover_disk` walks the runs, and the tier-C frontier
-    /// assertion walks the table on every apply and undo. A disagreement between
-    /// them is a symmetric bug neither could catch alone, so they are compared
-    /// directly.
+    /// The row runs and the `DISK8` table are two independent statements of the same
+    /// cell set: `add_cover_disk` walks the runs, and the tier-C frontier assertion
+    /// walks the table on every apply and undo.
     #[test]
     fn disk_runs_visit_exactly_the_disk8_cells_in_disk8_order() {
         for &(q, r) in &[(0i16, 0i16), (5, -3), (-7, 11), (40, 40), (-40, 13)] {
@@ -1065,10 +853,8 @@ mod tests {
         }
     }
 
-    /// The per-row domain clip must agree cell for cell with `is_valid`, which is
-    /// only observable within `LEGAL_RADIUS` of a face. The arena recentres on the
-    /// stone box, so a disk at the far corner of the domain still fits in 4,096
-    /// cells.
+    /// The per-row domain clip must agree cell for cell with `is_valid`, which is only
+    /// observable within `LEGAL_RADIUS` of a face.
     #[test]
     fn disk_runs_clip_exactly_what_the_coordinate_domain_excludes() {
         for &(q, r) in &[
@@ -1091,8 +877,8 @@ mod tests {
     }
 
     /// Applying and removing the same disk restores every plane exactly, at a
-    /// coordinate whose disk the domain clips — the case where the two halves
-    /// could disagree about which cells to skip.
+    /// coordinate whose disk the domain clips â€” the case where the two halves could
+    /// disagree about which cells to skip.
     #[test]
     fn a_clipped_disk_round_trips() {
         let mut g = Grid::new();
@@ -1121,13 +907,13 @@ mod tests {
         assert_eq!(g.frontier_cells(), 0);
         g.set_frontier(HexCoord::new(1, 1));
         assert_eq!(g.frontier_cells(), 1);
-        g.set_frontier(HexCoord::new(1, 1)); // idempotent
+        g.set_frontier(HexCoord::new(1, 1));
         assert_eq!(g.frontier_cells(), 1);
         g.set_frontier(HexCoord::new(2, 1));
         assert_eq!(g.frontier_cells(), 2);
         g.clear_frontier(HexCoord::new(1, 1));
         assert_eq!(g.frontier_cells(), 1);
-        g.clear_frontier(HexCoord::new(1, 1)); // idempotent
+        g.clear_frontier(HexCoord::new(1, 1));
         assert_eq!(g.frontier_cells(), 1);
         let pop: u32 = g.frontier_plane().iter().map(|w| w.count_ones()).sum();
         assert_eq!(pop, g.frontier_cells());
@@ -1139,7 +925,6 @@ mod tests {
         place(&mut g, 0, 0);
         let before_rows = g.rows();
         let before_words = g.row_words();
-        // A box spanning ~9000 in both directions is far past 1 << 22 cells.
         let err = g
             .reserve_around(HexCoord::new(9000, 9000))
             .expect_err("must refuse");
@@ -1151,9 +936,9 @@ mod tests {
         assert_eq!(g.row_words(), before_words, "arena mutated on refusal");
     }
 
-    /// Regression: the growth policy grew *both* dimensions on every event, so
-    /// the arena quadrupled per growth, its aspect ratio froze at 32:128, and a
-    /// straight walk along `q` blew the ceiling after six allocations.
+    /// Regression: the growth policy grew *both* dimensions on every event, so the
+    /// arena quadrupled per growth, its aspect ratio froze at 32:128, and a straight
+    /// walk along `q` blew the ceiling after six allocations.
     #[test]
     fn a_q_only_walk_never_widens_r() {
         let mut g = Grid::new();
@@ -1169,22 +954,18 @@ mod tests {
             );
             assert!(cells(&g) <= MAX_GRID_CELLS);
         }
-        // A tall, one-word-wide arena, not a square one.
         assert!(g.rows() >= (q as usize) + 2 * PAD as usize);
         assert!(
             cells(&g) <= MAX_GRID_CELLS / 4,
             "{} cells for a one-row game",
             cells(&g)
         );
-        // Every stone survived the reshaping.
         for k in 0..=(q / 8) {
             assert_eq!(g.owner(HexCoord::new(k * 8, 0)), Some(Player::P0));
         }
     }
 
-    /// The mirror walk. `(q, r) -> (r, q)` is a symmetry of the rules, so the
-    /// two walks must survive equally far; the old policy refused the `q` walk
-    /// 4.5x sooner.
+    /// The mirror walk.
     #[test]
     fn q_and_r_walks_reach_the_same_extent() {
         fn walk(along_q: bool) -> usize {
@@ -1201,18 +982,15 @@ mod tests {
             }
             n
         }
-        // Neither direction may trip the ceiling inside the coordinate range a
-        // real game can reach; `COORD_LIMIT` is the binding constraint.
         assert_eq!(walk(true), 1999, "the q walk hit the arena ceiling");
         assert_eq!(walk(false), 1999, "the r walk hit the arena ceiling");
     }
 
-    /// The refusal predicate reads the stones, not the allocation history: an
-    /// arena that grew large and then lost those stones must decide exactly as
-    /// a fresh one holding the same stones does.
+    /// The refusal predicate reads the stones, not the allocation history: an arena
+    /// that grew large and then lost those stones must decide exactly as a fresh one
+    /// holding the same stones does.
     #[test]
     fn the_ceiling_is_a_function_of_the_stones_not_of_past_growth() {
-        // `inflated` is driven far out along q, then the stones are removed.
         let mut inflated = Grid::new();
         place(&mut inflated, 0, 0);
         let mut q = 0i16;
@@ -1231,8 +1009,6 @@ mod tests {
         let mut fresh = Grid::new();
         place(&mut fresh, 0, 0);
 
-        // Now push both, in lockstep, all the way to the ceiling along a
-        // diagonal that grows the box in both dimensions.
         let (mut q, mut r) = (0i16, 0i16);
         let mut refused = false;
         for step in 0..800 {
@@ -1304,7 +1080,6 @@ mod tests {
     fn strip11_is_total_off_the_arena_edge() {
         let mut g = Grid::new();
         grow(&mut g, 0, 0);
-        // Far outside the arena in every direction: all zero, no panic.
         for c in [
             HexCoord::new(9000, 0),
             HexCoord::new(-9000, 0),
@@ -1313,7 +1088,6 @@ mod tests {
         ] {
             assert_eq!(g.strip11(g.occ_plane(Player::P0), c), [0u16; 11]);
         }
-        // Straddling the edge: the in-arena part still reads correctly.
         let edge_q = (g.origin_q() + g.rows() as i32 - 1) as i16;
         g.set_owner(HexCoord::new(edge_q, 0), Player::P0);
         let s = g.strip11(g.occ_plane(Player::P0), HexCoord::new(edge_q, 0));
@@ -1328,8 +1102,6 @@ mod tests {
     fn strip11_fast_and_clamped_paths_agree_across_word_boundaries() {
         let mut g = Grid::new();
         grow(&mut g, 0, 200);
-        // Sprinkle stones, then compare the word-load path against a
-        // per-cell recomputation at every bit offset within a word.
         for q in -6i16..=6 {
             for r in 180i16..=220 {
                 if (q as i32 * 7 + r as i32 * 3) % 5 == 0 {
@@ -1383,8 +1155,6 @@ mod tests {
         let mut prev_cells = 0u64;
         let mut placed = Vec::new();
         for step in 0..60 {
-            // Stones make the live box monotone, which is what a real game
-            // does: the arena may be re-shaped but never loses a stone.
             place(&mut g, q, r);
             placed.push(HexCoord::new(q, r));
             let cells = cells(&g);
@@ -1401,8 +1171,8 @@ mod tests {
         }
     }
 
-    /// A dimension the content does not need is handed back when the arena is
-    /// re-shaped, so an excursion cannot leave a permanently bloated position.
+    /// A dimension the content does not need is handed back when the arena is re-
+    /// shaped, so an excursion cannot leave a permanently bloated position.
     #[test]
     fn a_reshape_hands_back_capacity_the_content_no_longer_needs() {
         let mut g = Grid::new();
@@ -1417,7 +1187,6 @@ mod tests {
             tall >= 1024,
             "the q walk should have grown rows, got {tall}"
         );
-        // Retract the walk, then force a growth along r.
         for k in 1..=(q / 8) {
             g.clear_owner(HexCoord::new(k * 8, 0), Player::P0);
         }

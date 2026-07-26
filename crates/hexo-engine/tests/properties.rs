@@ -1,10 +1,4 @@
 //! Property tests over random legal games.
-//!
-//! Games are driven by a shrinkable vector of choice indices rather than a raw
-//! seed, so a failure shrinks to a short move list.
-//!
-//! Every oracle here is written to disagree with the engine — see
-//! `tests/common/mod.rs`.
 
 mod common;
 
@@ -19,8 +13,6 @@ use proptest::prelude::*;
 const MAX_PLIES: usize = 80;
 
 /// Play a game driven by `choices`, calling `on_ply` after each placement.
-///
-/// Returns the move list actually played.
 fn drive(choices: &[u32], mut on_ply: impl FnMut(&Position, usize)) -> Vec<Action> {
     let mut pos = Position::new();
     let mut moves = Vec::new();
@@ -50,16 +42,15 @@ fn choices(max: usize) -> impl Strategy<Value = Vec<u32>> {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 24, max_shrink_iters: 2_000, ..ProptestConfig::default() })]
 
-    /// Properties 2, 3, 4, 5 at **every ply**: the legal-set oracle, the
-    /// Zobrist oracle, the win oracle, and the turn sequence — plus the full
-    /// Tier-A audit.
+    /// Properties 2, 3, 4, 5 at **every ply**: the legal-set oracle, the Zobrist
+    /// oracle, the win oracle, and the turn sequence â€” plus the full Tier-A audit.
     #[test]
     fn all_oracles_hold_at_every_ply(cs in choices(MAX_PLIES)) {
         drive(&cs, check_all_oracles);
     }
 
-    /// Property 1: `apply` then `undo` restores a `PartialEq` state, and
-    /// `audit()` passes after every apply *and* every undo.
+    /// Property 1: `apply` then `undo` restores a `PartialEq` state, and `audit()`
+    /// passes after every apply *and* every undo.
     #[test]
     fn apply_then_undo_restores_exactly(cs in choices(MAX_PLIES)) {
         let moves = drive(&cs, |_, _| {});
@@ -83,7 +74,6 @@ proptest! {
                 legal_before
             );
 
-            // Re-apply for real and check the second apply reports the same.
             let again = search.apply(a).expect("legal again");
             prop_assert_eq!(again, applied);
             search.commit();
@@ -91,16 +81,13 @@ proptest! {
         }
     }
 
-    /// Property 7 (T5): for every prefix length `k`, a fresh `Position`
-    /// advanced `k` times equals a `Search` that applied `n` plies and undid
-    /// `n - k`. The two construction paths share no incremental bookkeeping
-    /// with the comparison.
+    /// Property 7 (T5): for every prefix length `k`, a fresh `Position` advanced `k`
+    /// times equals a `Search` that applied `n` plies and undid `n - k`.
     #[test]
     fn replay_parity_for_every_prefix(cs in choices(40)) {
         let moves = drive(&cs, |_, _| {});
         let n = moves.len();
 
-        // Fresh replays, one per prefix.
         let mut prefixes = Vec::with_capacity(n + 1);
         let mut fresh = Position::new();
         prefixes.push(fresh.clone());
@@ -131,17 +118,6 @@ proptest! {
     }
 
     /// Property 6a: arena geometry never leaks into an observable (hazard H9).
-    ///
-    /// One position is pre-grown far out and rewound — `undo` never shrinks the
-    /// arena — the other is not. The identical game must then be
-    /// indistinguishable at every ply, **including on whether `advance`
-    /// accepts the placement at all**, which is the observable the growth
-    /// policy has to keep history-independent.
-    ///
-    /// The pre-growth runs along a *single* axis, chosen by the case. A
-    /// balanced pre-growth in all four directions re-centres the arena roughly
-    /// where the flat position's own growth lands and cannot expose an
-    /// asymmetric leak.
     #[test]
     fn growth_never_leaks_into_an_observable(
         cs in choices(40),
@@ -182,8 +158,6 @@ proptest! {
                 flat.legal_actions().collect::<Vec<_>>()
             );
         }
-        // `audit()` is O(arena) and the grown arena is deliberately enormous,
-        // so it runs once at the end rather than on every ply.
         grown.audit().expect("grown audit");
         flat.audit().expect("flat audit");
     }
@@ -192,14 +166,9 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 4, max_shrink_iters: 64, ..ProptestConfig::default() })]
 
-    /// Property 6a, driven all the way to [`MoveError::BoardExtentExceeded`]:
-    /// a searched-and-rewound position and a freshly replayed one must agree on
-    /// every accept *and* on the refusal itself.
-    ///
-    /// Property 6a alone cannot reach this: it drives ~40 plies, nowhere near
-    /// the ceiling, and the leak only becomes observable where the ceiling
-    /// bites. The spreading diagonal below widens the bounding box in both
-    /// dimensions, which is the only shape of game the ceiling can stop.
+    /// Property 6a, driven all the way to [`MoveError::BoardExtentExceeded`]: a
+    /// searched-and-rewound position and a freshly replayed one must agree on every
+    /// accept *and* on the refusal itself.
     #[test]
     fn accept_and_refuse_agree_all_the_way_to_the_ceiling(
         spread in 1u16..70,
@@ -247,20 +216,8 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 8, max_shrink_iters: 200, ..ProptestConfig::default() })]
 
-    /// Property 6b: a game that deliberately spreads as far from the origin as
-    /// the rules allow stays consistent and never panics.
-    ///
-    /// This is the adversarial case the spec calls out: legality permits a
-    /// stone eight cells from the nearest stone, so two players who both like
-    /// to extend widen the bounding box by 8 per ply and the dense arena grows
-    /// quadratically. Far enough out that *does* reach
-    /// [`MoveError::BoardExtentExceeded`] — the documented, typed, non-rule
-    /// outcome, not a failure; a game spreading in every direction at once
-    /// refuses once its padded box passes roughly 2048 x 2048, which the ply
-    /// bound here does not necessarily reach. What is tested is that a refusal,
-    /// if one happens, is clean: it is not a rule violation, the refused move is
-    /// still reported legal, the position is untouched, and play continues
-    /// elsewhere.
+    /// Property 6b: a game that deliberately spreads as far from the origin as the
+    /// rules allow stays consistent and never panics.
     #[test]
     fn spreading_games_stay_consistent_and_never_panic(seed in any::<u64>()) {
         let mut rng = Rng::new(seed);
@@ -270,8 +227,6 @@ proptest! {
             if pos.is_terminal() {
                 break;
             }
-            // Take the legal cell furthest along a rotating direction, so the
-            // arena grows on almost every ply.
             let dir = rng.next_u64() % 4;
             let pick = pos
                 .legal_actions()
@@ -309,8 +264,6 @@ proptest! {
                 prop_assert_eq!(pos.is_terminal(), !winners_oracle(&pos).is_empty());
             }
         }
-        // `audit()` is O(arena) and this arena is at the ceiling, so it runs
-        // once, at the end.
         pos.audit().expect("audit after a maximal spread");
     }
 
@@ -341,8 +294,8 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
 
-    /// Property 5 (T4) for whole games: `P0; P1 P1; P0 P0; P1 P1; ...` with
-    /// freeze applied at the terminal ply.
+    /// Property 5 (T4) for whole games: `P0; P1 P1; P0 P0; P1 P1; ...` with freeze
+    /// applied at the terminal ply.
     #[test]
     fn turn_sequence_matches_the_documented_pattern(cs in choices(MAX_PLIES)) {
         let mut pos = Position::new();
@@ -351,7 +304,6 @@ proptest! {
             if pos.is_terminal() {
                 break;
             }
-            // Before the placement, the mover and phase are the oracle's.
             let (mover, phase) = turn_oracle(ply);
             prop_assert_eq!(pos.current_player(), mover, "before ply {}", ply);
             prop_assert_eq!(
@@ -367,7 +319,6 @@ proptest! {
             ply += 1;
 
             if applied.outcome.is_some() {
-                // Freeze: the position still reports the *pre-move* state.
                 prop_assert_eq!(pos.current_player(), mover, "freeze at ply {}", ply - 1);
                 prop_assert_eq!(
                     phase_kind(pos.phase()),
@@ -377,7 +328,6 @@ proptest! {
                 prop_assert_eq!(applied.phase_after, applied.phase_before);
                 break;
             }
-            // Not a win: the transition is the documented one.
             prop_assert_eq!(phase_kind(pos.phase()), phase_kind(turn_oracle(ply).1));
             prop_assert_eq!(pos.current_player(), turn_oracle(ply).0);
         }
@@ -398,7 +348,6 @@ proptest! {
                 prop_assert_eq!(o.winner, mover);
                 prop_assert_eq!(winners_oracle(&pos), vec![mover]);
                 prop_assert_eq!(pos.outcome(), Some(o));
-                // Nothing at all is legal now.
                 prop_assert_eq!(pos.legal_count(), 0);
                 for probe in [HexCoord::ORIGIN, HexCoord::new(1, 1), HexCoord::new(-3, 4)] {
                     prop_assert!(!pos.is_legal(Action::new(probe)));

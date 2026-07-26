@@ -243,8 +243,8 @@ baseline for the reason already recorded — the paper's Table 4 has no `V` head
 **The proposal.** Maintain a cross-play matrix among checkpoints and report
 worst-case historical win rate, not just latest-vs-latest.
 
-**Why it survives.** §11 anchors evaluation on strix and nothing else, which
-measures strength but cannot see cyclic forgetting — a monotone anchor curve is
+**Why it survives.** §11 anchors evaluation on one fixed checkpoint and nothing
+else, which measures strength but cannot see cyclic forgetting — a monotone anchor curve is
 compatible with each checkpoint losing to one three iterations back. The matrix
 is cheap because the games are already being played and the checkpoints already
 exist. Accepting it does not require accepting R3 or R4: the matrix is a
@@ -382,8 +382,8 @@ reward shaping. Nothing here changes that.
 "The state generator must preserve reachability, **or at least rule legality**"
 is precisely the construction path `OPEN_DECISIONS.md` A3 closed. `Position` has
 no `serde` impl and no board-shaped constructor, deliberately, because that is
-the rule-bypass hole the previous engine had — its `Board` deserialiser skipped
-the turn rules. `Position::replay` is the only way in, so a curriculum position
+the rule-bypass hole: a deserialiser that accepts a cell list skips the turn
+rules entirely. `Position::replay` is the only way in, so a curriculum position
 is a **move prefix**, and generating a prefix that produces a named threat
 structure with correct mover, phase, and stone parity is a search problem, not a
 board-filling exercise.

@@ -32,11 +32,6 @@ the only detectors. They are not redundant with each other, and making one of
 them agree with the implementation *by construction* silently deletes a
 detector rather than fixing anything.
 
-**`crates/hexo-reference` is a photograph, not a dependency.** It is a frozen
-copy of the previous engine and the only independent evidence in the workspace.
-A differential failure is a finding to report, not a thing to patch — see the
-`reference-divergence` skill before touching anything.
-
 **`docs/ENGINE_SPEC.md` is normative for `hexo-engine`.** Where the code and the
 spec disagree, that is a finding to raise, not a discrepancy to quietly resolve
 in whichever direction is less work.

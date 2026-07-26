@@ -1,26 +1,4 @@
 //! Criterion suite for the `hexo-engine` hot paths.
-//!
-//! Every group here exists to turn a deferred optimisation into a number:
-//!
-//! - `advance` and `apply_undo` price the 217-cell disk walk of
-//!   `place`/`unplace`, split into the interior and edge placements the audit
-//!   claims differ.
-//! - `clone` prices the five allocations the player-mirror design pays per
-//!   position handed out.
-//! - `enumerate` prices the frontier and occupancy bit scans, including on an
-//!   arena a search excursion inflated — which is what would justify the
-//!   `row_any` row-summary bits deferred in `docs/ENGINE_SPEC.md` §12.
-//! - `ordering` puts `legal_rank` and `nth_legal` head to head against the
-//!   naive iterator walk they replaced, at the first, middle, and last rank,
-//!   and again on the inflated arena — same legal set, four times the words.
-//! - `windows`, `replay`, and `new_game` price the read surface, the
-//!   record-loading path, and a reset.
-//!
-//! ```text
-//! cargo bench -p hexo-engine
-//! cargo bench -p hexo-engine -- ordering        # one group
-//! cargo bench -p hexo-engine -- 'apply_undo/edge'
-//! ```
 
 mod common;
 
@@ -32,12 +10,11 @@ use hexo_engine::{Action, HexCoord, Position, Search};
 
 use common::{PLIES, game, inflated, interior_and_edge, position_at};
 
-/// Plies of `+q` excursion behind the inflated-arena fixture. Enough to force
-/// the arena's row count past its next two doublings from the ply-96 shape.
+/// Plies of `+q` excursion behind the inflated-arena fixture.
 const EXCURSION_STEPS: usize = 32;
 
-/// The ply the inflated-arena fixture is taken from: a mid-game root, which is
-/// where a search that reaches far out and unwinds actually happens.
+/// The ply the inflated-arena fixture is taken from: a mid-game root, which is where a
+/// search that reaches far out and unwinds actually happens.
 const INFLATED_PLY: usize = 96;
 
 /// One game stage, with the two placements the timing is split over.
@@ -69,8 +46,6 @@ impl Fixtures {
             .map(|&ply| {
                 let pos = position_at(ply);
                 let (interior, edge) = interior_and_edge(&pos);
-                // Asserted here so the timed loops can drop the `Result`
-                // without a branch and still be measuring the success path.
                 assert!(pos.is_legal(interior) && pos.is_legal(edge));
                 Stage {
                     ply,
@@ -89,14 +64,12 @@ impl Fixtures {
     }
 }
 
-/// `Position::advance` — the runner's forward path, on a placement that does
-/// not grow the arena.
+/// `Position::advance` â€” the runner's forward path, on a placement that does not grow
+/// the arena.
 fn advance(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("advance");
     for s in &f.stages {
         g.bench_function(BenchmarkId::from_parameter(s.ply), |b| {
-            // The clone is setup, and criterion excludes it from the sample;
-            // `LargeInput` keeps a batch of arenas from dwarfing the cache.
             b.iter_batched_ref(
                 || s.pos.clone(),
                 |p| black_box(p.advance(s.interior)),
@@ -107,12 +80,7 @@ fn advance(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// `Search::apply` + `Search::undo` as a pair — the search hot path.
-///
-/// Steady state: the first apply of a sample may grow the arena, and undo
-/// deliberately keeps the allocation, so every later iteration in that sample
-/// runs against a warm arena and a warm undo stack. That is what a search
-/// worker actually does.
+/// `Search::apply` + `Search::undo` as a pair â€” the search hot path.
 fn apply_undo(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("apply_undo");
     for s in &f.stages {
@@ -130,8 +98,8 @@ fn apply_undo(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// `Position::clone` and drop — paid once per position handed to a player
-/// mirror, and once per game slot reset.
+/// `Position::clone` and drop â€” paid once per position handed to a player mirror, and
+/// once per game slot reset.
 fn clone_drop(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("clone");
     for s in &f.stages {
@@ -143,10 +111,6 @@ fn clone_drop(c: &mut Criterion, f: &Fixtures) {
 }
 
 /// Full enumeration of the frontier and occupancy planes.
-///
-/// Throughput is in items, so the reported rate is directly comparable across
-/// plies and against the inflated arena, which yields the same items out of
-/// four times the words.
 fn enumerate(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("enumerate");
     for s in &f.stages {
@@ -191,14 +155,7 @@ fn enumerate(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// The two directions of the canonical ordering against the naive walk they
-/// replaced.
-///
-/// `legal_rank` is a popcount prefix and `nth_legal` a select scan, both
-/// `O(arena words)`; `legal_actions().position(..)` and `.nth(k)` are
-/// `O(rank)`. Measuring the first, middle, and last rank locates the crossover
-/// in the rank, and repeating it on the inflated arena — same legal set, four
-/// times the words — is what shows whether the crossover moves with the arena.
+/// The two directions of the canonical ordering against the naive walk they replaced.
 fn ordering(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("ordering");
     let mut subjects: Vec<(String, &Position)> = f
@@ -234,7 +191,7 @@ fn ordering(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// `Position::windows_through` — the 18-window gather a feature encoder reads.
+/// `Position::windows_through` â€” the 18-window gather a feature encoder reads.
 fn windows(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("windows");
     for s in &f.stages {
@@ -246,8 +203,7 @@ fn windows(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// `Position::replay` of a whole game — the record-loading path. Throughput is
-/// in plies, so the rate is directly comparable with `advance`.
+/// `Position::replay` of a whole game â€” the record-loading path.
 fn replay(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("replay");
     g.throughput(Throughput::Elements(f.record.len() as u64));
@@ -257,8 +213,8 @@ fn replay(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// `Position::new()` plus the opening placement — a game slot reset, including
-/// the first arena allocation.
+/// `Position::new()` plus the opening placement â€” a game slot reset, including the
+/// first arena allocation.
 fn new_game(c: &mut Criterion) {
     let mut g = c.benchmark_group("new_game");
     g.bench_function("new_plus_opening", |b| {
@@ -271,14 +227,9 @@ fn new_game(c: &mut Criterion) {
     g.finish();
 }
 
-/// Written out rather than assembled by `criterion_group!` +
-/// `criterion_main!`: those expand to exactly these five lines, plus a `pub fn`
-/// with no doc comment that the workspace `missing_docs` lint then rejects.
-///
-/// The measurement window is half of criterion's default. The suite has ~80
-/// benchmarks and every one is a scalar operation with a tight distribution, so
-/// the shorter window costs no resolution and keeps a full run to a few
-/// minutes.
+/// Written out rather than assembled by `criterion_group!` + `criterion_main!`: those
+/// expand to exactly these five lines, plus a `pub fn` with no doc comment that the
+/// workspace `missing_docs` lint then rejects.
 fn main() {
     let mut criterion = Criterion::default()
         .warm_up_time(Duration::from_millis(500))

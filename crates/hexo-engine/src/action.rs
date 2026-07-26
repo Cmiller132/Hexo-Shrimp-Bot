@@ -1,40 +1,26 @@
 //! The move atom and its record encoding.
-//!
-//! [`ActionId`] is unbounded and exactly invertible, and its packing is
-//! order-preserving: unsigned comparison of the inner `u32` is signed
-//! lexicographic comparison of `(q, r)`. That is what makes the canonical
-//! legal-move ordering of spec §9 a *sort* rather than an index into a table,
-//! so no region, crop, or fixed-width mask is imposed on the action space.
 
 use crate::coord::HexCoord;
 
-/// Version of the canonical legal-move ordering (spec §9).
-///
-/// Bumping this invalidates every trained checkpoint that indexed a policy head
-/// by legal-move position.
+/// Version of the canonical legal-move ordering (spec Â§9).
 pub const ACTION_ORDER_VERSION: u32 = 1;
 
-/// Unbounded, exactly invertible identity of a placement. The record encoding.
-///
-/// The packing is order-preserving: comparing the inner `u32` is exactly
-/// lexicographic `(q, r)` comparison on the signed coordinate (spec §9).
+/// Unbounded, exactly invertible identity of a placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ActionId(
-    /// The wire value. Public so a record writer needs no accessor.
+    /// The wire value.
     pub u32,
 );
 
 impl ActionId {
     /// `((q as u16 ^ 0x8000) as u32) << 16 | (r as u16 ^ 0x8000) as u32`.
-    ///
-    /// Total and injective over every [`HexCoord`].
     #[inline]
     #[must_use]
     pub const fn from_coord(c: HexCoord) -> Self {
         Self((((c.q as u16 ^ 0x8000) as u32) << 16) | ((c.r as u16 ^ 0x8000) as u32))
     }
 
-    /// The exact inverse of [`ActionId::from_coord`]. Total over every `u32`.
+    /// The exact inverse of [`ActionId::from_coord`].
     #[inline]
     #[must_use]
     pub const fn coord(self) -> HexCoord {
@@ -59,10 +45,7 @@ impl From<ActionId> for HexCoord {
     }
 }
 
-/// A single placement — the atom of play.
-///
-/// Carries no legality claim; validation happens in [`crate::Position::advance`]
-/// and [`crate::Search::apply`].
+/// A single placement â€” the atom of play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Action(HexCoord);
 
@@ -88,7 +71,7 @@ impl Action {
         ActionId::from_coord(self.0)
     }
 
-    /// Recover a placement from its record encoding. Total over every `u32`.
+    /// Recover a placement from its record encoding.
     #[inline]
     #[must_use]
     pub const fn from_id(id: ActionId) -> Self {

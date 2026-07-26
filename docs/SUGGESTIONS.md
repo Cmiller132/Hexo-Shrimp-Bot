@@ -1,8 +1,8 @@
 # Suggestions
 
 *Optional* design proposals — things worth doing that nothing forces. Each
-carries a status and, where it matters, an explicit statement of what would
-change relative to the previous implementation in `Hexo-BotTrainer-hexgt`.
+carries a status and, where it matters, an explicit statement of what it would
+change in the crates that already exist.
 
 Questions that **must** be answered to build at all live in
 [OPEN_DECISIONS.md](OPEN_DECISIONS.md).
@@ -17,7 +17,6 @@ stable: a closed item's number is not reused, because other documents cite it.
 | S1 | Dense action indexing | **Closed.** The diagnosis was right and the proposed fix was wrong; what survived is in [crates/hexo-engine/README.md](../crates/hexo-engine/README.md) |
 | S2 | Symmetry operations in the engine | Deferred — probably not yet |
 | S3 | The evaluator seam | Deferred — explained below |
-| S4 | Differential test against the old engine | **Closed.** Built, and it agrees; findings are in [crates/hexo-reference/README.md](../crates/hexo-reference/README.md) |
 | S5 | Read-surface contract for model encoders | Open — needed once models start |
 | S6 | Containerised bots | **Closed.** Accepted and specified in [CONTAINER_SPEC.md](CONTAINER_SPEC.md); the wire format it leaves open is `OPEN_DECISIONS.md` C1/C2 |
 | S7 | Python-side tooling (ruff, type checking) | Deferred — no Python yet |

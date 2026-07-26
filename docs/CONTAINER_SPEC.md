@@ -5,9 +5,8 @@ deployed, and run. Nothing here constrains `hexo-engine`, whose contract remains
 `ENGINE_SPEC.md`. Deliberately says nothing about how a model works — the trunk,
 the encoder, and the training objective are decided elsewhere.
 
-This is a ground-up design. It is not a port of `Hexo-BotTrainer-hexgt`'s
-workflow, and it does not inherit that repo's process supervision, shard
-writers, or dashboard.
+This is a ground-up design. Process supervision, shard writing, and metrics are
+specified here on their own terms, or left out where nothing needs them yet.
 
 ---
 

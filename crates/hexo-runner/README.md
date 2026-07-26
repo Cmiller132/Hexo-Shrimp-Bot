@@ -79,18 +79,17 @@ There is deliberately no `player.rs` and no `Player` trait. See below.
   rule violation. `MoveError::is_rule_violation` tells the two apart, and a
   `NoContest::EngineLimit` blames nobody.
 
-- **Three result arms, not two.** The previous implementation had `COMPLETED`
-  and `ABORTED`, so a game that legitimately hit its action cap was recorded
-  identically to one where a player segfaulted — both unusable as training
-  signal and neither distinguishable from the other. `MatchResult` splits by
-  whose fault it was, and `is_contested()` is the query that was impossible
-  before.
+- **Three result arms, not two.** A completed/aborted split cannot say what a
+  training pipeline needs to know: a game that legitimately hit its action cap
+  and a game where a player crashed are both unusable as signal, but only the
+  second is anybody's fault. `MatchResult` splits by whose fault it was, and
+  `is_contested()` answers "was this a real game" directly.
 
 - **Diagnostics are opaque and actually persisted.** A seat attaches bytes; the
-  game stores them verbatim and never parses them. The previous runner had this
-  field, documented it as reaching the record, and never read it — so every
-  model package wrote its own training shards on a path that bypassed the runner
-  entirely.
+  game stores them verbatim and never parses them. The field is only worth
+  having if it reaches the record — a diagnostics channel that is documented but
+  dropped pushes every model package onto its own shard-writing path that
+  bypasses the runner entirely.
 
 ## Not built yet
 
@@ -99,7 +98,7 @@ There is deliberately no `player.rs` and no `Player` trait. See below.
 | Wire protocol and transport | C1, C2 — line-delimited stdio over a handshake pinning protocol, rules, and action-order versions |
 | On-disk record format | C4. `PlyRecord` is the in-memory shape; nothing serialises it yet |
 | The binary and its subcommands | C3 |
-| Seed ownership | B4. Deliberately absent rather than decorative — the previous runner carried a seed that reproduced nothing |
+| Seed ownership | B4. Deliberately absent rather than decorative — replay determinism comes from the stored action list, so a seed field would reproduce nothing |
 
 ## Connections
 

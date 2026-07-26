@@ -60,10 +60,11 @@ crates/hexo-engine/
 `use hexo_engine::{Position, Search, Action, Player};`.
 
 There is deliberately no `board.rs`, `rules.rs`, `legal.rs`, `windows.rs`, or
-`snapshot.rs`. A public `Board` type is what re-opened the rule-bypassing
-construction path in the previous engine; a free `is_legal_placement` invites
-non-atomic check-then-place; and neither the legal set nor the window masks are
-stored, so neither gets a module.
+`snapshot.rs`. A public `Board` type re-opens the rule-bypassing construction
+path, since anything that can build a board from cells can build one no sequence
+of legal turns could reach; a free `is_legal_placement` invites non-atomic
+check-then-place; and neither the legal set nor the window masks are stored, so
+neither gets a module.
 
 ## Design notes
 
@@ -134,14 +135,16 @@ stored, so neither gets a module.
 
 - **The action region is unbounded, and that is load-bearing.** The obvious
   alternative is to index a fixed hex disk around the origin, since the opening is
-  always at the centre. That has already been run in production and failed: a
-  radius-20 crop excluded out-of-crop legal moves from policy and search, froze
-  out-of-rim wins, and caused the previous repo's `main_3` training collapse. A
-  larger radius narrows the failure without removing it, because the crop is still
-  there. So the policy head is sized by the legal set instead, and the two jobs get
-  two encodings — `ActionId` is action *identity*, unbounded and exactly
-  invertible, for records and validation; this ordering is the *index*, for model
-  I/O. The previous `pack_coord` was doing both, and could not do the second.
+  always at the centre. It fails on a board that has no edge: a radius-20 crop
+  excludes out-of-crop legal moves from policy and search and freezes out-of-rim
+  wins, so the model is trained on an action space that does not match the game
+  it is playing. A larger radius narrows the failure without removing it, because
+  the crop is still there. So the policy head is sized by the legal set instead,
+  and the two jobs get two encodings — `ActionId` is action *identity*, unbounded
+  and exactly invertible, for records and validation; this ordering is the
+  *index*, for model I/O. One encoding cannot serve both: an identity that is
+  unbounded is not a dense index, and a dense index is not invertible outside its
+  region.
 
   The bijection did not hold at first: `legal_actions` offered 136 coordinates
   that `advance` refused, so `legal_rank` was assigning policy indices to

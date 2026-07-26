@@ -1,7 +1,6 @@
 # Hexo-Shrimp-Bot
 
-A ground-up rebuild of the Hexo engine and bot-training framework, succeeding
-`Hexo-BotTrainer-hexgt`. The game rules are unchanged; the architecture is not.
+A Hexo engine and bot-training framework, built ground up.
 
 > **Status: `hexo-engine` and `hexo-runner` implemented.** The engine ships the
 > full rule machine, make/unmake search, and its test suite; the runner ships
@@ -17,7 +16,6 @@ Hexo-Shrimp-Bot/
   crates/
     hexo-engine/          authoritative rules and game state
     hexo-runner/          the authoritative game and adjudication policy
-    hexo-reference/       frozen copy of the previous engine; a test oracle only
   xtask/                  the verification gates, defined once; `cargo xtask`
   docs/
     ENGINE_SPEC.md        normative implementation target for hexo-engine
@@ -34,10 +32,11 @@ Each crate carries its own `README.md` with a module table and design notes.
 
 Settled. Open questions live in [docs/SUGGESTIONS.md](docs/SUGGESTIONS.md).
 
-**The game is unchanged.** Infinite hex board, axial coordinates, centre
-opening, two placements per turn with a win check after each, six-in-a-row
-windows, frontier-radius legality. The rules are being reimplemented, not
-redesigned.
+**The rules are fixed, and the architecture is what is being designed.**
+Infinite hex board, axial coordinates, centre opening, two placements per turn
+with a win check after each, six-in-a-row windows, frontier-radius legality.
+`docs/ENGINE_SPEC.md` states them normatively; nothing in this workspace is
+free to reinterpret them.
 
 **Rust owns the engine and the match loop.** Where the Rust/Python boundary
 ultimately falls is deliberately undecided — Python earns its place in plenty of
@@ -70,15 +69,15 @@ engine owns one canonical action ordering in both directions, `legal_rank` and
 per turn: the player replays the prefix into its own mirror and applies the moves
 the runner sends. This costs O(1) per ply instead of O(board), and it is a move
 list rather than a serialised position because a container cannot be handed one —
-`Position` has no `serde` impl, deliberately, since board-shaped construction is
-what re-opens the rule-bypass hole. The old engine had exactly that and its
-`Board` deserialiser skipped the turn rules.
+`Position` has no `serde` impl, deliberately. Board-shaped construction is a
+rule-bypass hole: a deserialiser that accepts a bare cell list reconstructs a
+position without ever running the turn rules that could have produced it.
 
 **The hash crosses the container boundary.** `zobrist()` is position-only, which
 is an engine decision argued with the engine — but it is what lets the runner
-catch desync by exchanging one number per ply. The previous repo's
-history-sensitive hash had to be documented as process-internal and never
-persisted; this one does not.
+catch desync by exchanging one number per ply. A history-sensitive hash would
+have to be documented as process-internal and never persisted; this one is safe
+to store and to compare across processes.
 
 **Models are independent and own their own encoding.** A model may be written in
 Rust and depends only on the engine's read surface. Neither the engine nor the
@@ -92,16 +91,16 @@ two deployment shapes. Exactly one authority exists per game — a container
 answering someone else's protocol runs as a player and does not adjudicate.
 
 **One build backend, one workspace.** Cargo workspace for Rust; when Python
-arrives, a `uv` workspace and maturin — not the three backends and manual
-`PYTHONPATH` assembly of the previous repo.
+arrives, a `uv` workspace and maturin. One backend and one dependency graph, so
+that "how is this built" has a single answer and no step assembles a
+`PYTHONPATH` by hand.
 
-**The previous engine is kept as a test oracle.** `hexo-reference` is a frozen,
-dependency-free copy of `Hexo-BotTrainer-hexgt`'s rules crate, and
-`cargo test --workspace` drives random legal games through both engines and
-compares legality, terminal results, turn state, and window ownership ply by
-ply. It exists so "the rules are unchanged" is a checked property rather than a
-claim, and it must never be edited to make a test pass — a divergence is a
-finding, and the rewrite is not automatically the correct side.
+**The engine is checked against oracles written independently of it.**
+`Position::audit()`, the independent oracles in `crates/hexo-engine/tests/common`,
+and the frozen golden vectors each detect a class the others cannot — in
+particular the symmetric bugs that apply and un-apply identically, which no
+round-trip or invariant test can see. Making one of them agree with the
+implementation by construction deletes a detector rather than fixing anything.
 
 ## Build
 

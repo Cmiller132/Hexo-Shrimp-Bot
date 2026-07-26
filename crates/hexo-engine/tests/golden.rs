@@ -1,13 +1,5 @@
-//! Frozen golden vectors for the two things that are pinned across processes:
-//! the Zobrist hash and the canonical legal-move ordering.
-//!
-//! **These are not optional and they are not redundant.** A wrong `cell_key`
-//! constant, a wrong slot table, or a reordered enumeration is a *symmetric*
-//! bug: it applies and un-applies identically, so no round-trip or invariant
-//! test can see it. If one of these fails, the artefact it protects broke —
-//! stored game records, cross-process hash agreement, or every checkpoint that
-//! indexed a policy head by legal-move position — and the correct response is a
-//! deliberate `RULES_VERSION` / `ACTION_ORDER_VERSION` bump, not a re-baseline.
+//! Frozen golden vectors for the two things that are pinned across processes: the
+//! Zobrist hash and the canonical legal-move ordering.
 
 mod common;
 
@@ -18,8 +10,8 @@ fn act(q: i16, r: i16) -> Action {
     Action::new(HexCoord::new(q, r))
 }
 
-/// A fixed 40-ply game that spreads across 36 rows and 68 columns — several
-/// arena growths — and does not terminate.
+/// A fixed 40-ply game that spreads across 36 rows and 68 columns â€” several arena
+/// growths â€” and does not terminate.
 const GAME: [(i16, i16); 40] = [
     (0, 0),
     (5, 2),
@@ -108,9 +100,6 @@ const ZOBRIST_BY_PLY: [u64; 40] = [
 ];
 
 /// A 64-bit digest of the full legal-move ordering emitted at each ply.
-///
-/// The digest folds every `ActionId` in emission order, so it is sensitive to
-/// both membership and order.
 const ORDER_DIGEST_BY_PLY: [u64; 40] = [
     0x6cf1_f1fe_a5ac_1e7e,
     0x9cdd_6cb3_053f_e111,
@@ -215,8 +204,6 @@ fn legal_move_ordering_per_ply_matches_the_frozen_table() {
 
 #[test]
 fn zobrist_stream_matches_the_independent_oracle() {
-    // The frozen table and the oracle are two different ways to be wrong in the
-    // same direction, so check them against each other as well.
     let mut pos = Position::new();
     for (ply, &(q, r)) in GAME.iter().enumerate() {
         pos.advance(act(q, r)).expect("legal");
@@ -229,14 +216,7 @@ fn zobrist_stream_matches_the_independent_oracle() {
     }
 }
 
-/// [`Position::legal_rank`] of each played move of [`GAME`], at the ply it was
-/// played.
-///
-/// This is the quantity a policy target is recorded against, so every trained
-/// checkpoint is permanently married to it. It is pinned separately from
-/// [`ORDER_DIGEST_BY_PLY`] because a digest over the whole legal list and the
-/// index of one move inside that list can move independently — a bug in the
-/// rank scan alone would leave the digest untouched.
+/// [`Position::legal_rank`] of each played move of [`GAME`], at the ply it was played.
 const PLAYED_RANK_BY_PLY: [usize; GAME.len()] = [
     0, 184, 279, 330, 56, 220, 375, 16, 477, 809, 660, 429, 973, 764, 989, 148, 771, 1236, 398,
     1150, 884, 505, 262, 251, 806, 1496, 1083, 453, 41, 1501, 668, 1996, 1845, 1373, 1715, 1705,
@@ -262,8 +242,6 @@ fn played_move_ranks_match_the_frozen_table() {
 
 #[test]
 fn nth_legal_inverts_the_frozen_ranks() {
-    // The inverse direction is what serving uses to turn a head's argmax back
-    // into a move, so it is pinned against the same table.
     let mut pos = Position::new();
     for (ply, &(q, r)) in GAME.iter().enumerate() {
         let rank = PLAYED_RANK_BY_PLY[ply];

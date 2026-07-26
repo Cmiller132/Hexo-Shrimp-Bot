@@ -2,7 +2,6 @@
 resolver = "3"
 members = [
     "crates/hexo-engine",
-    "crates/hexo-reference",
     "crates/hexo-runner",
     # Not a crate of the project: `cargo xtask` defines the verification gates
     # so that CI and a local run cannot disagree about what they are. It is a

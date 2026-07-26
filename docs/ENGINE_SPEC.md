@@ -1788,8 +1788,9 @@ mask** — it is a *sort*, not an index into a table. The index of a cell within
 position's legal list is still position-dependent, which is unavoidable without a crop,
 but the *rule producing that list* is global and fixed, so self-play, training, and
 serving all read the same ordering and nothing downstream can accidentally invent a
-different one. The reference's radius-20 crop, which caused the main_3 training collapse,
-is structurally unreachable through this API.
+different one. A fixed radius-20 crop, which would exclude out-of-crop legal moves from
+policy and search and freeze out-of-rim wins, is structurally unreachable through this
+API.
 
 **How the engine produces it, and why it is free.** `LegalActions` walks the `frontier`
 plane in storage order: rows ascending (row `i` is `q = origin_q + i`), and within a row,

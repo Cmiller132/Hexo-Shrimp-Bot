@@ -1,33 +1,18 @@
 //! The workspace verification gates, defined once.
-//!
-//! Every command CI runs lives in [`GATES`] and nowhere else. `cargo xtask
-//! verify` runs the set that guards every push, in the order CI runs it;
-//! `cargo xtask <gate>` runs one. The workflow files choose which machine runs
-//! which gate, but never restate a command line.
-//!
-//! That single-source rule is not tidiness. The gate list had already been
-//! copied into `README.md` and `crates/hexo-engine/README.md`, and both copies
-//! had drifted: neither mentioned the rustdoc gate, the MSRV check, or the
-//! `wasm32` lint. Following either one to a green result and calling the work
-//! done left three CI failures behind.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// Which toolchain a gate runs under.
 enum Toolchain {
-    /// Whatever `cargo` already resolves to — current stable, in practice.
+    /// Whatever `cargo` already resolves to â€” current stable, in practice.
     Current,
-    /// The `rust-version` floor declared in the workspace manifest, read from
-    /// that manifest so the gate cannot outlive the promise it checks.
+    /// The `rust-version` floor declared in the workspace manifest, read from that
+    /// manifest so the gate cannot outlive the promise it checks.
     Msrv,
 }
 
 /// One gate: what it runs, and why it catches something no other gate does.
-///
-/// `why` is printed when the gate fails, because "clippy failed again" is not
-/// the useful part — "this is the release profile, and it sees dead code the
-/// debug profile cannot" is.
 struct Gate {
     /// The subcommand name, as typed.
     name: &'static str,
@@ -83,9 +68,8 @@ const GATES: &[Gate] = &[
         toolchain: Toolchain::Current,
         env: &[],
         args: &["test", "--workspace"],
-        why: "The test suite, debug profile — so the tier-C assertions run on \
-              every placement. Includes the differential test against \
-              `hexo-reference` at its default size.",
+        why: "The test suite, debug profile â€” so the tier-C assertions run on \
+              every placement.",
     },
     Gate {
         name: "docs",
@@ -105,7 +89,7 @@ const GATES: &[Gate] = &[
         env: &[],
         args: &["check", "--workspace", "--all-targets"],
         why: "The declared `rust-version` floor. CI otherwise only ever sees \
-              current stable, so the promise drifts silently — it already had \
+              current stable, so the promise drifts silently â€” it already had \
               once. `--all-targets` holds tests and benches to the floor too. \
               If the toolchain is missing, `rustup toolchain install` it.",
     },
@@ -151,7 +135,7 @@ const GATES: &[Gate] = &[
         toolchain: Toolchain::Current,
         env: &[("HEXO_SMOKE_GAMES", "10000"), ("HEXO_SMOKE_UNIFORM", "500")],
         args: &["test", "--release", "-p", "hexo-engine", "--test", "smoke"],
-        why: "The deep smoke run — an order of magnitude more games than the \
+        why: "The deep smoke run â€” an order of magnitude more games than the \
               defaults `test` uses. Release profile, because a debug build \
               runs the full tier-C assertion set on every placement. Scheduled \
               nightly rather than per-push; that is why `verify` omits it.",
@@ -183,8 +167,8 @@ fn main() -> ExitCode {
 }
 
 impl Gate {
-    /// Runs the gate from the workspace root, echoing the exact command first
-    /// so a failure can be reproduced by hand.
+    /// Runs the gate from the workspace root, echoing the exact command first so a
+    /// failure can be reproduced by hand.
     fn run(&self) -> bool {
         let root = workspace_root();
         let toolchain = match self.toolchain {
@@ -227,8 +211,8 @@ impl Gate {
     }
 }
 
-/// The workspace root, resolved from this crate's own manifest directory so
-/// `cargo xtask` works from any subdirectory.
+/// The workspace root, resolved from this crate's own manifest directory so `cargo
+/// xtask` works from any subdirectory.
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -236,9 +220,7 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The `rust-version` the workspace declares. Read rather than hardcoded: the
-/// point of the MSRV gate is that the declared floor and the checked floor are
-/// the same number.
+/// The `rust-version` the workspace declares.
 fn declared_msrv(root: &Path) -> String {
     let manifest_path = root.join("Cargo.toml");
     let manifest = std::fs::read_to_string(&manifest_path)
