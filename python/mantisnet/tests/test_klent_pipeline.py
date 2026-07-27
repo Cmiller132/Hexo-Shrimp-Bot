@@ -13,7 +13,6 @@ import numpy as np
 import torch
 
 from mantisnet import MantisConfig, MantisNet
-from mantisnet.builder import _CANONICAL, NUM_PATTERNS
 from mantisnet.klent import (
     KlentConfig,
     episode_samples,
@@ -23,22 +22,14 @@ from mantisnet.klent import (
     play_match,
 )
 from mantisnet.klent.evaluate import argmax_choose
-from mantisnet.klent.seeds import seed_prefix
+from mantisnet.klent.seeds import line_scores, seed_prefix
 from mantisnet.klent.train import fit, network_evaluate
-
-_POPCOUNT = torch.tensor([bin(int(m)).count("1") for m in _CANONICAL])
 
 
 def heuristic_evaluate(batch):
-    """Line-extending scores through the evaluator seam: each legal cell's
-    best own-window stone count, with a completion scored decisively."""
-    own = batch.window_feat < NUM_PATTERNS
-    wscore = torch.where(own, _POPCOUNT[batch.window_feat % NUM_PATTERNS], 0)
-    per_cell = torch.zeros(batch.n_cells)
-    per_cell.index_reduce_(
-        0, batch.dec_cell, wscore.index_select(0, batch.dec_window).float(), "amax"
-    )
-    score = torch.where(per_cell >= 5, 8.0, per_cell)
+    """The line builder's scoring through the evaluator seam, so games
+    terminate and the buffer rules are observable without a trained model."""
+    score = line_scores(batch)
     return score.clone(), score.clone()
 
 

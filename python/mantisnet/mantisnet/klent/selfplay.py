@@ -18,7 +18,7 @@ from typing import Callable
 import numpy as np
 import torch
 
-from ..builder import collate, from_position
+from ..builder import collate_positions
 from .improve import improved_policy
 from .returns import lambda_returns, signs_from_moves_remaining
 
@@ -88,7 +88,7 @@ def play_episodes(
     live = list(range(len(episodes)))
     kl_sum, ent_sum, decisions = 0.0, 0.0, 0
     while live:
-        batch = collate([from_position(positions[i]) for i in live])
+        batch = collate_positions([positions[i] for i in live])
         policy_logits, q_values = evaluate(batch)
         imp = improved_policy(policy_logits, q_values, batch.legal_offsets, tau, lam)
 
@@ -108,7 +108,7 @@ def play_episodes(
             ep.improved.append(probs.astype(np.float32))
             ep.v_hats.append(float(imp.v_hat[slot]))
 
-            move = pos.legal_moves()[rank]
+            move = pos.nth_legal(rank)
             pos.advance(*move)
             ep.moves.append(move)
 

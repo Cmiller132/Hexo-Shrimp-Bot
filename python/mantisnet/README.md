@@ -8,8 +8,11 @@ faithful-first against that document.
 **Status: implemented and green.** The model is 1.25 M parameters at the §2
 defaults — the spec's 1.2 M plus the appendix-B Q head — with the spec's §12
 obligations as tests; KLENT carries the design
-doc's §4.7 obligations as its own, and one real iteration (seeded self-play →
-buffer → fit) runs end to end on the 4070 Ti. **Not yet a `ModelPackage`:** no
+doc's §4.7 obligations as its own. On the 4070 Ti a steady-state KLENT
+iteration (32 seeded games → buffer → fit) runs in ~3 s: batch building is
+Rust and rayon-parallel (~0.1 ms/position) and the forward is
+`torch.compile`d (~2.1× over eager) — the Performance section below has the
+numbers. **Not yet a `ModelPackage`:** no
 encoder, no evaluator, no sessions, no checkpoints, and no record/runner
 integration — the KLENT buffer is in-memory per iteration, as the paper's is.
 
@@ -56,13 +59,17 @@ uv run python bench/bench_forward.py # throughput on CPU and the local GPU
 
 ## Design notes
 
-- **The builder re-derives windows; it never calls the engine's walk.** That is
-  what keeps `windows_through` an *independent* oracle for §12.1 — a builder
-  built on the engine's enumeration would agree with it by construction, which
-  is the deleted-detector failure `CLAUDE.md` warns about. The enumeration is
-  vectorised numpy end to end: candidate windows by broadcast, occupancy by one
-  `searchsorted` against the packed stone keys, the decoder table by a second
-  one against the live set.
+- **Two builders, one representation, and a parity detector between them.**
+  The Python builder (`build`/`collate`) is the normative reference: it never
+  calls the engine's window walk, which is what keeps `windows_through` an
+  *independent* oracle for §12.1 — a builder built on the engine's enumeration
+  would agree with it by construction, the deleted-detector failure `CLAUDE.md`
+  warns about. The production path (`collate_positions`/`collate_prefixes`) is
+  Rust in `hexo-py`: rayon-parallel with the GIL released, ~16× the Python
+  path at batch 256, and *allowed* to use the engine's walk precisely because
+  `test_rust_builder.py` holds it exactly equal to the Python output, field
+  for field — the §12.7-style detector a second implementation owes. Both are
+  covered by one `MODEL_REPR_VERSION`.
 
 - **34 canonical patterns, not the spec draft's 32.** The 62 nonempty, nonfull
   6-bit masks fold to `(62 + 6 palindromes) / 2 = 34` orbits under reversal.
@@ -160,7 +167,34 @@ metrics = iterate(model, opt, cfg, np.random.default_rng(0))  # f, KL, H/log|A|,
 | Records / runner integration for the buffer | Design doc §12/§14. The in-memory per-iteration buffer is the paper's own shape; persistence arrives with B2's per-move blob, not with a private writer here. |
 | Checkpoint I/O | The manifest and probe protocol are `hexo-model`'s, and arrive with the package. |
 | Test-time Gumbel MCTS | Design doc §15: the paper's best number, but it measures the search, not the algorithm. |
-| Builder parallelism / `torch.compile` | The CPU builder dominates collection (~1.6 ms/position, single thread); worker parallelism and bucketed compile shapes are the known next perf steps once a real training load exists. |
+| Hand-written Triton kernels | Measured out, for now: after `torch.compile` (which generates fused Triton kernels itself) the forward is no longer the bottleneck, and the remaining costs are memory-bound scatters Inductor already fuses. Revisit if a profile ever shows one kernel dominating. |
+
+## Performance
+
+Measured on the 4070 Ti / 12-core host, batch 256 over the random-playout
+pool (worst-case-dense positions):
+
+| Path | Throughput |
+| --- | --- |
+| Batch build, Rust (`collate_positions`, all cores) | ~9.5 k pos/s (~0.10 ms/pos) |
+| Batch build, Python reference (single thread) | ~0.6 k pos/s |
+| Forward, compiled, bf16 autocast | ~9.4 k pos/s (27 ms/batch) |
+| Forward, eager, bf16 autocast | ~4.4 k pos/s |
+| KLENT iteration, steady state (32 games, cap 200) | ~3 s (was ~30 s eager + Python builder) |
+
+`KlentConfig.compile` turns on one `torch.compile(dynamic=True)` graph shared
+by collection and fitting. Sizes inside the forward come from tensor shapes,
+not the `Batch`'s ints, so one symbolic graph serves every batch shape; the
+first process pays the compile (tens of seconds, partly cached across runs),
+plus one extra specialisation the first time a 0/1-sized dimension appears.
+
+**Platforms.** The deploy target is Linux (WSL2 / the container of
+`CONTAINER_SPEC.md`), where the torch wheel bundles Triton; the
+`triton-windows` dependency is marked `sys_platform == 'win32'` and exists
+only for the Windows dev box. Under WSL, keep the two trees separate from the
+Windows ones: build `hexo-py` with `CARGO_TARGET_DIR=target-wsl` (the repo's
+convention) and give uv its own environment, e.g.
+`UV_PROJECT_ENVIRONMENT=$HOME/.venvs/mantisnet uv sync`.
 
 ## Connections
 

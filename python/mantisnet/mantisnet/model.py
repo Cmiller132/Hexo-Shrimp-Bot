@@ -127,7 +127,9 @@ class _Block(nn.Module):
         self, s: Tensor, w: Tensor, g: Tensor, batch: Batch, bucket: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.cfg
-        p, max_t = batch.n_pos, batch.max_t
+        # Sizes come from tensor shapes, not the Batch's ints: under
+        # torch.compile they become symbolic, so one graph serves every shape.
+        p, max_t = g.shape[0], batch.attn_valid.shape[1]
 
         # §5.1: windows aggregate their stones. Sum, not mean — the count is
         # signal.
@@ -230,7 +232,7 @@ class MantisNet(nn.Module):
         dr = c[:, :, None, 1] - c[:, None, :, 1]
         d = torch.maximum(dq.abs(), torch.maximum(dr.abs(), (dq + dr).abs()))
         bucket = d.clamp(1, cfg.d_max) - 1
-        t = batch.max_t
+        t = c.shape[1]
         eye = torch.eye(t, dtype=torch.bool, device=c.device)
         bucket = bucket.masked_fill(eye, cfg.self_bucket)
         bucket[:, 0, :] = cfg.token_bucket
@@ -262,7 +264,7 @@ class MantisNet(nn.Module):
         gather-sum over the decoder table; background cells overwrite from
         their bucket table; the token half of the MLP runs per position."""
         msg = lin(w).index_select(0, batch.dec_window) + e_w(batch.dec_class)
-        h = g.new_zeros(batch.n_cells, self.cfg.h)
+        h = g.new_zeros(batch.cell_pos.shape[0], self.cfg.h)
         h.index_add_(0, batch.dec_cell, msg.to(h.dtype))
         if batch.bg_cell.numel():
             h.index_copy_(0, batch.bg_cell, e_bg(batch.bg_bucket).to(h.dtype))
@@ -284,13 +286,13 @@ class MantisNet(nn.Module):
         before padding — row-wise, so identical, and the padded copy is
         written once."""
         cfg = self.cfg
-        p = batch.n_pos
-        rows = g.new_zeros(p * batch.max_w, cfg.h)
-        token_slot = torch.arange(p, device=g.device) * batch.max_w
+        p, max_w = g.shape[0], batch.value_valid.shape[1]
+        rows = g.new_zeros(p * max_w, cfg.h)
+        token_slot = torch.arange(p, device=g.device) * max_w
         rows.index_copy_(0, token_slot, self.ln_value(g))
         if batch.window_slot.numel():
             rows.index_copy_(0, batch.window_slot, self.ln_value(w).to(rows.dtype))
-        kv = rows.view(p, batch.max_w, cfg.h)
+        kv = rows.view(p, max_w, cfg.h)
         scores = torch.einsum("qh,pth->pqt", self.value_queries, kv) / math.sqrt(cfg.h)
         scores = scores.masked_fill(
             ~batch.value_valid[:, None, :], torch.finfo(scores.dtype).min

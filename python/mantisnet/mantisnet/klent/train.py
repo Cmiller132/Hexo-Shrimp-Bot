@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from ..builder import collate, from_position
+from ..builder import collate_prefixes
 from ..losses import policy_loss
 from .seeds import seed_prefix
 from .selfplay import Sample, episode_samples, play_episodes
@@ -37,61 +37,74 @@ class KlentConfig:
     lr: float = 1e-3  # paper's Adam rate
     device: str = "cpu"
     autocast: bool = False  # bf16 autocast for the network passes
+    compile: bool = False  # torch.compile the policy/Q pass (one-time cost)
+
+
+def _policy_q(model, batch):
+    """The KLENT pass: trunk + the two heads it trains, never the value head."""
+    _s, w, g = model.trunk(batch)
+    return model.policy_head(w, g, batch), model.q_head(w, g, batch)
+
+
+# One symbolic-shape graph serves every batch; compiled lazily, shared by
+# collection and fitting (the same graph gets the compiled backward).
+_policy_q_compiled = None
+
+
+def _policy_q_fn(cfg: KlentConfig):
+    global _policy_q_compiled
+    if not cfg.compile:
+        return _policy_q
+    if _policy_q_compiled is None:
+        _policy_q_compiled = torch.compile(_policy_q, dynamic=True)
+    return _policy_q_compiled
 
 
 def network_evaluate(model, cfg: KlentConfig):
-    """The self-play evaluator: trunk + policy + Q, never the value head.
-
-    Returns flat CPU tensors so the collection loop stays device-ignorant.
-    """
+    """The self-play evaluator, returning flat CPU tensors so the collection
+    loop stays device-ignorant."""
+    policy_q = _policy_q_fn(cfg)
 
     def evaluate(batch):
         b = batch.to(cfg.device)
         with torch.no_grad(), torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
-            _s, w, g = model.trunk(b)
-            policy = model.policy_head(w, g, b)
-            q = model.q_head(w, g, b)
+            policy, q = policy_q(model, b)
         return policy.float().cpu(), q.float().cpu()
 
     return evaluate
 
 
 def _rebuild(samples: list[Sample]):
-    """Buffer states back into graphs by replay (design doc §12: a position
-    is a move prefix). Refuses a sample whose stored π′ no longer matches the
-    position's legal count — that misalignment trains against scrambled
-    targets and has no downstream symptom."""
-    import hexo_py
-
-    graphs = []
-    for s in samples:
-        pos = hexo_py.Position.replay(list(s.moves[: s.t]))
-        graph = from_position(pos)
-        if graph.n_legal != len(s.improved):
+    """Buffer states back into one batch by parallel replay (design doc §12:
+    a position is a move prefix). Refuses a sample whose stored π′ no longer
+    matches its position's legal count — that misalignment trains against
+    scrambled targets and has no downstream symptom."""
+    batch = collate_prefixes([s.moves for s in samples], [s.t for s in samples])
+    counts = (batch.legal_offsets[1:] - batch.legal_offsets[:-1]).tolist()
+    for s, count in zip(samples, counts):
+        if count != len(s.improved):
             raise ValueError(
                 f"sample at ply {s.t}: stored pi' has {len(s.improved)} entries, "
-                f"position has {graph.n_legal} legal moves"
+                f"position has {count} legal moves"
             )
-        graphs.append(graph)
-    return graphs
+    return batch
 
 
 def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.random.Generator):
     """One epoch over the buffer. Returns the mean loss components."""
     model.train()
+    policy_q = _policy_q_fn(cfg)
     order = rng.permutation(len(samples))
     policy_sum, q_sum, steps = 0.0, 0.0, 0
     for start in range(0, len(order), cfg.batch_size):
         chunk = [samples[i] for i in order[start : start + cfg.batch_size]]
-        batch = collate(_rebuild(chunk)).to(cfg.device)
+        batch = _rebuild(chunk).to(cfg.device)
         target = torch.from_numpy(np.concatenate([s.improved for s in chunk])).to(cfg.device)
         ranks = torch.tensor([s.rank for s in chunk], device=cfg.device)
         returns = torch.tensor([s.g for s in chunk], dtype=torch.float32, device=cfg.device)
 
         with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
-            _s, w, g = model.trunk(batch)
-            policy_logits = model.policy_head(w, g, batch)
-            q_values = model.q_head(w, g, batch)
+            policy_logits, q_values = policy_q(model, batch)
         ce = policy_loss(policy_logits.float(), batch.legal_offsets, target)
         taken = q_values.float().index_select(0, batch.legal_offsets[:-1] + ranks)
         q_mse = (taken - returns).square().mean()

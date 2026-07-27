@@ -12,6 +12,8 @@ from .builder import (
     PositionGraph,
     build,
     collate,
+    collate_positions,
+    collate_prefixes,
     from_position,
 )
 from .losses import param_groups, policy_loss, value_loss, value_target
@@ -24,6 +26,8 @@ __all__ = [
     "PositionGraph",
     "build",
     "collate",
+    "collate_positions",
+    "collate_prefixes",
     "from_position",
     "MantisConfig",
     "MantisNet",

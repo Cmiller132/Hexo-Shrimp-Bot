@@ -11,18 +11,18 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from ..builder import collate, from_position
+from ..builder import collate_positions
 
 
 def argmax_choose(model, device: str = "cpu"):
     """A chooser playing the policy head's argmax over the legal set."""
 
     def choose(pos, _rng):
-        batch = collate([from_position(pos)]).to(device)
+        batch = collate_positions([pos]).to(device)
         with torch.no_grad():
             _s, w, g = model.trunk(batch)
             logits = model.policy_head(w, g, batch)
-        return pos.legal_moves()[int(logits.argmax())]
+        return pos.nth_legal(int(logits.argmax()))
 
     return choose
 

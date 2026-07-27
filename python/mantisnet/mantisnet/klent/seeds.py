@@ -7,36 +7,43 @@ giving backward induction somewhere to start. The seed source here is the
 checkpoint-free one the design doc names: a scripted line builder that
 extends its own longest clean line and therefore terminates in tens of plies.
 
-The same chooser doubles as a fixed evaluation opponent — one implementation,
-two callers.
+The same chooser doubles as a fixed evaluation opponent, and its scoring —
+each legal cell's best own live window — is the scripted evaluator the
+pipeline tests drive the collection loop with. One implementation, three
+callers, all reading the builder's own batch arrays.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import torch
+
+from ..builder import NUM_PATTERNS, PATTERN_STONES, collate_positions
+
+_STONES = torch.from_numpy(PATTERN_STONES)
+
+
+def line_scores(batch) -> torch.Tensor:
+    """Per legal cell: the stone count of its best own live window, with a
+    six-completing cell scored decisively above every extension."""
+    own = batch.window_feat < NUM_PATTERNS
+    wscore = torch.where(own, _STONES[batch.window_feat % NUM_PATTERNS], 0)
+    per_cell = torch.zeros(batch.n_cells)
+    per_cell.index_reduce_(
+        0, batch.dec_cell, wscore.index_select(0, batch.dec_window).float(), "amax"
+    )
+    return torch.where(per_cell >= 5, 8.0, per_cell)
 
 
 def line_builder_choose(pos, rng: np.random.Generator, noise: float = 0.1):
-    """One placement: the legal cell with the longest own run through it
-    among windows free of opposing stones, with ``noise`` chance of a
+    """One placement: the best-scoring legal cell, with ``noise`` chance of a
     uniformly random legal move. Ties break randomly so two line builders
     produce different games."""
-    legal = pos.legal_moves()
     if rng.random() < noise:
-        return legal[rng.integers(len(legal))]
-    me = pos.current_player
-    scores = np.empty(len(legal), dtype=np.int64)
-    for i, (q, r) in enumerate(legal):
-        best = 0
-        for _axis, _sq, _sr, m0, m1 in pos.windows_through(q, r):
-            own, theirs = (m0, m1) if me == 0 else (m1, m0)
-            if theirs == 0:
-                count = bin(own).count("1")
-                if count > best:
-                    best = count
-        scores[i] = best
+        return pos.nth_legal(int(rng.integers(pos.legal_count)))
+    scores = line_scores(collate_positions([pos])).numpy()
     top = np.flatnonzero(scores == scores.max())
-    return legal[top[rng.integers(len(top))]]
+    return pos.nth_legal(int(top[rng.integers(len(top))]))
 
 
 def line_builder_game(rng: np.random.Generator, noise: float = 0.1, cap: int = 512):

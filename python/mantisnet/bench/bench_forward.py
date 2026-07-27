@@ -16,7 +16,7 @@ import time
 import hexo_py
 import torch
 
-from mantisnet import MantisConfig, MantisNet, collate, from_position
+from mantisnet import MantisConfig, MantisNet, collate, collate_positions, from_position
 
 
 def make_positions(count: int, seed: int) -> list[hexo_py.Position]:
@@ -59,6 +59,7 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--iters", type=int, default=50)
     ap.add_argument("--seed", type=int, default=99)
+    ap.add_argument("--compile", action="store_true", help="torch.compile the forward")
     args = ap.parse_args()
 
     positions = make_positions(args.batch, args.seed)
@@ -69,20 +70,30 @@ def main() -> None:
     t0 = time.perf_counter()
     batch = collate(graphs)
     collate_s = time.perf_counter() - t0
+    collate_positions(positions)  # warm the rayon pool
+    t0 = time.perf_counter()
+    batch = collate_positions(positions)
+    rust_s = time.perf_counter() - t0
 
     stones = sum(g.n_stones for g in graphs)
     windows = sum(g.n_windows for g in graphs)
     cells = sum(g.n_legal for g in graphs)
     print(f"pool: {len(graphs)} positions | {stones} stones | {windows} live windows | {cells} legal cells")
-    print(f"build:   {len(graphs) / build_s:8.0f} pos/s  ({build_s * 1e3 / len(graphs):.3f} ms/pos, single thread)")
-    print(f"collate: {len(graphs) / collate_s:8.0f} pos/s")
+    print(f"build[python]: {len(graphs) / build_s:8.0f} pos/s  ({build_s * 1e3 / len(graphs):.3f} ms/pos, single thread)")
+    print(f"collate[python]: {len(graphs) / collate_s:6.0f} pos/s")
+    print(f"batch[rust]:   {len(graphs) / rust_s:8.0f} pos/s  ({rust_s * 1e3 / len(graphs):.3f} ms/pos, build+collate, all cores)")
 
     torch.manual_seed(0)
     net = MantisNet(MantisConfig()).eval()
     params = sum(p.numel() for p in net.parameters())
     print(f"model: {params / 1e6:.2f} M parameters, batch max_t={batch.max_t} max_w={batch.max_w}")
+    if args.compile:
+        net = torch.compile(net, dynamic=True)
 
-    for device in ["cpu"] + (["cuda"] if torch.cuda.is_available() else []):
+    devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
+    if args.compile:
+        devices = [d for d in devices if d == "cuda"]  # the deploy target
+    for device in devices:
         net_d, batch_d = net.to(device), batch.to(device)
         modes = [("fp32", False)] + ([("bf16", True)] if device == "cuda" else [])
         for name, ac in modes:

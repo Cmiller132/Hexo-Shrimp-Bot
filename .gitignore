@@ -12,6 +12,9 @@ __pycache__/
 *.pyd
 *.egg-info/
 .venv/
+# A WSL-side venv, if placed in-tree rather than under $HOME (see
+# python/mantisnet/README.md) — same collision logic as target-wsl.
+.venv-wsl/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

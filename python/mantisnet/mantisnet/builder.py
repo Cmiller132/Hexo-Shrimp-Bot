@@ -57,6 +57,10 @@ _PATTERN_RANK[_CANONICAL] = np.arange(len(_CANONICAL))
 # orbits under reversal. (MODEL_SPEC §3.2.)
 NUM_PATTERNS = len(_CANONICAL)
 
+# Stones in each canonical pattern, indexed by rank — reversal preserves the
+# count, so this is well-defined per orbit.
+PATTERN_STONES = np.array([bin(int(m)).count("1") for m in _CANONICAL])
+
 # Slot class of slot s in 0..5: min(s, 5 - s) — end / near-end / centre (§4.3).
 _SLOT_CLASS = np.minimum(np.arange(WINDOW_LEN), WINDOW_LEN - 1 - np.arange(WINDOW_LEN))
 
@@ -308,6 +312,42 @@ class Batch:
             for name, v in vars(self).items()
         }
         return Batch(**moved)
+
+
+def _batch_from_arrays(raw: dict) -> Batch:
+    """A `Batch` from the Rust builder's array dict (same field names)."""
+    t = {name: torch.from_numpy(arr) for name, arr in raw.items()}
+    p, max_t = t["attn_valid"].shape
+    return Batch(
+        n_pos=int(p),
+        max_t=int(max_t),
+        max_w=int(t["value_valid"].shape[1]),
+        n_cells=int(t["cell_pos"].shape[0]),
+        **t,
+    )
+
+
+def collate_positions(positions) -> Batch:
+    """Positions straight to one collated batch, through the Rust builder.
+
+    The production path: `hexo_py.build_batch` builds every position in
+    parallel with the GIL released. Field-for-field equal to
+    ``collate([from_position(p) ...])`` — the parity tests are what let the
+    two share `MODEL_REPR_VERSION`.
+    """
+    import hexo_py
+
+    return _batch_from_arrays(hexo_py.build_batch(list(positions)))
+
+
+def collate_prefixes(games, ts) -> Batch:
+    """Move prefixes to one collated batch: replay + build, in parallel.
+
+    The fitting path — a stored position is a move prefix (KLENT design §12).
+    """
+    import hexo_py
+
+    return _batch_from_arrays(hexo_py.build_batch_prefixes(list(games), list(ts)))
 
 
 def collate(graphs: list[PositionGraph]) -> Batch:

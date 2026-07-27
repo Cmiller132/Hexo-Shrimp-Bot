@@ -7,6 +7,7 @@ dependencies = [
     "numpy>=2",
     "torch>=2.8",
     "hexo-py",
+    "triton-windows>=3.7.1.post27 ; sys_platform == 'win32'",
 ]
 
 [dependency-groups]
