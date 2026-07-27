@@ -175,6 +175,19 @@ impl EncodedBatch {
         self.offsets.len() - 2
     }
 
+    /// Append one already-encoded item verbatim, returning its index.
+    ///
+    /// [`EncodedBatch::push_with`] is the worker-side append, taken while the
+    /// leaf position still exists. By the time those bytes are merged into a
+    /// device-bound batch on a batcher thread the position is gone — which is
+    /// the point of encoding worker-side — so the merge appends the bytes
+    /// themselves rather than pretending to re-encode.
+    pub fn push_bytes(&mut self, item: &[u8]) -> usize {
+        self.data.extend_from_slice(item);
+        self.offsets.push(self.data.len());
+        self.offsets.len() - 2
+    }
+
     /// How many items the batch holds.
     #[inline]
     #[must_use]
