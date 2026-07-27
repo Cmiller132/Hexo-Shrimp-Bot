@@ -1,0 +1,34 @@
+[project]
+name = "mantisnet"
+version = "0.1.0"
+description = "MantisNet: the stone/window graph network of docs/MODEL_SPEC.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2",
+    "torch>=2.8",
+    "hexo-py",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.uv.sources]
+hexo-py = { path = "../hexo-py" }
+torch = { index = "pytorch-cu128" }
+
+# CUDA wheels; the target device is the container spec's 4070 Ti. `explicit`
+# keeps every other dependency on PyPI.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mantisnet"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
