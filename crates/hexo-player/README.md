@@ -27,7 +27,7 @@ crates/hexo-player/
 
 | Module | Role |
 | --- | --- |
-| `player` | `Player`: one method, `choose`, taking the whole `&Game`. What a human, a scripted bot, or a transport adapter implements. |
+| `player` | `Player`: one method, `choose`, taking the whole `&Game` and returning the whole `Decision`. What a human, a scripted bot, or a transport adapter implements. |
 | `model` | `Model`: two required methods, one per `Mode`, on the same `&Game`. `ModelPlayer` binds a model to a mode and is the only bridge between the two traits. |
 | `table` | `Table` owns one `Game` and its two seats; `sweep` drives many at once. |
 
@@ -62,10 +62,22 @@ crates/hexo-player/
 
 - **A player is handed the canonical game, not a replay mirror.** In process the
   driver already holds it and ownership already makes it read-only. The mirror
-  belongs in the same change as the transport that needs it; until then the
-  echoed `zobrist` is the canonical one.
+  belongs in the same change as the transport that needs it — but a seat that
+  keeps one anyway attests the mirror's hash, and the test suite's `Mirrorer`
+  does exactly that.
 
-- **`choose` returns `Action`, not `Reply`.** `Reply::Failed` is driver-reported:
+- **`choose` returns the whole `Decision`, not a bare `Action`.** Two of its
+  fields can only be authored by the seat. The `zobrist` is an attestation of
+  the position the seat actually chose from — a driver that filled it in from
+  the canonical game would be the desync check vouching for itself — and the
+  `diagnostics` are the seat's training annotations, which nothing downstream
+  could invent. The driver submits the decision verbatim. If the game refuses
+  it as a desync, the driver reports `Failure::Desync` and the failure policy
+  adjudicates, so one broken seat ends its own game rather than the sweep; a
+  transport adapter that can resync its remote does so inside `choose`, before
+  the decision is ever submitted.
+
+- **`choose` still does not return `Reply`.** `Reply::Failed` is driver-reported:
   a seat cannot declare itself crashed. Resignation is the first extension, and is
   absent until something can evaluate its own position well enough to give up.
 
@@ -89,6 +101,6 @@ crates/hexo-player/
 
 ## Connections
 
-- Depends on `hexo-engine` for `Action` and the position read surface, and on
-  `hexo-runner` for `Game` — which is the whole seat argument, and carries the
-  record, the spec, and the result model with it.
+- Depends on `hexo-engine` for the seat type and the position read surface, and
+  on `hexo-runner` for `Game` and `Decision` — the seat's whole argument and its
+  whole answer, carrying the record, the spec, and the result model with them.

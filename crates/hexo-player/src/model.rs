@@ -1,8 +1,7 @@
 //! What a trainable player must provide, and how it becomes a [`Player`].
 
 use crate::player::Player;
-use hexo_engine::Action;
-use hexo_runner::Game;
+use hexo_runner::{Decision, Game};
 
 /// How a model is being asked to play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -18,12 +17,17 @@ pub enum Mode {
 /// Two methods rather than one taking a [`Mode`], because a mode argument can be
 /// ignored: that compiles, passes, and yields a self-play run of one repeated
 /// game.
+///
+/// Both return the whole [`Decision`], because the model is where its extra
+/// fields originate: the `diagnostics` are the training annotations — visit
+/// counts, value targets, whatever the trainer wants on the record — and the
+/// `zobrist` attests the position the model chose from (see [`Player::choose`]).
 pub trait Model {
     /// Choose by sampling. Must vary between calls, or the training set collapses.
-    fn self_play_move(&mut self, game: &Game) -> Action;
+    fn self_play_move(&mut self, game: &Game) -> Decision;
 
     /// Choose near-best. Not argmax — two deterministic seats replay one game.
-    fn eval_move(&mut self, game: &Game) -> Action;
+    fn eval_move(&mut self, game: &Game) -> Decision;
 }
 
 /// A [`Model`] bound to a [`Mode`]. Dispatch only; no selection logic lives here.
@@ -61,7 +65,7 @@ impl<M> ModelPlayer<M> {
 }
 
 impl<M: Model> Player for ModelPlayer<M> {
-    fn choose(&mut self, game: &Game) -> Action {
+    fn choose(&mut self, game: &Game) -> Decision {
         match self.mode {
             Mode::SelfPlay => self.model.self_play_move(game),
             Mode::Eval => self.model.eval_move(game),

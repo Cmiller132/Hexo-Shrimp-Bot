@@ -7,17 +7,19 @@
 //! fills it; a consumer importing both aliases one.
 //!
 //! ```
-//! use hexo_engine::Action;
 //! use hexo_player::{Player, Table, sweep};
-//! use hexo_runner::{Game, GameSpec};
+//! use hexo_runner::{Decision, Game, GameSpec};
 //! use std::num::NonZeroU32;
 //!
 //! /// Takes the lowest-ranked legal placement, every time.
 //! struct Lowest;
 //!
 //! impl Player for Lowest {
-//!     fn choose(&mut self, game: &Game) -> Action {
-//!         game.position().nth_legal(0).expect("a running game has a legal placement")
+//!     fn choose(&mut self, game: &Game) -> Decision {
+//!         let action = game.position().nth_legal(0).expect("a running game has a legal placement");
+//!         // The hash is the seat's attestation of the position it chose from —
+//!         // for a seat reading the canonical game, the canonical hash.
+//!         Decision::new(action, game.position().zobrist())
 //!     }
 //! }
 //!

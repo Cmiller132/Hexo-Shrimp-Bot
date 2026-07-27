@@ -25,6 +25,7 @@ reused, because other documents cite it.
 | C3 | The binary crate, and its modes | `CONTAINER_SPEC.md` §3: `hexo-bot`, with `train`, `serve`, and `play`. Self-play is not a mode — it is the first phase of `train`, because one loop cannot be split into pieces that could drift from it |
 | C5 | ~~`R` for dense action indexing~~ — **withdrawn**, not answered: a fixed radius-20 crop makes wins outside the crop unrepresentable, so the action space silently stops matching the game | `crates/hexo-engine/README.md`; the canonical unbounded ordering replaced it |
 | C6 | One image or two | `CONTAINER_SPEC.md` §2. One: a play-only image would need a second implementation of the model's forward pass, which the no-dual-paths rule forbids and which could silently disagree with the first |
+| B6 | What a seat returns — a bare action, or the whole decision | `crates/hexo-player/README.md`. The whole `Decision`: the hash attestation and the diagnostics can only be authored by the seat, so a driver that filled either in was deleting the desync detector and discarding the training annotations. `Failure::Desync` carries a refused attestation into adjudication |
 
 ---
 
@@ -46,28 +47,6 @@ field at all**, deliberately.
 This stops being optional the moment a player samples rather than maximising:
 seeds must then be minted and recorded, derived from stable game and seat ids so
 that scheduling cannot change a run.
-
----
-
-## B6. What a seat returns — `Action`, or the whole `Decision`
-
-`Player::choose` and `Model`'s two methods return a bare `Action`; `Game::submit`
-accepts a `Decision { action, zobrist, diagnostics }`. `Table::step` bridges the
-gap by echoing the canonical hash and filling `diagnostics` with `None`. Two
-consequences, both found by hostile review (2026-07-27):
-
-- A model that computes training annotations — visit counts, value targets —
-  cannot get them into `PlyRecord` through `Table`; only a direct `Game::submit`
-  caller can persist diagnostics, so the supplied self-play path records none.
-- A future out-of-process seat cannot echo *its own* mirror's hash, so the
-  `Desync` check degenerates: the driver reads the canonical hash and hands it
-  straight back.
-
-Neither bites today — no model exists, in-process seats deliberately read the
-canonical `Game`, and remote seats are C1 territory. The moment either becomes
-real, the seat methods likely widen to return a `Decision`-shaped value, and the
-question is the ergonomics for the seat that has only an action. Decide then;
-widening now would be building for a caller that does not exist.
 
 ---
 

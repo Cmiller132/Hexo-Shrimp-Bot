@@ -64,7 +64,10 @@ pub enum Step {
         generation: u64,
         /// What this seat is told it may spend.
         budget: Budget,
-        /// The hash of the position being decided in.
+        /// The hash of the position being decided in. Request framing for the
+        /// seat — a mirror-keeping seat compares it against its own before it
+        /// spends any search. It is not for the driver to copy into a
+        /// [`crate::Decision`]: the decision's hash is the seat's attestation.
         zobrist: u64,
         /// Placements made so far.
         ply: u32,
@@ -192,6 +195,7 @@ impl Game {
                         Failure::Timeout => WinReason::Timeout,
                         Failure::Crashed => WinReason::Crash,
                         Failure::Protocol => WinReason::Protocol,
+                        Failure::Desync { expected, got } => WinReason::Desync { expected, got },
                     },
                 },
                 FailurePolicy::NoContest => {

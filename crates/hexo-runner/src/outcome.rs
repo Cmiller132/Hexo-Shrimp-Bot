@@ -65,6 +65,13 @@ pub enum WinReason {
     Crash,
     /// The other seat answered, but unintelligibly.
     Protocol,
+    /// The other seat answered from a position that is not the game's.
+    Desync {
+        /// The canonical hash.
+        expected: u64,
+        /// The hash the seat attested.
+        got: u64,
+    },
 }
 
 /// Why a game ended without a winner, blamelessly.

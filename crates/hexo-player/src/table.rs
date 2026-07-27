@@ -2,7 +2,7 @@
 
 use crate::player::Player;
 use hexo_engine::Player as Seat;
-use hexo_runner::{Decision, Game, GameSpec, MatchResult, Reply, Step};
+use hexo_runner::{Failure, Game, GameSpec, MatchResult, Reply, Step, SubmitError};
 
 /// One game and the two seats playing it.
 ///
@@ -50,24 +50,32 @@ impl<P: Player> Table<P> {
         self.seats
     }
 
-    /// Ask the seat on turn for one placement and submit it. `Some` once the game
-    /// has ended, whether on this placement or before the call.
+    /// Ask the seat on turn for one placement and submit it — verbatim, hash
+    /// attestation and diagnostics included. `Some` once the game has ended,
+    /// whether on this placement or before the call.
     pub fn step(&mut self) -> Option<MatchResult> {
         let Step::NeedDecision {
-            seat,
-            generation,
-            zobrist,
-            ..
+            seat, generation, ..
         } = self.game.step()
         else {
             return self.game.result();
         };
 
-        let action = self.seats[seat.index()].choose(&self.game);
-        self.game
-            .submit(generation, Reply::Place(Decision::new(action, zobrist)))
-            .expect("the generation and hash were read from this game on the line above")
-            .result
+        let decision = self.seats[seat.index()].choose(&self.game);
+        match self.game.submit(generation, Reply::Place(decision)) {
+            Ok(transition) => transition.result,
+            Err(SubmitError::Desync { expected, got }) => {
+                // The seat chose from a position that is not the game's. This
+                // driver has nothing to resync — a transport adapter that can
+                // does so inside `choose`, before the decision reaches here —
+                // so it gives up on the turn and lets policy adjudicate.
+                self.game
+                    .submit(generation, Reply::Failed(Failure::Desync { expected, got }))
+                    .expect("a refused submission leaves the generation unchanged")
+                    .result
+            }
+            Err(e) => unreachable!("the generation was read from this game above: {e}"),
+        }
     }
 
     /// Drive this game to its end, which [`GameSpec::ply_cap`] bounds.

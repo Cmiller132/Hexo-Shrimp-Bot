@@ -77,7 +77,12 @@ arrow points that way and never back.
   or duplicated reply from playing a move chosen for a position the game has
   moved past — reachable the moment decisions are batched or cross a process
   boundary. The echoed `zobrist` catches a mirror whose *board content* has
-  drifted, on the ply it drifts rather than at the end of a corrupted game.
+  drifted, on the ply it drifts rather than at the end of a corrupted game. The
+  echo is the **seat's** attestation — its own mirror's hash, if it keeps one —
+  and a driver must never fill it in from the canonical position, which would be
+  the check vouching for itself. A refused desync leaves the game live at the
+  same generation, so a driver that can resync its seat may retry; one that
+  cannot reports `Failure::Desync` and the failure policy adjudicates.
 
   Neither guard sees move order within a turn. A mirror that replays an
   opponent's non-winning two-stone turn in the opposite order reaches the same

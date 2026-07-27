@@ -430,7 +430,15 @@ fn an_engine_limit_is_a_no_contest_and_blames_nobody() {
 #[test]
 fn every_failure_kind_obeys_each_failure_policy() {
     for policy in [FailurePolicy::Forfeit, FailurePolicy::NoContest] {
-        for failure in [Failure::Timeout, Failure::Crashed, Failure::Protocol] {
+        for failure in [
+            Failure::Timeout,
+            Failure::Crashed,
+            Failure::Protocol,
+            Failure::Desync {
+                expected: 0xFEED,
+                got: 0xF00D,
+            },
+        ] {
             let mut game = Game::new(GameSpec {
                 on_failure: policy,
                 ..GameSpec::default()
@@ -445,6 +453,7 @@ fn every_failure_kind_obeys_each_failure_policy() {
                         Failure::Timeout => WinReason::Timeout,
                         Failure::Crashed => WinReason::Crash,
                         Failure::Protocol => WinReason::Protocol,
+                        Failure::Desync { expected, got } => WinReason::Desync { expected, got },
                     },
                 },
                 FailurePolicy::NoContest => {

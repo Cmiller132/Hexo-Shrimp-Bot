@@ -2,7 +2,10 @@
 
 use hexo_engine::{Action, HexCoord, MoveError, Player as Seat, Position};
 use hexo_player::{Mode, Model, ModelPlayer, Player, Table, sweep};
-use hexo_runner::{Decision, DrawReason, Game, GameSpec, MatchResult, Reply, Step, WinReason};
+use hexo_runner::{
+    Decision, DrawReason, Failure, FailurePolicy, Game, GameSpec, MatchResult, NoContest, Reply,
+    Step, WinReason,
+};
 use std::num::NonZeroU32;
 
 fn cap(value: u32) -> NonZeroU32 {
@@ -35,15 +38,23 @@ fn opened_game() -> Game {
     game
 }
 
+/// The attestation of a seat that chose from the canonical game it was handed.
+fn attest(game: &Game, action: Action) -> Decision {
+    Decision::new(action, game.position().zobrist())
+}
+
 /// Takes the lowest-ranked legal placement, every time.
 #[derive(Clone, Debug)]
 struct Lowest;
 
 impl Player for Lowest {
-    fn choose(&mut self, game: &Game) -> Action {
-        game.position()
-            .nth_legal(0)
-            .expect("a running game has a legal placement")
+    fn choose(&mut self, game: &Game) -> Decision {
+        attest(
+            game,
+            game.position()
+                .nth_legal(0)
+                .expect("a running game has a legal placement"),
+        )
     }
 }
 
@@ -58,11 +69,11 @@ impl Liner {
 }
 
 impl Player for Liner {
-    fn choose(&mut self, game: &Game) -> Action {
+    fn choose(&mut self, game: &Game) -> Decision {
         match Self::LINE.get(self.next) {
             Some(&(q, r)) => {
                 self.next += 1;
-                Action::new(HexCoord::new(q, r))
+                attest(game, Action::new(HexCoord::new(q, r)))
             }
             None => Lowest.choose(game),
         }
@@ -74,8 +85,8 @@ impl Player for Liner {
 struct AlwaysOrigin;
 
 impl Player for AlwaysOrigin {
-    fn choose(&mut self, _game: &Game) -> Action {
-        Action::new(HexCoord::ORIGIN)
+    fn choose(&mut self, game: &Game) -> Decision {
+        attest(game, Action::new(HexCoord::ORIGIN))
     }
 }
 
@@ -86,28 +97,55 @@ struct Recorder {
 }
 
 impl Player for Recorder {
-    fn choose(&mut self, game: &Game) -> Action {
+    fn choose(&mut self, game: &Game) -> Decision {
         self.seen.push(game.position().current_player());
         Lowest.choose(game)
     }
 }
 
 /// Plays off a mirror rebuilt from the record rather than off the canonical board,
-/// which is the whole reason a seat is handed the game and not a position.
+/// which is the whole reason a seat is handed the game and not a position — and
+/// attests the *mirror's* hash, which the game accepts exactly because the record
+/// replays to the canonical position. A diverged mirror would end the game as a
+/// desync here, so the run itself is the parity check.
 #[derive(Clone, Debug, Default)]
 struct Mirrorer {
     plies_seen: Vec<usize>,
 }
 
 impl Player for Mirrorer {
-    fn choose(&mut self, game: &Game) -> Action {
+    fn choose(&mut self, game: &Game) -> Decision {
         let prefix = game.prefix();
         self.plies_seen.push(prefix.len());
         let mirror = Position::replay(&prefix).expect("the record must replay");
-        assert_eq!(mirror.zobrist(), game.position().zobrist());
-        mirror
+        let action = mirror
             .nth_legal(0)
-            .expect("a running game has a legal placement")
+            .expect("a running game has a legal placement");
+        Decision::new(action, mirror.zobrist())
+    }
+}
+
+/// Annotates every move with the ply index it saw, as a model would with search
+/// statistics.
+#[derive(Clone, Debug)]
+struct Annotator;
+
+impl Player for Annotator {
+    fn choose(&mut self, game: &Game) -> Decision {
+        let ply = game.plies().len() as u8;
+        Lowest.choose(game).with_diagnostics(vec![ply])
+    }
+}
+
+/// Attests a hash that is not its position's, as a diverged mirror would.
+#[derive(Clone, Debug)]
+struct WrongEcho;
+
+impl Player for WrongEcho {
+    fn choose(&mut self, game: &Game) -> Decision {
+        let mut decision = Lowest.choose(game);
+        decision.zobrist ^= 1;
+        decision
     }
 }
 
@@ -119,19 +157,25 @@ struct TwoFaced {
 }
 
 impl Model for TwoFaced {
-    fn self_play_move(&mut self, game: &Game) -> Action {
+    fn self_play_move(&mut self, game: &Game) -> Decision {
         self.self_play_calls += 1;
         let pos = game.position();
         let n = pos.legal_count();
-        pos.nth_legal(self.self_play_calls % n)
-            .expect("index is below the legal count")
+        attest(
+            game,
+            pos.nth_legal(self.self_play_calls % n)
+                .expect("index is below the legal count"),
+        )
     }
 
-    fn eval_move(&mut self, game: &Game) -> Action {
+    fn eval_move(&mut self, game: &Game) -> Decision {
         self.eval_calls += 1;
-        game.position()
-            .nth_legal(0)
-            .expect("a running game has a legal placement")
+        attest(
+            game,
+            game.position()
+                .nth_legal(0)
+                .expect("a running game has a legal placement"),
+        )
     }
 }
 
@@ -195,6 +239,80 @@ fn an_illegal_choice_is_adjudicated_rather_than_prevented() {
     );
 }
 
+/// The reason `choose` returns the whole `Decision`: the seat's annotations reach
+/// the record verbatim, and nothing downstream could have invented them.
+#[test]
+fn seat_diagnostics_reach_the_record() {
+    let seats: [Box<dyn Player>; 2] = [Box::new(Annotator), Box::new(Lowest)];
+    let mut table = Table::new(spec(8), seats);
+    table.run();
+
+    let plies = table.game().plies();
+    assert_eq!(plies.len(), 9, "the cap of 8 falls mid-turn");
+    for (i, ply) in plies.iter().enumerate() {
+        match ply.seat {
+            Seat::P0 => assert_eq!(
+                ply.diagnostics.as_deref(),
+                Some(&[i as u8][..]),
+                "ply {i}: the annotation was lost or rewritten"
+            ),
+            Seat::P1 => assert_eq!(ply.diagnostics, None, "ply {i}: an annotation appeared"),
+        }
+    }
+}
+
+/// A wrong attestation is a seat failure like any other, adjudicated by policy —
+/// not masked by the driver echoing the canonical hash on the seat's behalf.
+#[test]
+fn a_wrong_attestation_forfeits_the_seat_under_the_default_policy() {
+    let seats: [Box<dyn Player>; 2] = [Box::new(WrongEcho), Box::new(Lowest)];
+    let mut table = Table::new(GameSpec::default(), seats);
+    let result = table.run();
+
+    let canonical = Position::new().zobrist();
+    assert_eq!(
+        result,
+        MatchResult::Decisive {
+            winner: Seat::P1,
+            reason: WinReason::Desync {
+                expected: canonical,
+                got: canonical ^ 1,
+            },
+        }
+    );
+    assert_eq!(
+        table.game().plies().len(),
+        0,
+        "the desynced placement must not reach the record"
+    );
+}
+
+#[test]
+fn a_wrong_attestation_is_a_no_contest_under_that_policy() {
+    let seats: [Box<dyn Player>; 2] = [Box::new(WrongEcho), Box::new(Lowest)];
+    let mut table = Table::new(
+        GameSpec {
+            on_failure: FailurePolicy::NoContest,
+            ..GameSpec::default()
+        },
+        seats,
+    );
+    let result = table.run();
+
+    let canonical = Position::new().zobrist();
+    assert_eq!(
+        result,
+        MatchResult::NoContest(NoContest::SeatFailure {
+            seat: Seat::P0,
+            failure: Failure::Desync {
+                expected: canonical,
+                got: canonical ^ 1,
+            },
+        })
+    );
+    assert!(!result.is_contested());
+}
+
 #[test]
 fn a_step_after_the_end_changes_nothing() {
     let mut table = Table::new(spec(4), [Lowest, Lowest]);
@@ -254,8 +372,11 @@ fn a_model_player_dispatches_on_its_mode() {
     let sampled = self_play.choose(&game);
     let greedy = eval.choose(&game);
 
-    assert_eq!(greedy, game.position().nth_legal(0).expect("legal"));
-    assert_ne!(sampled, greedy, "the two modes must be distinguishable");
+    assert_eq!(greedy.action, game.position().nth_legal(0).expect("legal"));
+    assert_ne!(
+        sampled.action, greedy.action,
+        "the two modes must be distinguishable"
+    );
 
     assert_eq!(self_play.model().self_play_calls, 1);
     assert_eq!(self_play.model().eval_calls, 0);

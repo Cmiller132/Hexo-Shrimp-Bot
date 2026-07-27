@@ -17,12 +17,18 @@ pub enum Budget {
     Wall(Duration),
 }
 
-/// A seat's chosen placement.
+/// A seat's chosen placement — its whole utterance for the turn.
+///
+/// Every field is authored by the seat, never by the driver. `zobrist` is an
+/// attestation: the hash of the position the seat actually chose from — the
+/// canonical one for a seat that reads the canonical [`crate::Game`], its own
+/// mirror's for a seat that keeps one. A driver that fills it in from the
+/// canonical game on the seat's behalf has deleted the desync detector.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     /// Where to place.
     pub action: Action,
-    /// The hash of the position the seat believed it was moving in.
+    /// The hash of the position the seat chose from.
     pub zobrist: u64,
     /// Opaque, seat-owned bytes, persisted verbatim and never interpreted.
     pub diagnostics: Option<Vec<u8>>,
@@ -47,7 +53,7 @@ impl Decision {
     }
 }
 
-/// Why a driver could not get a decision out of a seat.
+/// Why a seat's turn produced no accepted placement, as the driver reports it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Failure {
     /// The seat did not answer within its budget.
@@ -56,6 +62,14 @@ pub enum Failure {
     Crashed,
     /// The seat answered, but the answer could not be understood.
     Protocol,
+    /// The seat answered from a position that is not the game's, and the driver
+    /// could not bring it back into sync.
+    Desync {
+        /// The canonical hash.
+        expected: u64,
+        /// The hash the seat attested.
+        got: u64,
+    },
 }
 
 /// Everything a seat can come back with.
