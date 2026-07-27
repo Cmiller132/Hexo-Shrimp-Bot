@@ -308,6 +308,15 @@ Important constraints:
 - use line-oriented stdio only for external interoperability, not self-play;
 - avoid CPU oversubscription between actors, PyTorch, Rayon, and OpenMP.
 
+**This has a built counterpart** — `CONTAINER_SPEC.md` §7.1 states the topology
+as the container's and `hexo-bot`'s driver is it: lanes rather than actor
+shards, reusable encoding arenas, bounded channels carrying lane handles and
+encoded bytes, one batcher owning the device crossing, one writer owning the
+shard. Two constraints are answered differently on purpose and both are
+recorded: seeds are drawn from entropy rather than from stable ids while
+`OPEN_DECISIONS.md` B4 stays open, and the stdio constraint has nothing to bind
+yet because there is no wire protocol (C1, C2).
+
 ## Current performance snapshot
 
 **These predate the 17-row disk update.** They are kept as the "before" side of
@@ -337,7 +346,10 @@ caught only by someone running `cargo bench` by hand.
 
 The suite itself has since been built (see the two sections below and
 `crates/hexo-engine/README.md`); what remains open is a gate that runs it, and an
-end-to-end acceptance metric, which has nothing to measure until a search exists.
+end-to-end acceptance metric. The second now has something to measure —
+`hexo-bot` reports games, positions, evaluations, batches, and mean batch fill
+per epoch — but against a mock evaluator whose forward pass costs nothing, so
+the number it produces is the harness's throughput and not a model's.
 
 The benchmarks it asked for were:
 
@@ -426,7 +438,11 @@ Two things the numbers say that nobody asked about:
    dictated by an encoder that does not exist yet, and the workspace does not
    keep two versions of anything.
 6. Implement the deterministic runner state machine and result model.
-7. Add bounded actor, evaluator, and record pipelines.
+7. ~~Add bounded actor, evaluator, and record pipelines.~~ Done — `hexo-bot`'s
+   driver: a worker pool over lanes, one batcher thread owning the evaluator
+   crossing, one writer thread owning the shard, and bounded channels in both
+   directions, so a saturated device applies backpressure to the workers rather
+   than growing a queue.
 8. Prototype a batched SoA engine only if end-to-end profiling still shows the
    scalar engine as material. (Bit-covered storage has since landed.)
 

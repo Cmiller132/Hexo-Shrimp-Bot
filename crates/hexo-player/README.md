@@ -3,7 +3,10 @@
 The player seam, and the loop that drives games.
 
 **Status: the seam and the driver are implemented.** No player ships — the crate
-is two traits and a loop until a model exists.
+is two traits and a loop. The model package that exists plays through
+`hexo-search`'s session seam instead, which is the other seat shape and is
+described below; this one is what a human, a scripted bot, or a transport
+adapter implements.
 
 ## Shape
 
@@ -45,9 +48,9 @@ crates/hexo-player/
   match carries no more information than one.
 
 - **No sampler, no temperature, no argmax.** Those are move selection, and move
-  selection is the model's, as its encoding is. This is also what keeps
-  `OPEN_DECISIONS.md` B4 deferred: nothing here samples, so nothing here needs a
-  seed.
+  selection is the model's, as its encoding is. Nothing here samples, so nothing
+  here needs a seed — the sessions in `hexo-search` do sample and do take one,
+  and `OPEN_DECISIONS.md` B4 stays open above that seam rather than this one.
 
 - **A seat is handed the `Game` view, not a position and a budget.** The record
   is the game's history — `Position` keeps none — so a model whose features
@@ -93,14 +96,17 @@ crates/hexo-player/
 
 | Thing | Blocked on |
 | --- | --- |
-| Any actual player | A model. The test suite carries its own seats; none is public |
-| A human seat | C3 — it needs stdin, which arrives with the binary |
+| Any actual player | A seat that wants *this* shape. The test suite carries its own; none is public, and the model package that exists is a `hexo-search` session rather than a `Model` |
+| A human seat | The binary exists and reads no moves from anyone. A human seat needs a way to be asked and to answer, which is the same stdin-and-line-protocol story as C1 and C2 |
 | A remote seat | C1, C2 — the wire protocol, and the replay mirror that comes with it |
-| Recording which mode a game was played in | C4. `ModelPlayer` knows its mode; there is no record format to write it into |
-| Batched evaluation | S3. A separate seam, depending only on `hexo-engine` |
 
 ## Connections
 
 - Depends on `hexo-engine` for the seat type and the position read surface, and
   on `hexo-runner` for `Game` and `Decision` — the seat's whole argument and its
   whole answer, carrying the record, the spec, and the result model with them.
+- `hexo-search` is the *other* seat shape, and the one a model-backed seat
+  wants: a `DecisionSession` may ask a question halfway through its answer, so
+  it can hand its leaves to a batched evaluator, which a blocking `choose`
+  cannot. The two express the same contract about who authors a `Decision` and
+  differ only in that. Neither crate depends on the other.

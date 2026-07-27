@@ -1,15 +1,15 @@
 # Container spec
 
-**Status: design settled; being built.** The `train` loop is under construction
-against the mock model package, in the five crates this document names —
-`hexo-search`, `hexo-records`, `hexo-model`, `crates/models/mock`, and
-`hexo-bot`. **There is no image and there is no Python.** No Dockerfile exists,
-nothing in the workspace depends on PyO3, and no Python-backed model package has
-been written. Where this document describes those, it states the target they
-will be built to, not something that runs today.
+**Status: built and green for the Rust half.** The five crates this document
+names — `hexo-search`, `hexo-records`, `hexo-model`, `crates/models/mock`, and
+`hexo-bot` — are implemented, and `train` and `match` both run against the mock
+model package. **There is no image and there is no Python.** No Dockerfile
+exists, nothing in the workspace depends on PyO3, and no Python-backed model
+package has been written. Where this document describes those, it states the
+target they will be built to, not something that runs today.
 
-This is the normative design target for the container and for those five crates;
-a later phase trues it up against the code as built. Nothing here constrains
+This is the normative design target for the container and for those five crates,
+and it has been trued up against the code as built. Nothing here constrains
 `hexo-engine`, whose contract remains `ENGINE_SPEC.md`. It still says nothing
 about how any particular model works — the trunk, the encoder, and the training
 objective belong to a model package (§5), and the container's entire knowledge
@@ -98,13 +98,24 @@ of adjudicating.
 protocol is designed for this system's needs and translated into; a foreign
 protocol's assumptions never reach `hexo-runner`.
 
-`train` is the mode being built. `serve` and `play` do not exist yet and are
-blocked on C1 and C2: both are entirely wire protocol, and there is no wire
-protocol. The binary therefore ships only the subcommands that work. A stub that
-parses `--seat` and then exits with "not implemented" is a half-implementation
-in the exact sense the workspace forbids — it publishes a command line before
-the thing behind it is designed, and the flags it guessed become the constraint
-the real implementation has to argue its way out of.
+`train` ships. `serve` and `play` do not exist and remain blocked on C1 and C2:
+both are entirely wire protocol, and there is no wire protocol. The binary
+therefore ships only the subcommands that work. A stub that parses `--seat` and
+then exits with "not implemented" is a half-implementation in the exact sense
+the workspace forbids — it publishes a command line before the thing behind it
+is designed, and the flags it guessed become the constraint the real
+implementation has to argue its way out of.
+
+**A fourth subcommand shipped alongside `train`, and it is not a fourth mode.**
+`match` plays two seats — each named by package, checkpoint, package config, and
+session variant — over the same driver `train`'s phases use, and prints a JSON
+report. It adjudicates locally exactly as `train` does: it holds its own `Game`
+values and both seats are in-process sessions, so "exactly one authority per
+game" is untouched and no protocol is implied. It is a local benchmarking
+harness — how one checkpoint is measured against another, or two search shapes
+against each other over one set of weights — rather than a deployment shape, and
+it writes no records (§11). `crates/hexo-bot/README.md` states its flags and its
+seat grammar.
 
 ---
 
@@ -147,7 +158,7 @@ gate that would fail if a native-only dependency crept downward.
 
 None of this is built. No crate in the workspace depends on PyO3 today, and the
 mock package (§5) deliberately needs nothing from this section — which is what
-makes it possible to build and test the entire loop before the boundary exists.
+let the entire loop be built and tested before the boundary exists.
 
 ---
 
@@ -170,11 +181,12 @@ A package owns, and the container never has an opinion about:
 | Its checkpoint weight format | The container stores a file and a manifest, not a description of layers |
 | Its `fit` | The training objective, the optimiser, and the data pipeline |
 
-`--package <name>` selects one at startup, and the name is written into every
-shard header and every checkpoint manifest, so no artefact on disk is ambiguous
-about what produced it. Adding a GNN package or a CNN package is a new crate and
-one registry entry. Neither the engine, nor the runner, nor the record format
-learns anything, and no existing package is touched.
+`train --package <name>` selects one at startup, and a `match` seat names its
+own; either way the name is written into every shard header and every checkpoint
+manifest, so no artefact on disk is ambiguous about what produced it. Adding a
+GNN package or a CNN package is a new crate and one registry entry. Neither the
+engine, nor the runner, nor the record format learns anything, and no existing
+package is touched.
 
 The registry is not a museum. A package that is no longer built against the
 current record format and the current seam comes out in the same change that
@@ -186,6 +198,13 @@ self-play and one for evaluation, for the reason `hexo-player` gives for
 ignore it; that compiles, passes, and produces a self-play run in which every
 game is identical, and no downstream stage can detect it because the data is
 well-formed.
+
+A third constructor, `variant_session`, is optional and **may** default, because
+its default refuses. A variant names a search shape for a comparison or a
+benchmark match (§3), the vocabulary is the package's own, and a package that
+defines none inherits an honest "no such variant" rather than answering with a
+shape nobody chose. That is the line: a default that answers is forbidden, a
+default that declines is not.
 
 **The canonical action ordering is the indexing contract.** The engine owns it
 in both directions — `legal_rank` and `nth_legal` — and every package's policy
@@ -281,7 +300,7 @@ in whether the seat is allowed to ask something mid-answer.
 ### 7.1 Topology
 
 ```
-  G games, held as slots across ~13 worker threads
+  G games, held as slots across T worker threads
   +--------------------------------------+
   | Game (hexo-runner) + DecisionSession |
   |   pump    -> leaf requests           |
@@ -301,14 +320,21 @@ in whether the seat is allowed to ask something mid-answer.
   finished games --(bounded queue)--> writer, 1 thread --> records/<epoch>/
 ```
 
-The worker pool is sized to the silicon — about 13 of the 16 cores — leaving the
-batcher, the writer, and the interpreter's own pools somewhere to run (§13). One
-batcher thread owns the GPU crossing, because that crossing has to be serialised
-anyway and a second batcher would only contend for the same lock and the same
-device. One writer thread owns records, so the format has exactly one writer and
-no worker ever touches a file. Every queue is bounded in both directions: a
-saturated GPU applies backpressure to the workers rather than growing a queue
-until the process is killed.
+The worker pool is sized to the silicon rather than to the game count:
+`--threads`, defaulting to the host's parallelism less three so that the
+batcher, the writer, and — once there is one — the interpreter's own pools have
+somewhere to run (§13). On this machine that is a number to set deliberately
+rather than inherit, at about 13 of the 16 cores, once PyTorch's pools are
+budgeted against the same 32 threads. One batcher thread owns the GPU crossing,
+because that crossing has to be serialised anyway and a second batcher would
+only contend for the same lock and the same device. One writer thread owns
+records, so the format has exactly one writer and no worker ever touches a file.
+Every queue is bounded in both directions: a saturated GPU applies backpressure
+to the workers rather than growing a queue until the process is killed.
+
+`crates/hexo-bot/README.md` states this topology in the shapes it took — lanes
+checked out of a ready queue, two bounded channels, and the token argument that
+is why it cannot deadlock.
 
 ### 7.2 G and B are different numbers
 
@@ -343,13 +369,16 @@ Self-play and fitting are **one mode, not two**. One invocation runs a whole
 training run and is expected to stay up for days.
 
 ```
-hexo-bot train --run-dir <dir> --run-id <id> --package <name> --epochs N [--resume]
+hexo-bot train --run-dir <dir> --run-id <id> --package <name> --epochs N --games G [--resume]
 
 for epoch in 0..N:
     1. self-play   frozen weights, G concurrent games, produce records
     2. fit         consume this epoch's records, produce new weights
-    3. checkpoint  write weights + manifest
-    4. eval        every K epochs: current vs anchor and older checkpoints
+    3. checkpoint  write weights + manifest, rename into place, then load it —
+                   loading is proving (§10.2)
+    4. eval        every K epochs: current vs the anchor and the checkpoint it
+                   was fit from
+    5. metrics     one line, appended as it happens
 ```
 
 **Why one long-lived process rather than one container per epoch.** The fixed
@@ -374,15 +403,24 @@ make disk growth a function of run length.
 
 ### 8.1 What "long-lived" requires
 
-- **Bounded memory.** No cross-epoch growth. Game slots, encoded batch buffers,
-  and the record buffer are allocated once and reused; the record buffer is
-  cleared at the end of each epoch. Steady-state RSS after epoch 2 is a checked
-  property, not a hope.
+- **Bounded memory.** No cross-epoch growth. Within a phase the encoding arenas
+  circulate through a pool and a lane's session reuses the position buffer and
+  the tree it kept from its last game, so a sweep of a thousand games allocates
+  per game rather than per leaf; across epochs the lanes are rebuilt and each
+  epoch's finished games go to the writer thread and out to a file rather than
+  accumulating in the process. Nothing measures RSS, so this is a property of
+  those shapes rather than a checked one.
 - **Resumable at epoch boundaries only.** `--resume` restarts from the last
   complete checkpoint. A crash mid-epoch discards that epoch's records, which
   costs nothing: they are on-policy and worthless under new weights.
-- **Graceful stop.** `SIGTERM` finishes the phase's in-flight work, writes a
-  checkpoint, and exits. `docker stop` must never lose an epoch.
+- **Graceful stop.** `SIGTERM` — and Ctrl-C, which is the same request — sets a
+  flag that is checked between epochs and inside every sweep. A stop during
+  self-play abandons the partial epoch, records and all: those games were
+  on-policy and are worthless without the fit that was going to consume them, so
+  half an epoch of them is not a smaller epoch. A stop that arrives once the fit
+  has begun lets the fit, the checkpoint, the load that proves it, and the
+  metrics line all complete. `docker stop` therefore never loses an epoch that
+  was going to finish.
 - **Distinguishable exits**, pinned here so that a supervisor, a shell loop, or
   a person reading `docker inspect` does not have to infer them: **0** ran to
   completion, **2** stopped by signal after finishing cleanly, **1** failed. A
@@ -401,7 +439,7 @@ fail.
 | Kind | Examples | Where |
 | --- | --- | --- |
 | Baked | binary, CUDA/Python stack, version constants, the package registry | the image |
-| Injected | run directory, run id, package name, checkpoint reference, epochs, G, B, game spec | flags and env |
+| Injected | run directory, run id, package name and its config, checkpoint reference, epochs, G, B, game spec | flags; nothing is read from the environment |
 | Accumulated | checkpoints, metrics, records | the run directory, on a volume |
 
 Injected values are never guessed. A missing or unparseable one is a loud
@@ -451,10 +489,17 @@ what shape they have is the package's business, carried inside its own weight
 file; the container's manifest answers only which package wrote this, which
 version, and whether it is compatible with this binary.
 
-`--checkpoint` takes a **reference**, resolved from a filesystem path, a
+A checkpoint is named by a **reference**: a filesystem path, a
 `<run-id>/<epoch>` pair, `latest`, or a baked-in default. Shipping a
 tournament-ready bot is then a thin image layer that copies one checkpoint in
 and sets the default — not a separate architecture.
+
+No flag resolves all four forms yet, because nothing needs one: `train` resolves
+its own checkpoints out of the run layout, and a `match` seat takes a directory.
+The `<run-id>/<epoch>` form is already in use — it is what a shard header
+records, because a shard outlives the machine it was written on and an absolute
+path is not a reference. A resolver lands with the first caller that has to name
+a checkpoint it did not write.
 
 ### 10.1 Swapping
 
@@ -518,6 +563,12 @@ recorded per game, because a result cannot be read without it — a `PlyCap` dra
 means nothing unless the cap that produced it is in hand — and because a run is
 free to vary the budget between games in a way it cannot vary the mode within a
 phase.
+
+**Only self-play writes a shard.** An evaluation round and a `match` produce
+evidence about two checkpoints rather than training data, and the metrics line
+and the match report are what carry it; a shard nobody reads would be the
+largest artefact in a run written for no reader. Every shard written so far
+therefore says self-play in its header.
 
 **One implementation, in Rust.** When `fit` needs to read records, the Python
 side calls this reader through the embedded interpreter (§4) rather than growing

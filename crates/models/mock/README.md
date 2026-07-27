@@ -149,11 +149,13 @@ was played in, not the search shape, so a reader that only had the mode could no
 tell a visit table from a prior table without guessing.
 
 **Eval seats record nothing, on purpose.** Annotations exist to be trained on and
-an eval game trains nothing. Its shard is written to be read for results — which
-checkpoint beat which, and how — and diagnostics on it would be bytes nobody
-consumes occupying the largest field in the format. `hexo-records` keeps absent
-and present-but-empty distinguishable, so "this seat answered with nothing" stays
-a fact somebody can check.
+an eval game trains nothing: what an evaluation round produces is which
+checkpoint beat which, and how, which `hexo-bot` reports as a metrics line or a
+match report rather than as a shard (`CONTAINER_SPEC.md` §11). Diagnostics from
+an eval seat would therefore be bytes nobody consumes occupying the largest
+field in the format. `hexo-records` keeps absent and present-but-empty
+distinguishable, so "this seat answered with nothing" stays a fact somebody can
+check.
 
 ## Selection
 

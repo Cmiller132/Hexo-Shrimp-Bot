@@ -144,7 +144,7 @@ crates/hexo-model/
 | --- | --- |
 | A registry | It is one map from name to constructor, and it belongs in `hexo-bot` with the flag that reads it. A registry here would make this crate depend on every package. |
 | Anything about architecture | See above. The container stores a file and a manifest, not a description of layers. |
-| A checkpoint-reference resolver | `--checkpoint` takes a path, a `<run-id>/<epoch>` pair, or `latest` (`CONTAINER_SPEC.md` §10). Resolving those needs the run directory layout, which is `hexo-bot`'s. |
+| A checkpoint-reference resolver | A reference may be a path, a `<run-id>/<epoch>` pair, or `latest` (`CONTAINER_SPEC.md` §10). Resolving one needs the run directory layout, which is `hexo-bot`'s — and nothing resolves all three forms yet, because `train` finds its own checkpoints and a `match` seat is handed a directory. |
 | Atomic checkpoint placement | Writing to a temporary name and renaming is a decision about a whole directory, and belongs to whoever is making one. `Manifest::write` writes a file into a directory the caller owns. |
 | A `Mode` enum | There is no method that takes one, on purpose. |
 | A seed field on the manifest | `CONTAINER_SPEC.md` §12 and `OPEN_DECISIONS.md` B4: nothing mints a per-game seed, so a field for one would read as a guarantee nobody checked. |
@@ -154,7 +154,9 @@ crates/hexo-model/
 - Packages implement `ModelPackage`. `crates/models/mock` is the first, and is
   the one every CI run exercises.
 - `hexo-bot` consumes it: a name registry, `--package` to pick one, and a `train`
-  loop that calls `init`, `load`, the two session constructors, and `fit`.
+  loop that calls `init`, `load`, the two session constructors, and `fit`. Its
+  `match` subcommand is the caller of `variant_session`, which is where a
+  refusing default is the honest answer.
 - `hexo-search` supplies the seam types the trait hands back — `Encoder`,
   `Evaluator`, `DecisionSession` — and owns the two normative conventions on
   `Evaluation` that every package is held to.

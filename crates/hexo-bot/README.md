@@ -138,12 +138,12 @@ was abandoned has nothing to finish.
   `&self` and runs worker-side, so the driver holds a `threads × slots` table of
   them and every thread has its own. `Evaluator::evaluate` takes `&mut self` and
   is the one crossing, so the batcher owns all of them and there is exactly one.
-- **The batcher re-encodes bytes it did not produce.** `EncodedBatch` can only be
-  built by encoding a position, and the positions a job's bytes came from stopped
-  existing when the worker's `pump` callback returned — which is exactly why the
-  encoder runs worker-side. So the batcher merges with a splicing `Encoder` that
-  ignores its position argument and appends bytes that already exist. If
-  `hexo-search` ever grows a `push_bytes`, this is the caller that wants it.
+- **The batcher merges bytes it did not produce.** The positions a job's bytes
+  came from stopped existing when the worker's `pump` callback returned — which
+  is exactly why the encoder runs worker-side — so there is nothing for the
+  batcher to re-encode. It appends the items themselves with
+  `EncodedBatch::push_bytes`, which is the batcher-side half of that seam and
+  exists for this caller.
 
 ## Seeds
 

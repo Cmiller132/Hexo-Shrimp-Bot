@@ -3,8 +3,10 @@
 Match orchestration: the authoritative game, and the policy that decides how a
 match ends.
 
-**Status: the game state machine is implemented.** Transport, players, records
-on disk, and the binary are not.
+**Status: the game state machine is implemented.** Transport is not. The rest of
+what used to be missing here moved *out* of the crate rather than into it: the
+seats are `hexo-player`'s and `hexo-search`'s, the on-disk record format is
+`hexo-records`', and the binary is `hexo-bot`.
 
 ## Shape
 
@@ -141,12 +143,13 @@ arrow points that way and never back.
 | Thing | Blocked on |
 | --- | --- |
 | Wire protocol and transport | C1, C2 — line-delimited stdio over a handshake pinning protocol, rules, and action-order versions |
-| On-disk record format | C4. `PlyRecord` is the in-memory shape; nothing serialises it yet |
-| The binary and its subcommands | C3 |
-| Seed ownership | B4. Deliberately absent rather than decorative — replay determinism comes from the stored action list, so a seed field would reproduce nothing |
+| Seed ownership | B4. Deliberately absent rather than decorative — replay determinism comes from the stored action list, so a seed field would reproduce nothing. `hexo-search`'s sessions take a seed and `hexo-bot` draws one from entropy per game; nothing mints or records one |
 
 ## Connections
 
 - Depends on `hexo-engine` for rules and state.
 - A driver — in-process, subprocess, or container — sits between `Game` and the
-  seats. The runner never learns what a model is.
+  seats. The runner never learns what a model is. `hexo-bot`'s driver is the
+  in-process one, and it advances `Game` directly.
+- `hexo-records` is the byte layout of the shapes defined here — `GameSpec`,
+  `MatchResult`, `PlyRecord` — and adds no field this crate does not have.

@@ -3,9 +3,10 @@
 The on-disk game record: a shard of finished games, written once and read
 strictly.
 
-**Status: the format is implemented.** It settles `OPEN_DECISIONS.md` C4. One
-shard file holds every game from one (run, epoch, phase); nothing yet writes one
-in anger, because no bot loop exists to produce them.
+**Status: the format is implemented, and written in anger.** It settles
+`OPEN_DECISIONS.md` C4. One shard file holds every game from one (run, epoch,
+phase), and `hexo-bot`'s training loop writes one per epoch of self-play and
+hands it to the package's `fit`.
 
 ## Shape
 
@@ -203,5 +204,7 @@ offset in the file.
   runner does not have and drops none it does.
 - `hexo-engine` supplies the replay `verify` checks against, and two of the four
   version constants the header pins.
-- `hexo-bot` writes one shard per epoch of self-play and one per eval round; a
-  model package reads them back in its `fit` phase.
+- `hexo-bot` writes one shard per epoch of self-play, and a model package reads
+  it back in its `fit` phase. Only self-play writes one: an evaluation round and
+  a `match` are evidence about two checkpoints rather than training data, and
+  nothing would read a shard of them (`CONTAINER_SPEC.md` §11).

@@ -2,12 +2,18 @@
 
 A Hexo engine and bot-training framework, built ground up.
 
-> **Status: `hexo-engine`, `hexo-runner`, and `hexo-player` implemented.** The
-> engine ships the full rule machine, make/unmake search, and its test suite; the
-> runner ships the nonblocking game state machine and the result and adjudication
-> model; `hexo-player` ships the seam a model plugs into and the loop that drives
-> games. No player ships — nothing decides a move yet. The container design is
-> written but not built. No models, no tree search, no training, no Python.
+> **Status: the training loop runs, against a mock package.** The engine ships
+> the full rule machine, make/unmake search, and its test suite; the runner ships
+> the nonblocking game state machine and the result and adjudication model;
+> `hexo-player` ships the seat seam a human, a scripted bot, or a transport
+> adapter plugs into. Above them, `hexo-search` ships the evaluator seam and the
+> nonblocking decision sessions, `hexo-records` the on-disk shard format,
+> `hexo-model` the model-package trait and the probe that holds a checkpoint
+> honest, `crates/models/mock` the first package built to it, and `hexo-bot` the
+> binary, whose `train` and `match` subcommands both run end to end. **A mock
+> loop is not a trained bot:** the only package is a weightless salt that learns
+> nothing, and there is no real model, no Python, no PyO3 dependency anywhere,
+> and no image.
 
 ## Layout
 
@@ -18,6 +24,11 @@ Hexo-Shrimp-Bot/
     hexo-engine/          authoritative rules and game state
     hexo-runner/          the authoritative game and adjudication policy
     hexo-player/          the player seam, and the loop that drives games
+    hexo-search/          the evaluator seam, and the nonblocking sessions
+    hexo-records/         the on-disk shard format, written once, read strictly
+    hexo-model/           the model-package trait, the manifest, and the probe
+    models/               model packages, one crate each; `mock` is the first
+    hexo-bot/             the binary: `train` and `match`
   xtask/                  the verification gates, defined once; `cargo xtask`
   docs/
     ENGINE_SPEC.md        normative implementation target for hexo-engine
@@ -95,12 +106,52 @@ vary, and `eval_move`, which is greedier but not deterministic. A non-model seat
 — a human, a scripted bot — implements the plainer `Player` trait and never sees
 a mode. [crates/hexo-player/README.md](crates/hexo-player/README.md) argues both.
 
+**A model is a package, and the container's whole knowledge of it is one trait.**
+Packages live under `crates/models/`, one crate each; each implements
+`ModelPackage` and owns its encoder, its evaluator, its two session modes, its
+selection policies, its diagnostics format, its weight format, and its `fit`, so
+adding one is a new crate and one registry entry and nothing below learns
+anything. A checkpoint is weights plus a manifest, and loading one is *proving*
+it: the probe hash is recomputed over the bytes the evaluator actually returns
+and a mismatch refuses the load.
+[crates/hexo-model/README.md](crates/hexo-model/README.md) argues the trait and
+the probe; [crates/models/mock/README.md](crates/models/mock/README.md) is the
+exemplar the whole loop is exercised against.
+
+**The evaluator seam is three types, and no session blocks.** The package's
+encoder runs worker-side, so a leaf position never crosses a thread and the
+queues carry bytes; the package's evaluator answers a whole batch batcher-side,
+so one crossing serves hundreds of leaves. A seat's search is a state machine
+that hands out the leaves it wants and returns, which is what makes a game in
+flight cost bytes rather than a thread.
+[crates/hexo-search/README.md](crates/hexo-search/README.md) argues both, and
+settles [docs/SUGGESTIONS.md](docs/SUGGESTIONS.md) S3.
+
+**Records are one binary format with one implementation, read strictly.** A
+shard is written once by one writer and renamed into place, and the reader
+refuses any file it cannot fully account for rather than offering a lenient
+mode; `verify` replays the record through the engine, which is the detector
+parsing cannot be. Python will read shards through this code rather than growing
+a parser of its own, because two parsers are two definitions of the format.
+[crates/hexo-records/README.md](crates/hexo-records/README.md) argues it.
+
 **The runner is a library, not a service.** A containerised bot carries the
 engine *and* the runner inside it, so it can drive its own self-play games
 without an outside orchestrator, while the same library also backs a host
 orchestrator running matches between containers. One authority implementation,
 two deployment shapes. Exactly one authority exists per game — a container
 answering someone else's protocol runs as a player and does not adjudicate.
+
+**The binary ships the subcommands that work.** `hexo-bot train` is a whole
+training run — batched self-play, fit, checkpoint, evaluation — in one
+long-lived process, and `hexo-bot match` is the local head-to-head that pits two
+checkpoints, or two search shapes over one checkpoint, against each other. One
+driver serves both. `serve` and `play` are absent rather than stubbed: both are
+entirely wire protocol and there is no wire protocol yet, so a stub would
+publish a command line before the thing behind it is designed and its guessed
+flags would become the constraint the real implementation has to argue its way
+out of. [crates/hexo-bot/README.md](crates/hexo-bot/README.md) argues both
+halves.
 
 **One build backend, one workspace.** Cargo workspace for Rust; when Python
 arrives, a `uv` workspace and maturin. One backend and one dependency graph, so
@@ -145,6 +196,6 @@ Building the same tree from both Windows and WSL collides on `target/`. Set
 | --- | --- |
 | [docs/ENGINE_SPEC.md](docs/ENGINE_SPEC.md) | **Normative.** The single implementation target for `crates/hexo-engine`: rules, state, storage, growth policy, error precedence, invariants, and test obligations. |
 | [docs/ENGINE_RL_AUDIT.md](docs/ENGINE_RL_AUDIT.md) | Review findings on readiness for massively parallel self-play, with each one's resolution recorded next to it. A snapshot with annotations, not a live plan. |
-| [docs/CONTAINER_SPEC.md](docs/CONTAINER_SPEC.md) | How a bot is packaged, deployed, and run: one image, one binary with three modes, where state lives, and what a long-lived training process has to guarantee. Design spec, not yet built. |
-| [docs/OPEN_DECISIONS.md](docs/OPEN_DECISIONS.md) | Questions that *must* be answered before the code depending on them exists. A settled one leaves, and the file records where its answer went — the engine's and the runner's are all settled; seeds and the wire protocol are not. |
+| [docs/CONTAINER_SPEC.md](docs/CONTAINER_SPEC.md) | **Normative** for the five container crates: how a bot is packaged, deployed, and run — one binary, where state lives, and what a long-lived training process has to guarantee. Trued up against the code as built: the Rust half runs, the image and the Python half do not exist. |
+| [docs/OPEN_DECISIONS.md](docs/OPEN_DECISIONS.md) | Questions that *must* be answered before the code depending on them exists. A settled one leaves, and the file records where its answer went — the engine's, the runner's, and the record format's are all settled; seeds and the wire protocol are not. |
 | [docs/SUGGESTIONS.md](docs/SUGGESTIONS.md) | *Optional* design proposals with status, rationale, and trade-offs. Accepted items graduate to the `README.md` of whatever they decided. |

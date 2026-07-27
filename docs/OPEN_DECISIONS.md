@@ -26,27 +26,39 @@ reused, because other documents cite it.
 | C5 | ~~`R` for dense action indexing~~ — **withdrawn**, not answered: a fixed radius-20 crop makes wins outside the crop unrepresentable, so the action space silently stops matching the game | `crates/hexo-engine/README.md`; the canonical unbounded ordering replaced it |
 | C6 | One image or two | `CONTAINER_SPEC.md` §2. One: a play-only image would need a second implementation of the model's forward pass, which the no-dual-paths rule forbids and which could silently disagree with the first |
 | B6 | What a seat returns — a bare action, or the whole decision | `crates/hexo-player/README.md`. The whole `Decision`: the hash attestation and the diagnostics can only be authored by the seat, so a driver that filled either in was deleting the desync detector and discarding the training annotations. `Failure::Desync` carries a refused attestation into adjudication |
+| C4 | On-disk record format | `crates/hexo-records/README.md`: shard format v1, a writer that renames into place, a reader that refuses anything it cannot account for, and a `verify` that replays the record through the engine. `CONTAINER_SPEC.md` §11 states what the container needs from it |
 
 ---
 
-## B4. Seed ownership — deliberately absent until it is real
+## B4. Seed ownership — deliberately open, against a seam that is built
 
-For byte-reproducible self-play the runner would mint and record a seed and hand
-per-seat seeds to players.
+For byte-reproducible self-play something would mint and record a seed and hand
+per-seat seeds to the seats.
 
-Nothing in the workspace needs one yet. The engine has no randomness at all, and
-replay determinism comes from the stored action list rather than from a seed: a
-game is reproduced by replaying its moves. A seed field would therefore be
-carried, persisted, and read by nobody.
+The engine has no randomness at all, and replay determinism comes from the
+stored action list rather than from a seed: a game is reproduced by replaying
+its moves. Either wire a seed end to end or do not carry it — a recorded seed
+that does not reproduce the game is worse than none, because it reads as a
+reproducibility guarantee that was never checked. `hexo-runner` therefore ships
+with **no seed field at all**, and neither the run manifest nor the shard header
+has one.
 
-Either wire a seed end to end or do not carry it — a recorded seed that does not
-reproduce the game is worse than none, because it reads as a reproducibility
-guarantee that was never checked. `hexo-runner` therefore ships with **no seed
-field at all**, deliberately.
+**The seam exists; nothing above it does.** A `DecisionSession` takes a seed
+when it is constructed and exposes `reseed`, because passing a seed in is a
+different job from retrofitting one into a search already written without it —
+`CONTAINER_SPEC.md` §12 argues that, and `crates/hexo-search/README.md` states
+the seam. `hexo-bot` reseeds both of a lane's sessions from entropy before every
+game, mixing the clock with the lane, the lane's game serial, and the seat, so
+that two lanes reseeded in the same nanosecond and the two seats of one game
+never share a stream. It records none of it. Sampling therefore arrived without
+seeds, and self-play games are deliberately non-deterministic rather than
+accidentally so.
 
-This stops being optional the moment a player samples rather than maximising:
-seeds must then be minted and recorded, derived from stable game and seat ids so
-that scheduling cannot change a run.
+B4 lands the day a run has to reproduce, and it lands as a small change with a
+known shape: mint per-game seeds from stable game and seat ids so scheduling
+cannot alter a run, hand them to the sessions that already accept them, and
+record them. That is a record format version bump and a regeneration of the
+data, which is how formats change here, rather than a redesign of the loop.
 
 ---
 
@@ -56,7 +68,8 @@ that scheduling cannot change a run.
 | --- | --- |
 | C1 | Transport and wire format. A line-oriented stdio protocol is the default: trivial to containerise, debuggable by hand, close to what tournament harnesses expect. |
 | C2 | Handshake fields: protocol version, rules version, action-encoding version, seat, seed, budget. |
-| C4 | On-disk record format. |
 
-`CONTAINER_SPEC.md` §9 is the same list from the other side, and adds B4 to it:
-`train` needs seeds the moment self-play samples rather than maximises.
+`CONTAINER_SPEC.md` §15 is the same list from the other side. It carries C1 and
+C2, B4 above, and one item that is the container's rather than the code's: the
+**Dockerfile**, which arrives with the first Python-backed package, because
+until then it would carry a CUDA and Python stack for a loop that uses neither.

@@ -58,8 +58,9 @@ crates/hexo-search/
   once. The thread pool is then sized to the silicon rather than to the number of
   games, and the number of concurrent games `G` is bounded by RAM instead of by
   scheduler pressure. `tests/topology.rs` is that loop, single-threaded and
-  complete; a threaded driver replaces the `for` with actor shards and a bounded
-  queue and changes nothing else.
+  complete; `hexo-bot`'s driver is the same loop with the `for` replaced by a
+  worker pool and two bounded channels, and nothing else about the shape
+  changed.
 
   Concretely, this is `docs/ENGINE_RL_AUDIT.md`'s recommended topology minus the
   threads: fixed CPU shards, many games and trees per shard, reusable encoded
@@ -74,6 +75,12 @@ crates/hexo-search/
   encoding is the CPU half of the work, so on the actor threads it scales with
   cores while on the batcher thread it serialises the one place the whole process
   converges.
+
+  The batch has one append per side of that split: `push_with` encodes a
+  position into it worker-side, while the position still exists, and
+  `push_bytes` appends an item that is already encoded — which is how a batcher
+  merges arriving jobs into one device-bound batch rather than pretending to
+  re-encode positions that stopped existing when the pump returned.
 
   `EncodedBatch` is deliberately ragged — one `Vec<u8>` plus CSR-style offsets.
   A fixed action crop is exactly what this workspace refuses: the board has no
@@ -179,10 +186,12 @@ crates/hexo-search/
   workspace would be the thing that needs explaining. It is not `Copy`, because a
   copied generator hands out the same stream twice.
 
-- **`reseed` is the B4 seam.** Today a driver passes entropy at construction and
-  games are non-deterministic, which is honest: nothing records a seed, so
-  nothing promises a replay. A session *is* a function of its position sequence,
-  its evaluations, and its seed — `tests/mcts.rs` and `tests/policy.rs` pin that
+- **`reseed` is the B4 seam.** Today a package constructs a session with a seed
+  of its own and `hexo-bot` reseeds both of a lane's seats from entropy before
+  every game, so games are non-deterministic — which is honest: nothing records
+  a seed, so nothing promises a replay. A session *is* a function of its
+  position sequence, its evaluations, and its seed — `tests/mcts.rs` and
+  `tests/policy.rs` pin that
   — so when `docs/OPEN_DECISIONS.md` B4 is answered, seeds minted from stable
   game and seat ids land in `reseed` and nothing else about a session moves.
 
@@ -194,15 +203,13 @@ crates/hexo-search/
 | Transposition table | v1 is a tree, not a DAG. Hexo transposes structurally — a turn's two stones are playable in either order — so the merge is worth roughly 2x per turn, and `Position::zobrist()` is position-only precisely so a table is possible later. It is not built now because a shared table is where a search stops being a pure function of its inputs, and the determinism tests above are worth more at this stage than the 2x. It would land as a map beside `Tree`. |
 | Dirichlet root noise | It is exploration policy, which is the model's, and it needs a Dirichlet sampler this crate has no business owning. A package applies it to the root evaluation before `resume`, or inside its own `Evaluator`. |
 | Batched `resume` | One leaf at a time. A slice-taking variant would save a bounds check per leaf against a network call, which is not a trade worth an API. |
-| Threads, queues, backpressure | `hexo-bot`. This crate is what makes them possible and deliberately contains none of them. |
+| Threads, queues, backpressure | `hexo-bot` has them. This crate is what makes them possible and deliberately contains none of them. |
+| Any encoder, evaluator, or selector | All three are what a *package* owns. `hexo-model` states the trait that binds them together and `crates/models/mock` implements them; `tests/common/mod.rs` carries test ones and none is public. |
 
 ## Not built yet
 
 | Thing | Blocked on |
 | --- | --- |
-| Any encoder, evaluator, or selector | A model. `hexo-model` owns the package trait that binds the three together; `tests/common/mod.rs` carries the test ones and none is public |
-| The threaded driver — actor shards, bounded queues, one batcher per device | `hexo-bot` |
-| Recording the visit distribution as a training target | The diagnostics channel is already end to end (`SelectFromSearch::diagnostics` to `PlyRecord::diagnostics`); what is missing is a record format, which is `docs/OPEN_DECISIONS.md` C4 |
 | Minted, recorded per-game seeds | B4. `reseed` is the seam and takes no position on the policy |
 
 ## Connections
@@ -212,6 +219,10 @@ crates/hexo-search/
 - Depends on `hexo-runner` for `Game` — the session's whole input — and
   `Decision`, which the session authors in full: the placement, the hash of the
   position it searched, and the package's diagnostics.
+- `hexo-model` binds an encoder, an evaluator, and the two session constructors
+  into the one trait a container knows a package by; `crates/models/mock`
+  supplies all of them, and `hexo-bot`'s driver is what pumps the sessions,
+  encodes their leaves worker-side, and fills the batches one evaluator answers.
 - `hexo-player` is the *other* seat shape: `Player::choose` is one blocking call
   that returns a whole `Decision`, which is what a human, a scripted bot, or a
   transport adapter wants. A model-backed seat wants this crate instead, because
