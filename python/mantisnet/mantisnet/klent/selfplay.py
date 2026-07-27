@@ -35,6 +35,7 @@ class Episode:
     seed_len: int  # plies replayed before π′ took over
     winner: int | None  # None exactly when the cap hit
     moves_remaining: list  # per acted ply, at acting time
+    movers: list  # per acted ply, the engine's mover
     ranks: list  # per acted ply, the action's legal rank
     improved: list  # per acted ply, π′ as float32 over the legal set
     v_hats: list  # per acted ply, E_{π′}[Q] at acting time
@@ -78,6 +79,7 @@ def play_episodes(
                 seed_len=len(prefix),
                 winner=None,
                 moves_remaining=[],
+                movers=[],
                 ranks=[],
                 improved=[],
                 v_hats=[],
@@ -104,6 +106,7 @@ def play_episodes(
             rank = int(rng.choice(len(probs), p=probs / probs.sum()))
 
             ep.moves_remaining.append(pos.moves_remaining)
+            ep.movers.append(pos.current_player)
             ep.ranks.append(rank)
             ep.improved.append(probs.astype(np.float32))
             ep.v_hats.append(float(imp.v_hat[slot]))
@@ -123,6 +126,45 @@ def play_episodes(
         "acting_norm_entropy": ent_sum / max(decisions, 1),
     }
     return episodes, metrics
+
+
+def collection_stats(episodes: list[Episode]) -> dict:
+    """The §13 collection-side metrics: the terminating fractions that decide
+    whether training data exists, seat and win-half coverage, seed-curriculum
+    state, and the v̂-vs-outcome calibration that makes the §9 overestimation
+    bias visible. Calibration reads won episodes only — a capped episode has
+    no grounded outcome to calibrate against."""
+    won = [e for e in episodes if e.winner is not None]
+    seeded = [e for e in episodes if e.seed_len > 0]
+    unseeded = [e for e in episodes if e.seed_len == 0]
+
+    def fraction(eps):
+        return sum(e.winner is not None for e in eps) / len(eps) if eps else float("nan")
+
+    def mean(values):
+        values = list(values)
+        return sum(values) / len(values) if values else float("nan")
+
+    v_win, v_loss, abs_err = [], [], []
+    for e in won:
+        for mover, v in zip(e.movers, e.v_hats):
+            z = 1.0 if mover == e.winner else -1.0
+            (v_win if z > 0 else v_loss).append(v)
+            abs_err.append(abs(v - z))
+
+    return {
+        "f_seeded": fraction(seeded),
+        "f_unseeded": fraction(unseeded),
+        "won_length_mean": mean(len(e.moves) for e in won),
+        "seed_len_mean": mean(e.seed_len for e in seeded),
+        "seed_len_max": max((e.seed_len for e in seeded), default=0),
+        "p0_win_rate": mean(float(e.winner == 0) for e in won),
+        # K2 coverage: how often the winning placement was a turn's first stone.
+        "first_stone_win_rate": mean(float(e.moves_remaining[-1] == 2) for e in won),
+        "v_hat_winner_mean": mean(v_win),
+        "v_hat_loser_mean": mean(v_loss),
+        "v_hat_mae": mean(abs_err),
+    }
 
 
 def episode_samples(episode: Episode, lam_ret: float) -> list[Sample]:

@@ -42,7 +42,8 @@ Hexo-Shrimp-Bot/
     ENGINE_SPEC.md        normative implementation target for hexo-engine
     MODEL_SPEC.md         normative target for the MantisNet network
     KLENT_DESIGN.md       how KLENT works on Hexo; the training path's governing doc
-    KLENT_PROPOSALS.md    an external KLENT suggestion set, reviewed; nothing applied
+    KLENT_PROPOSALS.md    an external KLENT suggestion set, reviewed; two items since applied
+    KLENT_RUN_PLAN.md     the operational plan: settled questions, shakeout, path to production
     ENGINE_RL_AUDIT.md    review findings on readiness for parallel self-play
     CONTAINER_SPEC.md     how a bot is packaged, deployed, and run
     OPEN_DECISIONS.md     what is still undecided, and where the settled answers went

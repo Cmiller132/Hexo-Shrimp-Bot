@@ -10,9 +10,10 @@ paper's own ablation (no V head, design doc fidelity ledger).
 from .improve import ImprovedPolicy, improved_policy
 from .returns import lambda_returns, signs_from_moves_remaining
 from .seeds import line_builder_choose, line_builder_game
-from .selfplay import Episode, Sample, episode_samples, play_episodes
+from .selfplay import Episode, Sample, collection_stats, episode_samples, play_episodes
 from .train import KlentConfig, fit, iterate
 from .evaluate import play_match
+from .run import run_training
 
 __all__ = [
     "ImprovedPolicy",
@@ -23,10 +24,12 @@ __all__ = [
     "line_builder_game",
     "Episode",
     "Sample",
+    "collection_stats",
     "episode_samples",
     "play_episodes",
     "KlentConfig",
     "fit",
     "iterate",
     "play_match",
+    "run_training",
 ]

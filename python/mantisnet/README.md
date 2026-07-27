@@ -31,9 +31,10 @@ python/mantisnet/
       improve.py      # eq. 3 closed form: π′, v̂, and the §13 diagnostics
       returns.py      # the sign on mover change, the λ-return
       seeds.py        # the line-building seeder / fixed opponent
-      selfplay.py     # batched collection, acting-time v̂, the buffer rules
+      selfplay.py     # batched collection, acting-time v̂, buffer rules, stats
       train.py        # KlentConfig, the fit epoch, the iteration
       evaluate.py     # argmax π_θ, seat-balanced matches
+      run.py          # the run driver: config.json, metrics.jsonl, checkpoints
   tests/              # the two specs' obligations, one file per concern
   bench/
     bench_forward.py  # builder and forward throughput at spec defaults
@@ -145,6 +146,18 @@ deviation from it can be measured.
   q_values)` on CPU. Training wraps the network; the pipeline tests wrap a
   scripted line-extender, which is how the buffer rules are testable without
   a trained model.
+- **The default coefficients are paper-verified, not carried.** `τ = 0.1`
+  (reverse KL) and `λ = 0.03` (entropy) per the paper's eq. 2 — the design
+  doc's original pair was transposed and is corrected — and
+  `λ_ret = e^{-1/16}`, the paper's 8-turn horizon at Hexo's two placements
+  per turn. `docs/KLENT_RUN_PLAN.md` §2 records both resolutions.
+- **A run is its directory.** `python -m mantisnet.klent.run --out runs/<name>
+  --iterations N` writes `config.json` (knobs + versions), `metrics.jsonl`
+  (the §13 metrics per iteration, including the v̂-vs-outcome calibration
+  that watches the §9 bias), and resumable checkpoints; `--resume` continues
+  after a crash and refuses a checkpoint from other versions. Evaluation is
+  deliberately absent for now — `docs/KLENT_RUN_PLAN.md` plans it and the
+  shakeout run.
 
 ```python
 from mantisnet import MantisConfig, MantisNet
