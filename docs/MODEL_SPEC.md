@@ -104,8 +104,10 @@ Each window's initial embedding is a table lookup on
 - occupancy pattern = the 6-bit mask of which of the window's slots hold a
   stone (slot order along the axis; 1–5 bits set);
 - canonicalized under reversal: `canon(m) = min(m, reverse6(m))`, because a
-  reflection reverses slot order. There are 32 canonical patterns of 1–5
-  bits, so the table has `2 × 32 = 64` entries.
+  reflection reverses slot order. There are 34 canonical patterns of 1–5
+  bits — the 62 nonempty, nonfull masks fold to `(62 + 6 palindromes) / 2`
+  orbits — so the table has `2 × 34 = 68` entries. (An earlier draft
+  miscounted 32; the builder's enumeration and a pinned test agree on 34.)
 
 The pattern hands the network shape distinctions (broken versus consecutive
 runs) at the input, rather than asking message passing to reconstruct them

@@ -3,10 +3,15 @@
 **Status: built and green for the Rust half.** The five crates this document
 names — `hexo-search`, `hexo-records`, `hexo-model`, `crates/models/mock`, and
 `hexo-bot` — are implemented, and `train` and `match` both run against the mock
-model package. **There is no image and there is no Python.** No Dockerfile
-exists, nothing in the workspace depends on PyO3, and no Python-backed model
-package has been written. Where this document describes those, it states the
-target they will be built to, not something that runs today.
+model package. **There is no image, and no Python-backed model package has
+been written.** No Dockerfile exists and nothing in the cargo workspace
+depends on PyO3. The Python that now exists lives outside the workspace, in
+`python/`: the MantisNet model itself (`docs/MODEL_SPEC.md`, forward and
+builder and losses, tested) and `python/hexo-py`, the PyO3 leaf crate the
+root README promised. Neither is wired to the evaluator seam yet — that
+wiring is the Python-backed package this document describes, and where the
+document describes it, it states the target it will be built to, not
+something that runs today.
 
 This is the normative design target for the container and for those five crates,
 and it has been trued up against the code as built. Nothing here constrains

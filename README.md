@@ -11,9 +11,12 @@ A Hexo engine and bot-training framework, built ground up.
 > `hexo-model` the model-package trait and the probe that holds a checkpoint
 > honest, `crates/models/mock` the first package built to it, and `hexo-bot` the
 > binary, whose `train` and `match` subcommands both run end to end. **A mock
-> loop is not a trained bot:** the only package is a weightless salt that learns
-> nothing, and there is no real model, no Python, no PyO3 dependency anywhere,
-> and no image.
+> loop is not a trained bot:** the only registered package is a weightless salt
+> that learns nothing, and there is no image. The first real network now exists
+> under `python/` — MantisNet (`docs/MODEL_SPEC.md`), a PyTorch model with its
+> builder, losses, and test suite, reaching the engine through the `hexo-py`
+> PyO3 leaf crate — but it is not yet a `ModelPackage`, and nothing in the
+> cargo workspace depends on Python.
 
 ## Layout
 
@@ -30,8 +33,12 @@ Hexo-Shrimp-Bot/
     models/               model packages, one crate each; `mock` is the first
     hexo-bot/             the binary: `train` and `match`
   xtask/                  the verification gates, defined once; `cargo xtask`
+  python/
+    hexo-py/              PyO3 bindings to hexo-engine; a leaf crate outside the workspace
+    mantisnet/            the MantisNet model: builder, network, losses, tests, bench
   docs/
     ENGINE_SPEC.md        normative implementation target for hexo-engine
+    MODEL_SPEC.md         normative target for the MantisNet network
     ENGINE_RL_AUDIT.md    review findings on readiness for parallel self-play
     CONTAINER_SPEC.md     how a bot is packaged, deployed, and run
     OPEN_DECISIONS.md     what is still undecided, and where the settled answers went
