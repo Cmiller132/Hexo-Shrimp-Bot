@@ -1,0 +1,12 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "hexo-py"
+version = "0.1.0"
+description = "Python bindings for the hexo-engine rule machine"
+requires-python = ">=3.12"
+
+[tool.maturin]
+module-name = "hexo_py"
