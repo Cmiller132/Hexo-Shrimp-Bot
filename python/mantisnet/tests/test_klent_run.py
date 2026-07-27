@@ -93,6 +93,37 @@ def test_run_resume_and_artifacts(tmp_path):
         main(args + ["--iterations", "1"])
 
 
+def test_eval_in_driver_leaves_training_untouched(tmp_path):
+    """The anchor match reports into the metrics row without perturbing the
+    training stream: the same run with eval off is bit-identical."""
+    base = [
+        "--games", "2", "--cap", "24", "--batch", "64",
+        "--checkpoint-every", "2", "--device", "cpu", "--seed", "5",
+        "--seed-cut", "1", "3", "--iterations", "2",
+    ]
+    main(["--out", str(tmp_path / "plain")] + base)
+    main(
+        ["--out", str(tmp_path / "evaled")]
+        + base
+        + ["--eval-every", "1", "--eval-games", "2"]
+    )
+
+    read = lambda name: [  # noqa: E731
+        json.loads(line)
+        for line in (tmp_path / name / "metrics.jsonl").read_text().splitlines()
+    ]
+    for plain, evaled in zip(read("plain"), read("evaled"), strict=True):
+        assert 0.0 <= evaled["eval_score"] <= 1.0
+        assert evaled["eval_games"] == 2 and 0 <= evaled["eval_capped"] <= 2
+        assert evaled["eval_seconds"] > 0
+        for key in plain:
+            if key != "seconds":
+                assert evaled[key] == plain[key], key
+
+    config = json.loads((tmp_path / "evaled" / "config.json").read_text())
+    assert config["eval_every"] == 1 and config["eval_anchor_noise"] == 0.1
+
+
 def test_checkpoint_refuses_version_drift(tmp_path):
     from mantisnet import MantisConfig, MantisNet
 
