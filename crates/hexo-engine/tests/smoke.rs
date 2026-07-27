@@ -3,7 +3,7 @@
 mod common;
 
 use common::{Rng, check_all_oracles, nth_legal, winners_oracle};
-use hexo_engine::{Action, Axis, HexCoord, Player, Position};
+use hexo_engine::{Action, Axis, HexCoord, Player, Position, WINDOW_LEN};
 
 /// Test-local ply bound.
 const PLY_BOUND: usize = 512;
@@ -15,10 +15,13 @@ const DEFAULT_GAMES: usize = 10_000;
 const DEFAULT_UNIFORM_GAMES: usize = 30;
 
 fn env_count(key: &str, fallback: usize) -> usize {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(fallback)
+    match std::env::var(key) {
+        Ok(s) => s
+            .parse()
+            .unwrap_or_else(|_| panic!("{key} must be a game count, got {s:?}")),
+        Err(std::env::VarError::NotPresent) => fallback,
+        Err(e) => panic!("{key}: {e}"),
+    }
 }
 
 /// Per-player line state for the biased driver.
@@ -96,15 +99,38 @@ fn playout(seed: u64, noise: u8) -> Playout {
                 o.winner, applied.mover,
                 "seed {seed}: the winner is not the mover"
             );
-            assert!(!applied.winning.is_empty());
-            for w in applied.winning_windows() {
+            assert!(applied.wins.iter().any(Option::is_some));
+            for w in applied.wins.iter().flatten() {
                 assert!(
-                    pos.window(w).is_full_for(o.winner),
-                    "seed {seed}: reported window {w:?} is not full for the winner"
+                    w.len as usize >= WINDOW_LEN,
+                    "seed {seed}: reported run {w:?} is shorter than a window"
                 );
+                let mut cell = w.start;
+                let mut hit = false;
+                for _ in 0..w.len {
+                    assert_eq!(
+                        pos.get(cell),
+                        Some(o.winner),
+                        "seed {seed}: run {w:?} names {cell:?}, which is not the winner's"
+                    );
+                    hit |= cell == applied.action.coord();
+                    cell = cell.step(w.axis, 1);
+                }
                 assert!(
-                    w.cells().contains(&applied.action.coord()),
-                    "seed {seed}: reported window {w:?} does not contain the placement"
+                    hit,
+                    "seed {seed}: reported run {w:?} does not contain the placement"
+                );
+                // Maximal: the cells just off each end are not the winner's, so the run
+                // is the whole line and not a six-cell slice of it.
+                assert_ne!(
+                    pos.get(w.start.step(w.axis, -1)),
+                    Some(o.winner),
+                    "seed {seed}: run {w:?} extends further back"
+                );
+                assert_ne!(
+                    pos.get(cell),
+                    Some(o.winner),
+                    "seed {seed}: run {w:?} extends further forward"
                 );
             }
             assert_eq!(

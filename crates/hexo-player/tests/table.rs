@@ -2,7 +2,7 @@
 
 use hexo_engine::{Action, HexCoord, MoveError, Player as Seat, Position};
 use hexo_player::{Mode, Model, ModelPlayer, Player, Table, sweep};
-use hexo_runner::{Budget, DrawReason, GameSpec, MatchResult, WinReason};
+use hexo_runner::{Decision, DrawReason, Game, GameSpec, MatchResult, Reply, Step, WinReason};
 use std::num::NonZeroU32;
 
 fn cap(value: u32) -> NonZeroU32 {
@@ -16,13 +16,33 @@ fn spec(ply_cap: u32) -> GameSpec {
     }
 }
 
+/// A game with only its opening placement made.
+fn opened_game() -> Game {
+    let mut game = Game::new(GameSpec::default());
+    let Step::NeedDecision {
+        generation,
+        zobrist,
+        ..
+    } = game.step()
+    else {
+        panic!("a fresh game wants a decision");
+    };
+    game.submit(
+        generation,
+        Reply::Place(Decision::new(Action::new(HexCoord::ORIGIN), zobrist)),
+    )
+    .expect("the opening is legal");
+    game
+}
+
 /// Takes the lowest-ranked legal placement, every time.
 #[derive(Clone, Debug)]
 struct Lowest;
 
 impl Player for Lowest {
-    fn choose(&mut self, pos: &Position, _budget: Budget) -> Action {
-        pos.nth_legal(0)
+    fn choose(&mut self, game: &Game) -> Action {
+        game.position()
+            .nth_legal(0)
             .expect("a running game has a legal placement")
     }
 }
@@ -38,13 +58,13 @@ impl Liner {
 }
 
 impl Player for Liner {
-    fn choose(&mut self, pos: &Position, budget: Budget) -> Action {
+    fn choose(&mut self, game: &Game) -> Action {
         match Self::LINE.get(self.next) {
             Some(&(q, r)) => {
                 self.next += 1;
                 Action::new(HexCoord::new(q, r))
             }
-            None => Lowest.choose(pos, budget),
+            None => Lowest.choose(game),
         }
     }
 }
@@ -54,7 +74,7 @@ impl Player for Liner {
 struct AlwaysOrigin;
 
 impl Player for AlwaysOrigin {
-    fn choose(&mut self, _pos: &Position, _budget: Budget) -> Action {
+    fn choose(&mut self, _game: &Game) -> Action {
         Action::new(HexCoord::ORIGIN)
     }
 }
@@ -66,9 +86,28 @@ struct Recorder {
 }
 
 impl Player for Recorder {
-    fn choose(&mut self, pos: &Position, budget: Budget) -> Action {
-        self.seen.push(pos.current_player());
-        Lowest.choose(pos, budget)
+    fn choose(&mut self, game: &Game) -> Action {
+        self.seen.push(game.position().current_player());
+        Lowest.choose(game)
+    }
+}
+
+/// Plays off a mirror rebuilt from the record rather than off the canonical board,
+/// which is the whole reason a seat is handed the game and not a position.
+#[derive(Clone, Debug, Default)]
+struct Mirrorer {
+    plies_seen: Vec<usize>,
+}
+
+impl Player for Mirrorer {
+    fn choose(&mut self, game: &Game) -> Action {
+        let prefix = game.prefix();
+        self.plies_seen.push(prefix.len());
+        let mirror = Position::replay(&prefix).expect("the record must replay");
+        assert_eq!(mirror.zobrist(), game.position().zobrist());
+        mirror
+            .nth_legal(0)
+            .expect("a running game has a legal placement")
     }
 }
 
@@ -80,16 +119,18 @@ struct TwoFaced {
 }
 
 impl Model for TwoFaced {
-    fn self_play_move(&mut self, pos: &Position, _budget: Budget) -> Action {
+    fn self_play_move(&mut self, game: &Game) -> Action {
         self.self_play_calls += 1;
+        let pos = game.position();
         let n = pos.legal_count();
         pos.nth_legal(self.self_play_calls % n)
             .expect("index is below the legal count")
     }
 
-    fn eval_move(&mut self, pos: &Position, _budget: Budget) -> Action {
+    fn eval_move(&mut self, game: &Game) -> Action {
         self.eval_calls += 1;
-        pos.nth_legal(0)
+        game.position()
+            .nth_legal(0)
             .expect("a running game has a legal placement")
     }
 }
@@ -105,8 +146,10 @@ fn a_table_drives_a_game_to_the_ply_cap() {
             reason: DrawReason::PlyCap
         }
     );
-    assert_eq!(table.game().position().stone_count(), 24);
-    assert_eq!(table.game().plies().len(), 24);
+    // The cap is tested only where a turn ended, and turns end at odd placement
+    // counts, so an even cap of 24 stops at 25.
+    assert_eq!(table.game().position().stone_count(), 25);
+    assert_eq!(table.game().plies().len(), 25);
     assert_eq!(table.result(), Some(result));
 }
 
@@ -188,6 +231,18 @@ fn each_seat_is_only_ever_asked_as_its_own_side() {
     assert_eq!((p0.seen.len(), p1.seen.len()), (5, 4));
 }
 
+/// The seam hands over the whole game, not a position and a budget, so a seat can
+/// build move-order features from the record — which is the only history there is.
+#[test]
+fn a_seat_can_replay_the_record_it_is_handed() {
+    let mut table = Table::new(spec(9), [Mirrorer::default(), Mirrorer::default()]);
+    table.run();
+
+    let [p0, p1] = table.into_seats();
+    assert_eq!(p0.plies_seen, vec![0, 3, 4, 7, 8]);
+    assert_eq!(p1.plies_seen, vec![1, 2, 5, 6]);
+}
+
 #[test]
 fn a_model_player_dispatches_on_its_mode() {
     let mut self_play = ModelPlayer::new(TwoFaced::default(), Mode::SelfPlay);
@@ -195,13 +250,11 @@ fn a_model_player_dispatches_on_its_mode() {
     assert_eq!(self_play.mode(), Mode::SelfPlay);
     assert_eq!(eval.mode(), Mode::Eval);
 
-    let mut pos = Position::new();
-    pos.advance(Action::new(HexCoord::ORIGIN)).expect("opening");
+    let game = opened_game();
+    let sampled = self_play.choose(&game);
+    let greedy = eval.choose(&game);
 
-    let sampled = self_play.choose(&pos, Budget::Unlimited);
-    let greedy = eval.choose(&pos, Budget::Unlimited);
-
-    assert_eq!(greedy, pos.nth_legal(0).expect("legal"));
+    assert_eq!(greedy, game.position().nth_legal(0).expect("legal"));
     assert_ne!(sampled, greedy, "the two modes must be distinguishable");
 
     assert_eq!(self_play.model().self_play_calls, 1);
@@ -239,7 +292,11 @@ fn a_plain_seat_can_face_a_model_backed_one() {
     let mut table = Table::new(spec(14), seats);
 
     assert!(table.run().is_contested());
-    assert_eq!(table.game().plies().len(), 14);
+    assert_eq!(
+        table.game().plies().len(),
+        15,
+        "the cap of 14 falls mid-turn"
+    );
 }
 
 #[test]
@@ -262,7 +319,9 @@ fn a_sweep_drives_every_table_and_counts_the_rest() {
         }
     }
 
-    assert_eq!(rounds, 12, "the longest game is the last to finish");
+    // One placement per table per round, so the round count is the longest game.
+    // Caps 8..=12 stop at the next turn boundary — 9, 9, 11, 11, 13.
+    assert_eq!(rounds, 13, "the longest game is the last to finish");
     for (i, table) in tables.iter().enumerate() {
         let result = table
             .result()

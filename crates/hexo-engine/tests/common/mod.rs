@@ -79,7 +79,7 @@ pub fn zobrist_oracle(pos: &Position) -> u64 {
     let kind = match pos.phase() {
         TurnPhase::Opening => 0,
         TurnPhase::FirstStone => 1,
-        TurnPhase::SecondStone { .. } => 2,
+        TurnPhase::SecondStone => 2,
     };
     let mover = match pos.current_player() {
         Player::P0 => 0,
@@ -139,19 +139,17 @@ pub fn turn_oracle(ply: usize) -> (Player, TurnPhase) {
     let phase = if (ply - 1).is_multiple_of(2) {
         TurnPhase::FirstStone
     } else {
-        TurnPhase::SecondStone {
-            first: HexCoord::ORIGIN,
-        }
+        TurnPhase::SecondStone
     };
     (mover, phase)
 }
 
-/// Canonical kind index of a phase, ignoring the `SecondStone` payload.
+/// Canonical kind index of a phase.
 pub fn phase_kind(phase: TurnPhase) -> usize {
     match phase {
         TurnPhase::Opening => 0,
         TurnPhase::FirstStone => 1,
-        TurnPhase::SecondStone { .. } => 2,
+        TurnPhase::SecondStone => 2,
     }
 }
 
@@ -254,32 +252,6 @@ pub fn check_all_oracles(pos: &Position, ply: usize) {
         pos.nth_legal(pos.legal_count()),
         None,
         "T6: nth_legal ran past the end at ply {ply}"
-    );
-
-    assert_eq!(
-        pos.history().len(),
-        pos.stone_count() as usize,
-        "T7: history length disagrees with stone_count at ply {ply}"
-    );
-    for (i, a) in pos.history().iter().enumerate() {
-        assert!(
-            pos.get(a.coord()).is_some(),
-            "T7: history entry {i} names an empty cell at ply {ply}"
-        );
-    }
-
-    let rebuilt = Position::replay(pos.history())
-        .unwrap_or_else(|e| panic!("T8: history failed to replay at ply {ply}: {e}"));
-    assert_eq!(&rebuilt, pos, "T8: replayed position differs at ply {ply}");
-    assert_eq!(
-        rebuilt.zobrist(),
-        pos.zobrist(),
-        "T8: replayed zobrist differs at ply {ply}"
-    );
-    assert_eq!(
-        rebuilt.history(),
-        pos.history(),
-        "T8: replayed history differs at ply {ply}"
     );
 
     pos.audit()

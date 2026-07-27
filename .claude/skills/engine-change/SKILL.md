@@ -15,9 +15,9 @@ a finding to raise — not a discrepancy to resolve quietly in either direction.
 | --- | --- |
 | Public types, their fields, their derives | §3 |
 | A public function's contract or error precedence | §4, and §3.7 for the precedence table |
-| What is stored vs. derived, `cover`, the empty position | §5.1–§5.3 |
+| What is stored vs. derived, `covered`, the empty position | §5.1–§5.3 |
 | Arena growth, recentring, `MAX_GRID_CELLS` | §5.5 |
-| Window geometry, the 11x11 strip, slot order, win detection | §6 |
+| Window geometry, `windows_through`, win detection | §6 |
 | The delta, `undo`, the undo floor | §7 |
 | Zobrist keys, mixing, what the hash covers | §8 |
 | `legal_rank` / `nth_legal` ordering | §9 |
@@ -31,9 +31,9 @@ Check both before proposing a fix for something that looks missing.
 
 ## The invariant tiers, and why they are not redundant
 
-Symmetric bugs are the hazard: a wrong disk offset, a wrong shear in the QR
-fold, a wrong hash constant, or a growth copy with the same wrong index on both
-sides all apply and un-apply identically. Round-trip and invariant tests are
+Symmetric bugs are the hazard: a wrong disk offset, a wrong hash constant, or
+a growth copy with the same wrong index on both sides all apply and un-apply
+identically. Round-trip and invariant tests are
 structurally blind to them. Three independent detectors exist for that reason:
 
 - **Tier C** — `debug_assert` inside `apply_raw`/`undo_raw` (§10.1). Runs on
@@ -54,7 +54,11 @@ across processes. Its module doc states the policy and is the authority: a
 failure there means a persisted artefact broke — stored game records,
 cross-process hash agreement, or checkpoints that indexed a policy head by
 legal-move position — and the response is a deliberate `RULES_VERSION` /
-`ACTION_ORDER_VERSION` bump, never a re-baseline of the vectors.
+`ACTION_ORDER_VERSION` bump. Regenerating the vectors is legitimate only in that
+same change, which is why the test's own message says to do both; a re-baseline
+that leaves the version where it stood is forbidden, because it retires the
+detector and leaves every artefact written under the old version claiming an
+agreement it no longer has.
 
 ## What a change obliges
 

@@ -1,7 +1,7 @@
 //! The dense recentred arena. **Private: zero items escape the crate.**
 
 use crate::MAX_GRID_CELLS;
-use crate::coord::{COORD_LIMIT, DISK_CELLS, HexCoord, LEGAL_RADIUS};
+use crate::coord::{COORD_LIMIT, HexCoord, LEGAL_RADIUS};
 use crate::error::MoveError;
 use crate::player::Player;
 
@@ -23,6 +23,13 @@ const fn floor64(x: i32) -> i32 {
     x & !63
 }
 
+/// The low `n` bits. Total for `n < 64`.
+#[inline]
+const fn mask(n: usize) -> u64 {
+    debug_assert!(n < 64);
+    (1u64 << n) - 1
+}
+
 /// Bits `start .. start + n` of `plane`, as a mask whose bit `k` is cell `start + k`.
 #[inline]
 fn gather_run(plane: &[u64], start: usize, n: usize) -> u64 {
@@ -32,7 +39,7 @@ fn gather_run(plane: &[u64], start: usize, n: usize) -> u64 {
     if sh + n as u32 > 64 {
         v |= plane[w + 1] << (64 - sh);
     }
-    v & ((1u64 << n) - 1)
+    v & mask(n)
 }
 
 /// The dense recentred arena.
@@ -48,11 +55,11 @@ pub(crate) struct Grid {
     origin_r: i32,
     /// Occupancy bit planes, `rows * row_words` words each.
     occ: [Vec<u64>; 2],
-    /// Empty cells with `cover > 0`, `rows * row_words` words.
-    frontier: Vec<u64>,
-    /// Stones within [`LEGAL_RADIUS`], `rows * row_words * 64` bytes.
-    cover: Vec<u8>,
-    /// Maintained `popcount(frontier)`.
+    /// Cells within [`LEGAL_RADIUS`] of a stone, `rows * row_words` words. The
+    /// occupancy dilated by the radius-8 disk; the frontier is **derived** from it
+    /// as `covered & !occupied`, never stored.
+    covered: Vec<u64>,
+    /// Maintained popcount of the derived frontier.
     frontier_cells: u32,
 }
 
@@ -65,8 +72,7 @@ impl Grid {
             origin_q: 0,
             origin_r: 0,
             occ: [Vec::new(), Vec::new()],
-            frontier: Vec::new(),
-            cover: Vec::new(),
+            covered: Vec::new(),
             frontier_cells: 0,
         }
     }
@@ -107,16 +113,16 @@ impl Grid {
         &self.occ[p.index()]
     }
 
-    /// The frontier plane.
-    #[inline]
-    pub(crate) fn frontier_plane(&self) -> &[u64] {
-        &self.frontier
-    }
-
     /// The coverage plane.
     #[inline]
-    pub(crate) fn cover_plane(&self) -> &[u8] {
-        &self.cover
+    pub(crate) fn covered_plane(&self) -> &[u64] {
+        &self.covered
+    }
+
+    /// Word `i` of the derived frontier: covered and not occupied.
+    #[inline]
+    pub(crate) fn frontier_word(&self, i: usize) -> u64 {
+        self.covered[i] & !self.occ[0][i] & !self.occ[1][i]
     }
 
     /// Maintained frontier population count.
@@ -220,11 +226,11 @@ impl Grid {
     /// is not itself a frontier cell.
     pub(crate) fn frontier_rank(&self, c: HexCoord) -> Option<usize> {
         let (word, bit) = self.locate(c)?;
-        if (self.frontier[word] >> bit) & 1 == 0 {
+        if (self.frontier_word(word) >> bit) & 1 == 0 {
             return None;
         }
-        let below: u32 = self.frontier[..word].iter().map(|w| w.count_ones()).sum();
-        let within = (self.frontier[word] & ((1u64 << bit) - 1)).count_ones();
+        let below: u32 = (0..word).map(|i| self.frontier_word(i).count_ones()).sum();
+        let within = (self.frontier_word(word) & ((1u64 << bit) - 1)).count_ones();
         Some((below + within) as usize)
     }
 
@@ -232,7 +238,8 @@ impl Grid {
     /// the end.
     pub(crate) fn nth_frontier(&self, index: usize) -> Option<HexCoord> {
         let mut remaining = index;
-        for (word, &bits) in self.frontier.iter().enumerate() {
+        for word in 0..self.total_words() {
+            let bits = self.frontier_word(word);
             let pop = bits.count_ones() as usize;
             if remaining >= pop {
                 remaining -= pop;
@@ -256,26 +263,24 @@ impl Grid {
         }
     }
 
-    /// Set `c` to `p`'s stone.
+    /// Whether `c` lies within [`LEGAL_RADIUS`] of some stone. Total: `false`
+    /// outside the arena.
     #[inline]
-    pub(crate) fn set_owner(&mut self, c: HexCoord, p: Player) {
-        let (w, b) = self.locate_written(c);
-        self.occ[p.index()][w] |= 1 << b;
-    }
-
-    /// Clear `p`'s stone from `c`.
-    #[inline]
-    pub(crate) fn clear_owner(&mut self, c: HexCoord, p: Player) {
-        let (w, b) = self.locate_written(c);
-        self.occ[p.index()][w] &= !(1u64 << b);
-    }
-
-    /// Stones within [`LEGAL_RADIUS`] of `c`. Total: `0` outside the arena.
-    #[inline]
-    pub(crate) fn cover(&self, c: HexCoord) -> u8 {
+    pub(crate) fn is_covered(&self, c: HexCoord) -> bool {
         match self.locate(c) {
-            Some((w, b)) => self.cover[w * 64 + b as usize],
-            None => 0,
+            Some((w, b)) => (self.covered[w] >> b) & 1 == 1,
+            None => false,
+        }
+    }
+
+    /// Whether `c` is a frontier cell: covered and empty. Total: `false` outside
+    /// the arena. Derived, never stored.
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn frontier_bit(&self, c: HexCoord) -> bool {
+        match self.locate(c) {
+            Some((w, b)) => (self.frontier_word(w) >> b) & 1 == 1,
+            None => false,
         }
     }
 
@@ -308,159 +313,156 @@ impl Grid {
         out
     }
 
-    /// `cover += 1` across the disk around `c`, setting the frontier bit of every empty
-    /// cell the increment brought to coverage `1`.
-    pub(crate) fn add_cover_disk(&mut self, c: HexCoord) {
-        for (start, n) in self.disk_runs(c) {
+    /// Popcount of the derived frontier across the disk runs. Both placement halves
+    /// change the frontier only inside the placed cell's disk, so a before/after pair
+    /// of these is the whole [`Grid::frontier_cells`] delta.
+    fn frontier_pop_runs(&self, runs: &[(usize, usize); DISK_ROWS]) -> u32 {
+        let mut pop = 0;
+        for &(start, n) in runs {
             if n == 0 {
                 continue;
             }
-            let mut fresh = 0u64;
-            for (k, cell) in self.cover[start..start + n].iter_mut().enumerate() {
-                debug_assert!((*cell as usize) < DISK_CELLS, "C1: coverage overflow");
-                *cell += 1;
-                if *cell == 1 {
-                    fresh |= 1 << k;
-                }
-            }
-            let occupied = gather_run(&self.occ[0], start, n) | gather_run(&self.occ[1], start, n);
-            self.set_frontier_run(start, fresh & !occupied);
+            let f = gather_run(&self.covered, start, n)
+                & !gather_run(&self.occ[0], start, n)
+                & !gather_run(&self.occ[1], start, n);
+            pop += f.count_ones();
         }
+        pop
     }
 
-    /// The exact inverse of [`Grid::add_cover_disk`]: rows in reverse order, and each
-    /// frontier bit cleared *before* the decrement that justifies it.
-    pub(crate) fn remove_cover_disk(&mut self, c: HexCoord) {
-        for (start, n) in self.disk_runs(c).into_iter().rev() {
-            if n == 0 {
-                continue;
-            }
-            let mut falling = 0u64;
-            for (k, &cell) in self.cover[start..start + n].iter().enumerate() {
-                if cell == 1 {
-                    falling |= 1 << k;
-                }
-            }
-            let occupied = gather_run(&self.occ[0], start, n) | gather_run(&self.occ[1], start, n);
-            self.clear_frontier_run(start, falling & !occupied);
-            for cell in &mut self.cover[start..start + n] {
-                debug_assert!(*cell > 0, "C1: coverage underflow");
-                *cell -= 1;
-            }
-        }
-    }
-
-    /// Set the frontier bits named by `bits`, where bit `k` is cell `start + k`,
-    /// maintaining [`Grid::frontier_cells`].
+    /// OR `bits` into `covered`, where bit `k` is cell `start + k`. Idempotent.
     #[inline]
-    fn set_frontier_run(&mut self, start: usize, bits: u64) {
-        if bits == 0 {
-            return;
-        }
+    fn cover_run(&mut self, start: usize, n: usize, bits: u64) {
         let (w, sh) = (start >> 6, (start & 63) as u32);
-        debug_assert_eq!(self.frontier[w] & (bits << sh), 0, "C2: bit already set");
-        self.frontier[w] |= bits << sh;
-        if sh != 0 {
-            let high = bits >> (64 - sh);
-            if high != 0 {
-                debug_assert_eq!(self.frontier[w + 1] & high, 0, "C2: bit already set");
-                self.frontier[w + 1] |= high;
-            }
+        self.covered[w] |= bits << sh;
+        if sh as usize + n > 64 {
+            self.covered[w + 1] |= bits >> (64 - sh);
         }
-        self.frontier_cells += bits.count_ones();
     }
 
-    /// Clear the frontier bits named by `bits`, as [`Grid::set_frontier_run`].
+    /// Replace the `n` covered bits at `start` with `bits`.
     #[inline]
-    fn clear_frontier_run(&mut self, start: usize, bits: u64) {
-        if bits == 0 {
-            return;
-        }
+    fn store_covered_run(&mut self, start: usize, n: usize, bits: u64) {
+        debug_assert_eq!(bits & !mask(n), 0, "bits past the run");
         let (w, sh) = (start >> 6, (start & 63) as u32);
-        let low = bits << sh;
-        debug_assert_eq!(self.frontier[w] & low, low, "C2: bit not set");
-        self.frontier[w] &= !low;
-        if sh != 0 {
-            let high = bits >> (64 - sh);
-            if high != 0 {
-                debug_assert_eq!(self.frontier[w + 1] & high, high, "C2: bit not set");
-                self.frontier[w + 1] &= !high;
+        self.covered[w] = (self.covered[w] & !(mask(n) << sh)) | (bits << sh);
+        if sh as usize + n > 64 {
+            let spill = 64 - sh;
+            self.covered[w + 1] = (self.covered[w + 1] & !(mask(n) >> spill)) | (bits >> spill);
+        }
+    }
+
+    /// Put `p`'s stone at `c`: occupancy bit, coverage disk, frontier count.
+    pub(crate) fn place_stone(&mut self, c: HexCoord, p: Player) {
+        let runs = self.disk_runs(c);
+        let before = self.frontier_pop_runs(&runs);
+        let (w, b) = self.locate_written(c);
+        self.occ[p.index()][w] |= 1 << b;
+        for &(start, n) in &runs {
+            if n > 0 {
+                self.cover_run(start, n, mask(n));
             }
         }
-        self.frontier_cells -= bits.count_ones();
+        let after = self.frontier_pop_runs(&runs);
+        self.frontier_cells = self.frontier_cells - before + after;
     }
 
-    /// Whether `c`'s frontier bit is set. Total: `false` outside the arena.
-    #[inline]
-    #[cfg_attr(not(debug_assertions), allow(dead_code))]
-    pub(crate) fn frontier_bit(&self, c: HexCoord) -> bool {
-        match self.locate(c) {
-            Some((w, b)) => (self.frontier[w] >> b) & 1 == 1,
-            None => false,
-        }
-    }
-
-    /// Set `c`'s frontier bit, maintaining `frontier_cells`. Idempotent.
-    #[inline]
-    pub(crate) fn set_frontier(&mut self, c: HexCoord) {
+    /// The exact inverse of [`Grid::place_stone`]: clear the occupancy bit and
+    /// recompute the coverage disk from the stones that remain.
+    pub(crate) fn unplace_stone(&mut self, c: HexCoord, p: Player) {
+        let runs = self.disk_runs(c);
+        let before = self.frontier_pop_runs(&runs);
         let (w, b) = self.locate_written(c);
-        if (self.frontier[w] >> b) & 1 == 0 {
-            self.frontier[w] |= 1 << b;
-            self.frontier_cells += 1;
-        }
+        debug_assert_eq!((self.occ[p.index()][w] >> b) & 1, 1, "not {p:?}'s stone");
+        self.occ[p.index()][w] &= !(1u64 << b);
+        self.recompute_covered_disk(c, &runs);
+        let after = self.frontier_pop_runs(&runs);
+        self.frontier_cells = self.frontier_cells - before + after;
     }
 
-    /// Clear `c`'s frontier bit, maintaining `frontier_cells`. Idempotent.
-    #[inline]
-    pub(crate) fn clear_frontier(&mut self, c: HexCoord) {
-        let (w, b) = self.locate_written(c);
-        if (self.frontier[w] >> b) & 1 == 1 {
-            self.frontier[w] &= !(1u64 << b);
-            self.frontier_cells -= 1;
+    /// Union occupancy of row `q`, bits `r0 .. r0 + n`, as a window word whose bit `j`
+    /// is the cell `(q, r0 + j)`. Total: cells outside the arena read `0`.
+    fn occupied_window_row(&self, q: i32, r0: i32, n: usize) -> u64 {
+        let row = q - self.origin_q;
+        if self.rows == 0 || row < 0 || row >= self.rows as i32 {
+            return 0;
         }
-    }
-
-    /// `strip[i]` bit `j` = `plane` bit at `(c.q - 5 + i, c.r - 5 + j)`, for `i, j` in
-    /// `0..11`.
-    pub(crate) fn strip11(&self, plane: &[u64], c: HexCoord) -> [u16; 11] {
-        let mut out = [0u16; 11];
-        if self.rows == 0 {
-            return out;
-        }
-        let base_q = c.q as i32 - 5;
-        let base_r = c.r as i32 - 5;
         let total_bits = 64 * self.row_words as i32;
-        for (i, slot) in out.iter_mut().enumerate() {
-            let row = base_q + i as i32 - self.origin_q;
-            if row < 0 || row >= self.rows as i32 {
+        let lo = (r0 - self.origin_r).max(0);
+        let hi = (r0 + n as i32 - self.origin_r).min(total_bits);
+        if lo >= hi {
+            return 0;
+        }
+        let base = row as usize * self.row_words;
+        let (len, w, sh) = ((hi - lo) as usize, (lo >> 6) as usize, (lo & 63) as u32);
+        let plane = |i: usize| self.occ[0][base + i] | self.occ[1][base + i];
+        let mut v = plane(w) >> sh;
+        if sh as usize + len > 64 {
+            v |= plane(w + 1) << (64 - sh);
+        }
+        (v & mask(len)) << (lo - (r0 - self.origin_r))
+    }
+
+    /// Recompute `covered` across the disk around `c` from occupancy alone.
+    ///
+    /// Coverage is occupancy dilated by the radius-[`LEGAL_RADIUS`] hex disk, and the
+    /// disk is a zonogon: the Minkowski sum of the segments `0..=8` along `+Q`, `+R`,
+    /// and `+QR`, translated by `(-8, 0)`. The dilation therefore factors into three
+    /// 1-D dilations, each a log-shift schedule (spans 2, 4, 8, then 9). Removing the
+    /// stone at `c` changes coverage only inside `c`'s disk, and any stone covering a
+    /// cell of that disk lies within `2 * LEGAL_RADIUS` of `c`, so a 33x33 occupancy
+    /// window suffices. Writeback goes through the domain-clipped [`Grid::disk_runs`],
+    /// so no out-of-domain cell is ever painted covered.
+    fn recompute_covered_disk(&mut self, c: HexCoord, runs: &[(usize, usize); DISK_ROWS]) {
+        /// Window rows and bits: `c ± 2 * LEGAL_RADIUS`.
+        const W: usize = 4 * LEGAL_RADIUS as usize + 1;
+        let rad = LEGAL_RADIUS as usize;
+        let (cq, cr) = (c.q as i32, c.r as i32);
+
+        // t[i] bit j = a stone at (c.q - 16 + i, c.r - 16 + j).
+        let mut t = [0u64; W];
+        for (i, slot) in t.iter_mut().enumerate() {
+            *slot =
+                self.occupied_window_row(cq - 2 * rad as i32 + i as i32, cr - 2 * rad as i32, W);
+        }
+        // Dilate by 0..=8 rows of +Q: t[i] |= t[i - d]. Descending, so each pass reads
+        // the previous pass's spans, not its own.
+        for d in [1usize, 2, 4, 1] {
+            for i in (d..W).rev() {
+                t[i] |= t[i - d];
+            }
+        }
+        // Dilate by 0..=8 bits of +R: within-word shifts, no row coupling.
+        for row in t.iter_mut() {
+            let mut v = *row;
+            v |= v << 1;
+            v |= v << 2;
+            v |= v << 4;
+            v |= v << 1;
+            *row = v;
+        }
+        // Dilate by 0..=8 steps of +QR: paired (+row, -bit) shifts.
+        for d in [1usize, 2, 4, 1] {
+            for i in (d..W).rev() {
+                t[i] |= t[i - d] >> d;
+            }
+        }
+
+        // Translate by (-8, 0) and splice: covered row (c.q - 8 + k) = t[16 + k], and
+        // the domain-clipped run of that row selects which bits are written.
+        for (k, &(start, n)) in runs.iter().enumerate() {
+            if n == 0 {
                 continue;
             }
-            let row_base = row as usize * self.row_words;
-            let bit = base_r - self.origin_r;
-            *slot = if bit >= 0 && bit + 11 <= total_bits {
-                let w = (bit >> 6) as usize;
-                let sh = (bit & 63) as u32;
-                let mut v = plane[row_base + w] >> sh;
-                if sh + 11 > 64 {
-                    v |= plane[row_base + w + 1] << (64 - sh);
-                }
-                (v & 0x7FF) as u16
-            } else {
-                let mut v = 0u16;
-                for j in 0..11i32 {
-                    let b = bit + j;
-                    if b < 0 || b >= total_bits {
-                        continue;
-                    }
-                    let word = plane[row_base + (b >> 6) as usize];
-                    if (word >> (b & 63)) & 1 == 1 {
-                        v |= 1 << j;
-                    }
-                }
-                v
-            };
+            let r = self.origin_r + (start % (self.row_words * 64)) as i32;
+            let j0 = r - (cr - 2 * rad as i32);
+            debug_assert!(
+                (0..=(W as i32 - n as i32)).contains(&j0),
+                "run outside the window"
+            );
+            let bits = (t[2 * rad + k] >> j0) & mask(n);
+            self.store_covered_run(start, n, bits);
         }
-        out
     }
 
     /// Whether `[c.q ± PAD] × [c.r ± PAD]` is already inside the arena.
@@ -562,8 +564,7 @@ impl Grid {
         let words = new_rows * new_words;
         let mut occ0 = vec![0u64; words];
         let mut occ1 = vec![0u64; words];
-        let mut frontier = vec![0u64; words];
-        let mut cover = vec![0u8; words * 64];
+        let mut covered = vec![0u64; words];
 
         if let Some((sq0, sq1, sr0, sr1)) = bounds {
             let live_lo_q = (sq0 - PAD).max(self.origin_q);
@@ -586,9 +587,7 @@ impl Grid {
                 let dst = (dst_row0 + i) * new_words + dst_word0;
                 occ0[dst..dst + n_words].copy_from_slice(&self.occ[0][src..src + n_words]);
                 occ1[dst..dst + n_words].copy_from_slice(&self.occ[1][src..src + n_words]);
-                frontier[dst..dst + n_words].copy_from_slice(&self.frontier[src..src + n_words]);
-                let (bsrc, bdst, n) = (src * 64, dst * 64, n_words * 64);
-                cover[bdst..bdst + n].copy_from_slice(&self.cover[bsrc..bsrc + n]);
+                covered[dst..dst + n_words].copy_from_slice(&self.covered[src..src + n_words]);
             }
         }
 
@@ -597,8 +596,7 @@ impl Grid {
         self.origin_q = new_origin_q;
         self.origin_r = new_origin_r;
         self.occ = [occ0, occ1];
-        self.frontier = frontier;
-        self.cover = cover;
+        self.covered = covered;
 
         debug_assert!(
             self.contains_padded(c),
@@ -611,20 +609,34 @@ impl Grid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coord::{DISK8, offset};
+    use crate::coord::{DISK_CELLS, DISK8, offset};
 
     fn grow(g: &mut Grid, q: i16, r: i16) {
         g.reserve_around(HexCoord::new(q, r)).expect("growth");
     }
 
-    /// Reserve around `(q, r)` and put a stone there, the way `Position` does.
+    /// Reserve around `(q, r)` and place `P0`'s stone there, the way `Position` does.
     fn place(g: &mut Grid, q: i16, r: i16) {
         grow(g, q, r);
-        g.set_owner(HexCoord::new(q, r), Player::P0);
+        g.place_stone(HexCoord::new(q, r), Player::P0);
+    }
+
+    fn unplace(g: &mut Grid, q: i16, r: i16) {
+        g.unplace_stone(HexCoord::new(q, r), Player::P0);
     }
 
     fn cells(g: &Grid) -> u64 {
         g.rows() as u64 * g.row_words() as u64 * 64
+    }
+
+    /// Coverage of `c` recomputed straight off the offset table: any stone within the
+    /// disk. Independent of both the run-OR that paints coverage on placement and the
+    /// separable dilation that rewrites it on removal.
+    fn covered_by_table(g: &Grid, c: HexCoord) -> bool {
+        DISK8.iter().any(|&d| {
+            let s = offset(c, d);
+            s.is_valid() && g.owner(s).is_some()
+        })
     }
 
     /// Every frontier cell in canonical order, read by walking the whole arena
@@ -647,47 +659,93 @@ mod tests {
         out
     }
 
-    /// Fix the arena to span both corners by planting a stone at each.
-    fn anchor(g: &mut Grid, lo: (i16, i16), hi: (i16, i16)) {
-        place(g, lo.0, lo.1);
-        place(g, hi.0, hi.1);
+    /// The whole covered plane checked cell for cell against the table recount, and
+    /// the frontier counter against a brute popcount. An off-domain cell must never
+    /// read covered, however close a stone sits.
+    fn assert_coverage_planes(g: &Grid) {
+        let mut frontier = 0u32;
+        for row in 0..g.rows() {
+            for bit in 0..(64 * g.row_words()) {
+                let c = HexCoord::new(
+                    (g.origin_q() + row as i32) as i16,
+                    (g.origin_r() + bit as i32) as i16,
+                );
+                let want = c.is_valid() && covered_by_table(g, c);
+                assert_eq!(g.is_covered(c), want, "covered at ({}, {})", c.q, c.r);
+                if want && g.owner(c).is_none() {
+                    frontier += 1;
+                }
+            }
+        }
+        assert_eq!(frontier, g.frontier_cells(), "frontier counter");
     }
 
-    /// Mark `(q, r)` as a frontier cell directly, bypassing `Position`, so the
-    /// rank/select scan can be tested against arbitrary bit patterns.
-    fn mark_frontier(g: &mut Grid, q: i16, r: i16) {
-        let c = HexCoord::new(q, r);
-        assert!(
-            g.cell_index(c).is_some(),
-            "({q}, {r}) is outside the anchored arena"
-        );
-        g.set_frontier(c);
+    /// The one detector the coverage design leans on: the run-OR (placement), the
+    /// separable dilation (removal), and the offset table are three independent
+    /// statements of the same set, compared after every mutation and after a growth.
+    #[test]
+    fn coverage_matches_the_stone_recount_through_places_unplaces_and_growth() {
+        let mut g = Grid::new();
+        let script: [(i16, i16, Player); 8] = [
+            (0, 0, Player::P0),
+            (0, 63, Player::P1),
+            (0, 64, Player::P0),
+            (5, -3, Player::P1),
+            (-7, 11, Player::P0),
+            (12, 120, Player::P1),
+            (3, 60, Player::P0),
+            (-2, -8, Player::P1),
+        ];
+        for &(q, r, p) in &script {
+            grow(&mut g, q, r);
+            g.place_stone(HexCoord::new(q, r), p);
+            assert_coverage_planes(&g);
+        }
+        for &(q, r, p) in &[script[3], script[0], script[7], script[5]] {
+            g.unplace_stone(HexCoord::new(q, r), p);
+            assert_coverage_planes(&g);
+        }
+        grow(&mut g, 80, -80);
+        assert_coverage_planes(&g);
     }
 
     #[test]
-    fn frontier_rank_and_select_are_inverse_over_a_scattered_arena() {
+    fn place_then_unplace_restores_every_plane_exactly() {
         let mut g = Grid::new();
-        anchor(&mut g, (-6, -80), (8, 220));
-        let marks = [
-            (0i16, 0i16),
-            (0, 1),
-            (0, 63),
-            (0, 64),
-            (0, 65),
-            (1, -1),
-            (1, 0),
-            (-1, 7),
-            (-3, 130),
-            (5, -70),
-            (5, 200),
-        ];
-        for &(q, r) in &marks {
-            mark_frontier(&mut g, q, r);
+        for &(q, r) in &[(0i16, 0i16), (4, 60), (-5, 7)] {
+            place(&mut g, q, r);
         }
+        grow(&mut g, 9, 62);
+        let (occ0, occ1, covered, fc) = (
+            g.occ[0].clone(),
+            g.occ[1].clone(),
+            g.covered.clone(),
+            g.frontier_cells(),
+        );
+        g.place_stone(HexCoord::new(9, 62), Player::P1);
+        assert_ne!(g.covered, covered, "the placement must extend coverage");
+        g.unplace_stone(HexCoord::new(9, 62), Player::P1);
+        assert_eq!(g.occ[0], occ0);
+        assert_eq!(g.occ[1], occ1);
+        assert_eq!(g.covered, covered);
+        assert_eq!(g.frontier_cells(), fc);
+    }
 
+    #[test]
+    fn frontier_rank_and_select_are_inverse_over_scattered_stones() {
+        let mut g = Grid::new();
+        for &(q, r) in &[(0i16, 0i16), (0, 63), (2, 70), (-6, -40), (9, 130)] {
+            place(&mut g, q, r);
+        }
         let expected = frontier_by_brute_force(&g);
-        assert_eq!(expected.len(), marks.len(), "every mark must be distinct");
+        assert!(
+            expected.len() > 400,
+            "the disks should spread a real frontier"
+        );
         assert_eq!(expected.len() as u32, g.frontier_cells());
+        let mut sorted = expected.clone();
+        sorted.sort_unstable();
+        assert_eq!(expected, sorted, "the brute walk must already be canonical");
 
         for (i, &c) in expected.iter().enumerate() {
             assert_eq!(g.frontier_rank(c), Some(i), "rank of ({}, {})", c.q, c.r);
@@ -701,54 +759,28 @@ mod tests {
     #[test]
     fn frontier_select_rejects_an_index_above_u32_max() {
         let mut g = Grid::new();
-        anchor(&mut g, (-1, -1), (1, 1));
-        mark_frontier(&mut g, 0, 0);
+        place(&mut g, 0, 0);
         assert_eq!(g.nth_frontier(u32::MAX as usize + 1), None);
     }
 
     #[test]
-    fn frontier_rank_is_ascending_and_matches_canonical_order() {
+    fn frontier_rank_is_none_off_the_frontier() {
         let mut g = Grid::new();
-        anchor(&mut g, (-6, -10), (4, 100));
-        for &(q, r) in &[(2i16, 5i16), (-4, 90), (0, 0), (2, 4), (-4, 89)] {
-            mark_frontier(&mut g, q, r);
-        }
-        let listed = frontier_by_brute_force(&g);
-        let mut sorted = listed.clone();
-        sorted.sort_unstable();
-        assert_eq!(listed, sorted);
-        let ranks: Vec<usize> = listed
-            .iter()
-            .map(|&c| g.frontier_rank(c).expect("marked"))
-            .collect();
-        assert_eq!(ranks, (0..listed.len()).collect::<Vec<_>>());
-    }
-
-    #[test]
-    fn frontier_rank_is_none_off_the_plane() {
-        let mut g = Grid::new();
-        anchor(&mut g, (-4, -4), (4, 4));
-        mark_frontier(&mut g, 0, 0);
-        assert_eq!(g.frontier_rank(HexCoord::new(0, 1)), None);
-        assert_eq!(g.frontier_rank(HexCoord::new(9000, 9000)), None);
+        place(&mut g, 0, 0);
+        assert_eq!(g.frontier_rank(HexCoord::ORIGIN), None, "occupied");
+        assert_eq!(
+            g.frontier_rank(HexCoord::new(9, 0)),
+            None,
+            "past the radius"
+        );
+        assert_eq!(
+            g.frontier_rank(HexCoord::new(9000, 9000)),
+            None,
+            "off the arena"
+        );
         let empty = Grid::new();
         assert_eq!(empty.frontier_rank(HexCoord::ORIGIN), None);
         assert_eq!(empty.nth_frontier(0), None);
-    }
-
-    #[test]
-    fn a_full_word_ranks_every_bit() {
-        let mut g = Grid::new();
-        anchor(&mut g, (-2, -2), (2, 70));
-        for r in 0i16..64 {
-            mark_frontier(&mut g, 0, r);
-        }
-        assert_eq!(g.frontier_cells(), 64);
-        for r in 0i16..64 {
-            assert_eq!(g.frontier_rank(HexCoord::new(0, r)), Some(r as usize));
-            assert_eq!(g.nth_frontier(r as usize), Some(HexCoord::new(0, r)));
-        }
-        assert_eq!(g.nth_frontier(64), None);
     }
 
     #[test]
@@ -760,12 +792,10 @@ mod tests {
         assert_eq!(g.frontier_cells(), 0);
         assert!(g.is_empty_cell(HexCoord::ORIGIN));
         assert_eq!(g.owner(HexCoord::new(500, -500)), None);
-        assert_eq!(g.cover(HexCoord::ORIGIN), 0);
+        assert!(!g.is_covered(HexCoord::ORIGIN));
         assert!(!g.frontier_bit(HexCoord::ORIGIN));
-        assert_eq!(
-            g.strip11(g.occ_plane(Player::P0), HexCoord::ORIGIN),
-            [0; 11]
-        );
+        assert!(g.occ_plane(Player::P0).is_empty());
+        assert!(g.covered_plane().is_empty());
     }
 
     #[test]
@@ -784,13 +814,11 @@ mod tests {
     fn growth_in_each_of_four_directions_keeps_origin_r_aligned() {
         for (dq, dr) in [(400i16, 0i16), (-400, 0), (0, 400), (0, -400)] {
             let mut g = Grid::new();
-            grow(&mut g, 0, 0);
-            g.set_owner(HexCoord::ORIGIN, Player::P0);
-            g.add_cover_disk(HexCoord::ORIGIN);
+            place(&mut g, 0, 0);
             grow(&mut g, dq, dr);
             assert_eq!(g.origin_r() % 64, 0, "origin_r misaligned for {dq},{dr}");
             assert_eq!(g.owner(HexCoord::ORIGIN), Some(Player::P0));
-            assert_eq!(g.cover(HexCoord::ORIGIN), 1);
+            assert!(g.is_covered(HexCoord::ORIGIN));
             assert!(g.frontier_bit(HexCoord::new(1, 0)));
             assert!(g.contains_padded(HexCoord::new(dq, dr)));
             assert!(g.contains_padded(HexCoord::ORIGIN));
@@ -801,32 +829,33 @@ mod tests {
     fn grown_arena_reads_back_every_written_cell_and_zero_elsewhere() {
         let mut g = Grid::new();
         let written = [(0i16, 0i16), (3, -2), (-5, 7), (9, 9), (-11, -1)];
-        for &(q, r) in &written {
+        for (i, &(q, r)) in written.iter().enumerate() {
             grow(&mut g, q, r);
-            let c = HexCoord::new(q, r);
-            g.set_owner(c, if q % 2 == 0 { Player::P0 } else { Player::P1 });
-            g.add_cover_disk(c);
+            g.place_stone(
+                HexCoord::new(q, r),
+                if i % 2 == 0 { Player::P0 } else { Player::P1 },
+            );
         }
-        let expect: Vec<(HexCoord, Option<Player>, u8)> = written
+        let expect: Vec<(HexCoord, Option<Player>)> = written
             .iter()
             .map(|&(q, r)| {
                 let c = HexCoord::new(q, r);
-                (c, g.owner(c), g.cover(c))
+                (c, g.owner(c))
             })
             .collect();
         assert!(
             expect
                 .iter()
-                .all(|&(_, owner, cover)| owner.is_some() && cover > 0)
+                .all(|&(c, owner)| owner.is_some() && g.is_covered(c))
         );
 
         for &(q, r) in &[(300i16, 300i16), (-300, -300), (300, -300), (-300, 300)] {
             grow(&mut g, q, r);
-            for &(c, owner, cover) in &expect {
+            for &(c, owner) in &expect {
                 assert_eq!(g.owner(c), owner, "owner lost at {c:?}");
-                assert_eq!(g.cover(c), cover, "coverage lost at {c:?}");
+                assert!(g.is_covered(c), "coverage lost at {c:?}");
             }
-            assert_eq!(g.cover(HexCoord::new(q, r)), 0);
+            assert!(!g.is_covered(HexCoord::new(q, r)));
             assert!(g.is_empty_cell(HexCoord::new(q, r)));
             assert!(!g.frontier_bit(HexCoord::new(q, r)));
         }
@@ -851,8 +880,8 @@ mod tests {
     }
 
     /// The row runs and the `DISK8` table are two independent statements of the same
-    /// cell set: `add_cover_disk` walks the runs, and the tier-C frontier assertion
-    /// walks the table on every apply and undo.
+    /// cell set: placement paints coverage through the runs, and tier C recounts it
+    /// through the table.
     #[test]
     fn disk_runs_visit_exactly_the_disk8_cells_in_disk8_order() {
         for &(q, r) in &[(0i16, 0i16), (5, -3), (-7, 11), (40, 40), (-40, 13)] {
@@ -888,47 +917,42 @@ mod tests {
         }
     }
 
-    /// Applying and removing the same disk restores every plane exactly, at a
-    /// coordinate whose disk the domain clips — the case where the two halves could
-    /// disagree about which cells to skip.
+    /// Placing and removing the same stone restores every plane exactly, at a
+    /// coordinate whose disk the domain clips — the case where the paint and the
+    /// recompute could disagree about which cells exist.
     #[test]
     fn a_clipped_disk_round_trips() {
         let mut g = Grid::new();
         let c = HexCoord::new(COORD_LIMIT, -COORD_LIMIT + 3);
         grow(&mut g, c.q, c.r);
-        g.set_owner(c, Player::P0);
-        g.add_cover_disk(c);
-        let covered = g.cover_plane().iter().filter(|&&v| v > 0).count();
-        assert!(covered > 0 && covered < DISK_CELLS);
-        assert_eq!(
-            g.frontier_cells(),
-            covered as u32 - 1,
-            "the stone is not free"
-        );
+        g.place_stone(c, Player::P0);
+        let covered: u32 = g.covered_plane().iter().map(|w| w.count_ones()).sum();
+        assert!(covered > 0 && (covered as usize) < DISK_CELLS);
+        assert_eq!(g.frontier_cells(), covered - 1, "the stone is not free");
+        assert_coverage_planes(&g);
 
-        g.remove_cover_disk(c);
+        g.unplace_stone(c, Player::P0);
         assert_eq!(g.frontier_cells(), 0);
-        assert!(g.cover_plane().iter().all(|&v| v == 0));
-        assert!(g.frontier_plane().iter().all(|&w| w == 0));
+        assert!(g.covered_plane().iter().all(|&w| w == 0));
     }
 
     #[test]
-    fn frontier_counter_tracks_the_plane() {
+    fn the_frontier_counter_tracks_the_derived_plane() {
         let mut g = Grid::new();
-        grow(&mut g, 0, 0);
-        assert_eq!(g.frontier_cells(), 0);
-        g.set_frontier(HexCoord::new(1, 1));
-        assert_eq!(g.frontier_cells(), 1);
-        g.set_frontier(HexCoord::new(1, 1));
-        assert_eq!(g.frontier_cells(), 1);
-        g.set_frontier(HexCoord::new(2, 1));
-        assert_eq!(g.frontier_cells(), 2);
-        g.clear_frontier(HexCoord::new(1, 1));
-        assert_eq!(g.frontier_cells(), 1);
-        g.clear_frontier(HexCoord::new(1, 1));
-        assert_eq!(g.frontier_cells(), 1);
-        let pop: u32 = g.frontier_plane().iter().map(|w| w.count_ones()).sum();
-        assert_eq!(pop, g.frontier_cells());
+        for &(q, r) in &[(0i16, 0i16), (1, 1), (0, 63), (14, -2)] {
+            place(&mut g, q, r);
+            let brute: u32 = (0..g.total_words())
+                .map(|i| g.frontier_word(i).count_ones())
+                .sum();
+            assert_eq!(brute, g.frontier_cells());
+        }
+        for &(q, r) in &[(1i16, 1i16), (0, 0)] {
+            unplace(&mut g, q, r);
+            let brute: u32 = (0..g.total_words())
+                .map(|i| g.frontier_word(i).count_ones())
+                .sum();
+            assert_eq!(brute, g.frontier_cells());
+        }
     }
 
     #[test]
@@ -968,7 +992,7 @@ mod tests {
         }
         assert!(g.rows() >= (q as usize) + 2 * PAD as usize);
         assert!(
-            cells(&g) <= MAX_GRID_CELLS / 4,
+            cells(&g) <= MAX_GRID_CELLS / 16,
             "{} cells for a one-row game",
             cells(&g)
         );
@@ -989,7 +1013,7 @@ mod tests {
                 if g.reserve_around(HexCoord::new(q, r)).is_err() {
                     break;
                 }
-                g.set_owner(HexCoord::new(q, r), Player::P0);
+                g.place_stone(HexCoord::new(q, r), Player::P0);
                 n += 1;
             }
             n
@@ -1011,7 +1035,7 @@ mod tests {
             place(&mut inflated, q, 0);
         }
         for k in 1..=(q / 8) {
-            inflated.clear_owner(HexCoord::new(k * 8, 0), Player::P0);
+            inflated.unplace_stone(HexCoord::new(k * 8, 0), Player::P0);
         }
         assert!(
             inflated.rows() > 1000,
@@ -1023,7 +1047,7 @@ mod tests {
 
         let (mut q, mut r) = (0i16, 0i16);
         let mut refused = false;
-        for step in 0..800 {
+        for step in 0..1400 {
             if step % 2 == 0 {
                 q += 8;
             } else {
@@ -1042,97 +1066,10 @@ mod tests {
                 refused = true;
                 break;
             }
-            inflated.set_owner(c, Player::P0);
-            fresh.set_owner(c, Player::P0);
+            inflated.place_stone(c, Player::P0);
+            fresh.place_stone(c, Player::P0);
         }
         assert!(refused, "the diagonal never reached the ceiling");
-    }
-
-    #[test]
-    fn strip11_places_the_query_cell_at_row_5_bit_5() {
-        let mut g = Grid::new();
-        grow(&mut g, 0, 0);
-        let c = HexCoord::new(2, -3);
-        g.set_owner(c, Player::P0);
-        let s = g.strip11(g.occ_plane(Player::P0), c);
-        assert_eq!(s[5], 1 << 5);
-        for (i, row) in s.iter().enumerate() {
-            if i != 5 {
-                assert_eq!(*row, 0);
-            }
-        }
-    }
-
-    #[test]
-    fn strip11_reads_the_whole_11x11_neighbourhood() {
-        let mut g = Grid::new();
-        let c = HexCoord::new(0, 0);
-        grow(&mut g, 0, 0);
-        for dq in -5i16..=5 {
-            for dr in -5i16..=5 {
-                let cell = HexCoord::new(c.q + dq, c.r + dr);
-                grow(&mut g, cell.q, cell.r);
-            }
-        }
-        let mut expect = [0u16; 11];
-        for dq in -5i16..=5 {
-            for dr in -5i16..=5 {
-                if (dq + dr) % 3 != 0 {
-                    continue;
-                }
-                g.set_owner(HexCoord::new(c.q + dq, c.r + dr), Player::P1);
-                expect[(dq + 5) as usize] |= 1 << (dr + 5);
-            }
-        }
-        assert_eq!(g.strip11(g.occ_plane(Player::P1), c), expect);
-        assert_eq!(g.strip11(g.occ_plane(Player::P0), c), [0u16; 11]);
-    }
-
-    #[test]
-    fn strip11_is_total_off_the_arena_edge() {
-        let mut g = Grid::new();
-        grow(&mut g, 0, 0);
-        for c in [
-            HexCoord::new(9000, 0),
-            HexCoord::new(-9000, 0),
-            HexCoord::new(0, 9000),
-            HexCoord::new(0, -9000),
-        ] {
-            assert_eq!(g.strip11(g.occ_plane(Player::P0), c), [0u16; 11]);
-        }
-        let edge_q = (g.origin_q() + g.rows() as i32 - 1) as i16;
-        g.set_owner(HexCoord::new(edge_q, 0), Player::P0);
-        let s = g.strip11(g.occ_plane(Player::P0), HexCoord::new(edge_q, 0));
-        assert_eq!(s[5], 1 << 5);
-        let edge_r = (g.origin_r() + 64 * g.row_words() as i32 - 1) as i16;
-        g.set_owner(HexCoord::new(0, edge_r), Player::P1);
-        let s = g.strip11(g.occ_plane(Player::P1), HexCoord::new(0, edge_r));
-        assert_eq!(s[5], 1 << 5);
-    }
-
-    #[test]
-    fn strip11_fast_and_clamped_paths_agree_across_word_boundaries() {
-        let mut g = Grid::new();
-        grow(&mut g, 0, 200);
-        for q in -6i16..=6 {
-            for r in 180i16..=220 {
-                if (q as i32 * 7 + r as i32 * 3) % 5 == 0 {
-                    grow(&mut g, q, r);
-                    g.set_owner(HexCoord::new(q, r), Player::P0);
-                }
-            }
-        }
-        for r in 190i16..=210 {
-            let c = HexCoord::new(0, r);
-            let s = g.strip11(g.occ_plane(Player::P0), c);
-            for (i, &row) in s.iter().enumerate() {
-                for j in 0..11usize {
-                    let cell = HexCoord::new(c.q - 5 + i as i16, c.r - 5 + j as i16);
-                    let expect = g.owner(cell) == Some(Player::P0);
-                    assert_eq!((row >> j) & 1 == 1, expect, "at {cell:?}");
-                }
-            }
-        }
     }
 
     #[test]
@@ -1200,7 +1137,7 @@ mod tests {
             "the q walk should have grown rows, got {tall}"
         );
         for k in 1..=(q / 8) {
-            g.clear_owner(HexCoord::new(k * 8, 0), Player::P0);
+            g.unplace_stone(HexCoord::new(k * 8, 0), Player::P0);
         }
         grow(&mut g, 0, 400);
         assert!(

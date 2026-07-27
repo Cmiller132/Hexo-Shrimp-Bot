@@ -1,8 +1,8 @@
 //! What a trainable player must provide, and how it becomes a [`Player`].
 
 use crate::player::Player;
-use hexo_engine::{Action, Position};
-use hexo_runner::Budget;
+use hexo_engine::Action;
+use hexo_runner::Game;
 
 /// How a model is being asked to play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -20,10 +20,10 @@ pub enum Mode {
 /// game.
 pub trait Model {
     /// Choose by sampling. Must vary between calls, or the training set collapses.
-    fn self_play_move(&mut self, pos: &Position, budget: Budget) -> Action;
+    fn self_play_move(&mut self, game: &Game) -> Action;
 
     /// Choose near-best. Not argmax — two deterministic seats replay one game.
-    fn eval_move(&mut self, pos: &Position, budget: Budget) -> Action;
+    fn eval_move(&mut self, game: &Game) -> Action;
 }
 
 /// A [`Model`] bound to a [`Mode`]. Dispatch only; no selection logic lives here.
@@ -61,10 +61,10 @@ impl<M> ModelPlayer<M> {
 }
 
 impl<M: Model> Player for ModelPlayer<M> {
-    fn choose(&mut self, pos: &Position, budget: Budget) -> Action {
+    fn choose(&mut self, game: &Game) -> Action {
         match self.mode {
-            Mode::SelfPlay => self.model.self_play_move(pos, budget),
-            Mode::Eval => self.model.eval_move(pos, budget),
+            Mode::SelfPlay => self.model.self_play_move(game),
+            Mode::Eval => self.model.eval_move(game),
         }
     }
 }

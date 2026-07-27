@@ -24,15 +24,21 @@
 //! ```
 //! use hexo_engine::{Action, HexCoord, Position};
 //!
-//! let mut pos = Position::new();
-//! for c in [(0, 0), (1, 0), (2, 0)] {
-//!     pos.advance(Action::new(HexCoord::new(c.0, c.1))).unwrap();
-//! }
-//! assert_eq!(pos.history().len(), 3);
+//! // The move list belongs to whoever keeps the record; the position holds no copy.
+//! let moves: Vec<Action> = [(0, 0), (1, 0), (2, 0)]
+//!     .into_iter()
+//!     .map(|(q, r)| Action::new(HexCoord::new(q, r)))
+//!     .collect();
 //!
-//! // The history round-trips, and so does every prefix of it.
-//! assert_eq!(Position::replay(pos.history()).unwrap(), pos);
-//! assert_eq!(Position::replay(&pos.history()[..1]).unwrap().stone_count(), 1);
+//! let mut pos = Position::new();
+//! for &a in &moves {
+//!     pos.advance(a).unwrap();
+//! }
+//! assert_eq!(pos.stone_count(), 3);
+//!
+//! // A record round-trips through `replay`, and so does every prefix of it.
+//! assert_eq!(Position::replay(&moves).unwrap(), pos);
+//! assert_eq!(Position::replay(&moves[..1]).unwrap().stone_count(), 1);
 //! ```
 //!
 //! ```
@@ -65,15 +71,14 @@ pub use error::{IntegrityCheck, IntegrityError, MoveError, ReplayError};
 pub use player::{Player, TurnPhase};
 pub use position::{Applied, LegalActions, Outcome, Position, Stones};
 pub use search::Search;
-pub use window::{
-    WINDOWS_PER_PLACEMENT, Window, WindowMask, WindowRef, WinningSlots, WinningWindows,
-};
+pub use window::{WINDOWS_PER_PLACEMENT, Win, Window, WindowMask, WindowRef};
 
 /// Version of the rules and of the Zobrist mixing function.
 pub const RULES_VERSION: u32 = 1;
 
-/// Hard ceiling on dense arena cells.
-pub const MAX_GRID_CELLS: u64 = 1 << 22;
+/// Hard ceiling on dense arena cells. With three bit planes this caps a position
+/// at ~6 MiB, and a one-seat spreading walk cannot reach it inside a real game.
+pub const MAX_GRID_CELLS: u64 = 1 << 24;
 
 #[cfg(test)]
 mod tests {
@@ -91,7 +96,7 @@ mod tests {
         assert_eq!(LEGAL_RADIUS, 8);
         assert_eq!(DISK_CELLS, 3 * 8 * 9 + 1);
         assert_eq!(WINDOWS_PER_PLACEMENT, 18);
-        assert_eq!(MAX_GRID_CELLS, 1 << 22);
+        assert_eq!(MAX_GRID_CELLS, 1 << 24);
         assert_eq!(COORD_LIMIT, 16_000);
     }
 }

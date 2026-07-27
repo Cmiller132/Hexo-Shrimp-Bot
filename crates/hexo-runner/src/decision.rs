@@ -17,15 +17,6 @@ pub enum Budget {
     Wall(Duration),
 }
 
-impl Budget {
-    /// Whether two runs under this budget should produce identical games.
-    #[inline]
-    #[must_use]
-    pub const fn is_reproducible(self) -> bool {
-        !matches!(self, Self::Wall(_))
-    }
-}
-
 /// A seat's chosen placement.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
@@ -82,14 +73,6 @@ pub enum Reply {
 mod tests {
     use super::*;
     use hexo_engine::HexCoord;
-
-    #[test]
-    fn only_a_wall_clock_is_irreproducible() {
-        assert!(Budget::Unlimited.is_reproducible());
-        assert!(Budget::Nodes(1_000).is_reproducible());
-        assert!(Budget::Visits(800).is_reproducible());
-        assert!(!Budget::Wall(Duration::from_millis(50)).is_reproducible());
-    }
 
     #[test]
     fn the_default_budget_is_unlimited() {

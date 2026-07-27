@@ -9,9 +9,11 @@ pub enum MoveError {
     TerminalState,
     /// The opening placement must be at [`HexCoord::ORIGIN`].
     IllegalOpening,
-    /// The second stone of a turn may not reuse the first.
-    ReusedFirstStone(HexCoord),
-    /// The coordinate is outside [`crate::COORD_LIMIT`].
+    /// The coordinate is outside [`crate::COORD_LIMIT`], yet within
+    /// [`crate::LEGAL_RADIUS`] of a stone — a placement the rules allow but the
+    /// engine cannot represent. An off-domain cell far from every stone is
+    /// [`MoveError::TooFarFromStones`] instead: a rule violation is reported as
+    /// one even when the cell is also unrepresentable.
     CoordOutOfBounds(HexCoord),
     /// The cell already holds a stone.
     Occupied(HexCoord),
@@ -41,11 +43,6 @@ impl core::fmt::Display for MoveError {
         match self {
             Self::TerminalState => f.write_str("the game is over"),
             Self::IllegalOpening => f.write_str("the opening placement must be at the origin"),
-            Self::ReusedFirstStone(c) => write!(
-                f,
-                "the second stone of a turn may not reuse ({}, {})",
-                c.q, c.r
-            ),
             Self::CoordOutOfBounds(c) => {
                 write!(
                     f,
@@ -124,17 +121,14 @@ impl core::error::Error for IntegrityError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum IntegrityCheck {
-    /// `stone_count` disagrees with the occupancy planes.
-    StoneCount,
     /// A cell is owned by both players.
     DoubleOwned,
-    /// A per-player stone count disagrees with its plane.
+    /// A per-player stone count disagrees with its plane. Also covers the total:
+    /// `stone_count` is the sum of the per-player counts.
     StoneCountForPlayer,
-    /// `cover` disagrees with a recount of stones within `LEGAL_RADIUS`.
+    /// The `covered` plane disagrees with a recount of stones within `LEGAL_RADIUS`.
     Coverage,
-    /// A frontier bit disagrees with `cover > 0 && !occupied`.
-    FrontierBit,
-    /// The frontier population count disagrees with the maintained counter.
+    /// The derived frontier's population disagrees with the maintained counter.
     FrontierCount,
     /// `hash_cells` disagrees with a from-scratch recomputation.
     Zobrist,
@@ -146,19 +140,15 @@ pub enum IntegrityCheck {
     TurnClosedForm,
     /// A stone lies within `LEGAL_RADIUS` of the arena boundary.
     ArenaMargin,
-    /// The move history names different cells than the occupancy planes. Length is
-    /// covered by `StoneCount`, since history is the ply counter.
-    History,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL: [MoveError; 7] = [
+    const ALL: [MoveError; 6] = [
         MoveError::TerminalState,
         MoveError::IllegalOpening,
-        MoveError::ReusedFirstStone(HexCoord::ORIGIN),
         MoveError::CoordOutOfBounds(HexCoord::ORIGIN),
         MoveError::Occupied(HexCoord::ORIGIN),
         MoveError::TooFarFromStones(HexCoord::ORIGIN),
@@ -169,7 +159,6 @@ mod tests {
     fn rule_violation_classification() {
         assert!(MoveError::TerminalState.is_rule_violation());
         assert!(MoveError::IllegalOpening.is_rule_violation());
-        assert!(MoveError::ReusedFirstStone(HexCoord::ORIGIN).is_rule_violation());
         assert!(MoveError::Occupied(HexCoord::ORIGIN).is_rule_violation());
         assert!(MoveError::TooFarFromStones(HexCoord::ORIGIN).is_rule_violation());
         assert!(!MoveError::CoordOutOfBounds(HexCoord::ORIGIN).is_rule_violation());
@@ -191,11 +180,11 @@ mod tests {
             coord: Some(HexCoord::new(2, -3)),
         };
         let without = IntegrityError {
-            check: IntegrityCheck::StoneCount,
+            check: IntegrityCheck::FrontierCount,
             coord: None,
         };
         assert!(alloc_to_string(&with).contains("2, -3"));
-        assert!(alloc_to_string(&without).contains("StoneCount"));
+        assert!(alloc_to_string(&without).contains("FrontierCount"));
     }
 
     fn alloc_to_string(e: &dyn core::fmt::Display) -> String {

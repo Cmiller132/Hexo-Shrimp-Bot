@@ -2,9 +2,9 @@
 //! atomicity on rejection, the turn machine, windows, the legal set, and hashing.
 
 use super::*;
-use crate::COORD_LIMIT;
 use crate::action::ActionId;
 use crate::window::WINDOWS_PER_PLACEMENT;
+use crate::{COORD_LIMIT, DISK_CELLS};
 
 fn act(q: i16, r: i16) -> Action {
     Action::new(HexCoord::new(q, r))
@@ -20,6 +20,11 @@ fn play(moves: &[(i16, i16)]) -> Position {
     p
 }
 
+/// A move list as the actions `replay` takes.
+fn actions(moves: &[(i16, i16)]) -> Vec<Action> {
+    moves.iter().map(|&(q, r)| act(q, r)).collect()
+}
+
 /// P0's filler ladder: `(0, 1), (0, 3), (0, 5), ...`.
 const P0_LADDER: [(i16, i16); 8] = [
     (0, 1),
@@ -33,40 +38,44 @@ const P0_LADDER: [(i16, i16); 8] = [
 ];
 
 /// P1 wins with the **second** stone of a turn: six in a row ending at `(6, 0)`.
-pub(super) fn second_stone_win() -> Position {
-    play(&[
-        (0, 0),
-        (1, 0),
-        (2, 0),
-        P0_LADDER[0],
-        P0_LADDER[1],
-        (3, 0),
-        (4, 0),
-        P0_LADDER[2],
-        P0_LADDER[3],
-        (5, 0),
-        (6, 0),
-    ])
-}
+const SECOND_STONE_WIN: [(i16, i16); 11] = [
+    (0, 0),
+    (1, 0),
+    (2, 0),
+    P0_LADDER[0],
+    P0_LADDER[1],
+    (3, 0),
+    (4, 0),
+    P0_LADDER[2],
+    P0_LADDER[3],
+    (5, 0),
+    (6, 0),
+];
 
 /// P1 wins with the **first** stone of a turn, filling a gap to make seven in a row.
+const FIRST_STONE_WIN: [(i16, i16); 14] = [
+    (0, 0),
+    (1, 0),
+    (2, 0),
+    P0_LADDER[0],
+    P0_LADDER[1],
+    (3, 0),
+    (4, 0),
+    P0_LADDER[2],
+    P0_LADDER[3],
+    (6, 0),
+    (7, 0),
+    P0_LADDER[4],
+    P0_LADDER[5],
+    (5, 0),
+];
+
+pub(super) fn second_stone_win() -> Position {
+    play(&SECOND_STONE_WIN)
+}
+
 pub(super) fn first_stone_win() -> Position {
-    play(&[
-        (0, 0),
-        (1, 0),
-        (2, 0),
-        P0_LADDER[0],
-        P0_LADDER[1],
-        (3, 0),
-        (4, 0),
-        P0_LADDER[2],
-        P0_LADDER[3],
-        (6, 0),
-        (7, 0),
-        P0_LADDER[4],
-        P0_LADDER[5],
-        (5, 0),
-    ])
+    play(&FIRST_STONE_WIN)
 }
 
 #[test]
@@ -96,28 +105,29 @@ fn error_too_far_from_stones() {
     assert!(p.advance(act(8, 0)).is_ok());
 }
 
+/// An off-domain cell far from every stone breaks the distance rule before it
+/// breaks the representation, and is reported as the rule violation. The
+/// `CoordOutOfBounds` case — off-domain but within the radius — needs a stone
+/// at a face and is pinned in `tests/boundary.rs`.
 #[test]
-fn error_coord_out_of_bounds() {
+fn error_coord_out_of_bounds_is_reserved_for_rule_legal_placements() {
     let mut p = play(&[(0, 0)]);
-    let far = HexCoord::new(crate::COORD_LIMIT + 1, 0);
-    assert_eq!(
-        p.advance(Action::new(far)),
-        Err(MoveError::CoordOutOfBounds(far))
-    );
+    let far = HexCoord::new(COORD_LIMIT + 1, 0);
+    let err = p.advance(Action::new(far)).expect_err("off-domain");
+    assert_eq!(err, MoveError::TooFarFromStones(far));
+    assert!(err.is_rule_violation());
 }
 
+/// The rule "the second stone of a turn may not reuse the first" has no code of its own:
+/// occupancy already forbids the cell. This pins the variant that reports it.
 #[test]
-fn error_reused_first_stone() {
+fn the_second_stone_of_a_turn_reuses_the_first_only_as_occupied() {
     let mut p = play(&[(0, 0), (1, 0)]);
-    assert_eq!(
-        p.phase(),
-        TurnPhase::SecondStone {
-            first: HexCoord::new(1, 0)
-        }
-    );
+    assert_eq!(p.phase(), TurnPhase::SecondStone);
+    assert_eq!(p.get(HexCoord::new(1, 0)), Some(Player::P1));
     assert_eq!(
         p.advance(act(1, 0)),
-        Err(MoveError::ReusedFirstStone(HexCoord::new(1, 0)))
+        Err(MoveError::Occupied(HexCoord::new(1, 0)))
     );
 }
 
@@ -133,7 +143,7 @@ fn error_board_extent_exceeded() {
     let mut p = Position::new();
     p.advance(act(0, 0)).expect("opening");
     let mut r = 0i16;
-    for _ in 0..70 {
+    for _ in 0..300 {
         r += 8;
         p.advance(act(0, r)).expect("r walk");
     }
@@ -228,7 +238,7 @@ fn a_rewound_search_does_not_consume_the_extent_budget() {
     let mut b = flat;
     let (mut q, mut r) = (0i16, 0i16);
     let mut refused = None;
-    for step in 0..800 {
+    for step in 0..1400 {
         if step % 2 == 0 {
             q += 8;
         } else {
@@ -283,8 +293,9 @@ fn an_excursion_along_r_does_not_shorten_a_later_q_walk() {
         );
         assert_eq!(ra, rb, "ply {ply} at ({q}, 0)");
     }
+    // Only the observables must agree: the excursion may leave the searched arena a
+    // wider shape, but the walk above proves that never costs a placement.
     assert_eq!(a, b);
-    assert_eq!(a.grid.row_words(), b.grid.row_words());
 }
 
 #[test]
@@ -296,12 +307,6 @@ fn precedence_terminal_beats_everything_reachable() {
         p.advance(Action::new(HexCoord::new(crate::COORD_LIMIT + 1, 0))),
         Err(MoveError::TerminalState)
     );
-    let first = match p.phase() {
-        TurnPhase::SecondStone { first } => first,
-        other => panic!("expected a frozen SecondStone, got {other:?}"),
-    };
-    assert_eq!(p.get(first), Some(Player::P1));
-    assert_eq!(p.advance(Action::new(first)), Err(MoveError::TerminalState));
 }
 
 #[test]
@@ -320,31 +325,28 @@ fn precedence_illegal_opening_beats_too_far_from_stones() {
 }
 
 #[test]
-fn precedence_reused_first_stone_beats_occupied() {
-    let mut p = play(&[(0, 0), (1, 0)]);
-    assert_eq!(
-        p.advance(act(1, 0)),
-        Err(MoveError::ReusedFirstStone(HexCoord::new(1, 0)))
-    );
-}
-
-#[test]
-fn precedence_coord_out_of_bounds_beats_too_far_from_stones() {
+fn precedence_the_rules_speak_before_the_domain() {
     let mut p = play(&[(0, 0)]);
-    let far = HexCoord::new(crate::COORD_LIMIT + 1, 0);
+    let far = HexCoord::new(COORD_LIMIT + 1, 0);
     assert!(p.get(far).is_none());
     assert_eq!(
         p.advance(Action::new(far)),
-        Err(MoveError::CoordOutOfBounds(far))
+        Err(MoveError::TooFarFromStones(far))
     );
 }
 
 #[test]
 fn precedence_too_far_from_stones_beats_board_extent_exceeded() {
+    // (8000, 8000) violates both halves at once: it is 16,000 steps from the only
+    // stone, and its least padded box — 8017 rows by 127 words — is 65,162,176
+    // cells, over MAX_GRID_CELLS. The rule must speak before the representation
+    // limit, which a probe growth could actually represent would not establish.
     let mut p = play(&[(0, 0)]);
+    let c = HexCoord::new(8000, 8000);
+    assert!(c.is_valid());
     assert_eq!(
-        p.advance(act(9000, 0)),
-        Err(MoveError::TooFarFromStones(HexCoord::new(9000, 0)))
+        p.advance(Action::new(c)),
+        Err(MoveError::TooFarFromStones(c))
     );
 }
 
@@ -362,17 +364,35 @@ fn every_rejection_is_atomic() {
         (1, 0),
         (9, 0),
         (9000, 0),
+        (8000, 8000),
         (crate::COORD_LIMIT + 1, 0),
         (-crate::COORD_LIMIT - 1, 0),
         (300, -300),
     ];
+    // The spec's atomicity is bit identity *including arena geometry*, which
+    // `PartialEq`, `zobrist`, and `audit` all deliberately ignore — so the
+    // geometry is probed directly.
+    let shape = |p: &Position| {
+        (
+            p.grid.rows(),
+            p.grid.row_words(),
+            p.grid.origin_q(),
+            p.grid.origin_r(),
+        )
+    };
     for p in &mut positions {
         for &(q, r) in &probes {
             let before = p.clone();
             let z = p.zobrist();
+            let geometry = shape(p);
             if let Err(e) = p.advance(act(q, r)) {
                 assert_eq!(*p, before, "({q}, {r}) rejected with {e} but mutated");
                 assert_eq!(p.zobrist(), z);
+                assert_eq!(
+                    shape(p),
+                    geometry,
+                    "({q}, {r}) rejected with {e} but the arena moved"
+                );
                 p.audit().expect("audit after a rejection");
             } else {
                 *p = before;
@@ -396,8 +416,7 @@ fn opening_is_forced_and_hands_over_to_p1() {
     assert_eq!(applied.phase_before, TurnPhase::Opening);
     assert_eq!(applied.phase_after, TurnPhase::FirstStone);
     assert_eq!(applied.outcome, None);
-    assert!(applied.winning.is_empty());
-    assert_eq!(applied.winning_windows().count(), 0);
+    assert_eq!(applied.wins, [None, None, None]);
     assert_eq!(p.current_player(), Player::P1);
     assert_eq!(p.legal_count(), DISK_CELLS - 1);
 }
@@ -448,13 +467,10 @@ fn first_stone_win_freezes_the_phase_and_the_mover() {
 fn second_stone_win_freezes_at_second_stone_with_first_occupied() {
     let p = second_stone_win();
     assert_eq!(p.outcome(), Some(Outcome { winner: Player::P1 }));
-    match p.phase() {
-        TurnPhase::SecondStone { first } => {
-            assert_eq!(first, HexCoord::new(5, 0));
-            assert_eq!(p.get(first), Some(Player::P1));
-        }
-        other => panic!("expected SecondStone, got {other:?}"),
-    }
+    assert_eq!(p.phase(), TurnPhase::SecondStone);
+    // The turn's first stone, still on the board: a frozen phase names no cell, but the
+    // cell it used to name is occupied, which is the trap in spec §7.4 H2.
+    assert_eq!(p.get(HexCoord::new(5, 0)), Some(Player::P1));
     assert_eq!(p.current_player(), Player::P1);
     assert_eq!(p.legal_count(), 0);
     p.audit().expect("audit");
@@ -613,23 +629,6 @@ fn stones_iterate_in_canonical_order_regardless_of_play_order() {
 }
 
 #[test]
-fn zobrist_ignores_second_stone_first_but_partial_eq_does_not() {
-    let a = play(&[(0, 0), (1, 0)]);
-    assert_eq!(
-        a.phase(),
-        TurnPhase::SecondStone {
-            first: HexCoord::new(1, 0)
-        }
-    );
-    let mut b = a.clone();
-    b.phase = TurnPhase::SecondStone {
-        first: HexCoord::new(-4, 2),
-    };
-    assert_ne!(a, b, "PartialEq must include SecondStone::first");
-    assert_eq!(a.zobrist(), b.zobrist(), "zobrist must exclude it");
-}
-
-#[test]
 fn turn_slot_covers_kind_mover_and_terminal() {
     let mut seen = std::collections::HashSet::new();
     for p in [
@@ -708,42 +707,30 @@ fn audit_passes_on_a_fresh_and_a_played_position() {
 }
 
 #[test]
-fn history_is_empty_on_a_fresh_position() {
-    let p = Position::new();
-    assert!(p.history().is_empty());
-    assert_eq!(p.stone_count(), 0);
-}
-
-#[test]
-fn history_records_every_placement_in_order() {
-    let moves = [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)];
-    let p = play(&moves);
-    let want: Vec<Action> = moves.iter().map(|&(q, r)| act(q, r)).collect();
-    assert_eq!(p.history(), want.as_slice());
-    assert_eq!(p.history().len(), p.stone_count() as usize);
-}
-
-#[test]
-fn history_length_always_equals_the_stone_count() {
+fn stone_count_tracks_every_placement() {
     let mut p = Position::new();
-    for &(q, r) in &[(0, 0), (1, 0), (2, 0), (3, 0), (0, 1), (0, 2)] {
+    assert_eq!(p.stone_count(), 0);
+    for (i, &(q, r)) in [(0, 0), (1, 0), (2, 0), (3, 0), (0, 1), (0, 2)]
+        .iter()
+        .enumerate()
+    {
         p.advance(act(q, r)).expect("legal");
-        assert_eq!(p.history().len(), p.stone_count() as usize);
+        assert_eq!(p.stone_count() as usize, i + 1);
     }
 }
 
 #[test]
-fn replaying_a_history_reproduces_the_position() {
-    for p in [
-        play(&[(0, 0)]),
-        play(&[(0, 0), (1, 0), (2, 0), (0, 1)]),
-        first_stone_win(),
-        second_stone_win(),
+fn replaying_a_move_list_reproduces_the_position() {
+    for moves in [
+        &[(0, 0)][..],
+        &[(0, 0), (1, 0), (2, 0), (0, 1)][..],
+        &FIRST_STONE_WIN[..],
+        &SECOND_STONE_WIN[..],
     ] {
-        let rebuilt = Position::replay(p.history()).expect("history must replay");
+        let p = play(moves);
+        let rebuilt = Position::replay(&actions(moves)).expect("the move list must replay");
         assert_eq!(rebuilt, p);
         assert_eq!(rebuilt.zobrist(), p.zobrist());
-        assert_eq!(rebuilt.history(), p.history());
         assert_eq!(rebuilt.phase(), p.phase());
         assert_eq!(rebuilt.current_player(), p.current_player());
         assert_eq!(rebuilt.outcome(), p.outcome());
@@ -753,14 +740,13 @@ fn replaying_a_history_reproduces_the_position() {
 
 #[test]
 fn replaying_every_prefix_reproduces_that_ply() {
-    let full = second_stone_win();
-    let history = full.history().to_vec();
+    let moves = actions(&SECOND_STONE_WIN);
     let mut incremental = Position::new();
-    for k in 0..history.len() {
-        let from_prefix = Position::replay(&history[..k]).expect("prefix replays");
+    for k in 0..moves.len() {
+        let from_prefix = Position::replay(&moves[..k]).expect("prefix replays");
         assert_eq!(from_prefix, incremental, "prefix of length {k}");
-        assert_eq!(from_prefix.history(), &history[..k]);
-        incremental.advance(history[k]).expect("legal");
+        assert_eq!(from_prefix.stone_count() as usize, k);
+        incremental.advance(moves[k]).expect("legal");
     }
 }
 
@@ -768,7 +754,7 @@ fn replaying_every_prefix_reproduces_that_ply() {
 fn replay_of_an_empty_slice_is_the_empty_position() {
     let p = Position::replay(&[]).expect("empty replays");
     assert_eq!(p, Position::new());
-    assert!(p.history().is_empty());
+    assert_eq!(p.stone_count(), 0);
 }
 
 #[test]
@@ -781,7 +767,7 @@ fn replay_reports_the_ply_that_failed() {
 
     let err = Position::replay(&[act(0, 0), act(1, 0), act(1, 0)]).expect_err("must fail");
     assert_eq!(err.ply, 2);
-    assert_eq!(err.cause, MoveError::ReusedFirstStone(HexCoord::new(1, 0)));
+    assert_eq!(err.cause, MoveError::Occupied(HexCoord::new(1, 0)));
 }
 
 #[test]
@@ -793,22 +779,22 @@ fn replay_rejects_an_illegal_opening_at_ply_zero() {
 
 #[test]
 fn replay_past_a_win_is_a_terminal_error_not_a_silent_stop() {
-    let won = first_stone_win();
-    let mut too_long = won.history().to_vec();
+    let mut too_long = actions(&FIRST_STONE_WIN);
     too_long.push(act(1, 1));
     let err = Position::replay(&too_long).expect_err("must fail");
-    assert_eq!(err.ply, won.history().len());
+    assert_eq!(err.ply, FIRST_STONE_WIN.len());
     assert_eq!(err.cause, MoveError::TerminalState);
 }
 
 #[test]
 fn replay_from_continues_an_existing_position() {
-    let full = play(&[(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)]);
-    let history = full.history().to_vec();
-    let mut partial = Position::replay(&history[..2]).expect("prefix");
-    partial.replay_from(&history[2..]).expect("suffix");
+    const MOVES: [(i16, i16); 5] = [(0, 0), (1, 0), (2, 0), (0, 1), (0, 2)];
+    let full = play(&MOVES);
+    let moves = actions(&MOVES);
+    let mut partial = Position::replay(&moves[..2]).expect("prefix");
+    partial.replay_from(&moves[2..]).expect("suffix");
     assert_eq!(partial, full);
-    assert_eq!(partial.history(), history.as_slice());
+    assert_eq!(partial.stone_count() as usize, moves.len());
 }
 
 #[test]
@@ -823,38 +809,25 @@ fn replay_from_reports_a_ply_relative_to_its_own_slice() {
 }
 
 #[test]
-fn undo_pops_the_history() {
+fn undo_names_the_placement_it_reversed_and_restores_the_stone_count() {
     let mut p = play(&[(0, 0), (1, 0)]);
-    let before = p.history().to_vec();
     {
         let mut s = crate::search::Search::new(&mut p);
         s.apply(act(2, 0)).expect("legal");
         s.apply(act(3, 0)).expect("legal");
-        assert_eq!(s.position().history().len(), 4);
-        assert_eq!(s.position().history()[3], act(3, 0));
-        s.undo();
-        assert_eq!(s.position().history().len(), 3);
+        assert_eq!(s.position().stone_count(), 4);
+        assert_eq!(s.undo(), Some(act(3, 0)));
+        assert_eq!(s.position().stone_count(), 3);
     }
-    assert_eq!(p.history(), before.as_slice());
+    assert_eq!(p.stone_count(), 2);
 }
 
 #[test]
-fn a_rejected_placement_leaves_the_history_untouched() {
-    let mut p = play(&[(0, 0), (1, 0)]);
-    let before = p.history().to_vec();
-    for bad in [act(1, 0), act(400, 400), act(0, 0)] {
-        assert!(p.advance(bad).is_err());
-        assert_eq!(p.history(), before.as_slice(), "{bad:?} mutated history");
-    }
-}
-
-#[test]
-fn equality_ignores_history_order() {
+fn equality_ignores_move_order() {
     let a = play(&[(0, 0), (1, 0), (2, 0)]);
     let b = play(&[(0, 0), (2, 0), (1, 0)]);
-    assert_ne!(a.history(), b.history(), "the two games differ");
-    assert_eq!(a, b, "but the positions are equal");
-    assert_eq!(a.zobrist(), b.zobrist(), "and so are their hashes");
+    assert_eq!(a, b, "the two move orders reach the same position");
+    assert_eq!(a.zobrist(), b.zobrist(), "and the same hash");
 }
 
 #[test]
@@ -911,7 +884,7 @@ fn the_opening_ranks_only_the_origin() {
 #[test]
 fn the_second_stone_of_a_turn_cannot_rank_the_first() {
     let p = play(&[(0, 0), (1, 0)]);
-    assert!(matches!(p.phase(), TurnPhase::SecondStone { .. }));
+    assert_eq!(p.phase(), TurnPhase::SecondStone);
     assert_eq!(p.legal_rank(act(1, 0)), None, "the first stone is occupied");
     for (i, a) in p.legal_actions().enumerate() {
         assert_eq!(p.legal_rank(a), Some(i));

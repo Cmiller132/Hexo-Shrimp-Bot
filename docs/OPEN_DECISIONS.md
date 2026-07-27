@@ -19,7 +19,7 @@ reused, because other documents cite it.
 | A4 | Grid growth policy, and the extent ceiling as a function of the position | `crates/hexo-engine/src/grid.rs`; `ENGINE_SPEC.md` §5.5 |
 | A5 | Zobrist scope, and a baked-in rather than generated key table | `crates/hexo-engine/src/zobrist.rs`; `ENGINE_SPEC.md` §8 |
 | B1 | Player interface | `crates/hexo-runner/README.md` for why the runner has none, and `crates/hexo-player/README.md` for the one a driver actually drives. Answered by neither option offered: `Game` is a nonblocking state machine, so whether a caller blocks a thread or polls a thousand games is decided outside the crate — and the seat contract lives outside it too, split into `Player` for anything that plays and `Model` for anything that trains |
-| B2 | What is recorded per move | `PlyRecord::diagnostics` — an opaque seat-owned blob, and this one is actually persisted |
+| B2 | What is recorded per move | `PlyRecord`: seat, action, resulting hash, and `diagnostics` — an opaque seat-owned blob, and this one is actually persisted. `Game::plies` is the game's history; no other type keeps one |
 | B3 | Search budget | `Budget`, stated once on `GameSpec` and never enforced by the game. Not copied per ply: it cannot vary within a game, so a per-`PlyRecord` copy would carry no information |
 | B5 | Adjudication policy | `MatchResult`, `FailurePolicy`, `NoContest` |
 | C3 | The binary crate, and its modes | `CONTAINER_SPEC.md` §3: `hexo-bot`, with `train`, `serve`, and `play`. Self-play is not a mode — it is the first phase of `train`, because one loop cannot be split into pieces that could drift from it |
@@ -46,6 +46,28 @@ field at all**, deliberately.
 This stops being optional the moment a player samples rather than maximising:
 seeds must then be minted and recorded, derived from stable game and seat ids so
 that scheduling cannot change a run.
+
+---
+
+## B6. What a seat returns — `Action`, or the whole `Decision`
+
+`Player::choose` and `Model`'s two methods return a bare `Action`; `Game::submit`
+accepts a `Decision { action, zobrist, diagnostics }`. `Table::step` bridges the
+gap by echoing the canonical hash and filling `diagnostics` with `None`. Two
+consequences, both found by hostile review (2026-07-27):
+
+- A model that computes training annotations — visit counts, value targets —
+  cannot get them into `PlyRecord` through `Table`; only a direct `Game::submit`
+  caller can persist diagnostics, so the supplied self-play path records none.
+- A future out-of-process seat cannot echo *its own* mirror's hash, so the
+  `Desync` check degenerates: the driver reads the canonical hash and hands it
+  straight back.
+
+Neither bites today — no model exists, in-process seats deliberately read the
+canonical `Game`, and remote seats are C1 territory. The moment either becomes
+real, the seat methods likely widen to return a `Decision`-shaped value, and the
+question is the ergonomics for the seat that has only an action. Decide then;
+widening now would be building for a caller that does not exist.
 
 ---
 

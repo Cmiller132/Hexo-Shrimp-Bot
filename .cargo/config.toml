@@ -1,2 +1,5 @@
+# `--locked` here, not only inside the gates: the alias's own `cargo run` resolves
+# the workspace first, and unlocked it would quietly rewrite a stale `Cargo.lock`
+# before any gate could notice it.
 [alias]
-xtask = "run --quiet --package xtask --"
+xtask = "run --quiet --locked --package xtask --"

@@ -56,7 +56,6 @@ impl<P: Player> Table<P> {
         let Step::NeedDecision {
             seat,
             generation,
-            budget,
             zobrist,
             ..
         } = self.game.step()
@@ -64,7 +63,7 @@ impl<P: Player> Table<P> {
             return self.game.result();
         };
 
-        let action = self.seats[seat.index()].choose(self.game.position(), budget);
+        let action = self.seats[seat.index()].choose(&self.game);
         self.game
             .submit(generation, Reply::Place(Decision::new(action, zobrist)))
             .expect("the generation and hash were read from this game on the line above")

@@ -124,7 +124,10 @@ view needs to expose:
 - Terminal status.
 - Window and threat masks — derived, but expensive to recompute, so worth
   exposing rather than making every encoder rediscover.
-- Move history.
+
+Move order is deliberately not on that list. It is not a property of a position,
+and an encoder that wants it reads the game record — `hexo_runner::Game::plies`,
+which is what a seat is handed — rather than asking the engine for a second copy.
 
 Most of that list already exists as a *scalar* surface. What is open is the bulk
 form: methods that fill a caller-provided buffer for a caller-named region, so an

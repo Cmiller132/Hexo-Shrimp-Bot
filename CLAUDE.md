@@ -24,8 +24,8 @@ class the test run cannot see at all. Report work as verified only after
 `cargo xtask verify`.
 
 **Symmetric bugs are the hazard that matters here.** A wrong disk offset, a
-wrong shear in the QR fold, a wrong hash constant, or a growth copy with the
-same wrong index on both sides all apply and un-apply identically — so no
+wrong hash constant, or a growth copy with the same wrong index on both sides
+all apply and un-apply identically — so no
 round-trip or invariant test can see them. `Position::audit()`, the independent
 oracles in `crates/hexo-engine/tests/common`, and the frozen golden vectors are
 the only detectors. They are not redundant with each other, and making one of

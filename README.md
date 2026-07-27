@@ -62,8 +62,8 @@ never as a mutable handle.
 decisions constrain how `hexo-engine` is built rather than how the workspace is
 shaped, so [crates/hexo-engine/README.md](crates/hexo-engine/README.md) argues
 them and this list only names them: the board is a recentred dense grid, not a
-sparse map; one placement is the atom, not one turn; the position carries its
-move history and there is exactly one, position-only, Zobrist hash; and the
+sparse map; one placement is the atom, not one turn; the position is a value with
+no move history of its own and exactly one, position-only, Zobrist hash; and the
 engine owns one canonical action ordering in both directions, `legal_rank` and
 `nth_legal`. The invariants that protect each of them are documented there too.
 
@@ -74,8 +74,9 @@ A move list rather than a serialised position, because a container cannot be
 handed one: `Position` has no `serde` impl, deliberately. Board-shaped
 construction is a rule-bypass hole — a deserialiser that accepts a bare cell list
 reconstructs a position without ever running the turn rules that could have
-produced it. An in-process seat is handed `&Position` and needs no mirror; the
-mirror lands with the transport that requires it.
+produced it. The prefix is derived from the runner's record, which is the game's
+history — the position keeps none. An in-process seat is handed the whole `Game`
+and needs no mirror; the mirror lands with the transport that requires it.
 
 **The hash crosses the container boundary.** `zobrist()` is position-only, which
 is an engine decision argued with the engine — but it is what lets the runner

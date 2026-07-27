@@ -27,8 +27,8 @@ crates/hexo-player/
 
 | Module | Role |
 | --- | --- |
-| `player` | `Player`: one method, `choose`. What a human, a scripted bot, or a transport adapter implements. |
-| `model` | `Model`: two required methods, one per `Mode`. `ModelPlayer` binds a model to a mode and is the only bridge between the two traits. |
+| `player` | `Player`: one method, `choose`, taking the whole `&Game`. What a human, a scripted bot, or a transport adapter implements. |
+| `model` | `Model`: two required methods, one per `Mode`, on the same `&Game`. `ModelPlayer` binds a model to a mode and is the only bridge between the two traits. |
 | `table` | `Table` owns one `Game` and its two seats; `sweep` drives many at once. |
 
 ## Design notes
@@ -49,10 +49,21 @@ crates/hexo-player/
   `OPEN_DECISIONS.md` B4 deferred: nothing here samples, so nothing here needs a
   seed.
 
-- **A player is handed `&Position`, not a replay mirror.** In process the driver
-  already holds the canonical position and ownership already makes it read-only.
-  The mirror belongs in the same change as the transport that needs it; until
-  then the echoed `zobrist` is the canonical one.
+- **A seat is handed the `Game` view, not a position and a budget.** The record
+  is the game's history — `Position` keeps none — so a model whose features
+  depend on move order has to be able to reach it. One argument carries all of
+  it: `game.position()` for the board, `game.plies()` or `game.prefix()` for the
+  record, `game.spec().budget` for what it may spend. Passing the position alone
+  would force a parallel move list on every seat that wants recency, which is the
+  duplication the engine change removed.
+
+  `&Game` is a shared borrow with no mutable counterpart, so this hands out no
+  new authority: `submit` remains the only way to advance anything.
+
+- **A player is handed the canonical game, not a replay mirror.** In process the
+  driver already holds it and ownership already makes it read-only. The mirror
+  belongs in the same change as the transport that needs it; until then the
+  echoed `zobrist` is the canonical one.
 
 - **`choose` returns `Action`, not `Reply`.** `Reply::Failed` is driver-reported:
   a seat cannot declare itself crashed. Resignation is the first extension, and is
@@ -78,5 +89,6 @@ crates/hexo-player/
 
 ## Connections
 
-- Depends on `hexo-engine` for rules and state, and on `hexo-runner` for `Game`,
-  `Budget`, and the result model.
+- Depends on `hexo-engine` for `Action` and the position read surface, and on
+  `hexo-runner` for `Game` — which is the whole seat argument, and carries the
+  record, the spec, and the result model with it.

@@ -23,7 +23,11 @@ pub enum MatchResult {
 }
 
 impl MatchResult {
-    /// Whether this result is evidence about how well the seats played.
+    /// Whether the match reached a verdict, as opposed to a no-contest.
+    ///
+    /// A forfeit passes this and is a real match result, but says nothing about the
+    /// play on the board, so a consumer selecting training data matches on
+    /// [`WinReason`] rather than on this alone.
     #[inline]
     #[must_use]
     pub const fn is_contested(self) -> bool {
@@ -66,7 +70,9 @@ pub enum WinReason {
 /// Why a game ended without a winner, blamelessly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DrawReason {
-    /// The game reached [`crate::GameSpec::ply_cap`].
+    /// The game reached [`crate::GameSpec::ply_cap`] on a placement that completed
+    /// the mover's turn. Turns end at odd placement counts, so a game under an
+    /// even cap ends one placement past it.
     PlyCap,
 }
 

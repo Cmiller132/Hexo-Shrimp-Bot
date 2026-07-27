@@ -3,7 +3,7 @@
 use crate::decision::{Budget, Failure, Reply};
 use crate::error::SubmitError;
 use crate::outcome::{DrawReason, MatchResult, NoContest, WinReason};
-use hexo_engine::{Action, ActionId, Applied, Player, Position};
+use hexo_engine::{Action, ActionId, Applied, Player, Position, TurnPhase};
 use std::num::NonZeroU32;
 
 /// What a driver-reported [`Failure`] costs the seat it happened to.
@@ -19,7 +19,10 @@ pub enum FailurePolicy {
 /// The match rules a game is played under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GameSpec {
-    /// Placements after which the game is [`DrawReason::PlyCap`].
+    /// Placements after which the game is [`DrawReason::PlyCap`], tested only on a
+    /// placement that completed the mover's turn. Turns end at odd placement
+    /// counts, so an even cap stops the game one placement past it rather than
+    /// cutting a two-stone turn in half.
     pub ply_cap: NonZeroU32,
     /// What each seat is told it has to think with.
     pub budget: Budget,
@@ -121,6 +124,8 @@ impl Game {
     }
 
     /// Every placement so far, oldest first, with what the match knows about it.
+    ///
+    /// This is the game's history. Nothing else in the workspace keeps one.
     #[inline]
     #[must_use]
     pub fn plies(&self) -> &[PlyRecord] {
@@ -134,11 +139,17 @@ impl Game {
         self.result
     }
 
-    /// The move prefix a seat needs to build its own mirror.
-    #[inline]
+    /// The move prefix a seat needs to build its own mirror, derived from the record.
+    ///
+    /// [`Game::plies`] is the authoritative history — the position carries none — so
+    /// this is the record decoded back into placements. Feeding it to
+    /// [`Position::replay`] reproduces [`Game::position`].
     #[must_use]
-    pub fn prefix(&self) -> &[Action] {
-        self.position.history()
+    pub fn prefix(&self) -> Vec<Action> {
+        self.plies
+            .iter()
+            .map(|ply| Action::from_id(ply.action))
+            .collect()
     }
 
     /// What the game wants next.
@@ -236,7 +247,13 @@ impl Game {
                 winner: outcome.winner,
                 reason: WinReason::SixInARow,
             })
-        } else if self.position.stone_count() >= self.spec.ply_cap.get() {
+        } else if matches!(applied.phase_after, TurnPhase::FirstStone)
+            && self.position.stone_count() >= self.spec.ply_cap.get()
+        {
+            // `FirstStone` is the phase left behind by the opening placement and by
+            // every second stone, so the cap is only tested where the mover's turn
+            // is complete. Halting mid-turn would hand one seat a turn the other
+            // never got.
             Some(MatchResult::Drawn {
                 reason: DrawReason::PlyCap,
             })

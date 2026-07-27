@@ -161,93 +161,19 @@ pub struct WindowRef {
     pub mask: WindowMask,
 }
 
-/// Which of the 18 windows through a placement that placement completed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
-pub struct WinningWindows(u32);
-
-impl WinningWindows {
-    /// No window was completed — the placement did not win.
-    pub const EMPTY: Self = Self(0);
-
-    /// Wrap a raw slot mask. Internal: the bit layout is a private convention.
-    #[inline]
-    pub(crate) const fn from_bits(bits: u32) -> Self {
-        Self(bits)
-    }
-
-    /// Whether no window was completed.
-    #[inline]
-    #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    /// How many of the 18 windows this placement completed. Can exceed one.
-    #[inline]
-    #[must_use]
-    pub const fn count(self) -> u32 {
-        self.0.count_ones()
-    }
-
-    /// Whether the window at `offset` along `axis` was completed.
-    #[inline]
-    #[must_use]
-    pub const fn contains(self, axis: Axis, offset: usize) -> bool {
-        assert!(offset < WINDOW_LEN, "window offset out of range");
-        (self.0 >> (axis.index() * WINDOW_LEN + offset)) & 1 == 1
-    }
-
-    /// The raw slot mask, for a record writer that persists it verbatim.
-    #[inline]
-    #[must_use]
-    pub const fn bits(self) -> u32 {
-        self.0
-    }
-
-    /// The completed slots as `(axis, offset)` pairs, in ascending slot order.
-    #[inline]
-    #[must_use]
-    pub const fn iter(self) -> WinningSlots {
-        WinningSlots(self.0)
-    }
+/// A maximal run of one player's stones along one axis.
+///
+/// Produced by win detection, so `len >= WINDOW_LEN`. Maximal in both directions: the
+/// cells one step before `start` and one step past the end are not that player's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Win {
+    /// The axis the run lies along.
+    pub axis: Axis,
+    /// The first cell of the run — its end furthest back along `axis`.
+    pub start: HexCoord,
+    /// Cells in the run, `start` stepped `0..len` along `axis`.
+    pub len: u8,
 }
-
-impl IntoIterator for WinningWindows {
-    type Item = (Axis, usize);
-    type IntoIter = WinningSlots;
-
-    #[inline]
-    fn into_iter(self) -> WinningSlots {
-        self.iter()
-    }
-}
-
-/// Iterator over the completed slots of a [`WinningWindows`], ascending.
-#[derive(Clone, Debug)]
-pub struct WinningSlots(u32);
-
-impl Iterator for WinningSlots {
-    type Item = (Axis, usize);
-
-    #[inline]
-    fn next(&mut self) -> Option<(Axis, usize)> {
-        if self.0 == 0 {
-            return None;
-        }
-        let slot = self.0.trailing_zeros() as usize;
-        self.0 &= self.0 - 1;
-        Some((Axis::ALL[slot / WINDOW_LEN], slot % WINDOW_LEN))
-    }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        let n = self.0.count_ones() as usize;
-        (n, Some(n))
-    }
-}
-
-impl ExactSizeIterator for WinningSlots {}
-impl core::iter::FusedIterator for WinningSlots {}
 
 #[cfg(test)]
 mod tests {
@@ -496,91 +422,23 @@ mod tests {
         assert_eq!(WINDOWS_PER_PLACEMENT, Axis::ALL.len() * WINDOW_LEN);
     }
 
+    /// A `Win` names its cells by `start` stepped along `axis`, and the run it describes
+    /// is the one the winning placement completed.
     #[test]
-    fn winning_windows_is_empty_by_default() {
-        let w = WinningWindows::default();
-        assert_eq!(w, WinningWindows::EMPTY);
-        assert!(w.is_empty());
-        assert_eq!(w.count(), 0);
-        assert_eq!(w.bits(), 0);
-        assert_eq!(w.iter().next(), None);
-    }
-
-    /// `contains` and `iter` must agree with the documented bit layout over every one
-    /// of the 18 slots, one slot at a time.
-    #[test]
-    fn each_slot_round_trips_through_contains_and_iter() {
+    fn win_cells_walk_the_axis_from_its_start() {
         for axis in Axis::ALL {
-            for offset in 0..WINDOW_LEN {
-                let slot = axis.index() * WINDOW_LEN + offset;
-                let w = WinningWindows::from_bits(1 << slot);
-                assert!(!w.is_empty());
-                assert_eq!(w.count(), 1);
-                assert!(w.contains(axis, offset), "{axis:?}+{offset}");
-                assert_eq!(w.iter().collect::<Vec<_>>(), vec![(axis, offset)]);
-                for other in Axis::ALL {
-                    for k in 0..WINDOW_LEN {
-                        if other.index() * WINDOW_LEN + k == slot {
-                            continue;
-                        }
-                        assert!(!w.contains(other, k), "{other:?}+{k} leaked");
-                    }
-                }
+            let win = Win {
+                axis,
+                start: HexCoord::new(1, -2),
+                len: 7,
+            };
+            let mut cell = win.start;
+            for i in 0..win.len {
+                assert_eq!(cell, win.start.step(axis, i as i16));
+                assert_eq!(hex_distance(win.start, cell), u32::from(i));
+                cell = cell.step(axis, 1);
             }
+            assert_eq!(hex_distance(win.start, cell), u32::from(win.len));
         }
-    }
-
-    /// The multi-window case (H6): seven in a row and crossing lines both set more than
-    /// one bit, and `iter` must yield them all in ascending order.
-    #[test]
-    fn iter_yields_every_set_slot_in_ascending_order() {
-        let bits = (1 << 0) | (1 << 1) | (1 << 7) | (1 << 17);
-        let w = WinningWindows::from_bits(bits);
-        assert_eq!(w.count(), 4);
-        assert_eq!(w.iter().len(), 4);
-        assert_eq!(
-            w.iter().collect::<Vec<_>>(),
-            vec![
-                (Axis::Q, 0),
-                (Axis::Q, 1),
-                (Axis::R, 1),
-                (Axis::QR, WINDOW_LEN - 1),
-            ]
-        );
-        assert_eq!(w.into_iter().count(), 4);
-    }
-
-    /// `iter` and `contains` are two independent readings of the same bit layout, so
-    /// they are only a cross-check if they are compared.
-    #[test]
-    fn iter_agrees_with_contains_over_every_mask() {
-        let mut masks: Vec<u32> = vec![0, (1 << WINDOWS_PER_PLACEMENT) - 1];
-        for i in 0..WINDOWS_PER_PLACEMENT {
-            for j in 0..WINDOWS_PER_PLACEMENT {
-                masks.push((1 << i) | (1 << j));
-            }
-        }
-        for bits in masks {
-            let w = WinningWindows::from_bits(bits);
-            let from_iter: Vec<_> = w.iter().collect();
-            let mut from_contains = Vec::new();
-            for axis in Axis::ALL {
-                for offset in 0..WINDOW_LEN {
-                    if w.contains(axis, offset) {
-                        from_contains.push((axis, offset));
-                    }
-                }
-            }
-            assert_eq!(from_iter, from_contains, "bits {bits:#x}");
-            assert_eq!(w.count() as usize, from_iter.len());
-            assert_eq!(w.bits(), bits);
-            assert_eq!(w.is_empty(), bits == 0);
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "window offset out of range")]
-    fn contains_panics_past_the_end() {
-        let _ = WinningWindows::EMPTY.contains(Axis::Q, WINDOW_LEN);
     }
 }

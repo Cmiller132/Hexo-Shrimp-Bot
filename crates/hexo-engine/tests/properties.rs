@@ -27,7 +27,10 @@ fn drive(choices: &[u32], mut on_ply: impl FnMut(&Position, usize)) -> Vec<Actio
             .advance(a)
             .unwrap_or_else(|e| panic!("ply {i} {a:?} rejected: {e}"));
         assert_eq!(applied.action, a);
-        assert_eq!(applied.outcome.is_some(), !applied.winning.is_empty());
+        assert_eq!(
+            applied.outcome.is_some(),
+            applied.wins.iter().any(Option::is_some)
+        );
         moves.push(a);
         on_ply(&pos, moves.len());
     }
@@ -194,7 +197,7 @@ proptest! {
 
             let (mut q, mut r) = (0i16, 0i16);
             let mut refused = false;
-            for i in 0..900usize {
+            for i in 0..1400usize {
                 if i % 2 == 0 { q += 8; } else { r += 8; }
                 let a = Action::new(HexCoord::new(q, r));
                 let sa = searched.advance(a);

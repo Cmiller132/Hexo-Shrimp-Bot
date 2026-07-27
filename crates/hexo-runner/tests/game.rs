@@ -1,6 +1,6 @@
 //! The game state machine: adjudication, the guards, and the two drive shapes.
 
-use hexo_engine::{Action, HexCoord, MoveError, Player, Position};
+use hexo_engine::{Action, HexCoord, MoveError, Player, Position, TurnPhase};
 use hexo_runner::{
     Budget, Decision, DrawReason, Failure, FailurePolicy, Game, GameSpec, MatchResult, NoContest,
     Reply, Step, SubmitError, WinReason,
@@ -267,10 +267,60 @@ fn the_ply_cap_is_a_draw_and_not_an_abort() {
             reason: DrawReason::PlyCap
         }
     );
-    assert_eq!(game.position().stone_count(), 12);
+    // Turns end after placements 1, 3, 5, ...; 12 falls mid-turn, so the game
+    // stops at the next boundary rather than leaving P1 a stone short.
+    assert_eq!(game.position().stone_count(), 13);
+    assert_eq!(
+        game.position().phase(),
+        TurnPhase::FirstStone,
+        "the cap fired on a completed turn"
+    );
     assert!(!game.position().is_terminal(), "the engine knows no draw");
     assert!(result.is_contested(), "a capped game is usable data");
     assert_eq!(result.winner(), None);
+}
+
+/// The odd cap the boundary rule lands on exactly, as the counterpart to the even
+/// cap above.
+#[test]
+fn an_odd_ply_cap_is_reached_exactly() {
+    let mut game = Game::new(GameSpec {
+        ply_cap: cap(13),
+        ..GameSpec::default()
+    });
+    assert_eq!(
+        drive_to_the_end(&mut game),
+        MatchResult::Drawn {
+            reason: DrawReason::PlyCap
+        }
+    );
+    assert_eq!(game.position().stone_count(), 13);
+}
+
+/// The bug the boundary rule exists to stop: a cap reached on a turn's first stone
+/// must not end the game there, because it would give the mover one placement of
+/// the two its opponent got.
+#[test]
+fn the_cap_never_ends_a_turn_after_its_first_stone() {
+    for ply_cap in 2..=16 {
+        let mut game = Game::new(GameSpec {
+            ply_cap: cap(ply_cap),
+            ..GameSpec::default()
+        });
+        assert_eq!(
+            drive_to_the_end(&mut game),
+            MatchResult::Drawn {
+                reason: DrawReason::PlyCap
+            },
+            "cap {ply_cap}"
+        );
+        let stones = game.position().stone_count();
+        assert_eq!(stones % 2, 1, "cap {ply_cap} stopped mid-turn at {stones}");
+        assert!(
+            (ply_cap..=ply_cap + 1).contains(&stones),
+            "cap {ply_cap} overshot to {stones}"
+        );
+    }
 }
 
 #[test]
@@ -445,9 +495,6 @@ fn the_record_tracks_the_position_ply_for_ply() {
     drive_to_the_end(&mut game);
 
     assert_eq!(game.plies().len(), game.position().stone_count() as usize);
-    let actions: Vec<_> = game.plies().iter().map(|p| p.action).collect();
-    let history: Vec<_> = game.position().history().iter().map(|a| a.id()).collect();
-    assert_eq!(actions, history);
 
     let mut replay = Position::new();
     for (i, ply) in game.plies().iter().enumerate() {
@@ -467,7 +514,9 @@ fn the_prefix_replays_into_the_canonical_position() {
     });
     drive_to_the_end(&mut game);
 
-    let mirror = Position::replay(game.prefix()).expect("the prefix must replay");
+    let prefix = game.prefix();
+    assert_eq!(prefix.len(), game.plies().len());
+    let mirror = Position::replay(&prefix).expect("the prefix must replay");
     assert_eq!(&mirror, game.position());
     assert_eq!(mirror.zobrist(), game.position().zobrist());
 }
@@ -519,4 +568,29 @@ fn many_games_interleave_on_one_thread() {
         assert!(result.is_contested(), "game {i}: {result:?}");
         assert_eq!(game.plies().len(), game.position().stone_count() as usize);
     }
+}
+
+/// A garbage coordinate is a rule violation and forfeits the seat. It must not
+/// escape adjudication as a blameless engine-limit no-contest.
+#[test]
+fn a_garbage_coordinate_forfeits_rather_than_voiding_the_game() {
+    let mut game = Game::new(GameSpec::default());
+    play(&mut game, act(0, 0)).expect("opening");
+    let (_, generation, zobrist) = need(&game);
+    let t = game
+        .submit(
+            generation,
+            Reply::Place(Decision::new(act(20000, 0), zobrist)),
+        )
+        .expect("an illegal move is an accepted submission");
+    assert_eq!(
+        t.result,
+        Some(MatchResult::Decisive {
+            winner: Player::P0,
+            reason: WinReason::IllegalMove {
+                action: act(20000, 0).id(),
+                cause: MoveError::TooFarFromStones(HexCoord::new(20000, 0)),
+            }
+        })
+    );
 }

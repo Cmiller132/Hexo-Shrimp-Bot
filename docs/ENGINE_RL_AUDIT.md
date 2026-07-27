@@ -58,10 +58,10 @@ Reproduced exactly: at `q = 16000`, `legal_count()` was 270,216 with 136
 enumerated actions invalid, the first being `(15993, 8)` at `s = -16001`.
 
 Fixed at the source rather than by filtering at each read. The disk update skips
-cells outside the coordinate domain, so the frontier plane holds only valid
-coordinates and every accessor over it inherits the guarantee — `legal_count()`
-keeps its `O(1)`, and there is one writer to keep correct instead of four
-readers. Both halves derive the same predicate from the same coordinate, so they
+cells outside the coordinate domain, so coverage — and with it the derived legal
+set — holds only valid coordinates and every accessor over it inherits the
+guarantee — `legal_count()` keeps its `O(1)`, and there is one writer to keep
+correct instead of four readers. Both halves derive the same predicate from the same coordinate, so they
 remain exact inverses. Post-fix count is 270,080, and no golden vector moved,
 confirming the region is unreachable in ordinary play. (The filter has since
 moved into `Grid` and become a per-row clip; see the P1 section below.)
@@ -99,9 +99,10 @@ The recommended first optimization, essentially unchanged:
 3. update coverage directly through slices;
 4. update frontier words with masks and popcounts.
 
-`Grid::disk_runs` produces the runs and `Grid::add_cover_disk` /
-`Grid::remove_cover_disk` are now the only writers of coverage, so `position` no
-longer knows the disk is a disk. Safe Rust, and the representation is unchanged.
+`Grid::disk_runs` produces the runs, and every disk-shaped read and write goes
+through them — today via `Grid::place_stone` / `Grid::unplace_stone`, coverage
+having since become a bit plane (below) — so `position` no longer knows the disk
+is a disk. Safe Rust.
 
 Two things fell out that the recommendation did not anticipate.
 
@@ -114,8 +115,8 @@ plus a sufficient condition for it.
 
 **`DISK8` is worth more now than when it was load-bearing.** It is no longer the
 thing the machine follows, so it survives as an *independent* statement of the
-same cell set: the tier-C frontier assertion walks it offset by offset on every
-apply and undo, and `grid`'s tests compare the two formulations directly. A wrong
+same cell set: the tier-C coverage recount walks it offset by offset on every
+debug undo, and `grid`'s tests compare the two formulations directly. A wrong
 row run and a wrong offset are both symmetric bugs, so neither can be checked
 against itself.
 
@@ -136,24 +137,20 @@ growth events.
 
 The golden vectors, the boundary tests, and the property suite are all unmoved.
 
-### Higher-upside prototype
+### Higher-upside prototype — LANDED, by a different mechanism
 
-Prototype a one-bit `covered` plane plus a 217-bit `newly_covered` mask in each
-`Undo`. LIFO undo can clear exactly the coverage introduced by the most recent
-move.
+The prototype proposed a one-bit `covered` plane plus a 217-bit `newly_covered`
+mask carried in each `Undo`. The plane shipped; the mask did not. Coverage is a
+pure function of the stone set, so undo *recomputes* the removed stone's disk
+from occupancy — a separable zonogon dilation over a 33x33 window, normative in
+`ENGINE_SPEC.md` §5.4 — and the undo token stays a ~12-byte scalar delta instead
+of growing to 40-48 bytes. The stored frontier plane fell out entirely: the
+legal set is `covered & !occupied`, derived per word on read.
 
-Potential benefit:
-
-- position storage falls from roughly 11 to 4 bits per arena cell;
-- disk updates become row-mask operations;
-- clones become substantially smaller.
-
-Cost:
-
-- a larger undo token, approximately 40-48 bytes instead of a small scalar
-  delta.
-
-Measure this trade-off using realistic MCTS depths before adopting it.
+Measured: storage fell from 11 to 3 bits per arena cell; `clone` improved
+36-78% (~175 ns at ply 256, from ~780 ns); `apply_undo` paid 5-15% for the
+recomputation (edge ~455 ns at ply 256, from ~432 ns). The freed envelope
+funded raising `MAX_GRID_CELLS` from `1 << 22` to `1 << 24`.
 
 ## P1: Search excursions can permanently inflate a worker
 
@@ -189,22 +186,23 @@ Benchmark and implement one of:
 final iterator call does not scan trailing empty words.~~ Done — the early-out is
 at the top of `BitScan::next_slot`.
 
-## P1: Position cloning has four allocations
+## P1: Position cloning has an allocation per plane
 
-`Grid` owns four independent heap buffers: two occupancy planes, frontier, and
-coverage:
+`Grid` owns three independent heap buffers — two occupancy planes and coverage
+(four, before the frontier plane and the coverage bytes were replaced by the
+derived frontier and the coverage bits):
 
 - `struct Grid`, in `crates/hexo-engine/src/grid.rs`
 
-Derived `Clone` therefore performs four allocations and four copies — five since
-move history was added to `Position`. The documentation's "clone is a memcpy" and
-"allocates once" descriptions were useful shorthand but not literal; both have
-since been corrected in `crates/hexo-engine/README.md` and `docs/ENGINE_SPEC.md`
-§5.1 to say what actually happens.
+Derived `Clone` therefore performs three allocations and three copies. The
+documentation's "clone is a memcpy" and "allocates once" descriptions were useful
+shorthand but not literal; both have since been corrected in
+`crates/hexo-engine/README.md` and `docs/ENGINE_SPEC.md` §5.1 to say what
+actually happens.
 
-The first opened position allocates 4,096 cells, or 5,632 bytes of plane payload
+The first opened position allocates 4,096 cells, or 1,536 bytes of plane payload
 before allocator overhead. An 80 by 80 live region will commonly pad and round
-to a 128 by 128 arena, or 22,528 payload bytes rather than the unpadded 8.8 KB
+to a 128 by 128 arena, or 6,144 payload bytes rather than the unpadded 2.4 KB
 estimate.
 
 At large actor counts, state copies and allocator contention can become material
@@ -429,8 +427,8 @@ Two things the numbers say that nobody asked about:
    keep two versions of anything.
 6. Implement the deterministic runner state machine and result model.
 7. Add bounded actor, evaluator, and record pipelines.
-8. Prototype bit-covered storage or a batched SoA engine only if end-to-end
-   profiling still shows the scalar engine as material.
+8. Prototype a batched SoA engine only if end-to-end profiling still shows the
+   scalar engine as material. (Bit-covered storage has since landed.)
 
 Keep the current engine as the authoritative scalar oracle. Any optimized
 batch/SoA implementation should be differentially tested against it on every

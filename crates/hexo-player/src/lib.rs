@@ -7,17 +7,17 @@
 //! fills it; a consumer importing both aliases one.
 //!
 //! ```
-//! use hexo_engine::{Action, Position};
+//! use hexo_engine::Action;
 //! use hexo_player::{Player, Table, sweep};
-//! use hexo_runner::{Budget, GameSpec};
+//! use hexo_runner::{Game, GameSpec};
 //! use std::num::NonZeroU32;
 //!
 //! /// Takes the lowest-ranked legal placement, every time.
 //! struct Lowest;
 //!
 //! impl Player for Lowest {
-//!     fn choose(&mut self, pos: &Position, _budget: Budget) -> Action {
-//!         pos.nth_legal(0).expect("a running game has a legal placement")
+//!     fn choose(&mut self, game: &Game) -> Action {
+//!         game.position().nth_legal(0).expect("a running game has a legal placement")
 //!     }
 //! }
 //!

@@ -4,11 +4,21 @@ mod common;
 
 use common::{check_all_oracles, winners_oracle};
 use hexo_engine::{
-    Action, Axis, HexCoord, MoveError, Outcome, Player, Position, Search, TurnPhase, WINDOW_LEN,
+    Action, Axis, HexCoord, MoveError, Outcome, Player, Position, Search, TurnPhase, Win,
 };
 
 fn act(q: i16, r: i16) -> Action {
     Action::new(HexCoord::new(q, r))
+}
+
+/// The run a fixture expects, written the way the fixture's comment reads it off the
+/// move list: first cell, axis, length.
+const fn win(q: i16, r: i16, axis: Axis, len: u8) -> Option<Win> {
+    Some(Win {
+        axis,
+        start: HexCoord::new(q, r),
+        len,
+    })
 }
 
 /// Play every move but the last, returning the position and the final move.
@@ -29,7 +39,7 @@ fn assert_win_cycle(
     moves: &[(i16, i16)],
     winner: Player,
     expect_phase_kind_frozen: fn(TurnPhase) -> bool,
-    expect_window_bits: u32,
+    expect_wins: [Option<Win>; 3],
 ) {
     let (mut pos, winning_move) = setup(moves);
     let before = pos.clone();
@@ -48,30 +58,28 @@ fn assert_win_cycle(
         "a winning placement must freeze the phase"
     );
     assert_eq!(
-        applied.winning.bits(),
-        expect_window_bits,
-        "winning window slots"
+        applied.wins, expect_wins,
+        "the runs this placement completed"
     );
     assert!(
-        !applied.winning.is_empty(),
-        "outcome is Some, so winning must be non-empty"
+        applied.wins.iter().any(Option::is_some),
+        "outcome is Some, so some axis must report a run"
     );
-    assert_eq!(
-        applied.winning.count(),
-        expect_window_bits.count_ones(),
-        "count must agree with the raw mask"
-    );
-    let resolved: Vec<_> = applied.winning_windows().collect();
-    assert_eq!(resolved.len(), applied.winning.count() as usize);
-    for w in &resolved {
-        assert!(
-            search.position().window(*w).is_full_for(winner),
-            "resolved window {w:?} is not full for the winner"
-        );
-        assert!(
-            w.cells().contains(&applied.action.coord()),
-            "resolved window {w:?} does not contain the placement"
-        );
+    for (i, w) in applied.wins.iter().enumerate() {
+        let Some(w) = w else { continue };
+        assert_eq!(w.axis.index(), i, "wins must be indexed by axis");
+        let mut cell = w.start;
+        let mut hit = false;
+        for _ in 0..w.len {
+            assert_eq!(
+                search.position().get(cell),
+                Some(winner),
+                "run {w:?} names {cell:?}, which is not the winner's"
+            );
+            hit |= cell == applied.action.coord();
+            cell = cell.step(w.axis, 1);
+        }
+        assert!(hit, "run {w:?} does not contain the placement");
     }
 
     let won = search.position();
@@ -115,11 +123,6 @@ fn assert_win_cycle(
     check_all_oracles(&fresh, fresh.stone_count() as usize);
 }
 
-/// Slot index of a window in the canonical order of the spec.
-const fn slot(axis_index: usize, offset: usize) -> u32 {
-    1 << (axis_index * WINDOW_LEN + offset)
-}
-
 #[test]
 fn second_stone_win_freezes_mid_turn() {
     assert_win_cycle(
@@ -137,8 +140,10 @@ fn second_stone_win_freezes_mid_turn() {
             (6, 0),
         ],
         Player::P1,
-        |p| matches!(p, TurnPhase::SecondStone { .. }),
-        slot(Axis::Q.index(), 5),
+        |p| matches!(p, TurnPhase::SecondStone),
+        // P1 holds (1, 0)..(5, 0) and closes at (6, 0); (0, 0) is P0's, so the run is
+        // the six cells (1, 0)..(6, 0) along Q.
+        [win(1, 0, Axis::Q, 6), None, None],
     );
 
     let mut pos = Position::new();
@@ -157,17 +162,14 @@ fn second_stone_win_freezes_mid_turn() {
     ] {
         pos.advance(act(q, r)).expect("legal");
     }
-    match pos.phase() {
-        TurnPhase::SecondStone { first } => {
-            assert_eq!(first, HexCoord::new(5, 0));
-            assert_eq!(pos.get(first), Some(Player::P1));
-        }
-        other => panic!("expected SecondStone, got {other:?}"),
-    }
+    assert_eq!(pos.phase(), TurnPhase::SecondStone);
+    // The turn's first stone is still on the board, which is what makes a frozen
+    // `SecondStone` a trap for consumer code that branches on phase before terminal.
+    assert_eq!(pos.get(HexCoord::new(5, 0)), Some(Player::P1));
 }
 
 #[test]
-fn first_stone_win_with_seven_in_a_row_sets_two_window_bits() {
+fn first_stone_win_with_seven_in_a_row_reports_a_run_of_seven() {
     assert_win_cycle(
         &[
             (0, 0),
@@ -187,12 +189,14 @@ fn first_stone_win_with_seven_in_a_row_sets_two_window_bits() {
         ],
         Player::P1,
         |p| matches!(p, TurnPhase::FirstStone),
-        slot(Axis::Q.index(), 3) | slot(Axis::Q.index(), 4),
+        // P1 holds (1, 0)..(4, 0) and (6, 0), (7, 0); filling the gap at (5, 0) joins
+        // them into seven along Q, from (1, 0) to (7, 0).
+        [win(1, 0, Axis::Q, 7), None, None],
     );
 }
 
 #[test]
-fn two_crossing_lines_set_two_window_bits() {
+fn two_crossing_lines_report_a_run_on_each_axis() {
     assert_win_cycle(
         &[
             (0, 0),
@@ -220,7 +224,9 @@ fn two_crossing_lines_set_two_window_bits() {
         ],
         Player::P1,
         |p| matches!(p, TurnPhase::FirstStone),
-        slot(Axis::Q.index(), 5) | slot(Axis::R.index(), 0),
+        // (6, 0) is the crossing point: it closes (1, 0)..(6, 0) along Q and
+        // (6, 0)..(6, 5) along R at once.
+        [win(1, 0, Axis::Q, 6), win(6, 0, Axis::R, 6), None],
     );
 }
 
@@ -241,8 +247,10 @@ fn win_completed_away_from_the_window_ends() {
             (3, 0),
         ],
         Player::P1,
-        |p| matches!(p, TurnPhase::SecondStone { .. }),
-        slot(Axis::Q.index(), 2),
+        |p| matches!(p, TurnPhase::SecondStone),
+        // The placement at (3, 0) is interior to the run it completes: two of P1's
+        // stones sit behind it and three ahead, giving (1, 0)..(6, 0) along Q.
+        [win(1, 0, Axis::Q, 6), None, None],
     );
 }
 
@@ -263,8 +271,9 @@ fn win_on_the_qr_axis_exercises_the_shear() {
             (3, -3),
         ],
         Player::P1,
-        |p| matches!(p, TurnPhase::SecondStone { .. }),
-        slot(Axis::QR.index(), 2),
+        |p| matches!(p, TurnPhase::SecondStone),
+        // The same interior fill as above, on the QR diagonal: (1, -1)..(6, -6).
+        [None, None, win(1, -1, Axis::QR, 6)],
     );
 }
 
@@ -285,8 +294,9 @@ fn win_on_the_r_axis() {
             (1, 5),
         ],
         Player::P1,
-        |p| matches!(p, TurnPhase::SecondStone { .. }),
-        slot(Axis::R.index(), 5),
+        |p| matches!(p, TurnPhase::SecondStone),
+        // P1's column at q = 1 closes upward: (1, 0)..(1, 5) along R.
+        [None, win(1, 0, Axis::R, 6), None],
     );
 }
 
@@ -309,6 +319,8 @@ fn p0_can_win_too() {
         ],
         Player::P0,
         |p| matches!(p, TurnPhase::FirstStone),
-        slot(Axis::Q.index(), 0),
+        // P0 runs its opening stone backwards to (-5, 0), which is the run's first cell:
+        // (-5, 0)..(0, 0) along Q.
+        [win(-5, 0, Axis::Q, 6), None, None],
     );
 }

@@ -28,7 +28,7 @@ crates/hexo-runner/
 
 | Module | Role |
 | --- | --- |
-| `game` | `Game` owns the one canonical `Position` and is the only code that advances it. A state machine: `step()` says what it wants, `submit()` says what happened. |
+| `game` | `Game` owns the one canonical `Position` and the record of the game, and is the only code that advances either. A state machine: `step()` says what it wants, `submit()` says what happened. |
 | `decision` | What a seat comes back with — a placement, a resignation, or a driver-reported failure — and the `Budget` it was told it had. |
 | `outcome` | `MatchResult` and the adjudication vocabulary. Everything the engine refuses to model. |
 | `error` | `SubmitError`: a submission the game would not act on. |
@@ -60,17 +60,30 @@ arrow points that way and never back.
   ownership, not convention: `Game::position()` returns a shared borrow and
   there is no mutable counterpart. `submit` is the only way to advance.
 
+- **`Game::plies` is the game's history, not a mirror of one.** `Position` keeps
+  no move list, so this record is the only one: it is what a game is written out
+  as, and `Game::prefix()` decodes it back into placements. Nothing here
+  cross-checks a second copy on the board, because there is no second copy —
+  what is checked instead is that the record replays into the canonical position,
+  which is a claim about two independently built things.
+
 - **A remote seat is handed a move prefix, not a position.** `Game::prefix()` is
   a move list the seat replays with `Position::replay`. A container cannot be
   handed a `Position`, and board-shaped construction is the rule-bypass hole the
-  engine refuses to reopen. An in-process driver hands `Game::position()` straight
-  to the seat and needs no mirror.
+  engine refuses to reopen. An in-process driver hands the whole `Game` to the
+  seat, which reads `position()` directly and needs no mirror.
 
 - **Two guards on every submission, both structural.** `generation` stops a late
   or duplicated reply from playing a move chosen for a position the game has
   moved past — reachable the moment decisions are batched or cross a process
-  boundary. The echoed `zobrist` catches a seat whose mirror has drifted, on the
-  ply it drifts rather than at the end of a corrupted game.
+  boundary. The echoed `zobrist` catches a mirror whose *board content* has
+  drifted, on the ply it drifts rather than at the end of a corrupted game.
+
+  Neither guard sees move order within a turn. A mirror that replays an
+  opponent's non-winning two-stone turn in the opposite order reaches the same
+  occupied cells and the same mover, so it produces the same hash and submits
+  cleanly. Catching that needs a digest over the record, which belongs to the
+  wire protocol when it lands (C1, C2) rather than to a second hash here.
 
 - **An illegal move is a result, not an error.** `SubmitError` means *nothing
   happened*; the submission was unusable and the same request is still
@@ -92,11 +105,20 @@ arrow points that way and never back.
   training pipeline needs to know: a game that legitimately hit its action cap
   and a game where a player crashed are both unusable as signal, but only the
   second is anybody's fault. `MatchResult` splits by whose fault it was, and
-  `is_contested()` answers "was this a real game" directly.
+  `is_contested()` answers "did this match reach a verdict" directly.
+
+  It does not answer "is this game usable as training data". A forfeit —
+  `WinReason::Timeout`, `Crash`, or `Protocol` — is a decisive, contested
+  result, and it is real evidence in a match: a seat that cannot answer has
+  lost. But it says nothing about the play on the board, and the stones on it
+  are an abandoned game. A consumer selecting positions to learn from matches on
+  `WinReason`, not on `is_contested()` alone.
 
   `GameSpec::ply_cap` is nonzero by type. Adjudication checks a placement's win
-  before the cap, so a win on the capping placement is a win, not a draw.
-  Driver failures retain the `Player` and `Failure` in
+  before the cap, so a win on the capping placement is a win, not a draw. The
+  cap is only tested on a placement that ended the mover's turn, so a cap
+  falling mid-turn stops the game one placement later rather than giving one
+  seat a half turn. Driver failures retain the `Player` and `Failure` in
   `NoContest::SeatFailure`; the no-contest policy declines to charge the
   failure to either seat without erasing where it happened.
 

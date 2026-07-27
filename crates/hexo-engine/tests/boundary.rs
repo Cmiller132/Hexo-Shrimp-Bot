@@ -205,7 +205,6 @@ fn undo_restores_a_boundary_position_exactly() {
         assert_eq!(pos, before, "direction {dir:?}: undo did not restore");
         assert_eq!(pos.zobrist(), zobrist_before);
         assert_eq!(pos.legal_count(), legal_before);
-        assert_eq!(pos.history(), before.history());
     }
 }
 
@@ -228,4 +227,36 @@ fn a_diagonal_walk_is_stopped_by_the_arena_ceiling_not_the_domain() {
             .unwrap_or_else(|e| panic!("direction {dir:?}: audit failed: {e}"));
         assert_the_legal_set_is_self_consistent(&pos, &format!("diagonal {dir:?}"));
     }
+}
+
+/// Off-domain classification at a face: beside a face stone the placement is the
+/// engine's limit, not the seat's fault — and far from every stone it is the seat's
+/// rule violation, exactly as it would be on-domain.
+#[test]
+fn off_domain_cells_classify_by_the_rules_not_the_domain() {
+    let (pos, stop) = walk(AXIS_DIRECTIONS[0]);
+    assert_eq!(stop, Stop::DomainEdge);
+    let face_stone = HexCoord::new(COORD_LIMIT, 0);
+    assert!(
+        pos.get(face_stone).is_some(),
+        "the walk must reach the face"
+    );
+
+    let beside = HexCoord::new(COORD_LIMIT + 1, 0);
+    assert!(!beside.is_valid());
+    let mut probe = pos.clone();
+    let err = probe
+        .advance(Action::new(beside))
+        .expect_err("unrepresentable");
+    assert_eq!(err, MoveError::CoordOutOfBounds(beside));
+    assert!(!err.is_rule_violation(), "a rule-legal placement, refused");
+
+    let far = HexCoord::new(COORD_LIMIT + 1, 5000);
+    assert!(!far.is_valid());
+    let err = probe.advance(Action::new(far)).expect_err("far off-domain");
+    assert_eq!(err, MoveError::TooFarFromStones(far));
+    assert!(
+        err.is_rule_violation(),
+        "a rule violation, whoever refuses it"
+    );
 }

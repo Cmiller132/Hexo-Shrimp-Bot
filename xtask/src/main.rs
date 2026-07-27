@@ -21,7 +21,12 @@ struct Gate {
     toolchain: Toolchain,
     /// Environment set for this gate only.
     env: &'static [(&'static str, &'static str)],
-    /// Arguments after `cargo`.
+    /// Arguments after `cargo`. Every gate that resolves dependencies passes
+    /// `--locked`, so a lockfile a manifest has outgrown fails the gate instead of
+    /// being quietly rewritten under it. `cargo fmt` does not take the flag. The
+    /// `xtask` alias in `.cargo/config.toml` passes it too — the launcher's own
+    /// `cargo run` resolves the workspace before any gate, and unlocked it would
+    /// repair the lockfile out from under the checks.
     args: &'static [&'static str],
     /// One line for the gate table, then why the gate is not redundant.
     why: &'static str,
@@ -41,7 +46,14 @@ const GATES: &[Gate] = &[
         on_every_push: true,
         toolchain: Toolchain::Current,
         env: &[],
-        args: &["clippy", "--all-targets", "--", "-D", "warnings"],
+        args: &[
+            "clippy",
+            "--locked",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
         why: "Clippy, debug profile, including tests and benches.",
     },
     Gate {
@@ -51,6 +63,7 @@ const GATES: &[Gate] = &[
         env: &[],
         args: &[
             "clippy",
+            "--locked",
             "--release",
             "--all-targets",
             "--",
@@ -67,7 +80,7 @@ const GATES: &[Gate] = &[
         on_every_push: true,
         toolchain: Toolchain::Current,
         env: &[],
-        args: &["test", "--workspace"],
+        args: &["test", "--locked", "--workspace"],
         why: "The test suite, debug profile — so the tier-C assertions run on \
               every placement.",
     },
@@ -76,7 +89,7 @@ const GATES: &[Gate] = &[
         on_every_push: true,
         toolchain: Toolchain::Current,
         env: &[("RUSTDOCFLAGS", "-D warnings")],
-        args: &["doc", "--no-deps", "--workspace"],
+        args: &["doc", "--locked", "--no-deps", "--workspace"],
         why: "Rustdoc. `cargo clippy` does not check it: a broken intra-doc \
               link like [`Position::advance`] compiles fine and silently stops \
               resolving. The module docs cross-reference specific methods \
@@ -87,7 +100,7 @@ const GATES: &[Gate] = &[
         on_every_push: true,
         toolchain: Toolchain::Msrv,
         env: &[],
-        args: &["check", "--workspace", "--all-targets"],
+        args: &["check", "--locked", "--workspace", "--all-targets"],
         why: "The declared `rust-version` floor. CI otherwise only ever sees \
               current stable, so the promise drifts silently — it already had \
               once. `--all-targets` holds tests and benches to the floor too. \
@@ -100,6 +113,7 @@ const GATES: &[Gate] = &[
         env: &[],
         args: &[
             "build",
+            "--locked",
             "-p",
             "hexo-engine",
             "--target",
@@ -121,6 +135,7 @@ const GATES: &[Gate] = &[
         env: &[],
         args: &[
             "clippy",
+            "--locked",
             "-p",
             "hexo-engine",
             "--target",
@@ -140,7 +155,15 @@ const GATES: &[Gate] = &[
             ("HEXO_SMOKE_GAMES", "100000"),
             ("HEXO_SMOKE_UNIFORM", "500"),
         ],
-        args: &["test", "--release", "-p", "hexo-engine", "--test", "smoke"],
+        args: &[
+            "test",
+            "--locked",
+            "--release",
+            "-p",
+            "hexo-engine",
+            "--test",
+            "smoke",
+        ],
         why: "The deep smoke run — ten times as many line-building games and more \
               than sixteen times as many uniform games as the `test` defaults. \
               Release profile, because a debug build \

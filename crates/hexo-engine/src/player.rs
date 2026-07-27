@@ -1,7 +1,5 @@
 //! Who moves, and where they are inside the two-placement turn.
 
-use crate::coord::HexCoord;
-
 /// One of the two players.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -38,11 +36,8 @@ pub enum TurnPhase {
     Opening,
     /// The mover places the first stone of its turn.
     FirstStone,
-    /// The mover places the second stone of its turn and may not reuse `first`.
-    SecondStone {
-        /// The cell this turn's first stone went to.
-        first: HexCoord,
-    },
+    /// The mover places the second stone of its turn.
+    SecondStone,
 }
 
 impl TurnPhase {
@@ -53,7 +48,7 @@ impl TurnPhase {
         match self {
             Self::Opening => 0,
             Self::FirstStone => 1,
-            Self::SecondStone { .. } => 2,
+            Self::SecondStone => 2,
         }
     }
 }
@@ -79,33 +74,9 @@ mod tests {
     }
 
     #[test]
-    fn kind_index_ignores_the_first_payload() {
+    fn kind_index_is_the_zobrist_turn_order() {
         assert_eq!(TurnPhase::Opening.kind_index(), 0);
         assert_eq!(TurnPhase::FirstStone.kind_index(), 1);
-        assert_eq!(
-            TurnPhase::SecondStone {
-                first: HexCoord::ORIGIN
-            }
-            .kind_index(),
-            2
-        );
-        assert_eq!(
-            TurnPhase::SecondStone {
-                first: HexCoord::new(-9, 4)
-            }
-            .kind_index(),
-            2
-        );
-    }
-
-    #[test]
-    fn second_stone_equality_includes_first() {
-        let a = TurnPhase::SecondStone {
-            first: HexCoord::new(1, 2),
-        };
-        let b = TurnPhase::SecondStone {
-            first: HexCoord::new(1, 3),
-        };
-        assert_ne!(a, b);
+        assert_eq!(TurnPhase::SecondStone.kind_index(), 2);
     }
 }

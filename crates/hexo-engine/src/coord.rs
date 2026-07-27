@@ -140,7 +140,6 @@ pub const fn hex_distance(a: HexCoord, b: HexCoord) -> u32 {
 }
 
 /// Offsets of the radius-[`LEGAL_RADIUS`] disk, `dq`-major and `dr`-minor.
-#[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) const DISK8: [(i8, i8); DISK_CELLS] = {
     let mut out = [(0i8, 0i8); DISK_CELLS];
     let mut n = 0usize;

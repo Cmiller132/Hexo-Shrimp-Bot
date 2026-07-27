@@ -1,16 +1,16 @@
 //! The rule machine: `Position`, its read surface, `advance`, and `audit`.
 
 use crate::action::Action;
-use crate::coord::{Axis, DISK_CELLS, HexCoord, LEGAL_RADIUS, WINDOW_LEN, hex_distance};
 #[cfg(debug_assertions)]
-use crate::coord::{DISK8, offset};
+use crate::coord::offset;
+use crate::coord::{Axis, DISK8, HexCoord, LEGAL_RADIUS, WINDOW_LEN, hex_distance};
 use crate::error::{IntegrityCheck, IntegrityError, MoveError, ReplayError};
 use crate::grid::Grid;
 use crate::player::{Player, TurnPhase};
 use crate::search::Undo;
 #[cfg(debug_assertions)]
 use crate::search::UndoAudit;
-use crate::window::{WINDOWS_PER_PLACEMENT, Window, WindowMask, WindowRef, WinningWindows};
+use crate::window::{WINDOWS_PER_PLACEMENT, Win, Window, WindowMask, WindowRef};
 use crate::zobrist::{TURN_KEY, cell_key};
 use core::iter::FusedIterator;
 
@@ -18,12 +18,10 @@ use core::iter::FusedIterator;
 #[path = "position_tests.rs"]
 mod tests;
 
-/// A Hexo position: board, move history, turn phase, mover, hash, terminal status.
+/// A Hexo position: board, turn phase, mover, hash, terminal status.
 #[derive(Clone, Debug)]
 pub struct Position {
     grid: Grid,
-    /// Every placement, oldest first. Pushed by `place`, popped by `unplace`.
-    history: Vec<Action>,
     phase: TurnPhase,
     current: Player,
     terminal: Option<Outcome>,
@@ -40,8 +38,8 @@ impl Default for Position {
 
 impl PartialEq for Position {
     fn eq(&self, other: &Self) -> bool {
-        self.stone_count() == other.stone_count()
-            && self.stones_by == other.stones_by
+        // `stone_count()` is the sum of `stones_by`, so it is not compared separately.
+        self.stones_by == other.stones_by
             && self.phase == other.phase
             && self.current == other.current
             && self.terminal == other.terminal
@@ -65,19 +63,11 @@ pub struct Applied {
     pub phase_after: TurnPhase,
     /// `Some` iff this placement completed a six-window.
     pub outcome: Option<Outcome>,
-    /// Which of the 18 windows through `action` this placement completed.
-    pub winning: WinningWindows,
-}
-
-impl Applied {
-    /// The windows this placement completed, as geometry rather than slots.
-    pub fn winning_windows(&self) -> impl Iterator<Item = Window> + '_ {
-        let start = self.action.coord();
-        self.winning.iter().map(move |(axis, offset)| Window {
-            start: start.step(axis, -(offset as i16)),
-            axis,
-        })
-    }
+    /// The run this placement completed on each axis, indexed by [`Axis::index`].
+    ///
+    /// Some entry is `Some` iff `outcome.is_some()`; two can be, when the placement
+    /// completes two crossing lines at once. Iterate with `wins.iter().flatten()`.
+    pub wins: [Option<Win>; 3],
 }
 
 /// How the game ended. Win only.
@@ -88,13 +78,11 @@ pub struct Outcome {
 }
 
 impl Position {
-    /// The empty position: `P0` to move, [`TurnPhase::Opening`], no arena allocated and
-    /// no history.
+    /// The empty position: `P0` to move, [`TurnPhase::Opening`], no arena allocated.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             grid: Grid::new(),
-            history: Vec::new(),
             phase: TurnPhase::Opening,
             current: Player::P0,
             terminal: None,
@@ -179,7 +167,7 @@ impl Position {
     #[inline]
     #[must_use]
     pub const fn stone_count(&self) -> u32 {
-        self.history.len() as u32
+        self.stones_by[0] + self.stones_by[1]
     }
 
     /// Stones held by one player.
@@ -193,15 +181,8 @@ impl Position {
     #[must_use]
     pub fn stones(&self) -> Stones<'_> {
         Stones {
-            scan: BitScan::new(&self.grid, ScanPlane::Occupied, self.history.len()),
+            scan: BitScan::new(&self.grid, ScanPlane::Occupied, self.stone_count() as usize),
         }
-    }
-
-    /// Every placement that produced this position, oldest first.
-    #[inline]
-    #[must_use]
-    pub fn history(&self) -> &[Action] {
-        &self.history
     }
 }
 
@@ -213,7 +194,8 @@ impl Position {
         Ok(pos)
     }
 
-    /// Apply a placement sequence to an existing position, continuing its history.
+    /// Apply a placement sequence to an existing position, continuing from where it
+    /// stands.
     pub fn replay_from(&mut self, actions: &[Action]) -> Result<(), ReplayError> {
         for (ply, &action) in actions.iter().enumerate() {
             self.advance(action)
@@ -263,13 +245,7 @@ impl Position {
         let c = action.coord();
         match self.phase {
             TurnPhase::Opening => (c == HexCoord::ORIGIN).then_some(0),
-            TurnPhase::FirstStone => self.grid.frontier_rank(c),
-            TurnPhase::SecondStone { first } => {
-                if c == first {
-                    return None;
-                }
-                self.grid.frontier_rank(c)
-            }
+            TurnPhase::FirstStone | TurnPhase::SecondStone => self.grid.frontier_rank(c),
         }
     }
 
@@ -286,8 +262,7 @@ impl Position {
         }
     }
 
-    /// Whether `action` is legal right now: phase, occupancy, radius, and the first-
-    /// stone reuse rule.
+    /// Whether `action` is legal right now: phase, occupancy, and radius.
     #[must_use]
     pub fn is_legal(&self, action: Action) -> bool {
         if self.terminal.is_some() {
@@ -296,33 +271,47 @@ impl Position {
         let c = action.coord();
         match self.phase {
             TurnPhase::Opening => c == HexCoord::ORIGIN,
-            TurnPhase::FirstStone => self.check_placement(c).is_ok(),
-            TurnPhase::SecondStone { first } => c != first && self.check_placement(c).is_ok(),
+            TurnPhase::FirstStone | TurnPhase::SecondStone => self.check_placement(c).is_ok(),
         }
     }
 
     /// Occupancy and radius legality, in precedence order.
     fn check_placement(&self, c: HexCoord) -> Result<(), MoveError> {
         if !c.is_valid() {
-            return Err(MoveError::CoordOutOfBounds(c));
+            // Off the coordinate domain, which the rules do not know exists. Classify
+            // by what the rules would say: within LEGAL_RADIUS of a stone the
+            // placement is rule-legal but unrepresentable — an engine limit — and
+            // anywhere else it is plain TooFarFromStones. Occupied cannot happen
+            // off-domain, because stones exist only on valid cells.
+            return Err(if self.off_domain_within_radius(c) {
+                MoveError::CoordOutOfBounds(c)
+            } else {
+                MoveError::TooFarFromStones(c)
+            });
         }
         if self.grid.owner(c).is_some() {
             return Err(MoveError::Occupied(c));
         }
-        if self.grid.cover(c) == 0 {
+        if !self.grid.is_covered(c) {
             return Err(MoveError::TooFarFromStones(c));
         }
         Ok(())
     }
-}
 
-/// `(strip row, strip bit)` that bit `m` of slot `(axis, k)` reads from.
-#[inline]
-const fn strip_slot(axis: Axis, k: usize, m: usize) -> (usize, usize) {
-    match axis {
-        Axis::Q => (5 - k + m, 5),
-        Axis::R => (5, 5 - k + m),
-        Axis::QR => (5 - k + m, 5 + k - m),
+    /// Whether any stone lies within [`LEGAL_RADIUS`] of the off-domain cell `c`.
+    /// Cold: reached only for off-domain placements. Probes in `i32`, so the walk
+    /// cannot wrap `i16`; a neighbour that does not fit `i16` cannot hold a stone.
+    fn off_domain_within_radius(&self, c: HexCoord) -> bool {
+        let (q, r) = (i32::from(c.q), i32::from(c.r));
+        DISK8.iter().any(|&(dq, dr)| {
+            let (nq, nr) = (q + i32::from(dq), r + i32::from(dr));
+            i32::from(nq as i16) == nq
+                && i32::from(nr as i16) == nr
+                && self
+                    .grid
+                    .owner(HexCoord::new(nq as i16, nr as i16))
+                    .is_some()
+        })
     }
 }
 
@@ -336,8 +325,6 @@ impl Position {
     #[must_use]
     pub fn windows_through(&self, coord: HexCoord) -> [WindowRef; WINDOWS_PER_PLACEMENT] {
         debug_assert!(coord.is_valid());
-        let s0 = self.grid.strip11(self.grid.occ_plane(Player::P0), coord);
-        let s1 = self.grid.strip11(self.grid.occ_plane(Player::P1), coord);
         let mut out = [WindowRef {
             window: Window {
                 start: coord,
@@ -346,13 +333,22 @@ impl Position {
             mask: WindowMask::EMPTY,
         }; WINDOWS_PER_PLACEMENT];
         for axis in Axis::ALL {
+            // Cell `coord` stepped `i - 5` along the axis. Every cell of every window
+            // through `coord` on this axis is one of these eleven, so the whole axis is
+            // one gather: bit `m` of slot `k` is the cell at `m - k`.
+            let mut line = [None; 2 * WINDOW_LEN - 1];
+            for (i, owner) in line.iter_mut().enumerate() {
+                *owner = self.get(coord.step(axis, i as i16 - (WINDOW_LEN as i16 - 1)));
+            }
             for k in 0..WINDOW_LEN {
                 let mut m0 = 0u8;
                 let mut m1 = 0u8;
                 for m in 0..WINDOW_LEN {
-                    let (row, bit) = strip_slot(axis, k, m);
-                    m0 |= (((s0[row] >> bit) & 1) as u8) << m;
-                    m1 |= (((s1[row] >> bit) & 1) as u8) << m;
+                    match line[m + WINDOW_LEN - 1 - k] {
+                        Some(Player::P0) => m0 |= 1 << m,
+                        Some(Player::P1) => m1 |= 1 << m,
+                        None => {}
+                    }
                 }
                 out[axis.index() * WINDOW_LEN + k] = WindowRef {
                     window: Window {
@@ -383,83 +379,13 @@ impl Position {
     }
 }
 
-/// Bit `t` set iff bits `t..t+6` of `x` are all set.
-#[inline]
-const fn run6(x: u32) -> u32 {
-    let a = x & (x >> 1);
-    let b = a & (a >> 2);
-    b & (b >> 2)
-}
-
-/// `out[i]` bit `j` set iff rows `i..i+6` all have bit `j` set.
-#[inline]
-const fn fold6(s: &[u32; 11]) -> [u32; 6] {
-    let mut a = [0u32; 10];
-    let mut i = 0;
-    while i < 10 {
-        a[i] = s[i] & s[i + 1];
-        i += 1;
-    }
-    let mut b = [0u32; 8];
-    i = 0;
-    while i < 8 {
-        b[i] = a[i] & a[i + 2];
-        i += 1;
-    }
-    let mut c = [0u32; 6];
-    i = 0;
-    while i < 6 {
-        c[i] = b[i] & b[i + 2];
-        i += 1;
-    }
-    c
-}
-
-impl Position {
-    /// Bitmask over the 18 slots of spec §6.3: which windows through `c` are
-    /// fully `p`'s.
-    fn winning_slots(&self, c: HexCoord, p: Player) -> u32 {
-        let strip = self.grid.strip11(self.grid.occ_plane(p), c);
-        let mut s = [0u32; 11];
-        let mut i = 0;
-        while i < 11 {
-            s[i] = strip[i] as u32;
-            i += 1;
-        }
-        let mut out = 0u32;
-
-        let cq = fold6(&s);
-        for k in 0..WINDOW_LEN {
-            out |= ((cq[5 - k] >> 5) & 1) << k;
-        }
-
-        let cr = run6(s[5]);
-        for k in 0..WINDOW_LEN {
-            out |= ((cr >> (5 - k)) & 1) << (6 + k);
-        }
-
-        let mut sh = [0u32; 11];
-        let mut i = 0;
-        while i < 11 {
-            sh[i] = s[i] << i;
-            i += 1;
-        }
-        let cd = fold6(&sh);
-        for k in 0..WINDOW_LEN {
-            out |= ((cd[5 - k] >> 10) & 1) << (12 + k);
-        }
-
-        out
-    }
-}
-
 /// The only phase transition. Private, called from exactly one site.
 #[inline]
-const fn advance_turn(before: TurnPhase, current: Player, c: HexCoord) -> (Player, TurnPhase) {
+const fn advance_turn(before: TurnPhase, current: Player) -> (Player, TurnPhase) {
     match before {
         TurnPhase::Opening => (Player::P1, TurnPhase::FirstStone),
-        TurnPhase::FirstStone => (current, TurnPhase::SecondStone { first: c }),
-        TurnPhase::SecondStone { .. } => (current.other(), TurnPhase::FirstStone),
+        TurnPhase::FirstStone => (current, TurnPhase::SecondStone),
+        TurnPhase::SecondStone => (current.other(), TurnPhase::FirstStone),
     }
 }
 
@@ -487,34 +413,21 @@ pub(crate) const fn turn_closed_form(stones: u32, terminal: bool) -> Option<(usi
 }
 
 impl Position {
-    /// The involutive half of a placement (spec §5.4).
+    /// The forward half of a placement (spec §5.4).
     fn place(&mut self, c: HexCoord, p: Player) {
         debug_assert!(self.grid.is_empty_cell(c));
-        if self.grid.cover(c) > 0 {
-            self.grid.clear_frontier(c);
-        }
-        self.grid.set_owner(c, p);
-        self.grid.add_cover_disk(c);
+        self.grid.place_stone(c, p);
         self.hash_cells ^= cell_key(c, p);
         self.stones_by[p.index()] += 1;
-        self.history.push(Action::new(c));
     }
 
-    /// The exact inverse of [`Position::place`], in reverse statement order.
+    /// The exact inverse of [`Position::place`]. Coverage is a pure function of the
+    /// stone set — occupancy dilated by the disk — so removing the stone and
+    /// recomputing its disk restores every plane exactly.
     fn unplace(&mut self, c: HexCoord, p: Player) {
-        let popped = self.history.pop();
-        debug_assert_eq!(
-            popped,
-            Some(Action::new(c)),
-            "C15: history top is not the placement being undone"
-        );
         self.stones_by[p.index()] -= 1;
         self.hash_cells ^= cell_key(c, p);
-        self.grid.remove_cover_disk(c);
-        self.grid.clear_owner(c, p);
-        if self.grid.cover(c) > 0 {
-            self.grid.set_frontier(c);
-        }
+        self.grid.unplace_stone(c, p);
     }
 
     /// The single forward code path, called by [`Position::advance`] and [`Search::apply`].
@@ -530,13 +443,11 @@ impl Position {
                     return Err(MoveError::IllegalOpening);
                 }
             }
-            TurnPhase::FirstStone => self.check_placement(c)?,
-            TurnPhase::SecondStone { first } => {
-                if c == first {
-                    return Err(MoveError::ReusedFirstStone(c));
-                }
-                self.check_placement(c)?;
-            }
+            // The second stone of a turn takes the same checks as the first: the rule that
+            // it may not reuse the first is implied by occupancy. The first stone occupies
+            // its cell and stones are permanent, so the reuse placement is already refused
+            // as `Occupied`.
+            TurnPhase::FirstStone | TurnPhase::SecondStone => self.check_placement(c)?,
         }
         let player_before = self.current;
         let phase_before = self.phase;
@@ -547,15 +458,42 @@ impl Position {
         let mut audit = UndoAudit::capture(self);
         self.place(c, player_before);
 
-        let winning = self.winning_slots(c, player_before);
-        let outcome = if winning != 0 {
+        // The mover's maximal run through `c` on each axis. `get` is total, so the walk
+        // needs no bounds test: it stops at the first cell that is not the mover's, and
+        // never steps off one. No run of six existed before this placement — that would
+        // have ended the game — so each side extends at most five and `len <= 11`.
+        let mut wins: [Option<Win>; 3] = [None; 3];
+        for axis in Axis::ALL {
+            let mut back = 0u8;
+            let mut probe = c.step(axis, -1);
+            while self.get(probe) == Some(player_before) {
+                back += 1;
+                probe = probe.step(axis, -1);
+            }
+            let mut fwd = 0u8;
+            let mut probe = c.step(axis, 1);
+            while self.get(probe) == Some(player_before) {
+                fwd += 1;
+                probe = probe.step(axis, 1);
+            }
+            let len = back + fwd + 1;
+            if len as usize >= WINDOW_LEN {
+                wins[axis.index()] = Some(Win {
+                    axis,
+                    start: c.step(axis, -(back as i16)),
+                    len,
+                });
+            }
+        }
+
+        let outcome = if wins.iter().any(Option::is_some) {
             let o = Outcome {
                 winner: player_before,
             };
             self.terminal = Some(o);
             Some(o)
         } else {
-            let (p, ph) = advance_turn(phase_before, player_before, c);
+            let (p, ph) = advance_turn(phase_before, player_before);
             self.current = p;
             self.phase = ph;
             None
@@ -564,7 +502,7 @@ impl Position {
         #[cfg(debug_assertions)]
         {
             audit.set_after(self.zobrist());
-            self.debug_assert_tier_c(c, player_before, phase_before, winning, &audit);
+            self.debug_assert_tier_c(c, player_before, &wins, &audit);
         }
 
         let applied = Applied {
@@ -573,7 +511,7 @@ impl Position {
             phase_before,
             phase_after: self.phase,
             outcome,
-            winning: WinningWindows::from_bits(winning),
+            wins,
         };
         let undo = Undo {
             action,
@@ -608,7 +546,7 @@ impl Position {
                 "C14: frontier_cells"
             );
             debug_assert_eq!(self.stone_count(), u.audit.stones_before, "C14: stones");
-            self.debug_assert_frontier_around(u.action.coord());
+            self.debug_assert_covered_around(u.action.coord());
             self.debug_assert_turn_closed_form();
             debug_assert_eq!(
                 self.legal_count() == 0,
@@ -635,45 +573,58 @@ impl Position {
         debug_assert_eq!(self.current, player, "C5: mover");
     }
 
-    /// C2: the frontier invariant over the placed cell and its whole disk.
-    fn debug_assert_frontier_around(&self, c: HexCoord) {
-        let check = |cell: HexCoord| {
-            let expect = self.grid.cover(cell) > 0 && self.grid.owner(cell).is_none();
-            debug_assert_eq!(
-                self.grid.frontier_bit(cell),
-                expect,
-                "C2: frontier invariant at ({}, {})",
+    /// C1: every in-domain cell of the placed disk reads covered after an apply.
+    /// Necessary-direction only; the complete recount is C2, paid on the rarer undo,
+    /// and tier A's `audit` closes the sufficient direction at test checkpoints.
+    fn debug_assert_disk_covered(&self, c: HexCoord) {
+        for d in DISK8 {
+            let cell = offset(c, d);
+            debug_assert!(
+                !cell.is_valid() || self.grid.is_covered(cell),
+                "C1: ({}, {}) uncovered inside a placed disk",
                 cell.q,
                 cell.r
             );
-        };
-        check(c);
-        for d in DISK8 {
-            let cell = offset(c, d);
-            if cell.is_valid() {
-                check(cell);
-            }
         }
     }
 
-    /// C2, C3, C5, C6, C8, C10, C11, C12 after a successful apply.
+    /// C2: coverage across the undone cell's disk agrees with a stone recount.
+    ///
+    /// The maintained plane was written by run-OR on apply and by the separable
+    /// dilation on undo; this recount walks the `DISK8` offset table and probes the
+    /// occupancy directly, so the three formulations are pairwise independent.
+    fn debug_assert_covered_around(&self, c: HexCoord) {
+        for d in DISK8 {
+            let cell = offset(c, d);
+            if !cell.is_valid() {
+                continue;
+            }
+            let expect = DISK8.iter().any(|&e| {
+                let s = offset(cell, e);
+                s.is_valid() && self.grid.owner(s).is_some()
+            });
+            debug_assert_eq!(
+                self.grid.is_covered(cell),
+                expect,
+                "C2: coverage disagrees with the stone recount at ({}, {})",
+                cell.q,
+                cell.r
+            );
+        }
+    }
+
+    /// C1, C3, C5, C6, C8, C10, C11, C12 after a successful apply.
     fn debug_assert_tier_c(
         &self,
         c: HexCoord,
         mover: Player,
-        phase_before: TurnPhase,
-        winning: u32,
+        wins: &[Option<Win>; 3],
         audit: &UndoAudit,
     ) {
         debug_assert!(self.grid.contains_padded(c), "C8: arena margin");
         debug_assert!(!self.grid.is_double_owned(c), "C3: double-owned cell");
         debug_assert_eq!(self.stone_count(), audit.stones_before + 1, "C10: stones");
         debug_assert_eq!(self.get(c), Some(mover), "C10: owner");
-        debug_assert_eq!(
-            self.history.last().copied(),
-            Some(Action::new(c)),
-            "C15: history top"
-        );
         debug_assert_eq!(
             self.stones_by[mover.index()],
             audit.stones_by_before + 1,
@@ -686,25 +637,30 @@ impl Position {
         );
         debug_assert_eq!(
             self.terminal.is_some(),
-            winning != 0,
-            "C11: outcome/winning disagree"
+            wins.iter().any(Option::is_some),
+            "C11: outcome/wins disagree"
         );
+        // C11 does not re-derive the transition or the freeze: both are exactly what
+        // C5's closed form pins from the stone count and the terminal bit, and a
+        // re-derivation through `advance_turn` would check the function against
+        // itself. Only the winner's identity is C11's own fact.
         if let Some(o) = self.terminal {
             debug_assert_eq!(o.winner, mover, "C11: winner is not the mover");
-            debug_assert_eq!(self.phase, phase_before, "C11: phase did not freeze");
-            debug_assert_eq!(self.current, mover, "C11: mover did not freeze");
-        } else {
-            let (p, ph) = advance_turn(phase_before, mover, c);
-            debug_assert_eq!((self.current, self.phase), (p, ph), "C11: transition");
         }
-        let mut brute = 0u32;
-        for (i, wr) in self.windows_through(c).iter().enumerate() {
-            if wr.mask.is_full_for(mover) {
-                brute |= 1 << i;
-            }
+        for axis in Axis::ALL {
+            // A window whose start is off-domain holds a cell no stone can occupy, so it
+            // is never full and is skipped rather than read (§4.4).
+            let full = (0..WINDOW_LEN).any(|k| {
+                let start = c.step(axis, -(k as i16));
+                start.is_valid() && self.window(Window { start, axis }).is_full_for(mover)
+            });
+            debug_assert_eq!(
+                wins[axis.index()].is_some(),
+                full,
+                "C12: win formulations disagree on {axis:?}"
+            );
         }
-        debug_assert_eq!(brute, winning, "C12: win formulations disagree");
-        self.debug_assert_frontier_around(c);
+        self.debug_assert_disk_covered(c);
         self.debug_assert_turn_closed_form();
         debug_assert_eq!(
             self.legal_count() == 0,
@@ -751,7 +707,7 @@ impl<'a> BitScan<'a> {
 
     fn word_at(grid: &Grid, plane: ScanPlane, i: usize) -> u64 {
         match plane {
-            ScanPlane::Frontier => grid.frontier_plane()[i],
+            ScanPlane::Frontier => grid.frontier_word(i),
             ScanPlane::Occupied => grid.occupied_word(i),
         }
     }
@@ -890,9 +846,6 @@ impl Position {
 
         let pop0: u32 = occ0.iter().map(|w| w.count_ones()).sum();
         let pop1: u32 = occ1.iter().map(|w| w.count_ones()).sum();
-        if self.stone_count() != pop0 + pop1 {
-            return fail(IntegrityCheck::StoneCount, None);
-        }
 
         for i in 0..total {
             let both = occ0[i] & occ1[i];
@@ -908,7 +861,7 @@ impl Position {
             return fail(IntegrityCheck::StoneCountForPlayer, None);
         }
 
-        let mut stones: Vec<(HexCoord, Player)> = Vec::with_capacity(self.history.len());
+        let mut stones: Vec<(HexCoord, Player)> = Vec::with_capacity(self.stone_count() as usize);
         for i in 0..total {
             let mut w = occ0[i] | occ1[i];
             while w != 0 {
@@ -933,8 +886,7 @@ impl Position {
             }
         }
 
-        let cells = total * 64;
-        let mut recount = vec![0u8; cells];
+        let mut recount = vec![0u64; total];
         for &(s, _) in &stones {
             for dq in -(pad as i16)..=(pad as i16) {
                 for dr in -(pad as i16)..=(pad as i16) {
@@ -946,34 +898,19 @@ impl Position {
                         Some(i) => i,
                         None => return fail(IntegrityCheck::ArenaMargin, Some(cell)),
                     };
-                    if recount[idx] as usize >= DISK_CELLS {
-                        return fail(IntegrityCheck::Coverage, Some(cell));
-                    }
-                    recount[idx] += 1;
+                    recount[idx / 64] |= 1 << (idx % 64);
                 }
             }
         }
-        let cover = g.cover_plane();
+        let covered = g.covered_plane();
         for (i, &want) in recount.iter().enumerate() {
-            if cover[i] != want {
-                return fail(
-                    IntegrityCheck::Coverage,
-                    Some(g.coord_of(i / 64, (i % 64) as u32)),
-                );
+            if covered[i] != want {
+                let bad = (covered[i] ^ want).trailing_zeros();
+                return fail(IntegrityCheck::Coverage, Some(g.coord_of(i, bad)));
             }
         }
 
-        let frontier = g.frontier_plane();
-        for (i, &covered) in cover.iter().enumerate().take(cells) {
-            let (word, bit) = (i / 64, (i % 64) as u32);
-            let occupied = ((occ0[word] | occ1[word]) >> bit) & 1 == 1;
-            let set = (frontier[word] >> bit) & 1 == 1;
-            if set != (covered > 0 && !occupied) {
-                return fail(IntegrityCheck::FrontierBit, Some(g.coord_of(word, bit)));
-            }
-        }
-
-        let fpop: u32 = frontier.iter().map(|w| w.count_ones()).sum();
+        let fpop: u32 = (0..total).map(|i| g.frontier_word(i).count_ones()).sum();
         if fpop != g.frontier_cells() {
             return fail(IntegrityCheck::FrontierCount, None);
         }
@@ -1017,19 +954,6 @@ impl Position {
         match turn_closed_form(self.stone_count(), self.terminal.is_some()) {
             Some((kind, player)) if kind == self.phase.kind_index() && player == self.current => {}
             _ => return fail(IntegrityCheck::TurnClosedForm, None),
-        }
-
-        let mut replayed: Vec<HexCoord> = self.history.iter().map(|a| a.coord()).collect();
-        replayed.sort_unstable();
-        let mut occupied: Vec<HexCoord> = stones.iter().map(|&(c, _)| c).collect();
-        occupied.sort_unstable();
-        if let Some(bad) = replayed
-            .iter()
-            .zip(&occupied)
-            .find(|(a, b)| a != b)
-            .map(|(a, _)| *a)
-        {
-            return fail(IntegrityCheck::History, Some(bad));
         }
 
         Ok(())
