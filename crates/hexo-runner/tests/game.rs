@@ -5,9 +5,16 @@ use hexo_runner::{
     Budget, Decision, DrawReason, Failure, FailurePolicy, Game, GameSpec, MatchResult, NoContest,
     Reply, Step, SubmitError, WinReason,
 };
+use std::num::NonZeroU32;
+
+const P1_WINNING_PLY: u32 = 11;
 
 fn act(q: i16, r: i16) -> Action {
     Action::new(HexCoord::new(q, r))
+}
+
+fn cap(value: u32) -> NonZeroU32 {
+    NonZeroU32::new(value).expect("test caps are nonzero")
 }
 
 /// The outstanding request, or a panic if the game is over.
@@ -186,7 +193,7 @@ fn a_drifted_mirror_is_refused_and_changes_nothing() {
 #[test]
 fn nothing_is_accepted_after_the_game_ends() {
     let mut game = Game::new(GameSpec {
-        ply_cap: 3,
+        ply_cap: cap(3),
         ..GameSpec::default()
     });
     play(&mut game, act(0, 0)).expect("opening");
@@ -232,9 +239,25 @@ fn six_in_a_row_is_a_decisive_win() {
 }
 
 #[test]
+fn a_win_on_the_capping_placement_is_a_win() {
+    let mut game = Game::new(GameSpec {
+        ply_cap: cap(P1_WINNING_PLY),
+        ..GameSpec::default()
+    });
+    assert_eq!(
+        drive_to_a_p1_win(&mut game),
+        MatchResult::Decisive {
+            winner: Player::P1,
+            reason: WinReason::SixInARow,
+        }
+    );
+    assert_eq!(game.position().stone_count(), P1_WINNING_PLY);
+}
+
+#[test]
 fn the_ply_cap_is_a_draw_and_not_an_abort() {
     let mut game = Game::new(GameSpec {
-        ply_cap: 12,
+        ply_cap: cap(12),
         ..GameSpec::default()
     });
     let result = drive_to_the_end(&mut game);
@@ -285,7 +308,10 @@ fn an_illegal_placement_loses_rather_than_aborting() {
         t.result,
         Some(MatchResult::Decisive {
             winner: Player::P0,
-            reason: WinReason::IllegalMove
+            reason: WinReason::IllegalMove {
+                action: act(0, 0).id(),
+                cause: MoveError::Occupied(HexCoord::ORIGIN),
+            }
         })
     );
     assert!(t.result.expect("ended").is_contested());
@@ -307,7 +333,10 @@ fn a_far_placement_also_loses() {
         t.result,
         Some(MatchResult::Decisive {
             winner: Player::P0,
-            reason: WinReason::IllegalMove
+            reason: WinReason::IllegalMove {
+                action: act(300, 300).id(),
+                cause: MoveError::TooFarFromStones(HexCoord::new(300, 300)),
+            }
         })
     );
 }
@@ -315,7 +344,7 @@ fn a_far_placement_also_loses() {
 #[test]
 fn an_engine_limit_is_a_no_contest_and_blames_nobody() {
     let mut game = Game::new(GameSpec {
-        ply_cap: u32::MAX,
+        ply_cap: cap(u32::MAX),
         ..GameSpec::default()
     });
     play(&mut game, act(0, 0)).expect("opening");
@@ -349,55 +378,38 @@ fn an_engine_limit_is_a_no_contest_and_blames_nobody() {
 }
 
 #[test]
-fn the_failure_policy_decides_what_a_crash_costs() {
-    for (policy, expected) in [
-        (
-            FailurePolicy::Forfeit,
-            MatchResult::Decisive {
-                winner: Player::P0,
-                reason: WinReason::Crash,
-            },
-        ),
-        (
-            FailurePolicy::NoContest,
-            MatchResult::NoContest(NoContest::Harness {
-                stage: "seat.crashed",
-            }),
-        ),
-    ] {
-        let mut game = Game::new(GameSpec {
-            on_failure: policy,
-            ..GameSpec::default()
-        });
-        play(&mut game, act(0, 0)).expect("opening");
-        let (seat, generation, _) = need(&game);
-        assert_eq!(seat, Player::P1);
-        let t = game
-            .submit(generation, Reply::Failed(Failure::Crashed))
-            .expect("accepted");
-        assert_eq!(t.result, Some(expected), "policy {policy:?}");
-    }
-}
-
-#[test]
-fn every_failure_kind_maps_to_its_own_reason() {
-    for (failure, reason) in [
-        (Failure::Timeout, WinReason::Timeout),
-        (Failure::Crashed, WinReason::Crash),
-        (Failure::Protocol, WinReason::Protocol),
-    ] {
-        let mut game = Game::new(GameSpec::default());
-        let (seat, generation, _) = need(&game);
-        let t = game
-            .submit(generation, Reply::Failed(failure))
-            .expect("accepted");
-        assert_eq!(
-            t.result,
-            Some(MatchResult::Decisive {
-                winner: seat.other(),
-                reason
-            })
-        );
+fn every_failure_kind_obeys_each_failure_policy() {
+    for policy in [FailurePolicy::Forfeit, FailurePolicy::NoContest] {
+        for failure in [Failure::Timeout, Failure::Crashed, Failure::Protocol] {
+            let mut game = Game::new(GameSpec {
+                on_failure: policy,
+                ..GameSpec::default()
+            });
+            play(&mut game, act(0, 0)).expect("opening");
+            let (seat, generation, _) = need(&game);
+            assert_eq!(seat, Player::P1);
+            let expected = match policy {
+                FailurePolicy::Forfeit => MatchResult::Decisive {
+                    winner: seat.other(),
+                    reason: match failure {
+                        Failure::Timeout => WinReason::Timeout,
+                        Failure::Crashed => WinReason::Crash,
+                        Failure::Protocol => WinReason::Protocol,
+                    },
+                },
+                FailurePolicy::NoContest => {
+                    MatchResult::NoContest(NoContest::SeatFailure { seat, failure })
+                }
+            };
+            let t = game
+                .submit(generation, Reply::Failed(failure))
+                .expect("accepted");
+            assert_eq!(
+                t.result,
+                Some(expected),
+                "policy {policy:?}, failure {failure:?}"
+            );
+        }
     }
 }
 
@@ -420,14 +432,14 @@ fn diagnostics_are_persisted_verbatim() {
     assert_eq!(ply.diagnostics.as_deref(), Some(blob.as_slice()));
     assert_eq!(ply.seat, Player::P0);
     assert_eq!(ply.action, act(0, 0).id());
-    assert_eq!(ply.budget, Budget::Visits(800));
+    assert_eq!(game.spec().budget, Budget::Visits(800));
     assert_eq!(ply.zobrist_after, game.position().zobrist());
 }
 
 #[test]
 fn the_record_tracks_the_position_ply_for_ply() {
     let mut game = Game::new(GameSpec {
-        ply_cap: 20,
+        ply_cap: cap(20),
         ..GameSpec::default()
     });
     drive_to_the_end(&mut game);
@@ -450,7 +462,7 @@ fn the_record_tracks_the_position_ply_for_ply() {
 #[test]
 fn the_prefix_replays_into_the_canonical_position() {
     let mut game = Game::new(GameSpec {
-        ply_cap: 15,
+        ply_cap: cap(15),
         ..GameSpec::default()
     });
     drive_to_the_end(&mut game);
@@ -466,7 +478,7 @@ fn many_games_interleave_on_one_thread() {
     let mut games: Vec<Game> = (0..GAMES)
         .map(|i| {
             Game::new(GameSpec {
-                ply_cap: 8 + (i as u32 % 5),
+                ply_cap: cap(8 + (i as u32 % 5)),
                 ..GameSpec::default()
             })
         })

@@ -80,7 +80,7 @@ impl Applied {
     }
 }
 
-/// How the game ended. Win only — ruling 6.
+/// How the game ended. Win only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Outcome {
     /// The player who completed a window.
@@ -328,8 +328,11 @@ const fn strip_slot(axis: Axis, k: usize, m: usize) -> (usize, usize) {
 
 impl Position {
     /// Ownership of the 18 windows through `coord`, in the canonical slot order of spec
-    /// Â§6.3: axis-major (`Q`, `R`, `QR`), then offset `0..6`, where offset `k` means
+    /// §6.3: axis-major (`Q`, `R`, `QR`), then offset `0..6`, where offset `k` means
     /// `coord` sits at bit `k` of the window.
+    ///
+    /// Near a coordinate-domain face, a returned window's start can be off-domain.
+    /// Callers must skip those slots before passing the window to [`Position::window`].
     #[must_use]
     pub fn windows_through(&self, coord: HexCoord) -> [WindowRef; WINDOWS_PER_PLACEMENT] {
         debug_assert!(coord.is_valid());
@@ -514,7 +517,7 @@ impl Position {
         }
     }
 
-    /// The single forward code path. Two entry points call it:
+    /// The single forward code path, called by [`Position::advance`] and [`Search::apply`].
     pub(crate) fn apply_raw(&mut self, action: Action) -> Result<(Applied, Undo), MoveError> {
         let c = action.coord();
 

@@ -4,6 +4,7 @@ use crate::decision::{Budget, Failure, Reply};
 use crate::error::SubmitError;
 use crate::outcome::{DrawReason, MatchResult, NoContest, WinReason};
 use hexo_engine::{Action, ActionId, Applied, Player, Position};
+use std::num::NonZeroU32;
 
 /// What a driver-reported [`Failure`] costs the seat it happened to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
@@ -19,7 +20,7 @@ pub enum FailurePolicy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GameSpec {
     /// Placements after which the game is [`DrawReason::PlyCap`].
-    pub ply_cap: u32,
+    pub ply_cap: NonZeroU32,
     /// What each seat is told it has to think with.
     pub budget: Budget,
     /// What a driver-reported failure costs.
@@ -29,7 +30,7 @@ pub struct GameSpec {
 impl Default for GameSpec {
     fn default() -> Self {
         Self {
-            ply_cap: 512,
+            ply_cap: NonZeroU32::new(512).unwrap(),
             budget: Budget::Unlimited,
             on_failure: FailurePolicy::Forfeit,
         }
@@ -43,8 +44,6 @@ pub struct PlyRecord {
     pub seat: Player,
     /// What was placed, in the record encoding.
     pub action: ActionId,
-    /// What that seat had been told it could spend.
-    pub budget: Budget,
     /// The position hash after the placement.
     pub zobrist_after: u64,
     /// Seat-owned bytes, stored verbatim and never interpreted.
@@ -184,13 +183,9 @@ impl Game {
                         Failure::Protocol => WinReason::Protocol,
                     },
                 },
-                FailurePolicy::NoContest => MatchResult::NoContest(NoContest::Harness {
-                    stage: match failure {
-                        Failure::Timeout => "seat.timeout",
-                        Failure::Crashed => "seat.crashed",
-                        Failure::Protocol => "seat.protocol",
-                    },
-                }),
+                FailurePolicy::NoContest => {
+                    MatchResult::NoContest(NoContest::SeatFailure { seat, failure })
+                }
             })),
             Reply::Place(decision) => {
                 let expected = self.position.zobrist();
@@ -205,7 +200,10 @@ impl Game {
                     Err(error) if error.is_rule_violation() => {
                         Ok(self.finish(MatchResult::Decisive {
                             winner: seat.other(),
-                            reason: WinReason::IllegalMove,
+                            reason: WinReason::IllegalMove {
+                                action: decision.action.id(),
+                                cause: error,
+                            },
                         }))
                     }
                     Err(error) => Ok(self.finish(MatchResult::NoContest(NoContest::EngineLimit {
@@ -228,7 +226,6 @@ impl Game {
         self.plies.push(PlyRecord {
             seat,
             action: applied.action.id(),
-            budget: self.spec.budget,
             zobrist_after: zobrist,
             diagnostics,
         });
@@ -239,7 +236,7 @@ impl Game {
                 winner: outcome.winner,
                 reason: WinReason::SixInARow,
             })
-        } else if self.position.stone_count() >= self.spec.ply_cap {
+        } else if self.position.stone_count() >= self.spec.ply_cap.get() {
             Some(MatchResult::Drawn {
                 reason: DrawReason::PlyCap,
             })

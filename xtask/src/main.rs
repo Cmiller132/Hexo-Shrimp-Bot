@@ -5,7 +5,7 @@ use std::process::{Command, ExitCode};
 
 /// Which toolchain a gate runs under.
 enum Toolchain {
-    /// Whatever `cargo` already resolves to â€” current stable, in practice.
+    /// Whatever `cargo` already resolves to — current stable, in practice.
     Current,
     /// The `rust-version` floor declared in the workspace manifest, read from that
     /// manifest so the gate cannot outlive the promise it checks.
@@ -68,7 +68,7 @@ const GATES: &[Gate] = &[
         toolchain: Toolchain::Current,
         env: &[],
         args: &["test", "--workspace"],
-        why: "The test suite, debug profile â€” so the tier-C assertions run on \
+        why: "The test suite, debug profile — so the tier-C assertions run on \
               every placement.",
     },
     Gate {
@@ -89,7 +89,7 @@ const GATES: &[Gate] = &[
         env: &[],
         args: &["check", "--workspace", "--all-targets"],
         why: "The declared `rust-version` floor. CI otherwise only ever sees \
-              current stable, so the promise drifts silently â€” it already had \
+              current stable, so the promise drifts silently — it already had \
               once. `--all-targets` holds tests and benches to the floor too. \
               If the toolchain is missing, `rustup toolchain install` it.",
     },
@@ -107,9 +107,12 @@ const GATES: &[Gate] = &[
         ],
         why: "`hexo-engine` must stay `wasm32`-compilable, which is what would \
               let a web frontend run the real rules instead of a \
-              reimplementation. Nothing in the native build catches a \
-              `std::time` call, a threading primitive, or a PyO3 dependency \
-              creeping in. Needs `rustup target add wasm32-unknown-unknown`.",
+              reimplementation. What this catches is the dependency graph: a \
+              PyO3 or other native-only crate creeping in fails here and \
+              nowhere else. It does NOT catch a `std::time` or threading call \
+              — `wasm32-unknown-unknown` ships a full `std`, so those compile \
+              and fail at run time. Needs `rustup target add \
+              wasm32-unknown-unknown`.",
     },
     Gate {
         name: "wasm-lint",
@@ -133,10 +136,14 @@ const GATES: &[Gate] = &[
         name: "smoke",
         on_every_push: false,
         toolchain: Toolchain::Current,
-        env: &[("HEXO_SMOKE_GAMES", "10000"), ("HEXO_SMOKE_UNIFORM", "500")],
+        env: &[
+            ("HEXO_SMOKE_GAMES", "100000"),
+            ("HEXO_SMOKE_UNIFORM", "500"),
+        ],
         args: &["test", "--release", "-p", "hexo-engine", "--test", "smoke"],
-        why: "The deep smoke run â€” an order of magnitude more games than the \
-              defaults `test` uses. Release profile, because a debug build \
+        why: "The deep smoke run — ten times as many line-building games and more \
+              than sixteen times as many uniform games as the `test` defaults. \
+              Release profile, because a debug build \
               runs the full tier-C assertion set on every placement. Scheduled \
               nightly rather than per-push; that is why `verify` omits it.",
     },

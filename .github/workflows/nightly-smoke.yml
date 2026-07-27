@@ -27,7 +27,7 @@ jobs:
 
       # Profile and scale live with the gate definition in `xtask/src/main.rs`,
       # not here. In short: release, because a debug build runs the full
-      # tier-C assertion set on every placement, and `HEXO_SMOKE_UNIFORM` is
-      # the knob that matters, since full-length uniform games are the
-      # expensive case.
+      # tier-C assertion set on every placement. The gate runs ten times as
+      # many line-building games and more than sixteen times as many uniform
+      # games as their per-push defaults.
       - run: cargo xtask smoke

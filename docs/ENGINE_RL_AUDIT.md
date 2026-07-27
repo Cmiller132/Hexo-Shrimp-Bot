@@ -29,17 +29,17 @@ clause, narrowed to the three P1s below.
 `Position::place` marks every cell in the radius-8 disk as frontier without
 checking `HexCoord::is_valid()`:
 
-- `crates/hexo-engine/src/position.rs:587-601`
+- `Position::place`, in `crates/hexo-engine/src/position.rs`
 
 `Position::legal_actions` enumerates the frontier directly:
 
-- `crates/hexo-engine/src/position.rs:269-307`
+- `Position::legal_actions`, in `crates/hexo-engine/src/position.rs`
 
 But `Position::is_legal` and `Position::advance` reject coordinates outside
 `COORD_LIMIT`:
 
-- `crates/hexo-engine/src/position.rs:317-340`
-- `crates/hexo-engine/src/position.rs:638-665`
+- `Position::is_legal` and `Position::check_placement`, in `crates/hexo-engine/src/position.rs`
+- `Position::apply_raw`, in the same file
 
 This is reproducible with a legal sparse walk to `q = 16000`. At that point:
 
@@ -159,16 +159,16 @@ Measure this trade-off using realistic MCTS depths before adopting it.
 
 Undo deliberately retains arena geometry:
 
-- `crates/hexo-engine/src/search.rs:157-165`
+- `Position::undo_raw`, in `crates/hexo-engine/src/position.rs`
 
 `Grid::reserve_around` returns immediately while an action fits in the retained
 arena:
 
-- `crates/hexo-engine/src/grid.rs:463-466`
+- `Grid::reserve_around`, in `crates/hexo-engine/src/grid.rs`
 
 Legal and stone iteration scan allocated words:
 
-- `crates/hexo-engine/src/position.rs:892-930`
+- `BitScan`, in `crates/hexo-engine/src/position.rs`
 
 One deep, spreading MCTS rollout can therefore grow the arena, unwind to a small
 root position, and leave all subsequent scans, clones, and memory usage paying
@@ -185,21 +185,22 @@ Benchmark and implement one of:
   mirror;
 - a caller-selected search arena budget.
 
-Also make `BitScan::next_coord` return immediately when `remaining == 0` so the
-final iterator call does not scan trailing empty words.
+~~Also make `BitScan::next_coord` return immediately when `remaining == 0` so the
+final iterator call does not scan trailing empty words.~~ Done — the early-out is
+at the top of `BitScan::next_slot`.
 
 ## P1: Position cloning has four allocations
 
 `Grid` owns four independent heap buffers: two occupancy planes, frontier, and
 coverage:
 
-- `crates/hexo-engine/src/grid.rs:59-79`
+- `struct Grid`, in `crates/hexo-engine/src/grid.rs`
 
 Derived `Clone` therefore performs four allocations and four copies — five since
 move history was added to `Position`. The documentation's "clone is a memcpy" and
 "allocates once" descriptions were useful shorthand but not literal; both have
-since been corrected in `README.md`, `crates/hexo-engine/README.md`, and
-`docs/ENGINE_SPEC.md` §5.1 to say what actually happens.
+since been corrected in `crates/hexo-engine/README.md` and `docs/ENGINE_SPEC.md`
+§5.1 to say what actually happens.
 
 The first opened position allocates 4,096 cells, or 5,632 bytes of plane payload
 before allocator overhead. An 80 by 80 live region will commonly pad and round
@@ -220,12 +221,11 @@ before search trees and model buffers are counted.
 
 ## P1: The read surface is too scalar for model encoding
 
-`Stones::next` finds a bit slot, converts it to a coordinate, and then maps the
-coordinate back into the grid to determine its owner:
+`Stones::next` used to find a bit slot, convert it to a coordinate, and then map
+the coordinate back into the grid to read the owner. That half shipped:
+`BitScan::next_slot` hands the `(word, bit)` slot straight to `Grid::owner_at`.
 
-- `crates/hexo-engine/src/position.rs:939-949`
-
-There is no bulk, representation-independent export for occupancy planes,
+What remains open is the bulk form. There is no bulk, representation-independent export for occupancy planes,
 features, or ragged legal actions. Repeated scalar calls will add overhead when
 thousands of positions are encoded for inference.
 
@@ -236,8 +236,7 @@ arena origin or stride. Examples include:
 
 - copying selected coordinate regions into reusable per-player planes;
 - filling packed feature buffers directly;
-- filling `action_ids` plus row offsets for ragged inference batches;
-- returning owner information directly from the bit scan slot.
+- filling `action_ids` plus row offsets for ragged inference batches.
 
 Do not queue or serialize `Position` clones for inference.
 
@@ -334,11 +333,15 @@ They do not establish maximal performance.
 
 ## Required benchmark gate
 
-The repository currently has no checked-in benchmark or performance CI:
+No gate runs the benchmarks. `.github/workflows/ci.yml` executes the eight
+`cargo xtask` gates and none of them is a bench, so a performance regression is
+caught only by someone running `cargo bench` by hand.
 
-- `.github/workflows/ci.yml:23-36`
+The suite itself has since been built (see the two sections below and
+`crates/hexo-engine/README.md`); what remains open is a gate that runs it, and an
+end-to-end acceptance metric, which has nothing to measure until a search exists.
 
-Add reproducible release benchmarks for:
+The benchmarks it asked for were:
 
 - `Position::advance`;
 - `Search::apply` plus `undo`;

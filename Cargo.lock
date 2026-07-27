@@ -263,6 +263,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hexo-player"
+version = "0.1.0"
+dependencies = [
+ "hexo-engine",
+ "hexo-runner",
+]
+
+[[package]]
 name = "hexo-runner"
 version = "0.1.0"
 dependencies = [

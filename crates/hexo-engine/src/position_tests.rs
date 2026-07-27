@@ -2,6 +2,7 @@
 //! atomicity on rejection, the turn machine, windows, the legal set, and hashing.
 
 use super::*;
+use crate::COORD_LIMIT;
 use crate::action::ActionId;
 use crate::window::WINDOWS_PER_PLACEMENT;
 
@@ -159,8 +160,8 @@ fn error_board_extent_exceeded() {
 }
 
 /// Regression: the growth policy grew both arena dimensions on every growth event, so a
-/// straight walk along `q` â€” every ply exactly [`LEGAL_RADIUS`] from the last stone,
-/// so every ply legal â€” was refused at ply 65 with `BoardExtentExceeded { cells:
+/// straight walk along `q` — every ply exactly [`LEGAL_RADIUS`] from the last stone,
+/// so every ply legal — was refused at ply 65 with `BoardExtentExceeded { cells:
 /// 16777216 }` while `is_legal` still said yes.
 #[test]
 fn a_straight_q_walk_is_never_refused_by_the_arena() {
@@ -491,6 +492,25 @@ fn windows_through_agrees_with_the_per_cell_window_query() {
             }
         }
     }
+
+    let face = HexCoord::new(-COORD_LIMIT, 0);
+    let mut skipped = 0;
+    for slot in p.windows_through(face) {
+        if !slot.window.start.is_valid() {
+            skipped += 1;
+            continue;
+        }
+        assert_eq!(
+            p.window(slot.window),
+            slot.mask,
+            "on-domain face slot did not round-trip: {:?}",
+            slot.window
+        );
+    }
+    assert!(
+        skipped > 0,
+        "the face query did not exercise off-domain starts"
+    );
 }
 
 #[test]

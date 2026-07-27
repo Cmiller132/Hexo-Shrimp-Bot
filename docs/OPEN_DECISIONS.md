@@ -18,9 +18,9 @@ reused, because other documents cite it.
 | A3 | Arbitrary start positions: move-prefix replay only, no board-shaped deserialisation | root `README.md`; `Position::replay`; `ENGINE_SPEC.md` §12 |
 | A4 | Grid growth policy, and the extent ceiling as a function of the position | `crates/hexo-engine/src/grid.rs`; `ENGINE_SPEC.md` §5.5 |
 | A5 | Zobrist scope, and a baked-in rather than generated key table | `crates/hexo-engine/src/zobrist.rs`; `ENGINE_SPEC.md` §8 |
-| B1 | Player interface | `crates/hexo-runner/README.md`. Answered by neither option offered: `Game` is a nonblocking state machine, so whether a caller blocks a thread or polls a thousand games is decided outside the crate |
+| B1 | Player interface | `crates/hexo-runner/README.md` for why the runner has none, and `crates/hexo-player/README.md` for the one a driver actually drives. Answered by neither option offered: `Game` is a nonblocking state machine, so whether a caller blocks a thread or polls a thousand games is decided outside the crate — and the seat contract lives outside it too, split into `Player` for anything that plays and `Model` for anything that trains |
 | B2 | What is recorded per move | `PlyRecord::diagnostics` — an opaque seat-owned blob, and this one is actually persisted |
-| B3 | Search budget | `Budget`, stated and recorded by the game, never enforced by it |
+| B3 | Search budget | `Budget`, stated once on `GameSpec` and never enforced by the game. Not copied per ply: it cannot vary within a game, so a per-`PlyRecord` copy would carry no information |
 | B5 | Adjudication policy | `MatchResult`, `FailurePolicy`, `NoContest` |
 | C3 | The binary crate, and its modes | `CONTAINER_SPEC.md` §3: `hexo-bot`, with `train`, `serve`, and `play`. Self-play is not a mode — it is the first phase of `train`, because one loop cannot be split into pieces that could drift from it |
 | C5 | ~~`R` for dense action indexing~~ — **withdrawn**, not answered: a fixed radius-20 crop makes wins outside the crop unrepresentable, so the action space silently stops matching the game | `crates/hexo-engine/README.md`; the canonical unbounded ordering replaced it |

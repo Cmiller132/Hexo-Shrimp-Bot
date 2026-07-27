@@ -32,7 +32,7 @@ const fn turn_key_of(slot: usize) -> u64 {
     mix64(TURN_DOMAIN | ((slot as u64) << 1))
 }
 
-/// Number of distinct turn slots: 3 phase kinds Ã— 2 players Ã— 2 terminal states.
+/// Number of distinct turn slots: 3 phase kinds × 2 players × 2 terminal states.
 pub(crate) const TURN_SLOTS: usize = 12;
 
 /// The twelve turn keys, baked at compile time.

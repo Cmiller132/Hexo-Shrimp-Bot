@@ -10,8 +10,8 @@ fn act(q: i16, r: i16) -> Action {
     Action::new(HexCoord::new(q, r))
 }
 
-/// A fixed 40-ply game that spreads across 36 rows and 68 columns â€” several arena
-/// growths â€” and does not terminate.
+/// A fixed 40-ply game that spreads across 36 rows and 68 columns — several arena
+/// growths — and does not terminate.
 const GAME: [(i16, i16); 40] = [
     (0, 0),
     (5, 2),

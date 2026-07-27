@@ -13,7 +13,7 @@ pub(crate) struct Undo {
     pub(crate) action: Action,
     /// Class II.
     pub(crate) phase_before: TurnPhase,
-    /// Class II, and *also the mover* â€” one source of truth.
+    /// Class II, and *also the mover* — one source of truth.
     pub(crate) player_before: Player,
     /// Debug-only misuse and drift detector.
     #[cfg(debug_assertions)]
@@ -26,7 +26,7 @@ pub(crate) struct Undo {
 pub(crate) struct UndoAudit {
     /// `zobrist()` before the apply.
     pub(crate) zobrist_before: u64,
-    /// `zobrist()` after the apply â€” the LIFO / wrong-position detector.
+    /// `zobrist()` after the apply — the LIFO / wrong-position detector.
     pub(crate) zobrist_after: u64,
     /// `hash_cells` before the apply.
     pub(crate) hash_cells_before: u64,

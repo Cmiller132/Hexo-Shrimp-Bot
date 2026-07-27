@@ -43,7 +43,7 @@ proptest! {
     #![proptest_config(ProptestConfig { cases: 24, max_shrink_iters: 2_000, ..ProptestConfig::default() })]
 
     /// Properties 2, 3, 4, 5 at **every ply**: the legal-set oracle, the Zobrist
-    /// oracle, the win oracle, and the turn sequence â€” plus the full Tier-A audit.
+    /// oracle, the win oracle, and the turn sequence — plus the full Tier-A audit.
     #[test]
     fn all_oracles_hold_at_every_ply(cs in choices(MAX_PLIES)) {
         drive(&cs, check_all_oracles);
@@ -172,44 +172,45 @@ proptest! {
     #[test]
     fn accept_and_refuse_agree_all_the_way_to_the_ceiling(
         spread in 1u16..70,
-        dir in 0usize..4,
     ) {
-        let mut searched = Position::new();
-        searched.advance(Action::new(HexCoord::ORIGIN)).expect("opening");
-        let mut flat = searched.clone();
-        {
-            let mut s = Search::new(&mut searched);
-            let step = [(8i16, 0i16), (-8, 0), (0, 8), (0, -8)][dir];
+        for dir in 0..4 {
+            let mut searched = Position::new();
+            searched.advance(Action::new(HexCoord::ORIGIN)).expect("opening");
+            let mut flat = searched.clone();
+            {
+                let mut s = Search::new(&mut searched);
+                let step = [(8i16, 0i16), (-8, 0), (0, 8), (0, -8)][dir];
+                let (mut q, mut r) = (0i16, 0i16);
+                for _ in 0..spread {
+                    q += step.0;
+                    r += step.1;
+                    if s.apply(Action::new(HexCoord::new(q, r))).is_err() {
+                        break;
+                    }
+                }
+                s.unwind();
+            }
+            prop_assert_eq!(&searched, &flat);
+
             let (mut q, mut r) = (0i16, 0i16);
-            for _ in 0..spread {
-                q += step.0;
-                r += step.1;
-                if s.apply(Action::new(HexCoord::new(q, r))).is_err() {
+            let mut refused = false;
+            for i in 0..900usize {
+                if i % 2 == 0 { q += 8; } else { r += 8; }
+                let a = Action::new(HexCoord::new(q, r));
+                let sa = searched.advance(a);
+                let fa = flat.advance(a);
+                prop_assert_eq!(&sa, &fa, "dir {} ply {} at ({}, {})", dir, i, q, r);
+                if let Err(e) = sa {
+                    prop_assert!(matches!(e, MoveError::BoardExtentExceeded { .. }), "{:?}", e);
+                    prop_assert!(!e.is_rule_violation());
+                    prop_assert!(searched.is_legal(a), "the refused move was still legal");
+                    refused = true;
                     break;
                 }
             }
-            s.unwind();
+            prop_assert!(refused, "direction {} never reached the ceiling", dir);
+            prop_assert_eq!(&searched, &flat);
         }
-        prop_assert_eq!(&searched, &flat);
-
-        let (mut q, mut r) = (0i16, 0i16);
-        let mut refused = false;
-        for i in 0..900usize {
-            if i % 2 == 0 { q += 8; } else { r += 8; }
-            let a = Action::new(HexCoord::new(q, r));
-            let sa = searched.advance(a);
-            let fa = flat.advance(a);
-            prop_assert_eq!(&sa, &fa, "ply {} at ({}, {})", i, q, r);
-            if let Err(e) = sa {
-                prop_assert!(matches!(e, MoveError::BoardExtentExceeded { .. }), "{:?}", e);
-                prop_assert!(!e.is_rule_violation());
-                prop_assert!(searched.is_legal(a), "the refused move was still legal");
-                refused = true;
-                break;
-            }
-        }
-        prop_assert!(refused, "the spreading diagonal never reached the ceiling");
-        prop_assert_eq!(&searched, &flat);
     }
 }
 

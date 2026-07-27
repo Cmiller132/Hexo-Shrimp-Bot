@@ -142,12 +142,12 @@ pub enum IntegrityCheck {
     Terminal,
     /// The reported winner is not the owner of the completed window.
     Winner,
-    /// Phase or mover disagrees with the closed form of spec Â§10.2.
+    /// Phase or mover disagrees with the closed form of spec §10.2.
     TurnClosedForm,
     /// A stone lies within `LEGAL_RADIUS` of the arena boundary.
     ArenaMargin,
-    /// The move history disagrees with the occupancy planes, in length or in which
-    /// cells it names.
+    /// The move history names different cells than the occupancy planes. Length is
+    /// covered by `StoneCount`, since history is the ply counter.
     History,
 }
 

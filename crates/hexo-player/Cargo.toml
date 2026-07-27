@@ -1,0 +1,17 @@
+[package]
+name = "hexo-player"
+description = "The player seam: what a driver needs from a seat, what a trainable model must provide, and the loop that couples them to a game."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "hexo_player"
+path = "src/lib.rs"
+
+[dependencies]
+hexo-engine.workspace = true
+hexo-runner.workspace = true
+
+[lints]
+workspace = true

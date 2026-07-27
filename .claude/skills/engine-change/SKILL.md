@@ -5,7 +5,7 @@ description: Read before changing crates/hexo-engine — the rule machine, grid 
 
 # Changing hexo-engine
 
-`docs/ENGINE_SPEC.md` is normative and 2165 lines. Read the section that governs
+`docs/ENGINE_SPEC.md` is normative. Read the section that governs
 what you are changing, not the whole file. Where code and spec disagree, that is
 a finding to raise — not a discrepancy to resolve quietly in either direction.
 

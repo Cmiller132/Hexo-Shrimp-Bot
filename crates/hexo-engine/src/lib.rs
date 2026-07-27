@@ -16,7 +16,7 @@
 //! assert_eq!(first.coord(), HexCoord::new(-8, 0));
 //!
 //! // That order has both directions, and they are the mapping a policy head is
-//! // indexed by â€” which is why the engine owns them rather than each model.
+//! // indexed by — which is why the engine owns them rather than each model.
 //! assert_eq!(pos.legal_rank(first), Some(0));
 //! assert_eq!(pos.nth_legal(0), Some(first));
 //! ```

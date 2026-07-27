@@ -209,6 +209,7 @@ impl Grid {
     }
 
     /// Flat cell index of `c` within the byte-per-cell planes, or `None` if `c`
+    /// is outside the arena.
     #[inline]
     pub(crate) fn cell_index(&self, c: HexCoord) -> Option<usize> {
         let (w, b) = self.locate(c)?;
@@ -216,6 +217,7 @@ impl Grid {
     }
 
     /// How many frontier cells precede `c` in canonical order, or `None` if `c`
+    /// is not itself a frontier cell.
     pub(crate) fn frontier_rank(&self, c: HexCoord) -> Option<usize> {
         let (word, bit) = self.locate(c)?;
         if (self.frontier[word] >> bit) & 1 == 0 {
@@ -229,9 +231,9 @@ impl Grid {
     /// The frontier cell at `index` in canonical order, or `None` if `index` is past
     /// the end.
     pub(crate) fn nth_frontier(&self, index: usize) -> Option<HexCoord> {
-        let mut remaining = index as u32;
+        let mut remaining = index;
         for (word, &bits) in self.frontier.iter().enumerate() {
-            let pop = bits.count_ones();
+            let pop = bits.count_ones() as usize;
             if remaining >= pop {
                 remaining -= pop;
                 continue;
@@ -626,7 +628,7 @@ mod tests {
     }
 
     /// Every frontier cell in canonical order, read by walking the whole arena
-    /// coordinate by coordinate â€” deliberately not the word scan that `frontier_rank`
+    /// coordinate by coordinate — deliberately not the word scan that `frontier_rank`
     /// and `nth_frontier` use, so the two are a real cross-check rather than the same
     /// code twice.
     fn frontier_by_brute_force(g: &Grid) -> Vec<HexCoord> {
@@ -693,6 +695,15 @@ mod tests {
         }
         assert_eq!(g.nth_frontier(expected.len()), None);
         assert_eq!(g.nth_frontier(usize::MAX), None);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn frontier_select_rejects_an_index_above_u32_max() {
+        let mut g = Grid::new();
+        anchor(&mut g, (-1, -1), (1, 1));
+        mark_frontier(&mut g, 0, 0);
+        assert_eq!(g.nth_frontier(u32::MAX as usize + 1), None);
     }
 
     #[test]
@@ -763,6 +774,7 @@ mod tests {
         grow(&mut g, 0, 0);
         assert_eq!(g.rows(), MIN_ROWS);
         assert_eq!(g.row_words(), MIN_ROW_WORDS);
+        assert_eq!(g.origin_q(), -15);
         assert_eq!(g.origin_r(), -64);
         assert_eq!(g.origin_r() % 64, 0);
         assert!(g.contains_padded(HexCoord::ORIGIN));
@@ -877,7 +889,7 @@ mod tests {
     }
 
     /// Applying and removing the same disk restores every plane exactly, at a
-    /// coordinate whose disk the domain clips â€” the case where the two halves could
+    /// coordinate whose disk the domain clips — the case where the two halves could
     /// disagree about which cells to skip.
     #[test]
     fn a_clipped_disk_round_trips() {

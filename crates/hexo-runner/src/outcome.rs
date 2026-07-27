@@ -1,6 +1,7 @@
 //! How a match ends, and the adjudication policy that decides it.
 
-use hexo_engine::{MoveError, Player};
+use crate::decision::Failure;
+use hexo_engine::{ActionId, MoveError, Player};
 
 /// How a match ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,14 +42,19 @@ impl MatchResult {
 }
 
 /// How a seat won.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WinReason {
     /// Six or more of the winner's stones in a row.
     SixInARow,
     /// The other seat resigned.
     Resignation,
     /// The other seat submitted a placement that broke the rules.
-    IllegalMove,
+    IllegalMove {
+        /// The placement, in the record encoding.
+        action: ActionId,
+        /// The rule violation.
+        cause: MoveError,
+    },
     /// The other seat did not answer within its budget.
     Timeout,
     /// The other seat died, or its transport broke.
@@ -74,10 +80,12 @@ pub enum NoContest {
         /// The refusal.
         error: MoveError,
     },
-    /// The driver reported a failure that belongs to neither seat.
-    Harness {
-        /// Where it happened.
-        stage: &'static str,
+    /// The driver reported a failure that policy does not charge to either seat.
+    SeatFailure {
+        /// The seat whose decision failed.
+        seat: Player,
+        /// What went wrong.
+        failure: Failure,
     },
 }
 
@@ -95,7 +103,10 @@ mod tests {
         let drawn = MatchResult::Drawn {
             reason: DrawReason::PlyCap,
         };
-        let no_contest = MatchResult::NoContest(NoContest::Harness { stage: "test" });
+        let no_contest = MatchResult::NoContest(NoContest::SeatFailure {
+            seat: Player::P0,
+            failure: Failure::Protocol,
+        });
 
         assert!(decisive.is_contested());
         assert!(drawn.is_contested());
@@ -135,8 +146,9 @@ mod tests {
         let capped = MatchResult::Drawn {
             reason: DrawReason::PlyCap,
         };
-        let broken = MatchResult::NoContest(NoContest::Harness {
-            stage: "player.decide",
+        let broken = MatchResult::NoContest(NoContest::SeatFailure {
+            seat: Player::P1,
+            failure: Failure::Crashed,
         });
         assert_ne!(capped, broken);
         assert!(capped.is_contested());

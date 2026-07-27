@@ -1,6 +1,6 @@
 [package]
 name = "hexo-runner"
-description = "Hexo match orchestration: authoritative game loop and player communication."
+description = "Hexo match orchestration state machine and adjudication."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

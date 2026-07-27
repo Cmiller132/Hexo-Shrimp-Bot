@@ -12,8 +12,8 @@ mod rng;
 pub use rng::Rng;
 
 /// The brute-force union of radius-8 disks over all occupied cells, minus occupied
-/// cells, minus (in `Opening`) everything but the origin, minus (when terminal)
-/// everything.
+/// cells, minus cells outside the coordinate domain, minus (in `Opening`) everything
+/// but the origin, minus (when terminal) everything.
 pub fn legal_set_oracle(pos: &Position) -> Vec<HexCoord> {
     if pos.is_terminal() {
         return Vec::new();
@@ -28,6 +28,11 @@ pub fn legal_set_oracle(pos: &Position) -> Vec<HexCoord> {
         for dq in -radius..=radius {
             for dr in -radius..=radius {
                 let cell = HexCoord::new(s.q + dq, s.r + dr);
+                // The rule machine rejects an invalid coordinate with
+                // MoveError::CoordOutOfBounds, so it cannot be a legal action.
+                if !cell.is_valid() {
+                    continue;
+                }
                 if hex_distance(*s, cell) > LEGAL_RADIUS {
                     continue;
                 }

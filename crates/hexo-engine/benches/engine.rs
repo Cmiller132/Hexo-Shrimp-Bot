@@ -64,7 +64,7 @@ impl Fixtures {
     }
 }
 
-/// `Position::advance` â€” the runner's forward path, on a placement that does not grow
+/// `Position::advance` — the runner's forward path, on a placement that does not grow
 /// the arena.
 fn advance(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("advance");
@@ -80,7 +80,7 @@ fn advance(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// `Search::apply` + `Search::undo` as a pair â€” the search hot path.
+/// `Search::apply` + `Search::undo` as a pair — the search hot path.
 fn apply_undo(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("apply_undo");
     for s in &f.stages {
@@ -98,7 +98,7 @@ fn apply_undo(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// `Position::clone` and drop â€” paid once per position handed to a player mirror, and
+/// `Position::clone` and drop — paid once per position handed to a player mirror, and
 /// once per game slot reset.
 fn clone_drop(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("clone");
@@ -191,7 +191,7 @@ fn ordering(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// `Position::windows_through` â€” the 18-window gather a feature encoder reads.
+/// `Position::windows_through` — the 18-window gather a feature encoder reads.
 fn windows(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("windows");
     for s in &f.stages {
@@ -203,7 +203,7 @@ fn windows(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// `Position::replay` of a whole game â€” the record-loading path.
+/// `Position::replay` of a whole game — the record-loading path.
 fn replay(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("replay");
     g.throughput(Throughput::Elements(f.record.len() as u64));
@@ -213,7 +213,7 @@ fn replay(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// `Position::new()` plus the opening placement â€” a game slot reset, including the
+/// `Position::new()` plus the opening placement — a game slot reset, including the
 /// first arena allocation.
 fn new_game(c: &mut Criterion) {
     let mut g = c.benchmark_group("new_game");

@@ -33,7 +33,9 @@ crates/hexo-runner/
 | `outcome` | `MatchResult` and the adjudication vocabulary. Everything the engine refuses to model. |
 | `error` | `SubmitError`: a submission the game would not act on. |
 
-There is deliberately no `player.rs` and no `Player` trait. See below.
+There is deliberately no `player.rs` and no `Player` trait *here*. See below. The
+trait a driver drives lives in `hexo-player`, which depends on this crate — the
+arrow points that way and never back.
 
 ## Design notes
 
@@ -58,10 +60,11 @@ There is deliberately no `player.rs` and no `Player` trait. See below.
   ownership, not convention: `Game::position()` returns a shared borrow and
   there is no mutable counterpart. `submit` is the only way to advance.
 
-- **A seat is handed a move prefix, not a position.** `Game::prefix()` is a move
-  list the seat replays with `Position::replay`. A container cannot be handed a
-  `Position`, and board-shaped construction is the rule-bypass hole the engine
-  refuses to reopen.
+- **A remote seat is handed a move prefix, not a position.** `Game::prefix()` is
+  a move list the seat replays with `Position::replay`. A container cannot be
+  handed a `Position`, and board-shaped construction is the rule-bypass hole the
+  engine refuses to reopen. An in-process driver hands `Game::position()` straight
+  to the seat and needs no mirror.
 
 - **Two guards on every submission, both structural.** `generation` stops a late
   or duplicated reply from playing a move chosen for a position the game has
@@ -79,17 +82,32 @@ There is deliberately no `player.rs` and no `Player` trait. See below.
   rule violation. `MoveError::is_rule_violation` tells the two apart, and a
   `NoContest::EngineLimit` blames nobody.
 
+  Either way the result keeps its evidence: `WinReason::IllegalMove` carries the
+  `ActionId` played and the exact `MoveError` it was refused with, as
+  `NoContest::EngineLimit` carries its seat and error. A verdict whose reasons
+  were discarded is one an operator cannot debug and a training pipeline cannot
+  filter on, and both facts were in hand at the point the game ended.
+
 - **Three result arms, not two.** A completed/aborted split cannot say what a
   training pipeline needs to know: a game that legitimately hit its action cap
   and a game where a player crashed are both unusable as signal, but only the
   second is anybody's fault. `MatchResult` splits by whose fault it was, and
   `is_contested()` answers "was this a real game" directly.
 
+  `GameSpec::ply_cap` is nonzero by type. Adjudication checks a placement's win
+  before the cap, so a win on the capping placement is a win, not a draw.
+  Driver failures retain the `Player` and `Failure` in
+  `NoContest::SeatFailure`; the no-contest policy declines to charge the
+  failure to either seat without erasing where it happened.
+
 - **Diagnostics are opaque and actually persisted.** A seat attaches bytes; the
   game stores them verbatim and never parses them. The field is only worth
   having if it reaches the record — a diagnostics channel that is documented but
   dropped pushes every model package onto its own shard-writing path that
   bypasses the runner entirely.
+
+  `PlyRecord` stores facts that vary by placement. The match-wide thinking
+  budget remains in `GameSpec` rather than being repeated in every record.
 
 ## Not built yet
 

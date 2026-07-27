@@ -8,15 +8,18 @@ Questions that **must** be answered to build at all live in
 [OPEN_DECISIONS.md](OPEN_DECISIONS.md).
 
 Decided items live with the thing they decided. When a suggestion here is
-accepted, its reasoning moves to the relevant `README.md` and it is deleted from
-this file — this doc should only ever contain open questions. Numbering is
-stable: a closed item's number is not reused, because other documents cite it.
+accepted, its *reasoning* moves to the relevant `README.md` and the body of the
+item is deleted from this file — the table keeps a one-line row saying where the
+answer went, exactly as `OPEN_DECISIONS.md` does, so that a cited number always
+resolves to something. Numbering is stable: a closed item's number is never
+reused, because other documents cite it.
 
 | # | Suggestion | Status |
 | --- | --- | --- |
 | S1 | Dense action indexing | **Closed.** The diagnosis was right and the proposed fix was wrong; what survived is in [crates/hexo-engine/README.md](../crates/hexo-engine/README.md) |
 | S2 | Symmetry operations in the engine | Deferred — probably not yet |
 | S3 | The evaluator seam | Deferred — explained below |
+| S4 | ~~Differential test against the old engine~~ | **Retired.** It was built, the two engines agreed, and the crate that held it was deleted along with the old engine. Its job is now done by the independent oracles in `crates/hexo-engine/tests/common` and the frozen golden vectors, which do not depend on a second implementation existing |
 | S5 | Read-surface contract for model encoders | Open — needed once models start |
 | S6 | Containerised bots | **Closed.** Accepted and specified in [CONTAINER_SPEC.md](CONTAINER_SPEC.md); the wire format it leaves open is `OPEN_DECISIONS.md` C1/C2 |
 | S7 | Python-side tooling (ruff, type checking) | Deferred — no Python yet |

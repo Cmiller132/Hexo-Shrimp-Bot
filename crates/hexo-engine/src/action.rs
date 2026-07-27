@@ -2,7 +2,7 @@
 
 use crate::coord::HexCoord;
 
-/// Version of the canonical legal-move ordering (spec Â§9).
+/// Version of the canonical legal-move ordering (spec §9).
 pub const ACTION_ORDER_VERSION: u32 = 1;
 
 /// Unbounded, exactly invertible identity of a placement.
@@ -45,7 +45,7 @@ impl From<ActionId> for HexCoord {
     }
 }
 
-/// A single placement â€” the atom of play.
+/// A single placement — the atom of play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Action(HexCoord);
 

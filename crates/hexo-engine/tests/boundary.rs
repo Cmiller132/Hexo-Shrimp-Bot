@@ -1,5 +1,8 @@
 //! The coordinate-domain contract at all six faces of the cube.
 
+mod common;
+
+use common::check_all_oracles;
 use hexo_engine::{Action, COORD_LIMIT, HexCoord, LEGAL_RADIUS, MoveError, Position, Search};
 
 /// Cube distance from the coordinate domain's boundary that counts as "at the face":
@@ -140,6 +143,9 @@ fn enumeration_agrees_with_validation_at_every_face() {
             "direction {dir:?}: no legal action is at the face, so this proves nothing"
         );
         assert_the_legal_set_is_self_consistent(&pos, &format!("direction {dir:?}"));
+        if dir == AXIS_DIRECTIONS[0] {
+            check_all_oracles(&pos, pos.stone_count() as usize);
+        }
     }
 }
 

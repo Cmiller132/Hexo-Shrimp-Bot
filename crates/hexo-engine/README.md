@@ -28,6 +28,7 @@ crates/hexo-engine/
     position_tests.rs   # #[path]-included unit tests for the rule machine
     search.rs
     zobrist.rs          # private
+    error.rs
   tests/
     common/mod.rs       # brute-force oracles + a dependency-free PRNG
     boundary.rs         # the coordinate domain at all six faces
@@ -68,6 +69,19 @@ neither gets a module.
 
 ## Design notes
 
+- **The board is a recentred dense grid, not a sparse map.** An infinite board
+  reads like an argument for a `HashMap<HexCoord, _>`, but play is contiguous — a
+  placement must be within 8 steps of a stone — and every operation here is a
+  neighbourhood query: the radius-8 disk, the 11x11 window strip, the frontier
+  scan. Dense, each is address arithmetic over words already in cache; sparse,
+  each is hundreds of independent hashes, and the frontier scan loses canonical
+  order and has to sort.
+
+  The price is that the arena moves: recentred on the live stone box, grown when a
+  placement would break the padding margin. `COORD_LIMIT` and `MAX_GRID_CELLS` are
+  where it admits a bound, and both report as representation limits rather than
+  rule violations, so a runner can tell "you broke a rule" from "I cannot hold
+  this board".
 - **`undo` is a first-class operation, not an afterthought.** Every field is
   restored by exactly one of three named mechanisms: re-running a self-inverse
   operation (occupancy, coverage, frontier, hash, counters), copying a snapshot
@@ -86,8 +100,7 @@ neither gets a module.
   217 cells three or four times. It lives in `grid` because it is a claim about
   the layout, and it is the only writer of coverage.
 
-  The `DISK8` offset table is still there, and is worth more now than when it was
-  load-bearing: it is the *independent* statement of the same cell set, walked
+  The `DISK8` offset table is still there, and earns its place: it is the *independent* statement of the same cell set, walked
   offset by offset by the tier-C frontier assertion on every apply and undo, and
   compared against the runs directly in `grid`'s tests. A wrong run and a wrong
   offset are both symmetric, so neither can check itself.
@@ -146,13 +159,9 @@ neither gets a module.
   unbounded is not a dense index, and a dense index is not invertible outside its
   region.
 
-  The bijection did not hold at first: `legal_actions` offered 136 coordinates
-  that `advance` refused, so `legal_rank` was assigning policy indices to
-  unplayable moves. Fixed at the source — `place` no longer writes coverage
-  outside the coordinate domain — and pinned by `tests/boundary.rs`. A dense index
-  over a region that does not match the legal set is exactly the failure this
-  design exists to prevent, so it is worth recording that the first version of the
-  fix had it too.
+  The coordinate-domain clip in `Grid` is what keeps the ordering a bijection —
+  coverage is never written outside the domain, so `legal_actions` cannot offer a
+  coordinate `advance` would refuse. `tests/boundary.rs` pins it.
 - **Symmetric bugs are the real hazard.** A wrong disk offset, a wrong shear in
   the QR fold, a wrong hash constant, or a growth copy with the same wrong index
   on both sides all apply and un-apply identically, so round-trip tests are blind
@@ -168,9 +177,10 @@ a minute, of which `cargo xtask test` is about 20 seconds.
 Four of them exist for this crate specifically — the release lint, the rustdoc
 gate, and the two `wasm32` gates each see a class the debug test run cannot.
 
-The deep smoke run is `cargo xtask smoke`: an order of magnitude more games,
-release profile, scheduled nightly rather than per-push. Worth running by hand
-after a change to hashing, ordering, growth, or win detection.
+The deep smoke run is `cargo xtask smoke`: ten times as many line-building
+games and more than sixteen times as many uniform games, release profile,
+scheduled nightly rather than per-push. Worth running by hand after a change
+to hashing, ordering, growth, or win detection.
 
 The suite is also driven by the environment for a one-off:
 

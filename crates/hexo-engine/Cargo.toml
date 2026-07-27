@@ -8,6 +8,7 @@ rust-version.workspace = true
 [lib]
 name = "hexo_engine"
 path = "src/lib.rs"
+bench = false
 
 [dependencies]
 

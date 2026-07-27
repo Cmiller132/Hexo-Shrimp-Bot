@@ -2,11 +2,12 @@
 
 A Hexo engine and bot-training framework, built ground up.
 
-> **Status: `hexo-engine` and `hexo-runner` implemented.** The engine ships the
-> full rule machine, make/unmake search, and its test suite; the runner ships
-> the nonblocking game state machine, the result and adjudication model, and
-> its own. The container design is written but not built. No models, no tree
-> search, no training, no Python.
+> **Status: `hexo-engine`, `hexo-runner`, and `hexo-player` implemented.** The
+> engine ships the full rule machine, make/unmake search, and its test suite; the
+> runner ships the nonblocking game state machine and the result and adjudication
+> model; `hexo-player` ships the seam a model plugs into and the loop that drives
+> games. No player ships — nothing decides a move yet. The container design is
+> written but not built. No models, no tree search, no training, no Python.
 
 ## Layout
 
@@ -16,6 +17,7 @@ Hexo-Shrimp-Bot/
   crates/
     hexo-engine/          authoritative rules and game state
     hexo-runner/          the authoritative game and adjudication policy
+    hexo-player/          the player seam, and the loop that drives games
   xtask/                  the verification gates, defined once; `cargo xtask`
   docs/
     ENGINE_SPEC.md        normative implementation target for hexo-engine
@@ -65,13 +67,15 @@ move history and there is exactly one, position-only, Zobrist hash; and the
 engine owns one canonical action ordering in both directions, `legal_rank` and
 `nth_legal`. The invariants that protect each of them are documented there too.
 
-**Players are handed a move prefix once, then fed a move stream.** No fresh copy
-per turn: the player replays the prefix into its own mirror and applies the moves
-the runner sends. This costs O(1) per ply instead of O(board), and it is a move
-list rather than a serialised position because a container cannot be handed one —
-`Position` has no `serde` impl, deliberately. Board-shaped construction is a
-rule-bypass hole: a deserialiser that accepts a bare cell list reconstructs a
-position without ever running the turn rules that could have produced it.
+**A remote seat is handed a move prefix once, then fed a move stream.** It
+replays the prefix into its own mirror and applies the moves the runner sends, so
+it pays O(1) per ply rather than O(board) and never needs a fresh copy per turn.
+A move list rather than a serialised position, because a container cannot be
+handed one: `Position` has no `serde` impl, deliberately. Board-shaped
+construction is a rule-bypass hole — a deserialiser that accepts a bare cell list
+reconstructs a position without ever running the turn rules that could have
+produced it. An in-process seat is handed `&Position` and needs no mirror; the
+mirror lands with the transport that requires it.
 
 **The hash crosses the container boundary.** `zobrist()` is position-only, which
 is an engine decision argued with the engine — but it is what lets the runner
@@ -82,6 +86,13 @@ to store and to compare across processes.
 **Models are independent and own their own encoding.** A model may be written in
 Rust and depends only on the engine's read surface. Neither the engine nor the
 runner ever learns what a model is.
+
+**A model owns its move selection, and must implement two modes.** `hexo-player`
+states the seam and supplies none of it — no sampler, no temperature, no argmax.
+`Model` has two required methods with no defaults: `self_play_move`, which must
+vary, and `eval_move`, which is greedier but not deterministic. A non-model seat
+— a human, a scripted bot — implements the plainer `Player` trait and never sees
+a mode. [crates/hexo-player/README.md](crates/hexo-player/README.md) argues both.
 
 **The runner is a library, not a service.** A containerised bot carries the
 engine *and* the runner inside it, so it can drive its own self-play games
@@ -118,7 +129,7 @@ and CI cannot disagree about what they are. Several are not redundant with
 `cargo test` in ways that are easy to assume away — the release profile sees
 dead code the debug profile deletes, rustdoc is not checked by clippy, the MSRV
 floor is a promise nothing else tests, and the `wasm32` target is what keeps a
-`std::time` call or a PyO3 dependency out of `hexo-engine`. Each gate explains
+PyO3 or other native-only dependency out of `hexo-engine`. Each gate explains
 itself when it fails.
 
 Two need a toolchain you may not have: `rustup target add
