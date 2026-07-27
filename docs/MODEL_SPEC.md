@@ -408,3 +408,23 @@ Enabling or disabling this head does not touch `MODEL_REPR_VERSION` — it
 reads the trunk's output and adds no inputs. Checkpoints that carry it
 load into models without it by dropping the unmatched tensors loudly (an
 explicit allowlist, not silent prefix matching).
+
+---
+
+## Appendix B — action-value head (the KLENT path)
+
+The KLENT training path (`docs/KLENT_DESIGN.md`) evaluates positions through
+a per-action value and no state value: its improvement step is
+`π′ ∝ exp[(Q + τ·log π_θ)/(τ+λ)]` and its bootstrap is `v̂ = E_{π′}[Q]`. The
+head that supplies `Q` is the §6 decoder shape with its own parameters
+everywhere — its own window projection, slot-class table, background-bucket
+table, and MLP — emitting one raw unbounded scalar per legal cell in engine
+legal order. Trained by squared error against the λ-return of the action
+actually taken (KLENT eq. 4); nothing softmaxes or clamps it.
+
+Like appendix A, this head reads the trunk's output and adds no inputs, so
+`MODEL_REPR_VERSION` is untouched. Under KLENT the §7 value head sits outside
+the loss entirely — faithful to the paper's no-V-head ablation — and whether
+a KLENT checkpoint carries §7's tensors at all is a packaging decision that
+arrives with the `ModelPackage` wiring, not a model question; appendix A's
+drop-loudly rule applies either way.

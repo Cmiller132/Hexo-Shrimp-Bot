@@ -25,7 +25,9 @@ def test_d6_invariance(model, move_lists):
     for moves in move_lists:
         base = hexo_py.Position.replay(moves)
         out = _forward(model, base)
-        by_move = dict(zip(base.legal_moves(), out.policy_logits.tolist()))
+        legal = base.legal_moves()
+        by_move = dict(zip(legal, out.policy_logits.tolist()))
+        q_by_move = dict(zip(legal, out.q_values.tolist()))
 
         for t in transforms[1:]:
             tpos = hexo_py.Position.replay([t(m) for m in moves])
@@ -34,10 +36,13 @@ def test_d6_invariance(model, move_lists):
             assert torch.allclose(tout.value, out.value, atol=1e-5)
             assert torch.allclose(tout.value_dist, out.value_dist, atol=1e-5)
 
-            t_by_move = dict(zip(tpos.legal_moves(), tout.policy_logits.tolist()))
+            tlegal = tpos.legal_moves()
+            t_by_move = dict(zip(tlegal, tout.policy_logits.tolist()))
+            t_q_by_move = dict(zip(tlegal, tout.q_values.tolist()))
             assert set(t_by_move) == {t(m) for m in by_move}
             for m, logit in by_move.items():
                 assert abs(t_by_move[t(m)] - logit) <= 1e-5
+                assert abs(t_q_by_move[t(m)] - q_by_move[m]) <= 1e-5
 
 
 def test_transform_set_is_a_group_of_twelve(move_lists):

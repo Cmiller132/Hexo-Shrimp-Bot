@@ -58,9 +58,10 @@ class MantisConfig:
 
 @dataclass
 class ModelOutput:
-    """What one forward answers (§11)."""
+    """What one full forward answers (§11 plus the appendix-B Q head)."""
 
     policy_logits: Tensor  # (N_cells,) raw, engine legal order per position
+    q_values: Tensor  # (N_cells,) action values, same layout — the KLENT head
     value: Tensor  # (P,) scalar decode, in [-1, 1]
     value_dist: Tensor  # (P, K) softmax over bins, fp32
     value_logits: Tensor  # (P, K) the bins' raw logits — what value_loss trains
@@ -195,6 +196,13 @@ class MantisNet(nn.Module):
         self.e_bg = nn.Embedding(NEAREST_BUCKETS, h)
         self.mlp_p = _PairMlp(h, cfg.policy_hidden, 1)
 
+        # Appendix B action-value decoder: the same shape as §6 with its own
+        # parameters everywhere, one raw Q per legal cell. KLENT's head.
+        self.q = nn.Linear(h, h, bias=False)
+        self.e_qw = nn.Embedding(3, h)
+        self.e_qbg = nn.Embedding(NEAREST_BUCKETS, h)
+        self.mlp_q = _PairMlp(h, cfg.policy_hidden, 1)
+
         # §7 value head.
         self.value_queries = nn.Parameter(torch.empty(cfg.value_queries, h))
         self.ln_value = nn.LayerNorm(h)
@@ -229,10 +237,8 @@ class MantisNet(nn.Module):
         bucket[:, :, 0] = cfg.token_bucket
         return bucket
 
-    def forward(self, batch: Batch) -> ModelOutput:
-        cfg = self.cfg
-        p = batch.n_pos
-
+    def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
+        """Embeddings through the B blocks and the shared final LN (§5)."""
         s = self.stone_table(batch.stone_own)
         w = self.window_table(batch.window_feat)
         g = self.token_base + self.token_moves(batch.moves_idx)
@@ -240,27 +246,45 @@ class MantisNet(nn.Module):
         bucket = self._buckets(batch)
         for block in self.blocks:
             s, w, g = block(s, w, g, batch, bucket)
-        s = self.ln_out(s)
-        w = self.ln_out(w)
-        g = self.ln_out(g)
+        return self.ln_out(s), self.ln_out(w), self.ln_out(g)
 
-        # §6: one logit per legal cell. Window path is a gather-sum over the
-        # decoder table; background cells overwrite from their bucket table.
-        pw = self.p(w)
-        msg = pw.index_select(0, batch.dec_window) + self.e_pw(batch.dec_class)
-        h = g.new_zeros(batch.n_cells, cfg.h)
+    def _decode_cells(
+        self,
+        w: Tensor,
+        g: Tensor,
+        batch: Batch,
+        lin: nn.Linear,
+        e_w: nn.Embedding,
+        e_bg: nn.Embedding,
+        mlp: _PairMlp,
+    ) -> Tensor:
+        """§6's decoder: one scalar per legal cell. Window path is a
+        gather-sum over the decoder table; background cells overwrite from
+        their bucket table; the token half of the MLP runs per position."""
+        msg = lin(w).index_select(0, batch.dec_window) + e_w(batch.dec_class)
+        h = g.new_zeros(batch.n_cells, self.cfg.h)
         h.index_add_(0, batch.dec_cell, msg.to(h.dtype))
         if batch.bg_cell.numel():
-            h.index_copy_(0, batch.bg_cell, self.e_bg(batch.bg_bucket).to(h.dtype))
-        g_half = self.mlp_p.lin_b(g)  # (P, P_H), gathered to cells below
-        logits = self.mlp_p.out(
-            F.relu(self.mlp_p.lin_a(h) + g_half.index_select(0, batch.cell_pos))
-        )
-        policy_logits = logits.squeeze(-1)
+            h.index_copy_(0, batch.bg_cell, e_bg(batch.bg_bucket).to(h.dtype))
+        g_half = mlp.lin_b(g)
+        out = mlp.out(F.relu(mlp.lin_a(h) + g_half.index_select(0, batch.cell_pos)))
+        return out.squeeze(-1)
 
-        # §7: multi-query attention readout over [token; windows]. The LN runs
-        # on the concatenated rows before padding — row-wise, so identical, and
-        # the padded copy is written once.
+    def policy_head(self, w: Tensor, g: Tensor, batch: Batch) -> Tensor:
+        """§6: one raw policy logit per legal cell, engine legal order."""
+        return self._decode_cells(w, g, batch, self.p, self.e_pw, self.e_bg, self.mlp_p)
+
+    def q_head(self, w: Tensor, g: Tensor, batch: Batch) -> Tensor:
+        """Appendix B: one raw action value per legal cell, same layout."""
+        return self._decode_cells(w, g, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q)
+
+    def value_head(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
+        """§7: (value, value_dist, value_logits). Multi-query attention
+        readout over [token; windows]. The LN runs on the concatenated rows
+        before padding — row-wise, so identical, and the padded copy is
+        written once."""
+        cfg = self.cfg
+        p = batch.n_pos
         rows = g.new_zeros(p * batch.max_w, cfg.h)
         token_slot = torch.arange(p, device=g.device) * batch.max_w
         rows.index_copy_(0, token_slot, self.ln_value(g))
@@ -277,6 +301,17 @@ class MantisNet(nn.Module):
         # Scalar decode in-forward, fp32, so every consumer sees the same value.
         value_dist = v_logits.float().softmax(dim=-1)
         value = value_dist @ self.bin_centers
+        return value, value_dist, v_logits
+
+    def forward(self, batch: Batch) -> ModelOutput:
+        """Every head. KLENT's loop composes `trunk` with the two heads it
+        trains instead, skipping the value readout it never reads."""
+        s_, w, g = self.trunk(batch)
+        value, value_dist, value_logits = self.value_head(w, g, batch)
         return ModelOutput(
-            policy_logits=policy_logits, value=value, value_dist=value_dist, value_logits=v_logits
+            policy_logits=self.policy_head(w, g, batch),
+            q_values=self.q_head(w, g, batch),
+            value=value,
+            value_dist=value_dist,
+            value_logits=value_logits,
         )

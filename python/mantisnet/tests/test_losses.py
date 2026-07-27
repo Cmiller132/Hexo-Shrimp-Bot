@@ -97,8 +97,10 @@ def test_every_parameter_receives_gradient(positions):
     counts = batch.legal_offsets[1:] - batch.legal_offsets[:-1]
     targets = torch.cat([torch.full((int(c),), 1.0 / int(c)) for c in counts])
     z = torch.linspace(-0.9, 0.9, batch.n_pos)
-    loss = policy_loss(out.policy_logits, batch.legal_offsets, targets) + value_loss(
-        out.value_logits, z
+    loss = (
+        policy_loss(out.policy_logits, batch.legal_offsets, targets)
+        + value_loss(out.value_logits, z)
+        + (out.q_values.index_select(0, batch.legal_offsets[:-1]) - z).square().mean()
     )
     loss.backward()
     missing = [n for n, p in net.named_parameters() if p.grad is None]

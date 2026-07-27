@@ -19,6 +19,9 @@ def test_batched_forward_equals_per_position(model, positions):
         assert torch.allclose(
             batched.policy_logits[offset : offset + n], single.policy_logits, atol=1e-6
         )
+        assert torch.allclose(
+            batched.q_values[offset : offset + n], single.q_values, atol=1e-6
+        )
         assert torch.allclose(batched.value[i : i + 1], single.value, atol=1e-6)
         assert torch.allclose(batched.value_dist[i : i + 1], single.value_dist, atol=1e-6)
         offset += n
@@ -31,6 +34,8 @@ def test_output_contracts(model, positions):
     batch = collate(graphs)
     out = model(batch)
     assert out.policy_logits.shape == (sum(g.n_legal for g in graphs),)
+    assert out.q_values.shape == out.policy_logits.shape
+    assert torch.isfinite(out.q_values).all()
     assert batch.legal_offsets.tolist() == [0] + list(
         torch.tensor([g.n_legal for g in graphs]).cumsum(0).tolist()
     )
