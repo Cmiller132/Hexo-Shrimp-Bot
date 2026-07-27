@@ -1,0 +1,23 @@
+[package]
+name = "hexo-model-mock"
+description = "The mock model package: a deterministic, weightless evaluator that exercises every seam the container has, with no network and no GPU."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "hexo_model_mock"
+path = "src/lib.rs"
+
+[dependencies]
+hexo-engine.workspace = true
+hexo-runner.workspace = true
+hexo-search.workspace = true
+hexo-records.workspace = true
+hexo-model.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

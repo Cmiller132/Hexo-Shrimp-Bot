@@ -1,0 +1,17 @@
+[package]
+name = "hexo-search"
+description = "The evaluator seam and the nonblocking decision sessions: how a seat searches, and how its network questions are batched."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "hexo_search"
+path = "src/lib.rs"
+
+[dependencies]
+hexo-engine.workspace = true
+hexo-runner.workspace = true
+
+[lints]
+workspace = true

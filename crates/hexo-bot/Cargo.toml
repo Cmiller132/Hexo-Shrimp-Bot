@@ -1,0 +1,30 @@
+[package]
+name = "hexo-bot"
+description = "The one binary: the training loop that drives batched self-play, fitting, checkpoints, and evaluation from a single long-lived process."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "hexo_bot"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hexo-bot"
+path = "src/main.rs"
+
+[dependencies]
+hexo-engine.workspace = true
+hexo-runner.workspace = true
+hexo-search.workspace = true
+hexo-records.workspace = true
+hexo-model.workspace = true
+hexo-model-mock.workspace = true
+serde_json.workspace = true
+ctrlc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

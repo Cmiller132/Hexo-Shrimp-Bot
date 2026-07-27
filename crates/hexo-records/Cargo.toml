@@ -1,0 +1,20 @@
+[package]
+name = "hexo-records"
+description = "The on-disk game record: a versioned shard of move lists, results, and seat diagnostics, written once and read strictly."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "hexo_records"
+path = "src/lib.rs"
+
+[dependencies]
+hexo-engine.workspace = true
+hexo-runner.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
