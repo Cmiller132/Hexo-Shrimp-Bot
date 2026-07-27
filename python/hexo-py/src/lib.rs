@@ -9,8 +9,13 @@
 //! is the same argument `ENGINE_SPEC.md` §12 makes for the engine itself.
 
 use hexo_engine as engine;
+use numpy::PyArray1;
+use numpy::PyArrayMethods;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
+
+mod graph;
 
 /// A Hexo position. Wraps `hexo_engine::Position` one-to-one.
 #[pyclass]
@@ -77,6 +82,23 @@ impl Position {
                 (c.q, c.r)
             })
             .collect()
+    }
+
+    /// The legal placement at `index` in that same order — what a caller
+    /// holding a sampled rank wants, without materialising the whole list.
+    fn nth_legal(&self, index: usize) -> PyResult<(i16, i16)> {
+        self.inner
+            .nth_legal(index)
+            .map(|a| {
+                let c = a.coord();
+                (c.q, c.r)
+            })
+            .ok_or_else(|| {
+                PyValueError::new_err(format!(
+                    "legal index {index} out of range ({} legal moves)",
+                    self.inner.legal_count()
+                ))
+            })
     }
 
     /// The 18 win windows through `(q, r)`: `(axis, start_q, start_r, mask_p0,
@@ -165,10 +187,79 @@ impl Position {
     }
 }
 
-/// The module: `Position` plus the version constants a checkpoint pins.
+/// A collated `RawBatch` as a dict of numpy arrays, keyed by the field names
+/// `mantisnet.builder.Batch` uses.
+fn raw_to_dict<'py>(py: Python<'py>, raw: graph::RawBatch) -> PyResult<Bound<'py, PyDict>> {
+    let (p, max_t, max_w) = (raw.n_pos, raw.max_t, raw.max_w);
+    let d = PyDict::new(py);
+    d.set_item("stone_own", PyArray1::from_vec(py, raw.stone_own))?;
+    d.set_item("window_feat", PyArray1::from_vec(py, raw.window_feat))?;
+    d.set_item("moves_idx", PyArray1::from_vec(py, raw.moves_idx))?;
+    d.set_item("inc_stone", PyArray1::from_vec(py, raw.inc_stone))?;
+    d.set_item("inc_window", PyArray1::from_vec(py, raw.inc_window))?;
+    d.set_item("inc_class", PyArray1::from_vec(py, raw.inc_class))?;
+    d.set_item("stone_slot", PyArray1::from_vec(py, raw.stone_slot))?;
+    d.set_item(
+        "coords",
+        PyArray1::from_vec(py, raw.coords).reshape([p, max_t, 2])?,
+    )?;
+    d.set_item(
+        "attn_valid",
+        PyArray1::from_vec(py, raw.attn_valid).reshape([p, max_t])?,
+    )?;
+    d.set_item("window_slot", PyArray1::from_vec(py, raw.window_slot))?;
+    d.set_item(
+        "value_valid",
+        PyArray1::from_vec(py, raw.value_valid).reshape([p, max_w])?,
+    )?;
+    d.set_item("legal_offsets", PyArray1::from_vec(py, raw.legal_offsets))?;
+    d.set_item("cell_pos", PyArray1::from_vec(py, raw.cell_pos))?;
+    d.set_item("dec_cell", PyArray1::from_vec(py, raw.dec_cell))?;
+    d.set_item("dec_window", PyArray1::from_vec(py, raw.dec_window))?;
+    d.set_item("dec_class", PyArray1::from_vec(py, raw.dec_class))?;
+    d.set_item("bg_cell", PyArray1::from_vec(py, raw.bg_cell))?;
+    d.set_item("bg_bucket", PyArray1::from_vec(py, raw.bg_bucket))?;
+    Ok(d)
+}
+
+/// Build a collated MantisNet batch from positions, in parallel.
+///
+/// The production twin of `mantisnet.builder`'s Python path, held equal to it
+/// field for field by that package's parity tests. Raises `ValueError` on a
+/// terminal position.
+#[pyfunction]
+fn build_batch<'py>(
+    py: Python<'py>,
+    positions: Vec<PyRef<'py, Position>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let owned: Vec<engine::Position> = positions.iter().map(|p| p.inner.clone()).collect();
+    let raw = py
+        .detach(|| graph::build_batch(&owned))
+        .map_err(PyValueError::new_err)?;
+    raw_to_dict(py, raw)
+}
+
+/// Replay each game's first `ts[i]` placements and build the batch, in
+/// parallel — the fitting path, where a stored position is a move prefix.
+#[pyfunction]
+fn build_batch_prefixes<'py>(
+    py: Python<'py>,
+    games: Vec<Vec<(i16, i16)>>,
+    ts: Vec<usize>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let raw = py
+        .detach(|| graph::build_batch_prefixes(&games, &ts))
+        .map_err(PyValueError::new_err)?;
+    raw_to_dict(py, raw)
+}
+
+/// The module: `Position`, the batch builders, and the version constants a
+/// checkpoint pins.
 #[pymodule]
 fn hexo_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Position>()?;
+    m.add_function(wrap_pyfunction!(build_batch, m)?)?;
+    m.add_function(wrap_pyfunction!(build_batch_prefixes, m)?)?;
     m.add("RULES_VERSION", engine::RULES_VERSION)?;
     m.add("ACTION_ORDER_VERSION", engine::ACTION_ORDER_VERSION)?;
     m.add("LEGAL_RADIUS", engine::LEGAL_RADIUS)?;

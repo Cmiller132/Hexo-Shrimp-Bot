@@ -1,11 +1,12 @@
 # hexo-py
 
-Python bindings for `hexo-engine`: the read surface a model builder needs, and
-nothing that could bypass the rules.
+Python bindings for `hexo-engine` — the read surface a model builder needs and
+nothing that could bypass the rules — plus the production MantisNet batch
+builder, in Rust because that is the training loop's hot path.
 
-**Status: implemented.** One class, three module constants. It is the PyO3 leaf
-crate the root `README.md` promised — it depends on `hexo-engine` and nothing
-depends on it.
+**Status: implemented.** One class, two batch builders, three module
+constants. It is the PyO3 leaf crate the root `README.md` promised — it
+depends on `hexo-engine` and nothing depends on it.
 
 ## Shape
 
@@ -19,10 +20,15 @@ path dependency); `cargo xtask verify` neither builds nor gates it.
 
 ```
 python/hexo-py/
-  Cargo.toml      # own [workspace]; hexo-engine by path, pyo3 with abi3-py312
-  pyproject.toml  # maturin build backend, module name hexo_py
-  src/lib.rs      # everything
+  Cargo.toml      # own [workspace]; hexo-engine by path, pyo3 with abi3-py312,
+                  # numpy + rayon + rustc-hash for the batch builder
+  pyproject.toml  # maturin build backend (release profile), module hexo_py
+  src/lib.rs      # Position, the two batch entry points, numpy conversion
+  src/graph.rs    # the batched graph builder itself
 ```
+
+Building under WSL: set `CARGO_TARGET_DIR=target-wsl` (the repo's convention —
+the Windows and Linux toolchains fight over one `target/`).
 
 ## Surface
 
@@ -36,12 +42,31 @@ python/hexo-py/
 | `copy()` | `clone` | |
 | `stones()` | `stones` | `[(q, r, player)]`, canonical order |
 | `legal_moves()` | `legal_actions` | canonical order — the order priors index |
+| `nth_legal(i)` | `nth_legal` | one placement by rank, without the whole list |
 | `windows_through(q, r)` | `windows_through` | see below |
 | `legal_count`, `current_player`, `moves_remaining`, `is_terminal`, `winner`, `stone_count`, `zobrist` | getters | `moves_remaining` derives from `TurnPhase`: `FirstStone` is 2, `Opening` and `SecondStone` are 1 |
 
 Module constants: `RULES_VERSION`, `ACTION_ORDER_VERSION`, `LEGAL_RADIUS`.
 
+Module functions, the batch builder:
+
+- `build_batch(positions)` — every position's MantisNet graph, built in
+  parallel under rayon with the GIL released, collated into one dict of numpy
+  arrays keyed by `mantisnet.builder.Batch`'s field names.
+- `build_batch_prefixes(games, ts)` — the fitting path: replay each game's
+  first `ts[i]` placements, then the same build. A stored position is a move
+  prefix (`KLENT_DESIGN.md` §12).
+
 ## Design notes
+
+- **The batch builder is the production twin of `mantisnet.builder`, and the
+  Python builder is its oracle.** Two implementations of one representation
+  are only tolerable with an exact parity detector between them:
+  `mantisnet/tests/test_rust_builder.py` holds every emitted array exactly
+  equal to the Python path's, field for field. That test is also what frees
+  this implementation to use the engine's own `windows_through` walk — the
+  independence that `MODEL_SPEC.md` §12.1 needs is carried by the Python
+  builder, which never calls it.
 
 - **Positions are created empty or by replay, never deserialised.** The same
   argument as `ENGINE_SPEC.md` §12 one level down: a board-shaped constructor
