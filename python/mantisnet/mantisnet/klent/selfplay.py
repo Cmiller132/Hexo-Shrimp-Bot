@@ -1,0 +1,144 @@
+"""Self-play collection: batched episodes, acting-time v̂, and the buffer rules.
+
+Every ply the live games' positions are built into one batch, evaluated once,
+and each game samples its next placement from its own segment of π′. What is
+recorded per acted ply is exactly what design doc §4.5 keeps: the action's
+legal rank, π′ itself, and the acting-time `v̂` (K6) that the λ-return will
+consume. What is excluded is exactly what it excludes: terminal positions
+never exist as samples, every ply of a capped episode (K4), and every seeded
+prefix ply — those are replayed before collection starts, so they are never
+recorded at all.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Callable
+
+import numpy as np
+import torch
+
+from ..builder import collate, from_position
+from .improve import improved_policy
+from .returns import lambda_returns, signs_from_moves_remaining
+
+# The evaluator seam: flat (policy_logits, q_values) on CPU for one Batch.
+# Training wraps the network; tests may wrap anything with the same shape.
+Evaluate = Callable[[object], tuple[torch.Tensor, torch.Tensor]]
+
+
+@dataclass
+class Episode:
+    """One self-play episode; per-ply records cover acted plies only."""
+
+    moves: list  # the whole move list, seed prefix included
+    seed_len: int  # plies replayed before π′ took over
+    winner: int | None  # None exactly when the cap hit
+    moves_remaining: list  # per acted ply, at acting time
+    ranks: list  # per acted ply, the action's legal rank
+    improved: list  # per acted ply, π′ as float32 over the legal set
+    v_hats: list  # per acted ply, E_{π′}[Q] at acting time
+
+
+@dataclass
+class Sample:
+    """One buffer entry: `(S_t, A_t, π′, G_t)` with the state as a move prefix."""
+
+    moves: tuple  # episode move list; S_t = replay(moves[:t])
+    t: int
+    rank: int  # A_t as its index in engine legal order
+    improved: np.ndarray  # π′(·|S_t)
+    g: float  # λ-return, in the mover-at-t's frame
+
+
+def play_episodes(
+    evaluate: Evaluate,
+    prefixes: list[list],
+    ply_cap: int,
+    tau: float,
+    lam: float,
+    rng: np.random.Generator,
+) -> tuple[list[Episode], dict]:
+    """Play one episode per prefix (empty prefix = unseeded), in lockstep.
+
+    Returns the episodes plus the acting-time means of the §13 diagnostics:
+    `D_KL(π′ ‖ π_θ)` and `H(π′)/log|A|`.
+    """
+    import hexo_py
+
+    episodes = []
+    positions = []
+    for prefix in prefixes:
+        pos = hexo_py.Position.replay(list(prefix))
+        if pos.is_terminal:
+            raise ValueError("a seed prefix must leave a live game")
+        episodes.append(
+            Episode(
+                moves=list(prefix),
+                seed_len=len(prefix),
+                winner=None,
+                moves_remaining=[],
+                ranks=[],
+                improved=[],
+                v_hats=[],
+            )
+        )
+        positions.append(pos)
+
+    live = list(range(len(episodes)))
+    kl_sum, ent_sum, decisions = 0.0, 0.0, 0
+    while live:
+        batch = collate([from_position(positions[i]) for i in live])
+        policy_logits, q_values = evaluate(batch)
+        imp = improved_policy(policy_logits, q_values, batch.legal_offsets, tau, lam)
+
+        offsets = batch.legal_offsets.tolist()
+        kl_sum += float(imp.kl.sum())
+        ent_sum += float(imp.norm_entropy.sum())
+        decisions += len(live)
+
+        still_live = []
+        for slot, i in enumerate(live):
+            ep, pos = episodes[i], positions[i]
+            probs = imp.probs[offsets[slot] : offsets[slot + 1]].numpy().astype(np.float64)
+            rank = int(rng.choice(len(probs), p=probs / probs.sum()))
+
+            ep.moves_remaining.append(pos.moves_remaining)
+            ep.ranks.append(rank)
+            ep.improved.append(probs.astype(np.float32))
+            ep.v_hats.append(float(imp.v_hat[slot]))
+
+            move = pos.legal_moves()[rank]
+            pos.advance(*move)
+            ep.moves.append(move)
+
+            if pos.is_terminal:
+                ep.winner = pos.winner
+            elif len(ep.moves) < ply_cap:
+                still_live.append(i)
+        live = still_live
+
+    metrics = {
+        "acting_kl": kl_sum / max(decisions, 1),
+        "acting_norm_entropy": ent_sum / max(decisions, 1),
+    }
+    return episodes, metrics
+
+
+def episode_samples(episode: Episode, lam_ret: float) -> list[Sample]:
+    """The buffer entries of one episode: empty for a capped one (§5.1)."""
+    if episode.winner is None:
+        return []
+    signs = signs_from_moves_remaining(episode.moves_remaining)
+    returns = lambda_returns(signs, episode.v_hats, lam_ret)
+    moves = tuple(episode.moves)
+    return [
+        Sample(
+            moves=moves,
+            t=episode.seed_len + j,
+            rank=episode.ranks[j],
+            improved=episode.improved[j],
+            g=float(returns[j]),
+        )
+        for j in range(len(episode.ranks))
+    ]

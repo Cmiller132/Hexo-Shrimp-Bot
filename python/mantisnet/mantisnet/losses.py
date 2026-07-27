@@ -10,6 +10,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .segments import segment_ids, segment_log_softmax, segment_sum
+
 
 def value_target(z: Tensor, bins: int) -> Tensor:
     """Project outcomes ``z`` in [-1, 1] onto the bins, exactly in expectation.
@@ -45,22 +47,15 @@ def policy_loss(logits: Tensor, offsets: Tensor, target: Tensor) -> Tensor:
     against a policy nobody stated.
     """
     p = offsets.shape[0] - 1
-    counts = offsets[1:] - offsets[:-1]
-    seg = torch.repeat_interleave(torch.arange(p, device=logits.device), counts)
+    seg = segment_ids(offsets)
 
     target = target.float()
-    sums = target.new_zeros(p).index_add_(0, seg, target)
+    sums = segment_sum(target, seg, p)
     if not torch.allclose(sums, torch.ones_like(sums), atol=1e-4):
         raise ValueError("each position's policy target must sum to 1")
 
-    logits = logits.float()
-    seg_max = logits.new_full((p,), torch.finfo(torch.float32).min)
-    seg_max.index_reduce_(0, seg, logits, "amax", include_self=True)
-    exp = (logits - seg_max.index_select(0, seg)).exp()
-    lse = seg_max + logits.new_zeros(p).index_add_(0, seg, exp).log()
-    log_probs = logits - lse.index_select(0, seg)
-    per_position = logits.new_zeros(p).index_add_(0, seg, -(target * log_probs))
-    return per_position.mean()
+    log_probs = segment_log_softmax(logits.float(), offsets)
+    return segment_sum(-(target * log_probs), seg, p).mean()
 
 
 def param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
