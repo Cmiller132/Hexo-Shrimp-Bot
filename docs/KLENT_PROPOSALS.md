@@ -44,6 +44,12 @@ duals) is calibrated against whichever is right. **A single line of the paper
 settles it, and it should be checked before any of the source's coefficient
 recommendations are used.**
 
+> **Checked 2026-07-27, against the paper's eq. 2 and §6.1: the source was
+> right and this repo's reading was transposed.** The paper weights the
+> reverse KL by `β = 0.1` and the entropy by `α = 0.03`, so `τ = 0.1`,
+> `λ = 0.03`, prior exponent `0.77`. `KLENT_DESIGN.md` §1 and §8 are
+> corrected, and the implementation's defaults carry the corrected pair.
+
 ---
 
 ## Verdict table

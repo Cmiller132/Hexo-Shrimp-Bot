@@ -18,16 +18,20 @@ import torch
 from ..builder import collate_prefixes
 from ..losses import policy_loss
 from .seeds import seed_prefix
-from .selfplay import Sample, episode_samples, play_episodes
+from .selfplay import Sample, collection_stats, episode_samples, play_episodes
 
 
 @dataclass
 class KlentConfig:
     """Design doc §2's starting values, expected to move — not defaults to trust."""
 
-    tau: float = 0.03  # reverse-KL weight
-    lam: float = 0.1  # entropy weight
-    lam_ret: float = 0.883  # λ-return decay, the paper's e^{-1/8}
+    # Verified against the paper's eq. 2 (2026-07-27): reverse KL is the
+    # heavier regulariser. Prior exponent tau/(tau+lam) = 0.77.
+    tau: float = 0.1  # reverse-KL weight (the paper's beta)
+    lam: float = 0.03  # entropy weight (the paper's alpha)
+    # e^{-1/16}: the paper's 8-turn horizon at Hexo's two placements per turn
+    # (KLENT_PROPOSALS A1). The paper's literal e^{-1/8} would halve it.
+    lam_ret: float = 0.939
     ply_cap: int = 512  # §5: capped episodes are dropped whole
     games_per_iteration: int = 128
     seed_fraction: float = 1.0  # §5.2: anneal toward zero as f allows
@@ -132,16 +136,7 @@ def iterate(model, optimizer, cfg: KlentConfig, rng: np.random.Generator) -> dic
     episodes, metrics = play_episodes(
         network_evaluate(model, cfg), prefixes, cfg.ply_cap, cfg.tau, cfg.lam, rng
     )
-
-    def fraction(eps):
-        return sum(e.winner is not None for e in eps) / len(eps) if eps else float("nan")
-
-    metrics["f_seeded"] = fraction([e for e in episodes if e.seed_len > 0])
-    metrics["f_unseeded"] = fraction([e for e in episodes if e.seed_len == 0])
-    won = [e for e in episodes if e.winner is not None]
-    metrics["won_length_mean"] = (
-        sum(len(e.moves) for e in won) / len(won) if won else float("nan")
-    )
+    metrics.update(collection_stats(episodes))
 
     samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret)]
     metrics["buffer_samples"] = len(samples)

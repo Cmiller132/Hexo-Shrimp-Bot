@@ -60,7 +60,16 @@ The outer loop alternates a self-play phase filling an **on-policy buffer,
 discarded every iteration**, with a fitting phase over it. 1024 parallel
 environments x up to 2048 transitions, so roughly 2M fresh samples per update
 round. Adam, lr 1e-3, batch 4096. Hyperparameters unified across all five games
-at `(τ, λ, λ_ret) = (0.03, 0.1, e^{-1/8} ≈ 0.883)`.
+at `(τ, λ, λ_ret) = (0.1, 0.03, e^{-1/8} ≈ 0.883)`.
+
+> **Corrected 2026-07-27 against the paper's text.** The paper writes eq. 2 as
+> `−β·D_KL(π′‖π) + α·H(π′)` and sets `(α, β) = (0.03, 0.1)` — so in this
+> document's notation the reverse-KL weight is `τ = 0.1` and the entropy weight
+> is `λ = 0.03`. Earlier drafts of this document carried the pair transposed,
+> which `KLENT_PROPOSALS.md` flagged as the one-line check to make before use.
+> The temperature `τ+λ = 0.13` is unchanged; the prior exponent `τ/(τ+λ)` is
+> **0.77**, a prior that mostly holds, not the 0.23 the transposition implied.
+> §8 is corrected accordingly.
 
 Results worth carrying: 4x the training efficiency of Gumbel AlphaZero at equal
 simulator evaluations, and 77.2% average win rate against the anchored baseline
@@ -76,7 +85,7 @@ backward induction from terminal states, approaching Nash as `λ → 0`.
 
 Two facts about that theory matter more here than the theorems do. The
 finite-length result **assumes a finite `T_max` and an acyclic reachable state
-graph** (§5). And the paper's own practical `(τ, λ) = (0.03, 0.1)` sits far
+graph** (§5). And the paper's own practical `(τ, λ) = (0.1, 0.03)` sits far
 outside its normal-form guarantee, so the theory is directional guidance about
 which knobs stabilise learning, not a property the implementation has.
 
@@ -125,7 +134,8 @@ entirely**. They return only at test time (§14).
 | Dense `π′` vector per buffer sample | **Replaced — necessary.** Ragged storage (§12). |
 | Natural game termination | **Replaced — necessary.** 512-ply cap; capped episodes are dropped (§5). |
 | Self-play from the initial state | **Extended — necessary.** Seeded from foreign game prefixes (§5.2). |
-| `(τ, λ, λ_ret) = (0.03, 0.1, 0.883)` | **Starting values, expected to move** (§8). |
+| `(τ, λ) = (0.1, 0.03)`, verified against the paper | **Starting values, expected to move** (§8). |
+| `λ_ret = e^{-1/16} ≈ 0.939`, rescaled from the paper's `e^{-1/8}` | **Tweaked — necessary.** The paper's horizon is 8 transitions = 8 turns; 8 Hexo transitions is 4 turns, so carrying 0.883 would halve the strategic horizon (`KLENT_PROPOSALS.md` A1's correction). |
 | Adam, lr 1e-3, batch 4096 | **Unchanged as starting values.** |
 | Evaluate with `argmax π_θ`, no search | **Unchanged** (§11). |
 | Anchored pretrained opponent | **Unchanged** — a fixed pretrained checkpoint (§11). |
@@ -495,21 +505,23 @@ was seeded.
 
 ## 8. Regularisation at large `|A|`
 
-The paper unified `(τ, λ) = (0.03, 0.1)` across games with `b ∈ [7.5, 90.6]`. Two
-quantities in eq. 3 are functions of `|A|`:
+The paper unified `(τ, λ) = (0.1, 0.03)` across games with `b ∈ [7.5, 90.6]`
+(the pair as corrected in §1). Two quantities in eq. 3 are functions of `|A|`:
 
 - **The entropy term's scale.** Uniform entropy is `log b`: 4.5 nats at Hex's
-  b=90, 6.9 at b=1000. With `λ = 0.1` the entropy term contributes up to 0.69
-  against `Q ∈ [−1, 1]`, so the same coefficient buys substantially more
-  exploration pressure on Hexo than it did on Hex.
+  b=90, 6.9 at b=1000. With `λ = 0.03` the entropy term contributes up to ~0.21
+  against `Q ∈ [−1, 1]` — real exploration pressure that grows with the action
+  count, though less than the transposed reading once feared.
 - **The prior's strength.** Rearranged, eq. 3 is
-  `π′ ∝ π_θ^{τ/(τ+λ)} · exp(Q/(τ+λ))`, i.e. `π_θ^{0.23} · exp(Q/0.13)` at the
-  paper's values. An exponent below 1 flattens the prior, and it flattens it
-  across ten times as many tail actions here. The reverse-KL term is what makes
-  the update *gradual*, and its grip weakens as the action space grows.
+  `π′ ∝ π_θ^{τ/(τ+λ)} · exp(Q/(τ+λ))`, i.e. `π_θ^{0.77} · exp(Q/0.13)` at the
+  paper's values — a prior that mostly holds. An exponent below 1 still
+  flattens, and it flattens across ten times as many tail actions here; the
+  reverse-KL term is what makes the update *gradual*, and its grip weakens as
+  the action space grows, only from a stronger starting point than an exponent
+  of 0.23 would have given.
 
 So: treat **`τ/(τ+λ)`** as the knob rather than `τ` and `λ` separately, expect
-Hexo to want it closer to 1 than the paper's 0.23, and diagnose with quantities
+Hexo to want it at or above the paper's 0.77, and diagnose with quantities
 already normalised for action count — per-step `D_KL(π′ ‖ π_θ)` (their Figure 8)
 and `H(π′)/log|A_legal|` (their Figure 9 analogue), targeting the values they
 reached on Hex. Raw entropy is not comparable across positions in Hexo, because
