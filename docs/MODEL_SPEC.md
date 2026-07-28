@@ -418,19 +418,23 @@ a per-action value and no state value: its improvement step is
 `π′ ∝ exp[(Q + τ·log π_θ)/(τ+λ)]` and its bootstrap is `v̂ = E_{π′}[Q]`. The
 head that supplies `Q` is the §6 decoder shape with its own parameters
 everywhere — its own window projection, slot-class table, background-bucket
-table, and MLP — emitting one raw unbounded scalar per legal cell in engine
-legal order. Trained by squared error against the λ-return of the action
-actually taken (KLENT eq. 4); nothing softmaxes or clamps it.
+table, and MLP — emitting one scalar per legal cell in engine legal order,
+**bounded to `(−1, 1)` by a final `tanh`** as in the KLENT reference net's
+`PQNet` (its Q dense layer carries `activation="tanh"`): the improvement
+step exponentiates `Q/(τ+λ)`, and the bound caps how sharp π′ can get.
+Trained by squared error against the λ-return of the action actually taken
+(KLENT eq. 4).
 
-**Its MLP's output layer initializes to zero**, overriding §10's
-framework-default for that one layer, so `Q ≡ 0` until trained. This is a
-measured requirement, not a preference (2026-07-27): KLENT's improvement
-exponentiates `Q/(τ+λ)`, which at the §10 default turns initialization
-noise into sharp, arbitrary π′ targets; the first fitting epoch trains the
-policy toward them, seeded games stop terminating, and the training loop
-starves before Q has learned anything real. With a zero start, π′ opens as
-`π_θ^{τ/(τ+λ)}` — near the policy — and sharpens only as fitted returns
-give it reason to.
+**Both the policy decoder's and this head's MLP output layers initialize to
+zero**, overriding §10's framework-default for those two layers — the
+reference implementation's `zero_init` — so the policy opens uniform and
+`Q ≡ 0` until trained. This is a measured requirement, not a preference
+(2026-07-27, later found to match the reference config): KLENT's
+improvement exponentiates `Q/(τ+λ)`, which at the §10 default turns
+initialization noise into sharp, arbitrary π′ targets; the first fitting
+epoch trains the policy toward them and the training loop starves before Q
+has learned anything real. With a zero start, π′ opens uniform and sharpens
+only as fitted returns give it reason to.
 
 Like appendix A, this head reads the trunk's output and adds no inputs, so
 `MODEL_REPR_VERSION` is untouched. Under KLENT the §7 value head sits outside

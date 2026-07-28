@@ -5,9 +5,9 @@ bot for this exact game — 6-in-a-row on the infinite hex grid, one stone on
 the opening turn and two per turn after. It shares no code, no heuristic,
 and no training history with anything in this repo, which is what makes a
 score against it a strength measurement rather than a self-referential one:
-the line-builder anchor is our own seeding heuristic, and self-play metrics
-were measured to look perfect while a checkpoint lost 63/64 to it
-(``docs/KLENT_RUN_PLAN.md`` §3).
+self-play metrics were measured to look perfect while a checkpoint lost
+63/64 to an external opponent (``docs/KLENT_RUN_PLAN.md`` §3). It is the
+project's one evaluation, in the paper's anchored-external-opponent role.
 
 Interface facts this module leans on, checked against its source:
 
@@ -27,7 +27,7 @@ asserted against the engine's, and at each finished game the two rule
 implementations must name the same winner — a live cross-check between two
 independent rule implementations, in the spirit of the §12.1 oracles.
 
-Games run in seat-balanced pairs from shared line-builder openings: a
+Games run in seat-balanced pairs from shared uniform-random openings: a
 deterministic argmax policy against a mostly-deterministic searcher would
 otherwise replay near-identical games, and a paired design cancels opening
 luck out of the comparison.
@@ -54,7 +54,6 @@ from pathlib import Path
 import numpy as np
 
 from .evaluate import argmax_choose
-from .seeds import line_builder_choose_batch
 
 # SealBot's board covers [-70, 69] with ±5 window padding; refuse well clear.
 _COORD_LIMIT = 60
@@ -111,7 +110,7 @@ def _mirror(game_mod, moves):
 
 
 def _openings(rng: np.random.Generator, n: int, cut_range: tuple[int, int]):
-    """``n`` line-builder openings of uniform length in ``cut_range`` —
+    """``n`` uniform-random openings of uniform length in ``cut_range`` —
     short shared prefixes that decorrelate otherwise-deterministic games.
     Lengths ≤ 10 cannot be terminal (a win needs six stones of one colour)."""
     import hexo_py
@@ -119,15 +118,15 @@ def _openings(rng: np.random.Generator, n: int, cut_range: tuple[int, int]):
     lo, hi = cut_range
     if not 1 <= lo <= hi <= 10:
         raise ValueError(f"opening range must satisfy 1 <= lo <= hi <= 10: {cut_range}")
-    targets = rng.integers(lo, hi + 1, size=n)
-    positions = [hexo_py.Position() for _ in range(n)]
-    moves: list[list[tuple[int, int]]] = [[] for _ in range(n)]
-    for step in range(int(targets.max())):
-        group = [k for k in range(n) if step < targets[k]]
-        picked = line_builder_choose_batch([positions[k] for k in group], rng)
-        for k, move in zip(group, picked):
-            positions[k].advance(*move)
-            moves[k].append(move)
+    moves: list[list[tuple[int, int]]] = []
+    for target in rng.integers(lo, hi + 1, size=n):
+        pos = hexo_py.Position()
+        opening = []
+        for _ in range(int(target)):
+            move = pos.nth_legal(int(rng.integers(pos.legal_count)))
+            pos.advance(*move)
+            opening.append(move)
+        moves.append(opening)
     return moves
 
 
@@ -191,34 +190,6 @@ def _play_wave(states, choose, game_mod, rng, ply_cap):
         live = still
 
 
-def sealbot_opponent(root: Path, depth: int | None = 1, time_limit: float = 0.05,
-                     variant: str = "current"):
-    """A whole-turn *collection* opponent for grounded games:
-    ``opponent(position, moves) -> [(q, r), ...]``.
-
-    One engine is shared across every game — its transposition table is
-    position-keyed, so entries from other games are either irrelevant or
-    exact, and sharing keeps 256 concurrent games at one table (~32 MiB)
-    instead of gigabytes. The depth cap is the strength/speed knob
-    (~1 ms/turn at depth 1); the time limit is a backstop that rarely binds
-    under it. Eval matches (`sealbot_match`) deliberately do the opposite —
-    a fresh engine per game — because a measurement wants independence more
-    than throughput."""
-    game_mod, MinimaxBot = load_sealbot(root, variant)
-    bot = MinimaxBot(time_limit)
-    if depth is not None:
-        bot.max_depth = depth
-
-    def opponent(position, moves):
-        if any(max(abs(int(q)), abs(int(r))) > _COORD_LIMIT for q, r in moves):
-            raise RuntimeError(
-                f"game left SealBot's coordinate range (±{_COORD_LIMIT})"
-            )
-        return [(int(q), int(r)) for q, r in bot.get_move(_mirror(game_mod, moves))]
-
-    return opponent
-
-
 def _wilson(score: float, n: int, z: float = 1.96):
     p = score / n
     denom = 1 + z * z / n
@@ -246,22 +217,16 @@ def sealbot_match(
     variant: str = "current",
     opening_range: tuple[int, int] = (2, 6),
     max_depth: int | None = None,
-    chooser=None,
 ) -> dict:
     """``games`` seat-balanced games of argmax π_θ against SealBot, paired
     two per opening. Returns the model's score (win 1, cap ½) with a Wilson
     interval and its Elo transform, plus per-seat scores and SealBot's mean
-    search depth — the honest context for the headline number.
-
-    ``chooser`` replaces the model side entirely (``model``/``device`` are
-    then unused) — how non-model rungs like the line builder are measured."""
+    search depth — the honest context for the headline number."""
     if games < 2 or games % 2:
         raise ValueError(f"games must be even and >= 2 (paired seats): {games}")
     game_mod, MinimaxBot = load_sealbot(sealbot_root, variant)
-    if chooser is None:
-        model.eval()
-        chooser = argmax_choose(model, device)
-    choose = chooser
+    model.eval()
+    choose = argmax_choose(model, device)
 
     import hexo_py
 
@@ -341,8 +306,6 @@ def main(argv=None):
     target = parser.add_mutually_exclusive_group(required=True)
     target.add_argument("--checkpoint", type=Path, help="one checkpoint to measure")
     target.add_argument("--run", type=Path, help="run directory: measure the curve")
-    target.add_argument("--line-builder", action="store_true",
-                        help="measure the line-builder anchor instead of a model")
     parser.add_argument("--every", type=int, default=250,
                         help="with --run, iteration stride between measured checkpoints")
     parser.add_argument("--games", type=int, default=64)
@@ -355,19 +318,6 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     from .run import load_model
-
-    if args.line_builder:
-        from .evaluate import ANCHOR_NOISE
-
-        result = sealbot_match(
-            None, args.device, args.games, args.cap,
-            np.random.default_rng(args.seed), args.time, args.sealbot, args.variant,
-            max_depth=args.max_depth,
-            chooser=lambda ps, r: line_builder_choose_batch(ps, r, ANCHOR_NOISE),
-        )
-        print(f"line-builder({ANCHOR_NOISE})  {_fmt(result)}")
-        print(json.dumps(result))
-        return
 
     if args.checkpoint is not None:
         model = load_model(args.checkpoint, args.device)

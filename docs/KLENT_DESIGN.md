@@ -133,7 +133,7 @@ entirely**. They return only at test time (§14).
 | ResNetV2 + BatchNorm | **Replaced — necessary.** Variable-size inputs (§6.3). |
 | Dense `π′` vector per buffer sample | **Replaced — necessary.** Ragged storage (§12). |
 | Natural game termination | **Replaced — necessary.** 512-ply cap; capped episodes are dropped (§5). |
-| Self-play from the initial state | **Extended — necessary.** Seeded from foreign game prefixes (§5.2). |
+| Self-play from the initial state | **Unchanged.** Every episode starts from the empty board; the cold-start bootstrap, if one is needed, is a prefit that finishes before KLENT starts (§5.2). |
 | `(τ, λ) = (0.1, 0.03)`, verified against the paper | **Starting values, expected to move** (§8). |
 | `λ_ret = e^{-1/16} ≈ 0.939`, rescaled from the paper's `e^{-1/8}` | **Tweaked — necessary.** The paper's horizon is 8 transitions = 8 turns; 8 Hexo transitions is 4 turns, so carrying 0.883 would halve the strategic horizon (`KLENT_PROPOSALS.md` A1's correction). |
 | Adam, lr 1e-3, batch 4096 | **Unchanged as starting values.** |
@@ -149,7 +149,7 @@ baseline.
 
 ## 3. What Hexo forces, in one list
 
-The seven necessary deviations, each traceable to a property of the game rather
+The six necessary deviations, each traceable to a property of the game rather
 than to preference:
 
 1. **Ragged per-node heads** — the action space is unbounded (§6).
@@ -158,10 +158,16 @@ than to preference:
    different decisions (§7).
 4. **A 512-placement cap, with capped episodes dropped** — Hexo does not
    terminate on its own (§5).
-5. **Self-play seeded from foreign game prefixes** — without it, item 4 leaves an
-   empty buffer (§5.2).
-6. **Ragged/sparse `π′` storage** — a dense `|A|` vector does not exist (§12).
-7. **GroupNorm or LayerNorm instead of BatchNorm** — inputs vary in size (§6.3).
+5. **Ragged/sparse `π′` storage** — a dense `|A|` vector does not exist (§12).
+6. **GroupNorm or LayerNorm instead of BatchNorm** — inputs vary in size (§6.3).
+
+An earlier revision carried a seventh — self-play seeded from foreign game
+prefixes, with a warm-start heuristic phase and an annealed cut behind it —
+because item 4 leaves an untrained policy's buffer empty. It was removed
+whole (owner decision, 2026-07-28): the machinery grew into a curriculum the
+paper does not have, and its failure mode — self-play metrics perfect while
+strength against a real opponent died — was measured twice. §5.2 records
+what replaces it.
 
 ---
 
@@ -269,9 +275,6 @@ Excluded:
 - **Terminal positions.** No legal actions, no `π′`.
 - **Every ply of an episode that hit the cap.** Not just the tail — the early
   plies' returns depend on a terminal that does not exist (§5.1).
-- **Plies belonging to a seeded prefix** (§5.2). Their actions were not drawn from
-  `π′`, so including them breaks the on-policy assumption. They still shape the
-  state distribution, which is the point of seeding them.
 
 Ply 0 is included and harmless: one legal action, so `π′` is a point mass, `π_θ`
 masked to the legal set is a point mass, and the cross-entropy term is
@@ -370,43 +373,32 @@ be patched, all of which are things to watch:
   terminate. At `f = 0.5` you pay 2x per training sample; at `f = 0.1`, 10x. This
   is the term that dominates the compute budget (O1) and it is entirely a function
   of how often the agent actually wins.
-- **At `f = 0` the buffer is empty.** Not noisy, not biased — empty. Which is why
-  §5.2 is a necessary component and not an optimisation.
+- **At `f = 0` the buffer is empty.** Not noisy, not biased — empty. Which is
+  why a cold start needs §5.2's prefit before the loop can begin.
 
-### 5.2 Seeded starts
+### 5.2 The cold start: prefit, not in-loop seeding
 
-Self-play episodes begin from a **prefix of a game played by something that is
-not random**: replay `k` plies of a foreign game with `Position::replay`, then
-hand control to `π′` and continue to a win or the cap. `OPEN_DECISIONS.md` A3
-already settled that a start position *is* a move list and that there is no
-board-shaped construction path to abuse, so this costs no engine change.
+An untrained policy essentially never finishes a game, so a from-scratch run
+starves. The sanctioned answer is a **pretraining phase that finishes before
+KLENT starts**: fit `π_θ` (and optionally `Q_θ`) to a foreign corpus of
+finished games — human games, or another bot's — then hand the warmed
+checkpoint to the unmodified loop. Behaviour cloning is legal *there*
+precisely because it is not inside the loop; once KLENT begins, every episode
+starts from the empty board and every action is drawn from `π′`. This mirrors
+the paper's own evaluation anchor, a checkpoint pretrained outside the
+algorithm (Pgx's baseline models).
 
-Sources: an existing trained Hexo bot, which plays real Hexo and produces real
-terminations; the line-building driver already in
-`crates/hexo-engine/tests/smoke.rs`, which
-terminates games in tens of plies at a swept noise level and needs no checkpoint;
-and earlier checkpoints of the agent itself once any exist.
+An earlier revision instead seeded self-play episodes from foreign game
+prefixes, warm-started collection through a scripted heuristic, and annealed
+the seed cut against the measured `f`. All of it was removed (2026-07-28).
+What the removal cost is the ability to train from scratch without a corpus;
+what it bought is a loop with no curriculum machinery, no seeded/unseeded
+split in the corpus, and no way for prefix scheduling to fake progress —
+the measured failure of the seeded era was exactly self-play metrics
+looking perfect while strength against a real opponent died.
 
-Three properties this needs:
-
-- **Prefix length anneals toward zero**, driven by the measured terminating
-  fraction rather than by iteration count. Starting near-terminal gives backward
-  induction — the paper's own proof mechanism, and the behaviour their Count Up
-  Game figure shows empirically as values near terminals being learned first —
-  somewhere to start.
-- **Prefix plies stay out of the buffer** (§4.5).
-- **Seeded and unseeded episodes are distinguishable in the records**, so the
-  terminating fraction can be reported separately for each. An overall `f` carried
-  entirely by short seeded prefixes is not progress.
-
-This is not behaviour cloning. Training `π_θ` to imitate a foreign policy's moves
-would break the on-policy assumption outright; if wanted, that is a separate
-pretraining phase that finishes before KLENT starts.
-
-Note the coupling created by drawing seeds from the same family as the anchored
-opponent (§11): the train and test state distributions stop being independent.
-Using different bots for the two roles, or restricting seeds to the
-engine-internal line-building driver, keeps them separate.
+The `--starve-limit` guard makes the starving case loud: a run whose buffer
+stays empty stops with a checkpoint instead of burning the night.
 
 ---
 
@@ -587,12 +579,14 @@ scope here. Outside the baseline either way (§15).
 
 ## 11. Evaluation
 
-The anchor is **a fixed pretrained checkpoint**: never retrained, never used as
-a training opponent, wrapped as a player through the runner's
-transport-agnostic seam (`OPEN_DECISIONS.md` B1, `SUGGESTIONS.md` S6).
-Its own stochasticity setting must be pinned as part of the anchor definition —
-the paper's anchored opponent "selects actions stochastically based on its
-policy", and an anchor whose randomness drifts is not an anchor.
+The anchor is **SealBot** (`mantisnet.klent.sealbot`), an independent C++
+alpha-beta bot for this exact game: never trained, never a training opponent,
+sharing no code or heuristic with this repo — the same role the paper fills
+with Pgx's pretrained baseline checkpoints. It is the *only* evaluation
+(owner decision, 2026-07-28); a self-made heuristic anchor was measured to
+flatter exactly the failure it existed to catch. Its settings — per-turn time
+limit and search-depth cap — are pinned per run in `config.json`, because an
+anchor whose strength drifts is not an anchor.
 
 Protocol, following the paper so the curves are comparable:
 
@@ -654,10 +648,9 @@ cannot report them is not ready to run.
 
 | Metric | Why |
 | --- | --- |
-| **Terminating fraction `f` per iteration**, split seeded / unseeded | §5.1. Whether there is any training data, and the `1/f` multiplier on all compute. |
+| **Terminating fraction `f` per iteration** | §5.1. Whether there is any training data, and the `1/f` multiplier on all compute. |
 | **`D_KL(π′ ‖ π_θ)` per step** | §8. Whether updates are actually gradual. Their Figure 8. |
 | **`H(π′)/log|A_legal|`** | §8. Exploration, normalised so it is comparable across plies. |
-| Seeded-prefix length distribution | §5.2. Whether the curriculum is annealing or stuck. |
 | Game length distribution, terminated games only | Sets `λ_ret` and buffer sizing. |
 | Legal-count distribution; node and edge counts | Sets trunk cost, and confirms the `b` estimate this whole design rests on. |
 | P0 vs P1 win rate under self-play | Seat imbalance. |
@@ -750,29 +743,30 @@ runs on. Still needed:
 6. **`f`, the terminating fraction, is a first-class metric.** Under rule 5 it is
    not a diagnostic — it is the quantity that determines whether training data
    exists at all.
-7. **Self-play seeded from foreign game prefixes, annealed to zero.** Uses the
-   paper's own backward-induction mechanism, and costs no engine change because a
-   start position is already a move list (A3).
-8. **Prefix plies are excluded from the buffer.** They were not drawn from `π′`.
-9. **Per-node ragged heads over a graph: no crop, no bucket, no maximum.** A
+7. **Self-play starts from the empty board; the cold start is a prefit, not
+   in-loop seeding** (2026-07-28, reversing this ledger's earlier entry). The
+   seeded-prefix curriculum, its warm start, and its anneal were removed
+   whole; behaviour cloning on a foreign corpus is legal only as a phase that
+   finishes before KLENT begins (§5.2).
+8. **Per-node ragged heads over a graph: no crop, no bucket, no maximum.** A
    crop excludes out-of-crop legal moves and collapses training; a
    position-derived node set cannot reintroduce that.
-10. **The engine's canonical action ordering is the node ordering.** One mapping,
-    versioned by `ACTION_ORDER_VERSION`, shared by self-play, training, and
-    serving — a divergence there is silent and trains against scrambled targets.
-11. **GroupNorm or LayerNorm, never BatchNorm.** Variable-size inputs make batch
+9. **The engine's canonical action ordering is the node ordering.** One mapping,
+   versioned by `ACTION_ORDER_VERSION`, shared by self-play, training, and
+   serving — a divergence there is silent and trains against scrambled targets.
+10. **GroupNorm or LayerNorm, never BatchNorm.** Variable-size inputs make batch
     statistics meaningless.
-12. **`τ/(τ+λ)` is the knob, and diagnostics are normalised by `log|A_legal|`.**
+11. **`τ/(τ+λ)` is the knob, and diagnostics are normalised by `log|A_legal|`.**
     Both regularisers change strength with action count, and Hexo's action count
     moves inside a single game.
-13. **No V head. Dueling is outside the baseline.** Faithful to the paper's
+12. **No V head. Dueling is outside the baseline.** Faithful to the paper's
     Table 4, with the `1/b` coverage problem documented in §9 instead.
-14. **Records and training samples are one artefact.** B2's opaque per-move blob
+13. **Records and training samples are one artefact.** B2's opaque per-move blob
     *is* the buffer sample; a parallel shard writer alongside it is the thing
     being ruled out.
-15. **The anchor is a fixed pretrained checkpoint, and is never a training
-    opponent.** Pinned stochasticity, seat-balanced matches, `argmax π_θ` with
-    no search.
+14. **The anchor is SealBot, external and never a training opponent.** Pinned
+    time/depth settings, seat-balanced paired matches, `argmax π_θ` with no
+    search (2026-07-28; supersedes the earlier fixed-checkpoint wording).
 
 ---
 
@@ -789,6 +783,3 @@ runs on. Still needed:
   passes. One epoch, ~512 gradient steps, is the assumption until contradicted.
 - **O3 — derived window features in the observation.** §7. Deferred; an ablation,
   not an argument.
-- **O4 — seed/anchor coupling.** Drawing seeded prefixes from the same bot family
-  as the anchor couples the train and test state distributions (§5.2). Separate
-  bots for the two roles, or engine-internal seeds only, would decouple them.

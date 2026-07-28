@@ -11,11 +11,26 @@ document as they complete — it is a plan, not a changelog.
 ## 1. Where things stand
 
 The baseline is implemented and green (`python/mantisnet/README.md`): model,
-KLENT loop, 55 tests on Windows and WSL2. The run driver (`mantisnet.klent.run`)
+KLENT loop, 61 tests on Windows. The run driver (`mantisnet.klent.run`)
 persists what a run is: `config.json` with every knob and version,
 `metrics.jsonl` with the §13 metrics per iteration, and resumable checkpoints
 carrying model, optimizer, and RNG state. Evaluation runs in the driver
 (`--eval-every`, §4). Nothing here is a `ModelPackage` (§5, rung 5).
+
+**2026-07-28, the faithfulness reset (owner decision).** The in-loop
+machinery the first training nights accreted — line-builder seeded starts,
+the warm-start heuristic phase, the f-driven seed-cut anneal, and SealBot
+grounding inside collection — was removed whole, after checking the
+implementation against the authors' reference code
+([KazukiOhta/klent](https://github.com/KazukiOhta/klent)). Self-play runs
+from the empty board with no curriculum; the cold-start bootstrap, when
+needed, is a prefit on a foreign corpus before KLENT starts (design doc
+§5.2); SealBot is the only evaluation, in-driver via `--eval-every`.
+The same check landed two model-side fidelity fixes from the reference
+`PQNet`: the Q head is tanh-bounded to `(−1, 1)`, and *both* decoder output
+layers zero-initialize (the Q-side half of which the first training night
+had already discovered empirically). The §3 history below records the
+seeded/grounded era as measured; its mechanics are gone from the code.
 
 ---
 
@@ -42,13 +57,11 @@ correction). `KlentConfig.lam_ret` defaults to 0.939; the paper's literal
 0.883 stays one flag away, and if the λ_intra split (A1) ever lands the two
 knobs separate cleanly.
 
-### 2.3 Seed annealing — manual, for now
+### 2.3 Seed annealing — removed with the seeding (2026-07-28)
 
-`seed_fraction` and `seed_cut` are static config, adjusted by the operator
-against the reported `f_seeded`/`f_unseeded` — the design doc's requirement
-is that the annealing be *driven by the measured terminating fraction*, and
-for the first runs a human reading `metrics.jsonl` is that driver. An
-automated schedule is rung 2 of §5, earned only if manual proves tedious.
+Settled twice and then deleted: manual annealing gave way to the `--anneal`
+walk, and the whole seeding apparatus left with the faithfulness reset (§1).
+Kept here because §3's history reads against it.
 
 ### 2.4 The value head in checkpoints — deliberately open
 
@@ -210,22 +223,51 @@ stable self-play training at ≈ the warm clone's strength (eval ~0.65,
 peaks 0.82) — the loop *works*; exceeding the clone is what the next
 builds are for.
 
+### The first pure runs (2026-07-28, after the §1 reset)
+
+**`runs/pure-1`** forked from the overnight-3 endpoint at the paper's knobs
+(`--lam-ret 0.939 --lr 1e-3`, games 1024, no seeding, no grounding, SealBot
+depth-1 eval every 25). Two findings:
+
+- **Pure self-play needs no crutch from a trained start.** `f = 1.00` from
+  iteration 0, and the eval climbed 0 → 0.016 → 0.062 → **0.125** (8/64 off
+  depth-1 SealBot by iteration 124) — past anything the seeded/grounded era
+  posted.
+- **Mechanism 3 recurs even from a trained fork.** From ~iteration 130 the
+  λ-return's bootstrap ate the critic: winner-side and loser-side v̂ both
+  collapsed to ≈ 0 *while q_loss fell* — Q accurately fitting its own
+  collapsed targets, the diagnostic signature — and the ρ = 0.77 prior
+  exponent then flattened the policy wherever the now-flat Q gave it
+  nothing (H breathing 0.2 ↔ 0.96, won lengths 19 → 200 plies, 600 s
+  iterations, eval back to 0.016). At `λ_ret = 0.939` a target's grounding
+  in the terminal decays as `0.939^k`, so on Hexo's game lengths the
+  targets are almost pure bootstrap, and a weak critic (§9: `v̂_mae` never
+  below ~0.7) makes that a self-erasing fixed point. Stopped at ~175.
+
+**`runs/pure-2`** forks `pure-1/checkpoint_000100` (post-climb,
+pre-collapse) changing exactly one flag: `--lam-ret 1.0`. Monte-Carlo
+returns ground every ply in a real ±1 — the setting the only long stable
+run used. The λ-return returns when the critic earns it; the critic build
+that would earn it (dueling `Q = V + A`, or A2's Bernoulli critic — §9's
+named mitigations) is the next staged deviation if pure-2 holds its climb.
+
 ---
 
-## 4. Evaluation — in the driver, and what it still isn't
+## 4. Evaluation — SealBot, in the driver
 
-`--eval-every N` plays `argmax π_θ` (no search) against **anchor zero: the
-line builder at pinned noise** (`ANCHOR_NOISE` in `klent/evaluate.py` —
-pinned because an anchor whose randomness drifts is not an anchor). Seat
-balanced; capped games score ½ and stay visible as `eval_capped`. The score
-joins that iteration's `metrics.jsonl` row, and the eval RNG derives from
-(run seed, iteration) rather than the training stream — a run's training
-trajectory is bit-identical with evaluation on or off, tested.
+`--eval-every N` plays `argmax π_θ` (no search) in seat-balanced paired
+matches against **SealBot** (`--sealbot <root>`, depth capped by
+`--eval-depth`, per-turn time by `--eval-time` — pinned per run in
+`config.json`, because an anchor whose strength drifts is not an anchor).
+Capped games score ½ and stay visible as `eval_capped`. The score joins that
+iteration's `metrics.jsonl` row, and the eval RNG derives from (run seed,
+iteration) rather than the training stream — a run's training trajectory is
+bit-identical with evaluation on or off, tested. The line-builder anchor
+("anchor zero") is gone with the seeding: a self-made heuristic anchor was
+measured to flatter exactly the failure it existed to catch.
 
 Still future, deliberately:
 
-- The first strong checkpoint replaces the line builder as the frozen
-  anchor the design doc §11 wants, never retrained.
 - Games per point scale with budget (the paper used 1024; `--eval-games`
   defaults to 64, a health signal rather than a rating).
 - `KLENT_PROPOSALS.md` A7: the checkpoint cross-play matrix, as a
@@ -265,7 +307,11 @@ yardstick for closing it now exists: **score against depth-1 SealBot is
 the next headline metric**, with survival plies as the gradient while the
 score sits at zero.
 
-### Opponent grounding — landed same day (2026-07-28)
+### Opponent grounding — landed and removed the same day (2026-07-28)
+
+> Removed in the §1 faithfulness reset; kept as the record of what was
+> measured. The `abl-gnd*` ablation arms were stopped unfinished (~iteration
+> 277 of 1300); `runs/abl-gnd25` keeps its checkpoints and metrics.
 
 `--ground-fraction F --sealbot <root> --ground-depth 1` seats a
 depth-capped SealBot in one (alternating) side of `F` of each iteration's
@@ -319,9 +365,9 @@ iteration).
 
 In order; each rung is small and none blocks the one above it being useful.
 
-1. **First real run** (256+ games/iteration, days of wall clock), seed
-   annealing by hand from the metrics; automate the anneal only if manual
-   proves tedious.
+1. **First real run** (256+ games/iteration, days of wall clock), pure
+   self-play from a trained checkpoint (`--init-from`), watched through the
+   SealBot eval.
 2. **Measured deviations from the baseline**, each gated on the baseline's
    own curves and staged per `KLENT_PROPOSALS.md` A4 (screen at ~10% budget,
    promote on improvement): the λ_intra split (A1), the Bernoulli

@@ -1,0 +1,70 @@
+"""A scripted line-extending player for tests.
+
+Scores each legal cell by the stone count of its best own live window, with
+a six-completing cell scored decisively above every extension — so games
+reliably terminate in tens of plies without a trained model. Exposed through
+the same seams the network uses: an evaluator ``(batch) -> (logits, q)`` for
+the collection loop and a batched chooser ``(positions, rng) -> moves`` for
+matches. Test machinery only; the training path knows nothing of it.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+from mantisnet.builder import NUM_PATTERNS, PATTERN_STONES, collate_positions
+
+_STONES = torch.from_numpy(PATTERN_STONES)
+
+
+def heuristic_scores(batch) -> torch.Tensor:
+    """Per legal cell: the stone count of its best own live window, with a
+    six-completing cell scored decisively above every extension."""
+    own = batch.window_feat < NUM_PATTERNS
+    wscore = torch.where(own, _STONES[batch.window_feat % NUM_PATTERNS], 0)
+    per_cell = torch.zeros(batch.n_cells)
+    per_cell.index_reduce_(
+        0, batch.dec_cell, wscore.index_select(0, batch.dec_window).float(), "amax"
+    )
+    return torch.where(per_cell >= 5, 8.0, per_cell)
+
+
+def heuristic_evaluate(batch):
+    """The scores as an evaluator: cell scores as both policy logits and Q."""
+    scores = heuristic_scores(batch)
+    return scores, scores.clone()
+
+
+def heuristic_choose(positions, rng: np.random.Generator, noise: float = 0.0):
+    """One placement per position: each game's best-scoring legal cell, with
+    ``noise`` chance of a uniformly random legal move. Ties break randomly
+    so two heuristic players produce different games."""
+    batch = collate_positions(positions)
+    scores = heuristic_scores(batch).numpy()
+    offsets = batch.legal_offsets.tolist()
+    moves = []
+    for k, pos in enumerate(positions):
+        segment = scores[offsets[k] : offsets[k + 1]]
+        if rng.random() < noise:
+            moves.append(pos.nth_legal(int(rng.integers(len(segment)))))
+        else:
+            top = np.flatnonzero(segment == segment.max())
+            moves.append(pos.nth_legal(int(top[rng.integers(len(top))])))
+    return moves
+
+
+def heuristic_game(rng: np.random.Generator, noise: float = 0.1, cap: int = 512):
+    """One whole heuristic game from the empty board.
+
+    Returns ``(moves, winner)`` with ``winner`` ``None`` where the cap hit.
+    """
+    import hexo_py
+
+    pos = hexo_py.Position()
+    moves: list[tuple[int, int]] = []
+    while not pos.is_terminal and len(moves) < cap:
+        move = heuristic_choose([pos], rng, noise)[0]
+        pos.advance(*move)
+        moves.append(move)
+    return moves, pos.winner if pos.is_terminal else None

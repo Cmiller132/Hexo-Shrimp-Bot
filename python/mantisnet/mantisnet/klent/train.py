@@ -1,11 +1,12 @@
 """The KLENT iteration: collect an on-policy buffer, fit once, discard it.
 
 Faithful to the paper's outer loop (design doc §1): a self-play phase fills
-the buffer, one fitting epoch consumes it (O2's assumption), and nothing
-survives to the next iteration. The loss is eq. 4 — cross-entropy of π_θ
-against π′ plus squared error of the taken action's Q against the λ-return —
-under plain Adam at the paper's learning rate. The value head appears
-nowhere: KLENT has no state-value head, and v̂ = E_{π′}[Q] does its job.
+the buffer, one fitting epoch consumes it (the reference implementation's
+``fitting_epochs=1``), and nothing survives to the next iteration. The loss
+is eq. 4 — cross-entropy of π_θ against π′ plus squared error of the taken
+action's Q against the λ-return — under plain Adam at the paper's learning
+rate. The value head appears nowhere: KLENT has no state-value head, and
+v̂ = E_{π′}[Q] does its job.
 """
 
 from __future__ import annotations
@@ -19,16 +20,15 @@ import torch
 
 from ..builder import collate_prefixes
 from ..losses import policy_loss
-from .seeds import line_evaluate, seed_prefixes
 from .selfplay import Sample, collection_stats, play_episodes
 
 
 @dataclass
 class KlentConfig:
-    """Design doc §2's starting values, expected to move — not defaults to trust."""
+    """The paper's values wherever Hexo permits them (design doc §2)."""
 
-    # Verified against the paper's eq. 2 (2026-07-27): reverse KL is the
-    # heavier regulariser. Prior exponent tau/(tau+lam) = 0.77.
+    # Verified against the paper's eq. 2 and the reference implementation:
+    # reverse KL is the heavier regulariser. Prior exponent tau/(tau+lam) = 0.77.
     tau: float = 0.1  # reverse-KL weight (the paper's beta)
     lam: float = 0.03  # entropy weight (the paper's alpha)
     # e^{-1/16}: the paper's 8-turn horizon at Hexo's two placements per turn
@@ -36,14 +36,6 @@ class KlentConfig:
     lam_ret: float = 0.939
     ply_cap: int = 512  # §5: capped episodes are dropped whole
     games_per_iteration: int = 128
-    seed_fraction: float = 1.0  # §5.2: anneal toward zero as f allows
-    # Opponent grounding: this fraction of each iteration's games puts an
-    # external whole-turn opponent in one (alternating) seat, unseeded. Only
-    # the model's plies are recorded, with Monte-Carlo outcomes; capped
-    # grounded games are draws. 0 = pure self-play.
-    ground_fraction: float = 0.0
-    seed_cut: tuple = (1, 8)  # plies cut from a won seed game's end
-    seed_noise: float = 0.1
     batch_size: int = 4096  # paper's *effective* batch: chunks accumulate to it
     lr: float = 1e-3  # paper's Adam rate
     device: str = "cpu"
@@ -230,77 +222,23 @@ def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.rando
     }
 
 
-def generate_prefixes(seed: int, n: int, seed_fraction: float, seed_cut, seed_noise):
-    """One iteration's seed prefixes, from a self-contained RNG. The seed
-    games play in lockstep (`seed_prefixes`) — generating them one at a
-    time was the loop's single largest measured cost."""
-    prng = np.random.default_rng(seed)
-    seeded = prng.random(n) < seed_fraction
-    drawn = iter(seed_prefixes(prng, int(seeded.sum()), seed_cut, seed_noise))
-    return [next(drawn) if s else [] for s in seeded]
-
-
-def ground_count(cfg: KlentConfig, warm: bool) -> int:
-    """How many of an iteration's games are grounded: none during warm —
-    the bootstrap clones the line builder before any opponent can judge it."""
-    return 0 if warm else round(cfg.ground_fraction * cfg.games_per_iteration)
-
-
-def collect_episodes(
-    model,
-    cfg: KlentConfig,
-    rng: np.random.Generator,
-    warm: bool = False,
-    prefixes: list | None = None,
-    opponent=None,
-) -> tuple[list, dict]:
+def collect_episodes(model, cfg: KlentConfig, rng: np.random.Generator) -> tuple[list, dict]:
     """One iteration's corpus: episodes plus the §13 collection metrics.
 
     Worker-safe by construction — it draws only from the ``rng`` it is
     given and mutates only the episodes it creates, which is what lets the
     run driver collect iteration ``i+1`` on a weight snapshot while
-    iteration ``i`` fits on the live model.
-
-    ``warm`` is the bootstrap phase: collection acts through the line
-    builder's scores instead of the network, because an honestly-initialized
-    π′ is near-uniform and finishes almost no seeded games — measured, not
-    supposed. (Warm episodes must also fit against pure Monte-Carlo returns
-    — the heuristic's v̂ lives on an arbitrary scale and must not bootstrap;
-    the driver owns that choice of ``lam_ret``.)
-
-    ``prefixes`` covers the *self-play* games only — ``ground_count`` games
-    are grounded against ``opponent`` (unseeded, alternating seats) and take
-    no prefix. Left ``None``, they are drawn here from ``rng``."""
-    n_ground = ground_count(cfg, warm)
-    if n_ground and opponent is None:
-        raise ValueError("ground_fraction > 0 needs an opponent")
-    n_self = cfg.games_per_iteration - n_ground
-    if prefixes is None:
-        prefixes = generate_prefixes(
-            int(rng.integers(2**63)),
-            n_self,
-            cfg.seed_fraction,
-            cfg.seed_cut,
-            cfg.seed_noise,
-        )
-    if len(prefixes) != n_self:
-        raise ValueError(
-            f"{len(prefixes)} prefixes for {n_self} self-play games "
-            f"({n_ground} of {cfg.games_per_iteration} are grounded)"
-        )
+    iteration ``i`` fits on the live model."""
     model.eval()
     episodes, metrics = play_episodes(
-        line_evaluate if warm else network_evaluate(model, cfg),
-        [[]] * n_ground + list(prefixes),
+        network_evaluate(model, cfg),
+        cfg.games_per_iteration,
         cfg.ply_cap,
         cfg.tau,
         cfg.lam,
         rng,
         pair_budget=cfg.pair_budget,
         cell_budget=cfg.cell_budget,
-        opponent=opponent,
-        opponent_seats=[g % 2 for g in range(n_ground)] + [None] * n_self,
     )
     metrics.update(collection_stats(episodes))
-    metrics["warm"] = int(warm)
     return episodes, metrics

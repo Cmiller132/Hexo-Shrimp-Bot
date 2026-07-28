@@ -18,18 +18,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_rules_agree_over_line_builder_games():
+def test_rules_agree_over_heuristic_games():
     """Every hexo-engine game replays into SealBot's HexGame placement for
     placement — same legality, same turn structure, same winner. A second,
     unrelated rules implementation acting as an oracle."""
     from mantisnet.klent.sealbot import _mirror, load_sealbot
-    from mantisnet.klent.seeds import line_builder_game
+
+    from .heuristic import heuristic_game
 
     game_mod, _ = load_sealbot(SEALBOT)
     rng = np.random.default_rng(2)
     finished = 0
     for _ in range(15):
-        moves, winner = line_builder_game(rng, noise=0.1)
+        moves, winner = heuristic_game(rng, noise=0.1)
         g = _mirror(game_mod, [tuple(m) for m in moves])
         if winner is None:
             assert not g.game_over
@@ -37,26 +38,7 @@ def test_rules_agree_over_line_builder_games():
         finished += 1
         assert g.game_over
         assert g.winner.value - 1 == winner
-    assert finished >= 5, "the line builder should usually finish games"
-
-
-def test_sealbot_opponent_grounds_collection():
-    """Real SealBot as the grounding opponent: legal whole turns, finished
-    games, records on the model side only."""
-    from mantisnet.klent import play_episodes
-    from mantisnet.klent.sealbot import sealbot_opponent
-
-    from .test_klent_pipeline import heuristic_evaluate
-
-    opponent = sealbot_opponent(SEALBOT, depth=1, time_limit=0.05)
-    episodes, _ = play_episodes(
-        heuristic_evaluate, [[], []], 200, 0.1, 0.03, np.random.default_rng(3),
-        opponent=opponent, opponent_seats=[0, 1],
-    )
-    for ep, seat in zip(episodes, (0, 1)):
-        assert ep.winner is not None, "SealBot finishes games"
-        assert all(m == 1 - seat for m in ep.movers)
-        assert len(ep.ts) < len(ep.moves)
+    assert finished >= 5, "the heuristic player should usually finish games"
 
 
 def test_sealbot_match_smoke():
@@ -71,6 +53,10 @@ def test_sealbot_match_smoke():
     model = MantisNet(
         MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5)
     )
+    # The zero-init policy head argmaxes to the first legal cell every ply —
+    # a monotone march off SealBot's board. Untrained-but-varied is the
+    # scenario wanted here, so give the head real weights.
+    torch.nn.init.normal_(model.mlp_p.out.weight, std=0.1)
     result = sealbot_match(
         model, "cpu", games=2, ply_cap=80, rng=np.random.default_rng(0),
         time_limit=0.02, sealbot_root=SEALBOT,

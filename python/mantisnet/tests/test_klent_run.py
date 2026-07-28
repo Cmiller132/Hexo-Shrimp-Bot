@@ -11,22 +11,19 @@ import torch
 from mantisnet.klent import Episode, collection_stats, play_episodes
 from mantisnet.klent.run import load_checkpoint, main
 
-from .test_klent_pipeline import heuristic_evaluate
+from .heuristic import heuristic_evaluate
 
 
-def _episode(winner, movers, v_hats, seed_len=0, moves_remaining=None, opponent_seat=None):
+def _episode(winner, movers, v_hats, moves_remaining=None):
     n = len(movers)
     return Episode(
-        moves=[(0, 0)] * (seed_len + n),
-        seed_len=seed_len,
+        moves=[(0, 0)] * n,
         winner=winner,
         moves_remaining=moves_remaining or [1] * n,
         movers=movers,
         ranks=[0] * n,
         improved=[np.ones(1, dtype=np.float32)] * n,
         v_hats=v_hats,
-        ts=list(range(seed_len, seed_len + n)),
-        opponent_seat=opponent_seat,
     )
 
 
@@ -37,14 +34,13 @@ def test_collection_stats_by_hand():
         v_hats=[0.5, -0.5, 1.0],
         moves_remaining=[1, 1, 2],  # the win lands on a first stone
     )
-    capped = _episode(winner=None, movers=[1], v_hats=[9.0], seed_len=4)
+    capped = _episode(winner=None, movers=[1], v_hats=[9.0])
     stats = collection_stats([won, capped])
 
-    assert stats["f_unseeded"] == 1.0  # the won one is unseeded
-    assert stats["f_seeded"] == 0.0
+    assert stats["f"] == 0.5
     assert stats["p0_win_rate"] == 1.0
     assert stats["first_stone_win_rate"] == 1.0
-    assert stats["seed_len_mean"] == 4.0 and stats["seed_len_max"] == 4
+    assert stats["won_length_mean"] == 3.0
     # Calibration reads the won episode only: z = (+1, -1, +1) for movers
     # (0, 1, 0) with winner 0, so the capped episode's v = 9 never appears.
     assert stats["v_hat_winner_mean"] == pytest.approx((0.5 + 1.0) / 2)
@@ -54,14 +50,12 @@ def test_collection_stats_by_hand():
 
 def test_collection_stats_from_real_collection():
     rng = np.random.default_rng(21)
-    episodes, _ = play_episodes(
-        heuristic_evaluate, [[] for _ in range(6)], ply_cap=200, tau=0.1, lam=0.03, rng=rng
-    )
+    episodes, _ = play_episodes(heuristic_evaluate, 6, ply_cap=200, tau=0.1, lam=0.03, rng=rng)
     stats = collection_stats(episodes)
+    assert 0.0 <= stats["f"] <= 1.0
     assert 0.0 <= stats["p0_win_rate"] <= 1.0
     assert 0.0 <= stats["first_stone_win_rate"] <= 1.0
     assert stats["v_hat_mae"] >= 0.0
-    assert stats["f_seeded"] != stats["f_seeded"] or stats["f_seeded"] >= 0  # nan ok
 
 
 def test_run_resume_and_artifacts(tmp_path):
@@ -69,7 +63,6 @@ def test_run_resume_and_artifacts(tmp_path):
     args = [
         "--out", str(out), "--games", "2", "--cap", "24", "--batch", "64",
         "--checkpoint-every", "1", "--device", "cpu", "--seed", "3",
-        "--seed-cut", "1", "3",
     ]
     main(args + ["--iterations", "2"])
 
@@ -79,12 +72,12 @@ def test_run_resume_and_artifacts(tmp_path):
     lines = (out / "metrics.jsonl").read_text().splitlines()
     assert len(lines) == 2
     row = json.loads(lines[-1])
-    for key in ("iteration", "seconds", "f_seeded", "acting_kl", "v_hat_mae"):
+    for key in ("iteration", "seconds", "f", "acting_kl", "v_hat_mae"):
         assert key in row
     assert (out / "checkpoint_000002.pt").exists()
 
     # Resume finds the latest checkpoint and appends rather than restarting;
-    # a knob changed on resume (the anneal path) lands on the record.
+    # a knob changed on resume lands on the record.
     main(args + ["--iterations", "3", "--resume", "--lam", "0.05"])
     lines = (out / "metrics.jsonl").read_text().splitlines()
     assert len(lines) == 3
@@ -102,60 +95,54 @@ def test_run_resume_and_artifacts(tmp_path):
     with pytest.raises(SystemExit, match="not empty"):
         main(args + ["--iterations", "1"])
 
+    # In-driver eval is SealBot or nothing.
+    with pytest.raises(SystemExit, match="sealbot"):
+        main(["--out", str(tmp_path / "x"), "--iterations", "1", "--eval-every", "1"])
+
 
 def test_eval_in_driver_leaves_training_untouched(tmp_path):
-    """The anchor match reports into the metrics row without perturbing the
+    """``evaluate_fn`` reports into the metrics row without perturbing the
     training stream: the same run with eval off is bit-identical."""
-    base = [
-        "--games", "2", "--cap", "24", "--batch", "64",
-        "--checkpoint-every", "2", "--device", "cpu", "--seed", "5",
-        "--seed-cut", "1", "3", "--iterations", "2",
-    ]
-    main(["--out", str(tmp_path / "plain")] + base)
-    main(
-        ["--out", str(tmp_path / "evaled")]
-        + base
-        + ["--eval-every", "1", "--eval-games", "2"]
-    )
+    from mantisnet import MantisConfig, MantisNet
+    from mantisnet.klent import run as run_mod
+    from mantisnet.klent.train import KlentConfig
+
+    def build():
+        torch.manual_seed(2)
+        model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
+        return model, torch.optim.Adam(model.parameters())
+
+    cfg = KlentConfig(games_per_iteration=2, ply_cap=24, batch_size=64)
+    fake_eval = lambda m, done: {"eval_score": 0.5, "eval_capped": 0, "eval_games": 2}  # noqa: E731
+    for name, eval_every in (("plain", 0), ("evaled", 1)):
+        model, opt = build()
+        run_mod.run_training(
+            model, opt, cfg, iterations=2, out_dir=tmp_path / name,
+            rng=np.random.default_rng(5), checkpoint_every=2,
+            eval_every=eval_every, evaluate_fn=fake_eval if eval_every else None,
+        )
 
     read = lambda name: [  # noqa: E731
         json.loads(line)
         for line in (tmp_path / name / "metrics.jsonl").read_text().splitlines()
     ]
     for plain, evaled in zip(read("plain"), read("evaled"), strict=True):
-        assert 0.0 <= evaled["eval_score"] <= 1.0
-        assert evaled["eval_games"] == 2 and 0 <= evaled["eval_capped"] <= 2
-        assert evaled["eval_seconds"] > 0
+        assert evaled["eval_score"] == 0.5
+        assert evaled["eval_games"] == 2 and evaled["eval_capped"] == 0
+        assert evaled["eval_seconds"] >= 0
         for key in plain:
             if key != "seconds":
                 assert evaled[key] == plain[key], key
 
-    config = json.loads((tmp_path / "evaled" / "config.json").read_text())
-    assert config["eval_every"] == 1 and config["eval_anchor_noise"] == 0.1
 
-
-def test_frozen_anchor_and_crossplay(tmp_path):
-    """A checkpoint serves as the frozen eval opponent, and the A7 matrix
-    plays every checkpoint pair of a run."""
+def test_crossplay_plays_every_checkpoint_pair(tmp_path):
+    """The A7 matrix plays every checkpoint pair of a run."""
     from mantisnet.klent.crossplay import cross_play
 
     out = tmp_path / "run"
-    base = [
-        "--games", "2", "--cap", "16", "--batch", "64",
-        "--device", "cpu", "--seed-cut", "1", "3",
-    ]
     main(["--out", str(out), "--seed", "4", "--checkpoint-every", "1",
-          "--iterations", "2"] + base)
-    anchor = out / "checkpoint_000001.pt"
-
-    out2 = tmp_path / "run2"
-    main(["--out", str(out2), "--seed", "5", "--checkpoint-every", "1",
-          "--iterations", "1", "--eval-every", "1", "--eval-games", "2",
-          "--eval-anchor", str(anchor)] + base)
-    row = json.loads((out2 / "metrics.jsonl").read_text().splitlines()[-1])
-    assert 0.0 <= row["eval_score"] <= 1.0
-    invocation = json.loads((out2 / "invocations.jsonl").read_text().splitlines()[0])
-    assert invocation["eval_anchor"].endswith("checkpoint_000001.pt")
+          "--iterations", "2", "--games", "2", "--cap", "16", "--batch", "64",
+          "--device", "cpu"])
 
     matrix = cross_play(out, games=2, ply_cap=12, device="cpu", seed=0)
     pair = "checkpoint_000001.pt vs checkpoint_000002.pt"
@@ -171,10 +158,7 @@ def test_starvation_stops_the_run(tmp_path, monkeypatch):
     from mantisnet.klent import run as run_mod
     from mantisnet.klent.train import KlentConfig
 
-    starved = {
-        "f_seeded": 0.0, "f_unseeded": float("nan"), "warm": 0,
-        "acting_kl": 0.0, "acting_norm_entropy": 0.99,
-    }
+    starved = {"f": 0.0, "acting_kl": 0.0, "acting_norm_entropy": 0.99}
     monkeypatch.setattr(run_mod, "collect_episodes", lambda *a, **k: ([], dict(starved)))
 
     torch.manual_seed(0)
@@ -192,40 +176,6 @@ def test_starvation_stops_the_run(tmp_path, monkeypatch):
     lines = (tmp_path / "metrics.jsonl").read_text().splitlines()
     assert len(lines) == 3  # the limit, not the 50 requested
     assert (tmp_path / "checkpoint_000003.pt").exists()
-
-
-def test_anneal_walks_the_cut_by_measured_f(tmp_path, monkeypatch):
-    """§5.2 mechanised: the cut ceiling deepens while seeded games keep
-    terminating, backs off when they stop, and lands in every metrics row."""
-    from mantisnet import MantisConfig, MantisNet
-    from mantisnet.klent import run as run_mod
-    from mantisnet.klent.train import KlentConfig
-
-    cfg = KlentConfig(games_per_iteration=8, seed_cut=(1, 8), ply_cap=64)
-    fs = iter([1.0, 1.0, 1.0, 0.1, 0.1, float("nan"), 1.0])
-
-    def fake_collect(model, c, rng, warm=False, prefixes=None, opponent=None):
-        return [], {
-            "f_seeded": next(fs), "f_unseeded": 1.0, "warm": 0,
-            "acting_kl": 0.0, "acting_norm_entropy": 0.5,
-        }
-
-    monkeypatch.setattr(run_mod, "collect_episodes", fake_collect)
-    torch.manual_seed(0)
-    model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
-    run_mod.run_training(
-        model,
-        torch.optim.Adam(model.parameters()),
-        cfg,
-        iterations=7,
-        out_dir=tmp_path,
-        rng=np.random.default_rng(0),
-        checkpoint_every=100,
-        anneal=True,
-    )
-    rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
-    # +2 at f=1.0, -4 at f=0.1, held at NaN, +2 again.
-    assert [r["seed_cut_hi"] for r in rows] == [10, 12, 14, 10, 6, 6, 8]
 
 
 def test_checkpoint_refuses_version_drift(tmp_path):

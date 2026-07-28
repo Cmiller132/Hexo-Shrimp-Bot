@@ -223,13 +223,14 @@ class MantisNet(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
         nn.init.normal_(self.token_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
-        # Appendix B: the Q decoder's output layer starts at zero, so Q ≡ 0
-        # until trained. KLENT's π′ ∝ π_θ^{τ/(τ+λ)}·exp(Q/(τ+λ)) sharpens
-        # *initialization noise* otherwise — measured to poison the seeded
-        # bootstrap: the first fit trains the policy toward arbitrary sharp
-        # targets and seeded games stop terminating.
-        nn.init.zeros_(self.mlp_q.out.weight)
-        nn.init.zeros_(self.mlp_q.out.bias)
+        # Appendix B: both decoder output layers start at zero — the KLENT
+        # reference net's `zero_init` — so π_θ opens uniform and Q ≡ 0 until
+        # trained. π′ ∝ π_θ^{τ/(τ+λ)}·exp(Q/(τ+λ)) sharpens *initialization
+        # noise* otherwise, measured to train the first fit toward arbitrary
+        # sharp targets.
+        for head in (self.mlp_p, self.mlp_q):
+            nn.init.zeros_(head.out.weight)
+            nn.init.zeros_(head.out.bias)
 
     def _buckets(self, batch: Batch) -> Tensor:
         """Distance buckets for every padded row pair, once per forward (§4.1)."""
@@ -284,8 +285,12 @@ class MantisNet(nn.Module):
         return self._decode_cells(w, g, batch, self.p, self.e_pw, self.e_bg, self.mlp_p)
 
     def q_head(self, w: Tensor, g: Tensor, batch: Batch) -> Tensor:
-        """Appendix B: one raw action value per legal cell, same layout."""
-        return self._decode_cells(w, g, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q)
+        """Appendix B: one action value per legal cell, same layout, bounded
+        to (−1, 1) by tanh as in the KLENT reference net — π′ exponentiates
+        Q/(τ+λ), so an unbounded Q could sharpen without limit."""
+        return torch.tanh(
+            self._decode_cells(w, g, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q)
+        )
 
     def value_head(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """§7: (value, value_dist, value_logits). Multi-query attention

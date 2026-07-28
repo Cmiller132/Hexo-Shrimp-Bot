@@ -4,15 +4,16 @@ What a run leaves behind is the run directory — `config.json` (every knob and
 version the run depended on), `metrics.jsonl` (one line per iteration; the
 §13 metrics are the experiment, so they persist), and periodic checkpoints
 carrying model, optimizer, RNG state, and the iteration counter, so a crash
-loses at most one checkpoint interval. `--eval-every N` plays the anchor
-match (argmax π_θ vs the line builder at pinned noise, seat balanced) and
-merges its score into that iteration's metrics row; the eval RNG is derived
-from (run seed, iteration), never drawn from the training stream, so a run's
-training trajectory is identical with evaluation on or off.
+loses at most one checkpoint interval. `--eval-every N` plays a seat-balanced
+paired match against SealBot — the independent external yardstick, and the
+only evaluation — and merges its score into that iteration's metrics row;
+the eval RNG is derived from (run seed, iteration), never drawn from the
+training stream, so a run's training trajectory is identical with evaluation
+on or off.
 
 Run from python/mantisnet:
 
-    uv run python -m mantisnet.klent.run --out runs/shakeout-1 \
+    uv run python -m mantisnet.klent.run --out runs/pure-1 \
         --iterations 100 --games 64
 
 Resume after an interruption with `--resume` (the latest checkpoint in the
@@ -35,9 +36,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..builder import MODEL_REPR_VERSION
 from ..model import MantisConfig, MantisNet
-from .evaluate import ANCHOR_NOISE, anchor_match, argmax_choose
 from .selfplay import episode_samples
-from .train import KlentConfig, collect_episodes, fit, generate_prefixes, ground_count
+from .train import KlentConfig, collect_episodes, fit
 
 
 def _versions() -> dict:
@@ -68,7 +68,7 @@ def save_checkpoint(path: Path, model, optimizer, iteration: int, rng) -> None:
 
 
 def load_model(path: Path, device: str = "cpu"):
-    """A checkpoint's model half, version-checked — the frozen eval anchor.
+    """A checkpoint's model half, version-checked.
 
     Architecture comes from the default :class:`MantisConfig`, which is what
     every run trains; a checkpoint from other shapes fails the state-dict
@@ -118,87 +118,49 @@ def run_training(
     eval_every: int = 0,
     evaluate_fn=None,
     starve_limit: int = 10,
-    warm_iterations: int = 0,
-    anneal: bool = False,
-    opponent=None,
 ) -> None:
     """The pipelined loop: while iteration ``i`` fits on the main thread,
-    iteration ``i+1``'s prefixes generate and its episodes collect on a
-    worker, acting through a snapshot of the weights as they stood *before*
-    fit ``i``. The corpus therefore runs one fit behind the paper's strict
-    alternation — the deliberate cost of overlapping the loop's CPU half
-    with its GPU half, recorded here because it is an algorithmic property,
-    not an implementation detail. Collection draws from its own
-    per-iteration stream (seeded off the main one at submission), so a
-    resumed run replays the same corpus.
+    iteration ``i+1``'s episodes collect on a worker, acting through a
+    snapshot of the weights as they stood *before* fit ``i``. The corpus
+    therefore runs one fit behind the paper's strict alternation — the
+    deliberate cost of overlapping the loop's CPU half with its GPU half,
+    recorded here because it is an algorithmic property, not an
+    implementation detail. Collection draws from its own per-iteration
+    stream (seeded off the main one at submission), so a resumed run replays
+    the same corpus.
 
     ``evaluate_fn(model, done) -> dict`` runs every ``eval_every`` completed
     iterations and its fields join that iteration's metrics row.
 
-    ``starve_limit`` is the unattended-run guard: a policy that has collapsed
-    to uniform stops finishing seeded games, and every further iteration is
-    ~`ply_cap` plies of collection for an empty buffer. After this many
-    consecutive iterations yielding under one sample per game, the run stops
-    loudly (checkpointing first) instead of burning the night. 0 disables.
-
-    ``anneal`` is the design doc's §5.2 requirement made mechanical: the
-    seed-cut ceiling deepens while seeded games keep terminating (f ≥ 0.8)
-    and backs off when they stop (f < 0.3), so the corpus walks backward
-    from the endgame instead of parking on trivial near-terminal stubs —
-    measured to happen with a static cut: self-play stays perfect while
-    strength against a real opponent dies. The live ceiling is recorded in
-    every metrics row as ``seed_cut_hi``, and it is applied to the
-    *collection being submitted*, so a walk step reaches the corpus one
-    iteration later.
+    ``starve_limit`` is the unattended-run guard: a policy that stops
+    finishing games buys ~`ply_cap` plies of collection per iteration for an
+    empty buffer. After this many consecutive iterations yielding under one
+    sample per game, the run stops loudly (checkpointing first) instead of
+    burning the night. 0 disables.
     """
     starved = 0
-    cut_lo, cut_hi = cfg.seed_cut
     out_dir.mkdir(parents=True, exist_ok=True)
     # The collection actor: a persistent clone the worker forwards through
     # while fit mutates the live model. Reloaded (cheap, on-device copies)
     # at each submission, when the worker is idle by construction.
     snapshot = copy.deepcopy(model)
 
-    def submit_collect(pool, for_iteration):
-        warm = for_iteration < warm_iterations
-        frozen = dataclasses.replace(cfg)  # the anneal mutates cfg between iterations
-        prefix_seed = int(rng.integers(2**63))
+    def submit_collect(pool):
         play_seed = int(rng.integers(2**63))
-        if not warm:
-            snapshot.load_state_dict(model.state_dict())
-
-        def job():
-            prefixes = generate_prefixes(
-                prefix_seed,
-                frozen.games_per_iteration - ground_count(frozen, warm),
-                frozen.seed_fraction,
-                frozen.seed_cut,
-                frozen.seed_noise,
-            )
-            return collect_episodes(
-                snapshot, frozen, np.random.default_rng(play_seed),
-                warm=warm, prefixes=prefixes, opponent=opponent,
-            ), warm
-
-        return pool.submit(job)
+        snapshot.load_state_dict(model.state_dict())
+        return pool.submit(
+            collect_episodes, snapshot, cfg, np.random.default_rng(play_seed)
+        )
 
     with (
         (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file,
         ThreadPoolExecutor(max_workers=1) as pool,
     ):
-        pending = submit_collect(pool, start_iteration)
+        pending = submit_collect(pool)
         for i in range(start_iteration, iterations):
             t0 = time.perf_counter()
-            (episodes, metrics), was_warm = pending.result()
+            episodes, metrics = pending.result()
             metrics["iteration"] = i
-            if anneal and i >= warm_iterations:
-                f = metrics["f_seeded"]
-                if f >= 0.8:
-                    cut_hi = min(cut_hi + 2, cfg.ply_cap)
-                elif f < 0.3:
-                    cut_hi = max(cut_lo, cut_hi - 4)
-                cfg.seed_cut = (cut_lo, cut_hi)
-            metrics["seed_cut_hi"] = cut_hi
             # The first processed iteration stays sequential: its fit is the
             # train-graph torch.compile, and a concurrent collection hitting
             # the same compiled callable mid-compile was measured to livelock
@@ -206,24 +168,20 @@ def run_training(
             # graphs exist and collection overlaps fit.
             overlap = i > start_iteration
             if overlap and i + 1 < iterations:
-                pending = submit_collect(pool, i + 1)  # overlaps the fit below
-            samples = [
-                s
-                for e in episodes
-                for s in episode_samples(e, 1.0 if was_warm else cfg.lam_ret)
-            ]
+                pending = submit_collect(pool)  # overlaps the fit below
+            samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret)]
             metrics["buffer_samples"] = len(samples)
             if samples:
                 metrics.update(fit(model, samples, optimizer, cfg, rng))
             if not overlap and i + 1 < iterations:
-                pending = submit_collect(pool, i + 1)
+                pending = submit_collect(pool)
             metrics["seconds"] = time.perf_counter() - t0  # eval kept out: this
             done = i + 1  # column is the recompile/leak detector and must stay flat
             if eval_every and evaluate_fn is not None and done % eval_every == 0:
                 t1 = time.perf_counter()
                 metrics.update(evaluate_fn(model, done))
                 metrics["eval_seconds"] = time.perf_counter() - t1
-            # NaN (an empty stat, e.g. f_unseeded with no unseeded games)
+            # NaN (an empty stat, e.g. won_length_mean with nothing won)
             # becomes null: a `NaN` token would make the file invalid JSON
             # for exactly the tools an operator points at it.
             row = {k: None if v != v else v for k, v in metrics.items()}
@@ -235,13 +193,10 @@ def run_training(
                 )
             line = (
                 f"iteration {i}: {metrics['seconds']:.1f}s | "
-                f"f {metrics['f_seeded']:.2f}/{metrics['f_unseeded']:.2f} | "
+                f"f {metrics['f']:.2f} | "
                 f"buffer {metrics['buffer_samples']} | "
                 f"H/log|A| {metrics['acting_norm_entropy']:.3f}"
             )
-            gnd = metrics.get("grounded_score")
-            if gnd is not None and gnd == gnd:
-                line += f" | gnd {gnd:.2f}"
             if "eval_score" in metrics:
                 line += (
                     f" | eval {metrics['eval_score']:.3f}"
@@ -256,7 +211,7 @@ def run_training(
                 )
                 print(
                     f"stopping starved: {starved} consecutive iterations under "
-                    f"one sample per game — the policy has collapsed; "
+                    f"one sample per game — games are not finishing; "
                     f"checkpoint_{done:06d}.pt written",
                     flush=True,
                 )
@@ -272,8 +227,6 @@ def main(argv=None) -> None:
     ap.add_argument("--tau", type=float, default=KlentConfig.tau)
     ap.add_argument("--lam", type=float, default=KlentConfig.lam)
     ap.add_argument("--lam-ret", type=float, default=KlentConfig.lam_ret)
-    ap.add_argument("--seed-fraction", type=float, default=1.0)
-    ap.add_argument("--seed-cut", type=int, nargs=2, default=[1, 8], metavar=("LO", "HI"))
     ap.add_argument(
         "--batch", type=int, default=KlentConfig.batch_size,
         help="effective fitting batch, accumulated across packed chunks",
@@ -290,40 +243,24 @@ def main(argv=None) -> None:
     ap.add_argument("--checkpoint-every", type=int, default=25)
     ap.add_argument(
         "--eval-every", type=int, default=0,
-        help="anchor match every N iterations (0 = off)",
+        help="SealBot match every N iterations (0 = off; needs --sealbot)",
     )
     ap.add_argument("--eval-games", type=int, default=64)
     ap.add_argument(
-        "--eval-anchor", type=Path, default=None,
-        help="a frozen checkpoint as the eval opponent (default: the line builder)",
+        "--sealbot", type=Path, default=None,
+        help="SealBot checkout root, the external eval opponent",
+    )
+    ap.add_argument(
+        "--eval-depth", type=int, default=1,
+        help="SealBot's search-depth cap during eval matches",
+    )
+    ap.add_argument(
+        "--eval-time", type=float, default=0.05,
+        help="SealBot's per-turn time limit (rarely binds under the depth cap)",
     )
     ap.add_argument(
         "--starve-limit", type=int, default=10,
         help="stop after N consecutive starved iterations (0 = never)",
-    )
-    ap.add_argument(
-        "--warm-iterations", type=int, default=0,
-        help="bootstrap iterations acting through the line builder's scores",
-    )
-    ap.add_argument(
-        "--anneal", action="store_true",
-        help="deepen the seed cut while f_seeded holds (design doc §5.2)",
-    )
-    ap.add_argument(
-        "--ground-fraction", type=float, default=0.0,
-        help="fraction of each iteration's games grounded against SealBot",
-    )
-    ap.add_argument(
-        "--sealbot", type=Path, default=None,
-        help="SealBot checkout root (required when --ground-fraction > 0)",
-    )
-    ap.add_argument(
-        "--ground-depth", type=int, default=1,
-        help="the grounding opponent's search-depth cap",
-    )
-    ap.add_argument(
-        "--ground-time", type=float, default=0.05,
-        help="the grounding opponent's per-turn time limit (rarely binds under the depth cap)",
     )
     ap.add_argument(
         "--init-from", type=Path, default=None,
@@ -335,8 +272,8 @@ def main(argv=None) -> None:
     ap.add_argument("--resume", action="store_true", help="continue from the run dir's latest checkpoint")
     args = ap.parse_args(argv)
 
-    if args.ground_fraction > 0 and args.sealbot is None:
-        raise SystemExit("--ground-fraction > 0 needs --sealbot")
+    if args.eval_every > 0 and args.sealbot is None:
+        raise SystemExit("--eval-every > 0 needs --sealbot")
     if args.resume and args.init_from is not None:
         raise SystemExit("--resume and --init-from are exclusive")
 
@@ -346,9 +283,6 @@ def main(argv=None) -> None:
         lam_ret=args.lam_ret,
         ply_cap=args.cap,
         games_per_iteration=args.games,
-        seed_fraction=args.seed_fraction,
-        seed_cut=tuple(args.seed_cut),
-        ground_fraction=args.ground_fraction,
         batch_size=args.batch,
         pair_budget=args.pair_budget,
         cell_budget=args.cell_budget,
@@ -379,6 +313,10 @@ def main(argv=None) -> None:
         if args.init_from is not None:
             forked = load_checkpoint(args.init_from, model, optimizer)
             print(f"initialized from {args.init_from} ({forked} iterations trained)")
+    # A restored optimizer state carries the *source run's* learning rate in
+    # its param groups; the invocation's --lr is the truth, not that relic.
+    for group in optimizer.param_groups:
+        group["lr"] = cfg.lr
         out.mkdir(parents=True, exist_ok=True)
         config = {
             "klent": dataclasses.asdict(cfg),
@@ -387,33 +325,29 @@ def main(argv=None) -> None:
             "checkpoint_every": args.checkpoint_every,
             "eval_every": args.eval_every,
             "eval_games": args.eval_games,
-            "eval_anchor_noise": ANCHOR_NOISE,
+            "eval_depth": args.eval_depth,
+            "eval_time": args.eval_time,
+            "sealbot": str(args.sealbot) if args.sealbot else None,
             "seed": args.seed,
             "init_from": str(args.init_from) if args.init_from else None,
-            "sealbot": str(args.sealbot) if args.sealbot else None,
-            "ground_depth": args.ground_depth,
-            "ground_time": args.ground_time,
             "versions": _versions(),
         }
         (out / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     # Every invocation records its resolved knobs: a resume may legitimately
-    # change them (the seed curriculum anneals by stop-and-resume), and a
-    # run whose later knobs exist only in shell history does not reproduce.
+    # change them, and a run whose later knobs exist only in shell history
+    # does not reproduce.
     invocation = {
         "start_iteration": start,
         "iterations": args.iterations,
         "checkpoint_every": args.checkpoint_every,
         "eval_every": args.eval_every,
         "eval_games": args.eval_games,
-        "eval_anchor": str(args.eval_anchor) if args.eval_anchor else None,
-        "starve_limit": args.starve_limit,
-        "warm_iterations": args.warm_iterations,
-        "anneal": args.anneal,
-        "init_from": str(args.init_from) if args.init_from else None,
+        "eval_depth": args.eval_depth,
+        "eval_time": args.eval_time,
         "sealbot": str(args.sealbot) if args.sealbot else None,
-        "ground_depth": args.ground_depth,
-        "ground_time": args.ground_time,
+        "starve_limit": args.starve_limit,
+        "init_from": str(args.init_from) if args.init_from else None,
         "seed": args.seed,
         "klent": dataclasses.asdict(cfg),
         "versions": _versions(),
@@ -421,30 +355,29 @@ def main(argv=None) -> None:
     with (out / "invocations.jsonl").open("a", encoding="utf-8") as f:
         f.write(json.dumps(invocation) + "\n")
 
-    opponent = None
-    if args.eval_anchor is not None:
-        opponent = argmax_choose(load_model(args.eval_anchor, cfg.device), cfg.device)
+    evaluate_fn = None
+    if args.eval_every > 0:
+        from .sealbot import sealbot_match
 
-    ground_opponent = None
-    if args.ground_fraction > 0:
-        from .sealbot import sealbot_opponent
-
-        ground_opponent = sealbot_opponent(
-            args.sealbot, depth=args.ground_depth, time_limit=args.ground_time
-        )
-
-    def evaluate_fn(m, done):
-        # Seeded from (run seed, iteration), never the training stream: the
-        # training trajectory is identical with evaluation on or off, and a
-        # resumed run replays the same matches it would have played.
-        return anchor_match(
-            m,
-            cfg.device,
-            args.eval_games,
-            cfg.ply_cap,
-            np.random.default_rng([args.seed, done]),
-            opponent=opponent,
-        )
+        def evaluate_fn(m, done):
+            # Seeded from (run seed, iteration), never the training stream:
+            # the training trajectory is identical with evaluation on or off,
+            # and a resumed run replays the same matches it would have played.
+            result = sealbot_match(
+                m,
+                cfg.device,
+                args.eval_games,
+                cfg.ply_cap,
+                np.random.default_rng([args.seed, done]),
+                args.eval_time,
+                args.sealbot,
+                max_depth=args.eval_depth,
+            )
+            return {
+                "eval_score": result["win_rate"],
+                "eval_capped": result["capped"],
+                "eval_games": result["games"],
+            }
 
     run_training(
         model,
@@ -458,9 +391,6 @@ def main(argv=None) -> None:
         eval_every=args.eval_every,
         evaluate_fn=evaluate_fn,
         starve_limit=args.starve_limit,
-        warm_iterations=args.warm_iterations,
-        anneal=args.anneal,
-        opponent=ground_opponent,
     )
 
 

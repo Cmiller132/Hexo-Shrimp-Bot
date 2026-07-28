@@ -31,13 +31,12 @@ python/mantisnet/
     klent/
       improve.py      # eq. 3 closed form: π′, v̂, and the §13 diagnostics
       returns.py      # the sign on mover change, the λ-return
-      seeds.py        # the line-building seeder / fixed opponent
       selfplay.py     # batched collection, acting-time v̂, buffer rules, stats
       train.py        # KlentConfig, the fit epoch, the iteration
-      evaluate.py     # argmax π_θ, seat-balanced matches, the anchor match
+      evaluate.py     # the argmax chooser, seat-balanced match machinery
       run.py          # the run driver: config.json, metrics.jsonl, checkpoints
       crossplay.py    # the A7 checkpoint round-robin, the forgetting detector
-      sealbot.py      # the external yardstick: matches vs a SealBot checkout
+      sealbot.py      # the one evaluation: matches vs a SealBot checkout
   tests/              # the two specs' obligations, one file per concern
   bench/
     bench_forward.py  # builder and forward throughput at spec defaults
@@ -59,7 +58,7 @@ uv run python bench/bench_forward.py # throughput on CPU and the local GPU
 | `model` | `MantisConfig` (the §2 named parameters), `MantisNet`, `ModelOutput`. `trunk` and the three head methods are separate so a caller pays only for the heads it reads. |
 | `losses` | `value_target` (two-hot projection), `value_loss`, `policy_loss` (segmented CE over ragged engine-order logits), `param_groups` (§10 decay split). |
 | `segments` | The ragged per-position reductions everything above and below shares. |
-| `klent` | The KLENT baseline: operator, returns, seeding, collection, fitting, evaluation. See below. |
+| `klent` | The KLENT baseline: operator, returns, collection, fitting, evaluation. See below. |
 
 ## Design notes
 
@@ -113,11 +112,19 @@ uv run python bench/bench_forward.py # throughput on CPU and the local GPU
 ## KLENT
 
 `mantisnet/klent/` implements `docs/KLENT_DESIGN.md`'s baseline — the paper's
-algorithm at the design doc's seven forced deviations and nothing else. The
-accepted items of `KLENT_PROPOSALS.md` (the λ_intra split, the Bernoulli
-critic, the dual controller) are deliberately not in it: the design doc lists
-them as diffs to be decided, and a faithful baseline has to exist before a
-deviation from it can be measured.
+algorithm at the design doc's forced deviations and nothing else, checked
+against the authors' reference implementation
+([KazukiOhta/klent](https://github.com/KazukiOhta/klent)). The accepted items
+of `KLENT_PROPOSALS.md` (the λ_intra split, the Bernoulli critic, the dual
+controller) are deliberately not in it: the design doc lists them as diffs to
+be decided, and a faithful baseline has to exist before a deviation from it
+can be measured. The in-loop crutches an earlier revision carried — seeded
+starts from line-builder prefixes, a warm-start heuristic phase, an f-driven
+seed-cut anneal, and SealBot grounding inside collection — were removed whole
+(owner decision, 2026-07-28): self-play runs from the empty board, period.
+If a cold start starves (an untrained policy essentially never finishes a
+game — the design doc's §5 premise), the sanctioned bootstrap is a prefit on
+a foreign corpus *before* KLENT begins, not machinery inside the loop.
 
 - **The model KLENT trains is trunk + policy head + Q head.** The Q head is
   the §6 decoder shape with its own parameters (spec appendix B); the §7
@@ -136,82 +143,65 @@ deviation from it can be measured.
   and episodes scored by the real sign/λ-return machinery must average back
   to `Q*`. K1, K3, and K5 all move the fixed point and fail it.
 - **The buffer rules are the design doc's, with no cases added:** capped
-  episodes dropped whole (K4), seeded prefix plies never recorded, terminal
-  positions never samples, `v̂` captured at acting time (K6), and fitting
-  refuses a sample whose stored π′ no longer matches its position's legal
-  count. States are stored as move prefixes and rebuilt by replay (§12).
-- **Seeding is the line builder**, the checkpoint-free source the design doc
-  names, and the same scoring is the warm-start evaluator
-  (`--warm-iterations`) and the fixed evaluation opponent. The cut anneal is
-  earned and mechanical (`--anneal`): the ceiling deepens while measured `f`
-  holds and backs off when it falls, recorded per row as `seed_cut_hi` —
-  a static cut was measured to park the corpus on trivial endgame stubs
-  while strength died. Its known gap: `f` measures termination, not
-  competence; the successor is a competence-gated walk.
+  episodes dropped whole (K4 — the reference implementation's NaN-masked
+  unterminated tail, as a whole-episode drop), terminal positions never
+  samples, `v̂` captured at acting time (K6), and fitting refuses a sample
+  whose stored π′ no longer matches its position's legal count. States are
+  stored as move prefixes and rebuilt by replay (§12).
 - **Collection goes through one seam**: `evaluate(batch) -> (policy_logits,
   q_values)` on CPU. Training wraps the network; the pipeline tests wrap a
-  scripted line-extender, which is how the buffer rules are testable without
-  a trained model.
+  scripted line-extender (`tests/heuristic.py`), which is how the buffer
+  rules are testable without a trained model.
 - **The default coefficients are paper-verified, not carried.** `τ = 0.1`
   (reverse KL) and `λ = 0.03` (entropy) per the paper's eq. 2 — the design
   doc's original pair was transposed and is corrected — and
   `λ_ret = e^{-1/16}`, the paper's 8-turn horizon at Hexo's two placements
-  per turn. Operationally the first runs use `--lam-ret 1.0`: with a young
-  Q, a 0.94-weight bootstrap erases the warm start (measured — the
-  run plan's training-night record); the λ-return returns when v̂ has
-  earned trust. `docs/KLENT_RUN_PLAN.md` §2/§3 record all of it.
+  per turn. `docs/KLENT_RUN_PLAN.md` §2/§3 record the verification and the
+  measured history.
 - **A run is its directory.** `python -m mantisnet.klent.run --out runs/<name>
   --iterations N` writes `config.json` (knobs + versions), `metrics.jsonl`
   (strict JSON, one row per iteration: the §13 metrics including the
   v̂-vs-outcome calibration that watches the §9 bias), `invocations.jsonl`
-  (every process that touched the run, with its resolved knobs — the anneal
-  path changes them on resume), and resumable checkpoints; `--resume`
-  continues after a crash and refuses a checkpoint from other versions.
-  `--eval-every N` plays `argmax π_θ` against the line builder at pinned
-  noise (or a frozen checkpoint via `--eval-anchor`) — seat balanced, caps
-  scored ½ and kept visible — with an eval RNG derived from (run seed,
-  iteration) so the training trajectory is identical with evaluation on or
-  off. `--starve-limit` ends a collapsed run with a checkpoint instead of a
-  burned night, and `mantisnet.klent.crossplay` plays the A7 checkpoint
-  round-robin. `docs/KLENT_RUN_PLAN.md` is the operational plan, §3 of it
-  the measured history, around this driver.
-- **`mantisnet.klent.sealbot` is the external yardstick** — seat-balanced
+  (every process that touched the run, with its resolved knobs), and
+  resumable checkpoints; `--resume` continues after a crash and refuses a
+  checkpoint from other versions; `--init-from` forks a fresh run (own
+  seed, iteration 0) from a trained checkpoint. `--eval-every N` plays the
+  SealBot match in-driver (`--sealbot <root>`, `--eval-depth`) and merges
+  the score into that iteration's metrics row, with an eval RNG derived
+  from (run seed, iteration) so the training trajectory is identical with
+  evaluation on or off. `--starve-limit` ends a collapsed run with a
+  checkpoint instead of a burned night, and `mantisnet.klent.crossplay`
+  plays the A7 checkpoint round-robin. `docs/KLENT_RUN_PLAN.md` is the
+  operational plan, §3 of it the measured history, around this driver.
+- **`mantisnet.klent.sealbot` is the one evaluation** — seat-balanced
   paired matches against [SealBot](https://github.com/Ramora0/SealBot), an
   independent C++ alpha-beta bot for this exact game, from a machine-local
   checkout (`--sealbot <root>`; build its `minimax_cpp` there first —
-  MSVC via `setup.py build_ext --inplace` works). Its rules implementation
-  is held to agree with `hexo-engine` on every placement and winner (a live
+  MSVC via `setup.py build_ext --inplace` works). It stands in the paper's
+  anchored-external-opponent role: it shares no code or training history
+  with this repo, which is what makes its score a strength measurement
+  self-play conditioning cannot flatter. Its rules implementation is held
+  to agree with `hexo-engine` on every placement and winner (a live
   second-implementation oracle; setting `SEALBOT_ROOT` enables the tests),
   its moves are asserted legal, and `hexo_py` stays authoritative.
   `--max-depth` caps its search for graded rungs; `--run <dir> --every N`
   writes a strength curve to `sealbot_curve.jsonl`. First measurement
   (2026-07-28): the overnight-3 endpoint loses 0/64 even at depth 1 — the
   run plan §4 has the table and what it says about racing vs defending.
-- **Opponent grounding puts that opponent in the corpus**
-  (`--ground-fraction`, with `--sealbot`/`--ground-depth`): that fraction
-  of each iteration's games seats a depth-capped SealBot on one
-  (alternating) side, unseeded. Its whole turns enter the move list but
-  never the records — the buffer holds only the model's decisions, judged
-  by an outcome a real opponent enforced. Grounded returns are pure
-  Monte-Carlo whatever `lam_ret` says (the λ-return's bootstrap chain
-  breaks at unrecorded opponent plies), and a capped grounded game is a
-  draw (g = 0) rather than dropped: surviving a killer is an outcome, and
-  the only gradient toward defense while wins are out of reach. The f
-  stats stay self-play-only so the anneal keeps its signal; grounded games
-  report `f_grounded` and a per-iteration `grounded_score` (`gnd` on the
-  console) instead. Grounding is off during warm iterations, and
-  `--init-from` forks a fresh run (own seed, iteration 0) from a trained
-  checkpoint — how ablation arms share a parent.
 
 ```python
 from mantisnet import MantisConfig, MantisNet
-from mantisnet.klent import KlentConfig, iterate
+from mantisnet.klent import KlentConfig, collect_episodes, episode_samples, fit
 import numpy as np, torch
 
 model = MantisNet(MantisConfig()).to("cuda")
 cfg = KlentConfig(device="cuda", autocast=True, games_per_iteration=32)
 opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-metrics = iterate(model, opt, cfg, np.random.default_rng(0))  # f, KL, H/log|A|, losses
+rng = np.random.default_rng(0)
+episodes, metrics = collect_episodes(model, cfg, rng)  # f, KL, H/log|A|, …
+samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret)]
+if samples:
+    metrics.update(fit(model, samples, opt, cfg, rng))
 ```
 
 ## Deliberately absent
@@ -239,40 +229,30 @@ pool (worst-case-dense positions):
 | Forward, compiled, bf16 autocast | ~9.4 k pos/s (27 ms/batch) |
 | Forward, eager, bf16 autocast | ~4.4 k pos/s |
 | Collection, steady state (256 games, trained policy) | ~9.3 k pos/s (~0.35 s) |
-| KLENT iteration, pipelined (1024 games, ground 0.25) | ~2.3 s at ~14.8 k samples (~6.3 k samples/s end to end) |
-| Anchor eval, 128 games | ~0.3 s (was ~6 s sequential) |
+| KLENT iteration, pipelined (1024 games) | ~2.3 s at ~14.8 k samples (~6.3 k samples/s end to end) |
 | KLENT iteration (64 games, cap 512, iteration 0, untrained) | ~36 s — the capped-tail worst case |
 
-Three loop-level facts behind those numbers. **Choosers are batched**
+Two loop-level facts behind those numbers. **Choosers are batched**
 (`choose(positions, rng) -> moves`): `play_match` advances every live game
 per lockstep step with one collate and one forward per side, which is the
-~20× on evaluation. **Seed prefixes generate on a worker thread** during
-the previous iteration — they depend on nothing the model learns, so their
-~0.5 s leaves the critical path (`generate_prefixes`, seeded off the main
-stream for resume-reproducibility). **Sampling is one uniform per game**
-against the stored π′ CDF rather than a per-game `rng.choice`.
+~20× on evaluation. **Sampling is one uniform per game** against the
+stored π′ CDF rather than a per-game `rng.choice`.
 
 **The loop is pipelined: collection overlaps fitting** (2026-07-28, after
 a phase-level profile). The sequential loop plateaued at ~3.2 k samples/s
-whatever the game count, and the profile said why: ~0.9 s of every 2 s
-iteration was *prefix generation* playing seed games one at a time
-(4,000+ batch-of-one collates), another ~0.3 s was fit-side Python and a
-per-chunk GPU sync, and the GPU idled at ~6% between small bursts. The
-fixes, in measured order of value: seed games now play in lockstep
-cohorts (`line_builder_games` — prefix cost ~10× down); iteration
-``i+1``'s prefixes + collection run on a worker thread against a weight
-snapshot while iteration ``i`` fits on the live model (the corpus runs
-one fit behind the strict alternation — an algorithmic property,
-documented in `run_training`); the per-game sampling loop is one flat
-CDF + one vectorized `searchsorted` per chunk; fit preps each chunk one
-ahead on a worker and accumulates its loss scalars on-device (one host
-sync per iteration, not per chunk).
+whatever the game count — CPU orchestration with the GPU at ~6% duty. The
+fixes, in measured order of value: iteration ``i+1``'s collection runs on
+a worker thread against a weight snapshot while iteration ``i`` fits on
+the live model (the corpus runs one fit behind the strict alternation —
+an algorithmic property, documented in `run_training`); the per-game
+sampling loop is one flat CDF + one vectorized `searchsorted` per chunk;
+fit preps each chunk one ahead on a worker and accumulates its loss
+scalars on-device (one host sync per iteration, not per chunk).
 
-Measured at the operating point (games 1024, ground 0.25, warm caches):
+Measured at the operating point (games 1024, warm caches):
 **2.34 s/iteration at ~14.8 k samples — ~6.3 k samples/s end to end, 2×
 the sequential loop** — scaling with games again (512 → ~4.8 k/s), GPU
-bursting to 90–98% with ~5.0 GiB reserved. Depth-1 SealBot grounding
-still costs ~nothing (~1 ms/turn).
+bursting to 90–98% with ~5.0 GiB reserved.
 
 Two threading facts the pipeline depends on. **Every compiled-callable
 invocation holds one lock** (`train._gpu_lock`): a dynamo (re)compile on

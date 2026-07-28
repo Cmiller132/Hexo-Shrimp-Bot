@@ -1,9 +1,9 @@
 """Self-play collection, the buffer rules, fitting, and the whole iteration.
 
-The collection loop is exercised through the evaluator seam with a scripted
-line-extending evaluator — the same seam the network uses — so games
-reliably terminate and every buffer rule is observable without a trained
-model.
+The collection loop is exercised through the evaluator seam with the
+scripted line-extending evaluator (``tests/heuristic.py``) — the same seam
+the network uses — so games reliably terminate and every buffer rule is
+observable without a trained model.
 """
 
 from __future__ import annotations
@@ -21,13 +21,9 @@ from mantisnet.klent import (
     play_match,
 )
 from mantisnet.klent.evaluate import argmax_choose
-from mantisnet.klent.seeds import line_evaluate, line_scores, seed_prefix
 from mantisnet.klent.train import _pack, fit, network_evaluate
 
-# The line builder's scoring through the evaluator seam, so games terminate
-# and the buffer rules are observable without a trained model — the same
-# evaluator the warm start acts through.
-heuristic_evaluate = line_evaluate
+from .heuristic import heuristic_choose, heuristic_evaluate
 
 
 def _tiny_model():
@@ -38,24 +34,6 @@ def _tiny_model():
             policy_hidden=32, value_hidden=32,
         )
     )
-
-
-def test_warm_iteration_trains_through_the_line_evaluator():
-    """The warm start: collection acts through the line builder, games
-    finish, and both heads fit on Monte-Carlo outcomes."""
-    model = _tiny_model()
-    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
-    cfg = KlentConfig(games_per_iteration=8, ply_cap=200, batch_size=256)
-    episodes, metrics = collect_episodes(model, cfg, np.random.default_rng(9), warm=True)
-    assert metrics["warm"] == 1
-    samples = [s for e in episodes for s in episode_samples(e, 1.0)]
-    assert samples, "line play must terminate games"
-    out = fit(model, samples, opt, cfg, np.random.default_rng(9))
-    assert out["fit_steps"] >= 1
-    assert any(
-        p.grad is not None and float(p.grad.abs().sum()) > 0
-        for p in model.mlp_q.parameters()
-    ), "the zero-initialized Q head must receive warm gradients"
 
 
 def test_fit_packing_respects_budgets_and_loses_nothing():
@@ -83,9 +61,7 @@ def test_accumulated_gradients_match_one_big_batch():
     """Chunking is memory, not optimization: an epoch forced into many tiny
     chunks accumulates to the same gradients as one whole-buffer batch."""
     rng = np.random.default_rng(3)
-    episodes, _ = play_episodes(
-        heuristic_evaluate, [[] for _ in range(4)], 100, 0.1, 0.03, rng
-    )
+    episodes, _ = play_episodes(heuristic_evaluate, 4, 100, 0.1, 0.03, rng)
     samples = [s for e in episodes for s in episode_samples(e, 0.939)][:24]
     assert len(samples) >= 12
 
@@ -112,9 +88,7 @@ def test_collection_is_chunking_invariant():
     outcomes = []
     for budgets in ({}, {"pair_budget": 2_000, "cell_budget": 400}):
         rng = np.random.default_rng(11)
-        episodes, _ = play_episodes(
-            heuristic_evaluate, [[] for _ in range(5)], 60, 0.1, 0.03, rng, **budgets
-        )
+        episodes, _ = play_episodes(heuristic_evaluate, 5, 60, 0.1, 0.03, rng, **budgets)
         outcomes.append([(e.moves, e.winner) for e in episodes])
     assert outcomes[0] == outcomes[1]
 
@@ -122,7 +96,7 @@ def test_collection_is_chunking_invariant():
 def test_heuristic_selfplay_terminates_and_buffers_correctly():
     rng = np.random.default_rng(7)
     episodes, metrics = play_episodes(
-        heuristic_evaluate, [[] for _ in range(8)], ply_cap=200, tau=0.03, lam=0.1, rng=rng
+        heuristic_evaluate, 8, ply_cap=200, tau=0.03, lam=0.1, rng=rng
     )
     won = [e for e in episodes if e.winner is not None]
     assert len(won) >= 4, "the line-extending evaluator should usually finish games"
@@ -133,7 +107,7 @@ def test_heuristic_selfplay_terminates_and_buffers_correctly():
         if ep.winner is None:
             assert samples == []  # K4: capped episodes contribute nothing
             continue
-        # Unseeded: every ply is a sample, the win included, and G_T = +1.
+        # Every ply is a sample, the win included, and G_T = +1.
         assert len(samples) == len(ep.moves)
         assert samples[-1].g == 1.0
         assert all(np.isfinite(s.g) for s in samples)
@@ -144,9 +118,7 @@ def test_heuristic_selfplay_terminates_and_buffers_correctly():
 
 def test_samples_replay_to_their_positions():
     rng = np.random.default_rng(8)
-    episodes, _ = play_episodes(
-        heuristic_evaluate, [[]], ply_cap=200, tau=0.03, lam=0.1, rng=rng
-    )
+    episodes, _ = play_episodes(heuristic_evaluate, 1, ply_cap=200, tau=0.03, lam=0.1, rng=rng)
     samples = episode_samples(episodes[0], lam_ret=0.9)
     assert samples, "seed 8 should produce a finished game"
     for s in samples[:: max(len(samples) // 6, 1)]:
@@ -157,113 +129,9 @@ def test_samples_replay_to_their_positions():
         assert np.isclose(s.improved.sum(), 1.0, atol=1e-5)
 
 
-def _scripted_opponent(pos, moves):
-    """A whole-turn opponent for the grounding tests: the first legal move,
-    up to the turn's remaining placements — deterministic and rules-honest."""
-    p = pos.copy()
-    turn = []
-    for _ in range(p.moves_remaining):
-        move = p.nth_legal(0)
-        turn.append(move)
-        p.advance(*move)
-        if p.is_terminal:
-            break
-    return turn
-
-
-def test_grounded_games_record_model_plies_only():
-    """Grounded games: the opponent's plies enter the move list but never
-    the records, samples replay to model-to-move positions, and both seats
-    appear across games."""
-    rng = np.random.default_rng(14)
-    seats = [0, 1, None]
-    episodes, _ = play_episodes(
-        heuristic_evaluate, [[], [], []], 200, 0.1, 0.03, rng,
-        opponent=_scripted_opponent, opponent_seats=seats,
-    )
-    for ep, seat in zip(episodes, seats):
-        assert ep.opponent_seat == seat
-        if seat is None:
-            continue
-        assert ep.winner is not None, "a line-scorer vs the first-legal bot finishes"
-        model_seat = 1 - seat
-        assert all(m == model_seat for m in ep.movers)
-        assert len(ep.ts) == len(ep.ranks) < len(ep.moves)
-        for j in (0, len(ep.ts) - 1):
-            pos = hexo_py.Position.replay(list(ep.moves[: ep.ts[j]]))
-            assert pos.current_player == model_seat
-            assert pos.nth_legal(ep.ranks[j]) == tuple(ep.moves[ep.ts[j]])
-
-
-def test_grounded_returns_are_outcomes_and_caps_are_draws():
-    """Grounded returns are Monte-Carlo whatever lam_ret says — the bootstrap
-    chain breaks at unrecorded opponent plies — and a capped grounded episode
-    yields g = 0 samples where a capped self-play one yields none."""
-    rng = np.random.default_rng(15)
-    episodes, _ = play_episodes(
-        heuristic_evaluate, [[]], 200, 0.1, 0.03, rng,
-        opponent=_scripted_opponent, opponent_seats=[0],
-    )
-    ep = episodes[0]
-    assert ep.winner is not None
-    z = 1.0 if ep.winner == 1 else -1.0
-    for lam_ret in (1.0, 0.5):
-        samples = episode_samples(ep, lam_ret)
-        assert len(samples) == len(ep.ranks)
-        assert all(s.g == z for s in samples)
-
-    capped_ground, _ = play_episodes(
-        heuristic_evaluate, [[]], 8, 0.1, 0.03, np.random.default_rng(15),
-        opponent=_scripted_opponent, opponent_seats=[0],
-    )
-    capped_self, _ = play_episodes(
-        heuristic_evaluate, [[]], 8, 0.1, 0.03, np.random.default_rng(15),
-    )
-    assert capped_ground[0].winner is None and capped_self[0].winner is None
-    draws = episode_samples(capped_ground[0], 0.939)
-    assert draws and all(s.g == 0.0 for s in draws)
-    assert episode_samples(capped_self[0], 0.939) == []
-
-
-def test_collection_grounds_a_fraction_and_reports_it():
-    model = _tiny_model()
-    cfg = KlentConfig(
-        games_per_iteration=6, ground_fraction=0.5, ply_cap=200,
-        batch_size=64, seed_fraction=1.0, seed_cut=(1, 3),
-    )
-    episodes, metrics = collect_episodes(
-        model, cfg, np.random.default_rng(16), opponent=_scripted_opponent
-    )
-    assert sum(e.opponent_seat is not None for e in episodes) == 3
-    assert metrics["f_grounded"] == metrics["f_grounded"]  # grounded games exist
-    assert 0.0 <= metrics["grounded_score"] <= 1.0
-    assert any(episode_samples(e, cfg.lam_ret) for e in episodes)
-
-    import pytest
-
-    with pytest.raises(ValueError, match="opponent"):
-        collect_episodes(model, cfg, np.random.default_rng(16))
-
-
-def test_seeded_prefix_plies_stay_out_of_the_buffer():
-    rng = np.random.default_rng(9)
-    prefix = seed_prefix(rng, (1, 4))
-    assert prefix, "a line-builder game is longer than the cut"
-    episodes, _ = play_episodes(
-        heuristic_evaluate, [prefix], ply_cap=200, tau=0.03, lam=0.1, rng=rng
-    )
-    ep = episodes[0]
-    assert ep.seed_len == len(prefix)
-    assert [tuple(m) for m in ep.moves[: ep.seed_len]] == [tuple(m) for m in prefix]
-    for s in episode_samples(ep, lam_ret=0.883):
-        assert s.t >= ep.seed_len
-
-
 def test_fit_trains_policy_and_q_and_never_the_value_head():
     rng = np.random.default_rng(10)
-    episodes, _ = play_episodes(
-        heuristic_evaluate, [[] for _ in range(4)], ply_cap=200, tau=0.03, lam=0.1, rng=rng
-    )
+    episodes, _ = play_episodes(heuristic_evaluate, 4, ply_cap=200, tau=0.03, lam=0.1, rng=rng)
     samples = [s for e in episodes for s in episode_samples(e, 0.883)]
     assert samples
 
@@ -284,13 +152,16 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
 
 
 def test_collect_and_fit_end_to_end():
+    """The whole iteration through an untrained network: collection runs the
+    real evaluator, the metrics row is complete, and whatever the games
+    produced fits cleanly — including the honest zero-data case, since an
+    untrained policy rarely finishes a game (the design's §5 premise)."""
     model = _tiny_model()
-    cfg = KlentConfig(
-        games_per_iteration=4, ply_cap=60, batch_size=64, seed_fraction=1.0, seed_cut=(1, 3)
-    )
+    cfg = KlentConfig(games_per_iteration=4, ply_cap=60, batch_size=64)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     episodes, metrics = collect_episodes(model, cfg, np.random.default_rng(12))
-    for key in ("f_seeded", "f_unseeded", "acting_kl", "acting_norm_entropy"):
+    assert len(episodes) == 4
+    for key in ("f", "acting_kl", "acting_norm_entropy", "v_hat_mae"):
         assert key in metrics
     samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret)]
     if samples:
@@ -312,16 +183,13 @@ def test_network_evaluate_matches_forward():
 
 
 def test_play_match_is_seat_balanced_and_scores_caps_as_half():
-    from mantisnet.klent.seeds import line_builder_choose_batch
-
     rng = np.random.default_rng(13)
-    builder = lambda ps, r: line_builder_choose_batch(ps, r, noise=0.0)  # noqa: E731
-    result = play_match(builder, builder, games=4, ply_cap=300, rng=rng)
+    result = play_match(heuristic_choose, heuristic_choose, games=4, ply_cap=300, rng=rng)
     assert result["games"] == 4
     assert 0.0 <= result["score_a"] <= 4.0
     assert result["capped"] * 0.5 <= result["score_a"] <= 4 - result["capped"] * 0.5
 
     model = _tiny_model().eval()
-    quick = play_match(argmax_choose(model), builder, games=2, ply_cap=30, rng=rng)
+    quick = play_match(argmax_choose(model), heuristic_choose, games=2, ply_cap=30, rng=rng)
     assert quick["games"] == 2
     assert 0.0 <= quick["score_a"] <= 2.0
