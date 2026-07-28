@@ -24,7 +24,8 @@ from ..builder import collate_prefixes
 from ..klent import telemetry
 from ..klent.evaluate import argmax_choose, play_match
 from ..klent.run import _versions
-from ..klent.sealbot import _elo, _wilson, record_match, sealbot_match
+from ..klent.opponents import _elo, _wilson
+from ..klent.sealbot import record_match, sealbot_match
 from ..model import MantisConfig
 from .service import (
     InferenceCache,
@@ -197,21 +198,12 @@ class MatchRunner:
                     variant=request.sealbot_variant, max_depth=request.sealbot_depth,
                 )
                 with telemetry.open_telemetry(path_a.parent) as writer:
-                    try:
-                        match_id = record_match(
-                            writer, result, games, variant=request.sealbot_variant,
-                            source="deck", checkpoint=path_a.name,
-                        )
-                    except ValueError as exc:
-                        # The current telemetry schema predates the deck and
-                        # admits only driver/cli. Keep the one writer seam and
-                        # fall back only for that exact old source enum.
-                        if "source" not in str(exc):
-                            raise
-                        match_id = record_match(
-                            writer, result, games, variant=request.sealbot_variant,
-                            source="cli", checkpoint=path_a.name,
-                        )
+                    # The opponent's identity rides in the summary (the seam
+                    # put it there); the variant is part of that identity.
+                    match_id = record_match(
+                        writer, result, games, source="deck",
+                        checkpoint=path_a.name,
+                    )
                 result["match_id"] = match_id
             state.update_match(job_id, "completed", _jsonable(result))
         except Exception as exc:
