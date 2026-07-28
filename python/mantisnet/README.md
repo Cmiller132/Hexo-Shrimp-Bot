@@ -273,11 +273,20 @@ is **~72 ms an iteration**, ~1% of a 5–7 s iteration, on the driver thread
 between the fit and the wait for the next collection — and it draws nothing
 from the training RNG, which `tests/test_telemetry.py` pins by running the
 same seed with the writer stubbed out and comparing `metrics.jsonl` line for
-line. Storage is **~78 bytes a ply** (71 of it the `plies` row; five `REAL`
-columns are 40 of those, and SQLite has no `float32`), so the operating
-point writes ~1.4 GB an hour. That is the number to watch on a multi-day
-run: the levers, in order, are dropping a scalar column, quantizing the four
-bounded ones, or recording plies for a sample of games rather than all.
+line. **The per-ply scalars are stored quantized** (schema v2, owner
+directive 2026-07-28): integers in units of 1e-4, defined once as
+`telemetry._Q` — the five `REAL` columns were 40 bytes of a ~71-byte row
+and SQLite has no `float32`; as 2–3-byte varints the same row is ~40
+bytes, and 5e-5 of rounding is far below every consumer's noise floor.
+Writers multiply and readers divide inside `telemetry.py`; nothing outside
+sees an integer. Measured ~65 B/ply on a short-game synthetic corpus
+(games-row overhead is heavy at 11 plies a game; the production mix sits
+lower). There are still no migrations — a v1 database is refused — but a
+finished run's history cannot be replayed, so `--run <dir> convert`
+regenerates a v1 file as v2 in place, deliberately and once, keeping the
+original as `telemetry.db.v1.bak`. Never against a live writer. The
+remaining levers if disk hurts again: dropping a scalar column, or
+recording plies for a sample of games rather than all.
 
 ```python
 from mantisnet import MantisConfig, MantisNet
