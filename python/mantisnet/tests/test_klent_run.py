@@ -192,6 +192,40 @@ def test_starvation_stops_the_run(tmp_path, monkeypatch):
     assert (tmp_path / "checkpoint_000003.pt").exists()
 
 
+def test_anneal_walks_the_cut_by_measured_f(tmp_path, monkeypatch):
+    """§5.2 mechanised: the cut ceiling deepens while seeded games keep
+    terminating, backs off when they stop, and lands in every metrics row."""
+    from mantisnet import MantisConfig, MantisNet
+    from mantisnet.klent import run as run_mod
+    from mantisnet.klent.train import KlentConfig
+
+    cfg = KlentConfig(games_per_iteration=8, seed_cut=(1, 8), ply_cap=64)
+    fs = iter([1.0, 1.0, 1.0, 0.1, 0.1, float("nan"), 1.0])
+
+    def fake_iterate(model, opt, c, rng, warm=False):
+        return {
+            "f_seeded": next(fs), "f_unseeded": 1.0, "buffer_samples": 99,
+            "acting_kl": 0.0, "acting_norm_entropy": 0.5,
+        }
+
+    monkeypatch.setattr(run_mod, "iterate", fake_iterate)
+    torch.manual_seed(0)
+    model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
+    run_mod.run_training(
+        model,
+        torch.optim.Adam(model.parameters()),
+        cfg,
+        iterations=7,
+        out_dir=tmp_path,
+        rng=np.random.default_rng(0),
+        checkpoint_every=100,
+        anneal=True,
+    )
+    rows = [json.loads(line) for line in (tmp_path / "metrics.jsonl").read_text().splitlines()]
+    # +2 at f=1.0, -4 at f=0.1, held at NaN, +2 again.
+    assert [r["seed_cut_hi"] for r in rows] == [10, 12, 14, 10, 6, 6, 8]
+
+
 def test_checkpoint_refuses_version_drift(tmp_path):
     from mantisnet import MantisConfig, MantisNet
 

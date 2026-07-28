@@ -111,6 +111,7 @@ def run_training(
     evaluate_fn=None,
     starve_limit: int = 10,
     warm_iterations: int = 0,
+    anneal: bool = False,
 ) -> None:
     """Loop `iterate`, appending metrics and checkpointing as it goes.
 
@@ -122,14 +123,31 @@ def run_training(
     ~`ply_cap` plies of collection for an empty buffer. After this many
     consecutive iterations yielding under one sample per game, the run stops
     loudly (checkpointing first) instead of burning the night. 0 disables.
+
+    ``anneal`` is the design doc's §5.2 requirement made mechanical: the
+    seed-cut ceiling deepens while seeded games keep terminating (f ≥ 0.8)
+    and backs off when they stop (f < 0.3), so the corpus walks backward
+    from the endgame instead of parking on trivial near-terminal stubs —
+    measured to happen with a static cut: self-play stays perfect while
+    strength against a real opponent dies. The live ceiling is recorded in
+    every metrics row as ``seed_cut_hi``.
     """
     starved = 0
+    cut_lo, cut_hi = cfg.seed_cut
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file:
         for i in range(start_iteration, iterations):
             t0 = time.perf_counter()
             metrics = iterate(model, optimizer, cfg, rng, warm=i < warm_iterations)
             metrics["iteration"] = i
+            if anneal and i >= warm_iterations:
+                f = metrics["f_seeded"]
+                if f >= 0.8:
+                    cut_hi = min(cut_hi + 2, cfg.ply_cap)
+                elif f < 0.3:
+                    cut_hi = max(cut_lo, cut_hi - 4)
+                cfg.seed_cut = (cut_lo, cut_hi)
+            metrics["seed_cut_hi"] = cut_hi
             metrics["seconds"] = time.perf_counter() - t0  # eval kept out: this
             done = i + 1  # column is the recompile/leak detector and must stay flat
             if eval_every and evaluate_fn is not None and done % eval_every == 0:
@@ -215,6 +233,10 @@ def main(argv=None) -> None:
         "--warm-iterations", type=int, default=0,
         help="bootstrap iterations acting through the line builder's scores",
     )
+    ap.add_argument(
+        "--anneal", action="store_true",
+        help="deepen the seed cut while f_seeded holds (design doc §5.2)",
+    )
     ap.add_argument("--seed", type=int, default=0, help="the run's RNG seed")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-compile", action="store_true")
@@ -282,6 +304,7 @@ def main(argv=None) -> None:
         "eval_anchor": str(args.eval_anchor) if args.eval_anchor else None,
         "starve_limit": args.starve_limit,
         "warm_iterations": args.warm_iterations,
+        "anneal": args.anneal,
         "seed": args.seed,
         "klent": dataclasses.asdict(cfg),
         "versions": _versions(),
@@ -319,6 +342,7 @@ def main(argv=None) -> None:
         evaluate_fn=evaluate_fn,
         starve_limit=args.starve_limit,
         warm_iterations=args.warm_iterations,
+        anneal=args.anneal,
     )
 
 

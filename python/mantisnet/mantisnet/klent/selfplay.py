@@ -128,8 +128,13 @@ def play_episodes(
 
             for slot, i in enumerate(chunk):
                 ep, pos = episodes[i], positions[i]
+                # Renormalized in f64 before storage: the fp32 softmax's
+                # accumulated denominator leaves |sum−1| ≈ N·1e-8, which at
+                # 10^4-cell positions crosses policy_loss's corruption gate.
+                # The sampler and the stored target see the same numbers.
                 probs = imp.probs[offsets[slot] : offsets[slot + 1]].numpy().astype(np.float64)
-                rank = int(rng.choice(len(probs), p=probs / probs.sum()))
+                probs /= probs.sum()
+                rank = int(rng.choice(len(probs), p=probs))
 
                 ep.moves_remaining.append(pos.moves_remaining)
                 ep.movers.append(pos.current_player)
