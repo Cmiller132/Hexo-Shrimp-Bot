@@ -46,7 +46,9 @@ class MantisConfig:
 
     # Bucket indices of the attention bias table (§4.1): distances 1..D_MAX
     # occupy 0..D_MAX-1, then SELF, then TOKEN. TOKEN wins on the token-token
-    # pair.
+    # pair. PAD is not a table entry — it indexes the sentinel column the
+    # forward appends, so padded keys read -inf-class bias straight from the
+    # gather and no separate mask tensor ever exists.
     @property
     def self_bucket(self) -> int:
         return self.d_max
@@ -54,6 +56,10 @@ class MantisConfig:
     @property
     def token_bucket(self) -> int:
         return self.d_max + 1
+
+    @property
+    def pad_bucket(self) -> int:
+        return self.d_max + 2
 
 
 @dataclass
@@ -156,11 +162,14 @@ class _Block(nn.Module):
         k = self.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         v = self.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
 
-        bias = self.dist_bias[:, bucket].permute(1, 0, 2, 3)  # (P, A, T, T)
-        mask = bias.masked_fill(
-            ~batch.attn_valid[:, None, None, :], torch.finfo(bias.dtype).min
+        # The bias table plus its PAD sentinel, cast *before* the gather: the
+        # (P, A, T, T) tensor is built exactly once, in the compute dtype.
+        table = self.dist_bias.to(q.dtype)
+        table = torch.cat(
+            [table, table.new_full((cfg.heads, 1), torch.finfo(q.dtype).min)], dim=1
         )
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask.to(q.dtype))
+        mask = table[:, bucket].permute(1, 0, 2, 3)  # (P, A, T, T)
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
         out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(p * max_t, cfg.h)
         s = s + self.drop(out.index_select(0, batch.stone_slot))
         g = g + self.drop(out.index_select(0, token_slot))
@@ -233,9 +242,14 @@ class MantisNet(nn.Module):
             nn.init.zeros_(head.out.bias)
 
     def _buckets(self, batch: Batch) -> Tensor:
-        """Distance buckets for every padded row pair, once per forward (§4.1)."""
+        """Distance buckets for every padded row pair, once per forward (§4.1).
+
+        Arithmetic stays in the builder's int32 — the (P, T, T) intermediates
+        are pure memory traffic and need no promotion. Padded keys land in
+        ``pad_bucket``, whose sentinel bias column is the attention mask; the
+        final ``long()`` is the one int64 tensor, required by the gather."""
         cfg = self.cfg
-        c = batch.coords.long()
+        c = batch.coords
         dq = c[:, :, None, 0] - c[:, None, :, 0]
         dr = c[:, :, None, 1] - c[:, None, :, 1]
         d = torch.maximum(dq.abs(), torch.maximum(dr.abs(), (dq + dr).abs()))
@@ -245,7 +259,8 @@ class MantisNet(nn.Module):
         bucket = bucket.masked_fill(eye, cfg.self_bucket)
         bucket[:, 0, :] = cfg.token_bucket
         bucket[:, :, 0] = cfg.token_bucket
-        return bucket
+        bucket = torch.where(batch.attn_valid[:, None, :], bucket, cfg.pad_bucket)
+        return bucket.long()
 
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""
