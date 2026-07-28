@@ -37,6 +37,9 @@ python/mantisnet/
       run.py          # the run driver: config.json, metrics.jsonl, checkpoints
       crossplay.py    # the A7 checkpoint round-robin, the forgetting detector
       sealbot.py      # the one evaluation: matches vs a SealBot checkout
+      telemetry.py    # the run's SQLite capture + the queries over it, + CLI
+      hardware.py     # the GPU/process/host counter trace behind an iteration
+      inspect.py      # the policy debugger: one checkpoint's view of one position
   tests/              # the two specs' obligations, one file per concern
   bench/
     bench_forward.py  # builder and forward throughput at spec defaults
@@ -58,7 +61,7 @@ uv run python bench/bench_forward.py # throughput on CPU and the local GPU
 | `model` | `MantisConfig` (the §2 named parameters), `MantisNet`, `ModelOutput`. `trunk` and the three head methods are separate so a caller pays only for the heads it reads. |
 | `losses` | `value_target` (two-hot projection), `value_loss`, `policy_loss` (segmented CE over ragged engine-order logits), `param_groups` (§10 decay split). |
 | `segments` | The ragged per-position reductions everything above and below shares. |
-| `klent` | The KLENT baseline: operator, returns, collection, fitting, evaluation. See below. |
+| `klent` | The KLENT baseline: operator, returns, collection, fitting, evaluation, and the run's telemetry capture. See below. |
 
 ## Design notes
 
@@ -162,7 +165,9 @@ a foreign corpus *before* KLENT begins, not machinery inside the loop.
   --iterations N` writes `config.json` (knobs + versions), `metrics.jsonl`
   (strict JSON, one row per iteration: the §13 metrics including the
   v̂-vs-outcome calibration that watches the §9 bias), `invocations.jsonl`
-  (every process that touched the run, with its resolved knobs), and
+  (every process that touched the run, with its resolved knobs),
+  `telemetry.db` (the Telemetry section below: every game, every self-play
+  ply, every evaluation match, and the machine's counters), and
   resumable checkpoints; `--resume` continues after a crash and refuses a
   checkpoint from other versions; `--init-from` forks a fresh run (own
   seed, iteration 0) from a trained checkpoint. `--eval-every N` plays the
@@ -188,6 +193,71 @@ a foreign corpus *before* KLENT begins, not machinery inside the loop.
   writes a strength curve to `sealbot_curve.jsonl`. First measurement
   (2026-07-28): the overnight-3 endpoint loses 0/64 even at depth 1 — the
   run plan §4 has the table and what it says about racing vs defending.
+
+## Telemetry
+
+Every run writes `runs/<name>/telemetry.db` beside `metrics.jsonl` — one
+SQLite file per run, WAL, one transaction per iteration. It is not optional
+and has no flag: a run that cannot say what it did is not worth having, and
+one code path is cheaper than two. `metrics.jsonl` stays the §13 record;
+the database is the queryable substrate a dashboard is built on.
+
+**The storage decision: π′ is not stored.** The improved policy is
+`|A_legal|` floats per ply — kilobytes where a ply's whole row is tens of
+bytes — and it is *exactly* reproducible from a checkpoint and a move
+prefix. So the database keeps the four scalars a query needs (π′'s KL to
+π_θ, its normalized entropy, its maximum, and its value at the sampled
+move) and `klent.inspect.inspect_position` recomputes the array on demand,
+through the training path's own loader, builder, and closed form. Every
+other shape here follows from having chosen scalars over arrays.
+
+| Table | One row per | Carrying |
+| --- | --- | --- |
+| `runs` | process that trained into the run | resolved knobs + versions, the database's mirror of `invocations.jsonl` |
+| `iterations` | iteration | every `metrics.jsonl` field as its own column (so a threshold query needs no JSON parse), the row verbatim in `metrics_json`, and the hardware trace |
+| `games` | game, self-play *and* evaluation | winner, length, capped, eval seat/opening, and the move list as a blob |
+| `plies` | self-play ply | mover, `moves_remaining`, `legal_count`, the taken `rank`, and the five acting-time scalars |
+| `opponents` | opponent *at a setting* | `name` + `config_json`; SealBot at depth 1 and depth 3 are two opponents |
+| `eval_matches` | match | score, Wilson interval, Elo, per-seat split — keyed by opponent and by iteration or checkpoint |
+| `crossplay` | A7 pairing | replaced wholesale by each run of it, as `crossplay.json` is |
+
+- **Moves pack as little-endian `int16` `(q, r)` pairs**, four bytes a ply,
+  defined once in `pack_moves`/`unpack_moves`. Coordinates outside `int16`
+  are refused rather than wrapped.
+- **The opponent is a row, not a column.** Nothing SealBot-specific reaches
+  the schema: its variant, depth cap, and time limit identify an
+  `opponents` row, so a stronger engine arriving later registers itself the
+  same way and its strength curve is the same query.
+- **Resume supersedes rather than duplicates.** A resume starts at its
+  checkpoint's iteration, which can be behind what was recorded; those rows
+  and their games and plies are dropped as the run redoes them. Offline
+  evaluation matches are keyed by checkpoint, not by the loop's position,
+  and survive.
+- **The hardware trace is a background thread** (`hardware.py`) reading NVML
+  and psutil once a second — GPU utilization, power, temperature, both the
+  NVML and torch views of VRAM, process CPU/threads/RSS, host RAM —
+  aggregated to mean/max columns per iteration. It touches no model, no
+  RNG, and no database; a sensor failure stops it and is re-raised on the
+  training thread at the next drain rather than becoming quiet zeros.
+- **Reading is a module, not a service.** `iteration_series`,
+  `search_games`, `fetch_game`, `calibration` (reliability by v̂, by ply, or
+  by game length), `blunders` (v̂ swings across a ply, in the mover's own
+  frame), `opening_atlas` (symmetry-reduced by `canonical_opening` — the
+  rules are D6-invariant about the origin, so counting raw move lists would
+  split each opening twelve ways), `strength_curve`, `crossplay_matrix`.
+  `python -m mantisnet.klent.telemetry --run runs/<name> summary | games |
+  game <id>` is the operator's sanity check over the same functions.
+
+**Measured cost** (1024 games × ~30 plies, the operating point): the write
+is **~72 ms an iteration**, ~1% of a 5–7 s iteration, on the driver thread
+between the fit and the wait for the next collection — and it draws nothing
+from the training RNG, which `tests/test_telemetry.py` pins by running the
+same seed with the writer stubbed out and comparing `metrics.jsonl` line for
+line. Storage is **~78 bytes a ply** (71 of it the `plies` row; five `REAL`
+columns are 40 of those, and SQLite has no `float32`), so the operating
+point writes ~1.4 GB an hour. That is the number to watch on a multi-day
+run: the levers, in order, are dropping a scalar column, quantizing the four
+bounded ones, or recording plies for a sample of games rather than all.
 
 ```python
 from mantisnet import MantisConfig, MantisNet

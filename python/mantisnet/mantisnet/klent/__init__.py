@@ -13,6 +13,8 @@ from .selfplay import Episode, Sample, collection_stats, episode_samples, play_e
 from .train import KlentConfig, collect_episodes, fit
 from .evaluate import argmax_choose, play_match
 from .run import run_training
+from .telemetry import Telemetry, connect, open_telemetry
+from .inspect import inspect_position
 
 __all__ = [
     "ImprovedPolicy",
@@ -30,4 +32,8 @@ __all__ = [
     "argmax_choose",
     "play_match",
     "run_training",
+    "Telemetry",
+    "connect",
+    "open_telemetry",
+    "inspect_position",
 ]

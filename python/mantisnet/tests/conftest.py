@@ -14,6 +14,7 @@ import pytest
 import torch
 
 from mantisnet import MantisConfig, MantisNet
+from mantisnet.klent import telemetry
 
 # Ply depths for the shared position set: both movers, all three turn phases,
 # both stones of a turn, and boards from empty to crowded.
@@ -56,24 +57,13 @@ def model() -> MantisNet:
 def d6_transforms():
     """The 12 board symmetries as maps on (q, r). Index 0 is the identity.
 
-    Generators: rotation by 60 degrees (q, r) -> (-r, q + r) and the
-    reflection (q, r) -> (r, q), both of which permute the three window axes
-    and preserve hex distance.
+    The same group the telemetry read layer canonicalizes openings with —
+    one definition, used by the model's §12.3 invariance tests and by the
+    opening atlas. The model never sees these transforms, so sharing them
+    deletes no detector; the group itself is held to the rules by
+    `test_telemetry.py`, which replays transformed games through the engine.
     """
-
-    def rot(m):
-        return (-m[1], m[0] + m[1])
-
-    def ref(m):
-        return (m[1], m[0])
-
-    out = []
-    for base in (lambda m: m, ref):
-        f = base
-        for _ in range(6):
-            out.append(f)
-            f = (lambda g: lambda m: rot(g(m)))(f)
-    return out
+    return telemetry.D6_TRANSFORMS
 
 
 def oracle_live_windows(pos: hexo_py.Position) -> dict[tuple[int, int, int], tuple[int, int]]:

@@ -32,6 +32,10 @@ deterministic argmax policy against a mostly-deterministic searcher would
 otherwise replay near-identical games, and a paired design cancels opening
 luck out of the comparison.
 
+Matches land in the run's `telemetry.db` as well as on stdout — one
+`opponents` row per (variant, depth cap, time limit), so a curve is a query
+over one opponent id and a future stronger engine needs no schema change.
+
 CLI::
 
     python -m mantisnet.klent.sealbot --sealbot D:/SealBot \
@@ -217,11 +221,16 @@ def sealbot_match(
     variant: str = "current",
     opening_range: tuple[int, int] = (2, 6),
     max_depth: int | None = None,
-) -> dict:
+) -> tuple[dict, list[dict]]:
     """``games`` seat-balanced games of argmax π_θ against SealBot, paired
-    two per opening. Returns the model's score (win 1, cap ½) with a Wilson
-    interval and its Elo transform, plus per-seat scores and SealBot's mean
-    search depth — the honest context for the headline number."""
+    two per opening.
+
+    Returns the match summary and its games. The summary is the model's
+    score (win 1, cap ½) with a Wilson interval and its Elo transform, plus
+    per-seat scores and SealBot's mean search depth — the honest context for
+    the headline number. The per-game list is what `telemetry.py` stores and
+    what a curve's outliers are read from; both callers want it, so it is
+    returned rather than reconstructed."""
     if games < 2 or games % 2:
         raise ValueError(f"games must be even and >= 2 (paired seats): {games}")
     game_mod, MinimaxBot = load_sealbot(sealbot_root, variant)
@@ -241,6 +250,7 @@ def sealbot_match(
             {
                 "pos": hexo_py.Position.replay([tuple(m) for m in opening]),
                 "moves": [tuple(m) for m in opening],
+                "opening_len": len(opening),
                 "seat": g_idx % 2,  # even games: the model takes P0
                 "bot": bot,
                 "depths": [],
@@ -253,6 +263,7 @@ def sealbot_match(
         _play_wave(states[start : start + _WAVE], choose, game_mod, rng, ply_cap)
 
     score, per_seat, capped, plies, depths = 0.0, [0.0, 0.0], 0, 0, []
+    per_game = []
     for s in states:
         if s["capped"]:
             capped += 1
@@ -263,9 +274,20 @@ def sealbot_match(
         per_seat[s["seat"]] += g_score
         plies += len(s["moves"])
         depths.extend(s["depths"])
+        per_game.append(
+            {
+                "seat": s["seat"],
+                "winner": None if s["capped"] else s["pos"].winner,
+                "capped": s["capped"],
+                "score": g_score,
+                "opening_len": s["opening_len"],
+                "depth_mean": float(np.mean(s["depths"])) if s["depths"] else None,
+                "moves": s["moves"],
+            }
+        )
 
     ci_lo, ci_hi = _wilson(score, games)
-    return {
+    summary = {
         "score": score,
         "games": games,
         "capped": capped,
@@ -283,6 +305,52 @@ def sealbot_match(
         "avg_plies": plies / games,
         "seconds": time.monotonic() - t0,
     }
+    return summary, per_game
+
+
+def record_match(
+    telemetry,
+    result: dict,
+    per_game: list[dict],
+    *,
+    variant: str,
+    source: str,
+    iteration: int | None = None,
+    checkpoint: str | None = None,
+) -> int:
+    """A finished match into a run's telemetry database.
+
+    The opponent is SealBot *at these settings*: the depth cap, the per-turn
+    time limit, and the checkout variant are what make one anchor different
+    from another, so they identify the opponent rather than decorating the
+    match. A stronger engine arriving later registers itself the same way,
+    and its strength curve is the same query with another opponent id.
+    """
+    opponent = telemetry.opponent(
+        "sealbot",
+        {
+            "variant": variant,
+            "max_depth": result["sealbot_max_depth"],
+            "time_limit": result["sealbot_time_limit"],
+        },
+    )
+    return telemetry.write_eval_match(
+        opponent,
+        result,
+        per_game,
+        source=source,
+        iteration=iteration,
+        checkpoint=checkpoint,
+        depth_mean=result["sealbot_depth_mean"],
+    )
+
+
+def _checkpoint_iteration(path: Path) -> int | None:
+    """The iteration a checkpoint's name carries — the x-axis of a strength
+    curve. A file named anything else has no iteration, which is recorded as
+    exactly that rather than guessed at."""
+    match = re.fullmatch(r"checkpoint_(\d+)", path.stem)
+    return int(match.group(1)) if match else None
 
 
 def _fmt(result: dict) -> str:
@@ -318,16 +386,31 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     from .run import load_model
+    from .telemetry import open_telemetry
 
     if args.checkpoint is not None:
         model = load_model(args.checkpoint, args.device)
-        result = sealbot_match(
+        result, per_game = sealbot_match(
             model, args.device, args.games, args.cap,
             np.random.default_rng(args.seed), args.time, args.sealbot, args.variant,
             max_depth=args.max_depth,
         )
         print(f"{args.checkpoint.name}  {_fmt(result)}")
         print(json.dumps(result))
+        # A checkpoint inside a run directory belongs to that run's record;
+        # one measured anywhere else has no run to be part of, and saying so
+        # beats inventing a database beside it.
+        run_dir = args.checkpoint.parent
+        if (run_dir / "config.json").exists():
+            with open_telemetry(run_dir) as telemetry:
+                record_match(
+                    telemetry, result, per_game, variant=args.variant, source="cli",
+                    iteration=_checkpoint_iteration(args.checkpoint),
+                    checkpoint=args.checkpoint.name,
+                )
+            print(f"recorded in {run_dir / 'telemetry.db'}")
+        else:
+            print(f"{run_dir} is not a run directory: not recorded")
         return
 
     checkpoints = sorted(args.run.glob("checkpoint_*.pt"))
@@ -341,12 +424,15 @@ def main(argv=None):
         picked.append(checkpoints[-1])
 
     out = args.run / "sealbot_curve.jsonl"
-    with open(out, "w", encoding="utf-8") as fh:
+    with (
+        open(out, "w", encoding="utf-8") as fh,
+        open_telemetry(args.run) as telemetry,
+    ):
         for path in picked:
             model = load_model(path, args.device)
             # One seed for every checkpoint: identical openings pair the
             # whole curve, so differences are the model, not the draw.
-            result = sealbot_match(
+            result, per_game = sealbot_match(
                 model, args.device, args.games, args.cap,
                 np.random.default_rng(args.seed), args.time, args.sealbot, args.variant,
                 max_depth=args.max_depth,
@@ -354,8 +440,12 @@ def main(argv=None):
             row = {"checkpoint": path.name} | result
             fh.write(json.dumps(row) + "\n")
             fh.flush()
+            record_match(
+                telemetry, result, per_game, variant=args.variant, source="cli",
+                iteration=_checkpoint_iteration(path), checkpoint=path.name,
+            )
             print(f"{path.name}  {_fmt(result)}", flush=True)
-    print(f"wrote {out}")
+    print(f"wrote {out} and {args.run / 'telemetry.db'}")
 
 
 if __name__ == "__main__":

@@ -2,7 +2,9 @@
 
 What a run leaves behind is the run directory — `config.json` (every knob and
 version the run depended on), `metrics.jsonl` (one line per iteration; the
-§13 metrics are the experiment, so they persist), and periodic checkpoints
+§13 metrics are the experiment, so they persist), `telemetry.db` (the same
+metrics plus every game, every self-play ply, every evaluation match and the
+machine's counters, queryable — see `telemetry.py`), and periodic checkpoints
 carrying model, optimizer, RNG state, and the iteration counter, so a crash
 loses at most one checkpoint interval. `--eval-every N` plays a seat-balanced
 paired match against SealBot — the independent external yardstick, and the
@@ -36,7 +38,9 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..builder import MODEL_REPR_VERSION
 from ..model import MantisConfig, MantisNet
+from .hardware import hardware_sampler
 from .selfplay import episode_samples
+from .telemetry import open_telemetry
 from .train import KlentConfig, collect_episodes, fit
 
 
@@ -129,8 +133,17 @@ def run_training(
     stream (seeded off the main one at submission), so a resumed run replays
     the same corpus.
 
-    ``evaluate_fn(model, done) -> dict`` runs every ``eval_every`` completed
-    iterations and its fields join that iteration's metrics row.
+    ``evaluate_fn(model, done, telemetry) -> dict`` runs every ``eval_every``
+    completed iterations and its fields join that iteration's metrics row; it
+    is handed the telemetry writer because a match's per-game detail is
+    recorded by whoever played it, through the same call the offline sweep
+    uses.
+
+    Telemetry is written on this thread, between the fit and the wait for the
+    next collection — it draws nothing from the training RNG and adds nothing
+    to the metrics row, so a run's trajectory is identical with it removed
+    (which is what `tests/test_telemetry.py` holds it to). It is not optional:
+    a run that cannot record what it did is not a run worth having.
 
     ``starve_limit`` is the unattended-run guard: a policy that stops
     finishing games buys ~`ply_cap` plies of collection per iteration for an
@@ -154,8 +167,21 @@ def run_training(
 
     with (
         (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file,
+        open_telemetry(out_dir) as telemetry,
+        hardware_sampler(cfg.device) as hardware,
         ThreadPoolExecutor(max_workers=1) as pool,
     ):
+        telemetry.begin_run(
+            config={
+                "klent": dataclasses.asdict(cfg),
+                "iterations": iterations,
+                "checkpoint_every": checkpoint_every,
+                "eval_every": eval_every,
+                "starve_limit": starve_limit,
+            },
+            versions=_versions(),
+            start_iteration=start_iteration,
+        )
         pending = submit_collect(pool)
         for i in range(start_iteration, iterations):
             t0 = time.perf_counter()
@@ -179,7 +205,7 @@ def run_training(
             done = i + 1  # column is the recompile/leak detector and must stay flat
             if eval_every and evaluate_fn is not None and done % eval_every == 0:
                 t1 = time.perf_counter()
-                metrics.update(evaluate_fn(model, done))
+                metrics.update(evaluate_fn(model, done, telemetry))
                 metrics["eval_seconds"] = time.perf_counter() - t1
             # NaN (an empty stat, e.g. won_length_mean with nothing won)
             # becomes null: a `NaN` token would make the file invalid JSON
@@ -187,6 +213,8 @@ def run_training(
             row = {k: None if v != v else v for k, v in metrics.items()}
             metrics_file.write(json.dumps(row, allow_nan=False) + "\n")
             metrics_file.flush()
+            # The same row the file just took, plus the episodes behind it.
+            telemetry.write_iteration(row, episodes, hardware.drain())
             if done % checkpoint_every == 0 or done == iterations:
                 save_checkpoint(
                     out_dir / f"checkpoint_{done:06d}.pt", model, optimizer, done, rng
@@ -317,22 +345,23 @@ def main(argv=None) -> None:
     # its param groups; the invocation's --lr is the truth, not that relic.
     for group in optimizer.param_groups:
         group["lr"] = cfg.lr
-        out.mkdir(parents=True, exist_ok=True)
-        config = {
-            "klent": dataclasses.asdict(cfg),
-            "model": dataclasses.asdict(MantisConfig()),
-            "iterations": args.iterations,
-            "checkpoint_every": args.checkpoint_every,
-            "eval_every": args.eval_every,
-            "eval_games": args.eval_games,
-            "eval_depth": args.eval_depth,
-            "eval_time": args.eval_time,
-            "sealbot": str(args.sealbot) if args.sealbot else None,
-            "seed": args.seed,
-            "init_from": str(args.init_from) if args.init_from else None,
-            "versions": _versions(),
-        }
-        (out / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
+    out.mkdir(parents=True, exist_ok=True)
+    config = {
+        "klent": dataclasses.asdict(cfg),
+        "model": dataclasses.asdict(MantisConfig()),
+        "iterations": args.iterations,
+        "checkpoint_every": args.checkpoint_every,
+        "eval_every": args.eval_every,
+        "eval_games": args.eval_games,
+        "eval_depth": args.eval_depth,
+        "eval_time": args.eval_time,
+        "sealbot": str(args.sealbot) if args.sealbot else None,
+        "seed": args.seed,
+        "init_from": str(args.init_from) if args.init_from else None,
+        "versions": _versions(),
+    }
+    (out / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     # Every invocation records its resolved knobs: a resume may legitimately
     # change them, and a run whose later knobs exist only in shell history
@@ -357,13 +386,13 @@ def main(argv=None) -> None:
 
     evaluate_fn = None
     if args.eval_every > 0:
-        from .sealbot import sealbot_match
+        from .sealbot import record_match, sealbot_match
 
-        def evaluate_fn(m, done):
+        def evaluate_fn(m, done, telemetry):
             # Seeded from (run seed, iteration), never the training stream:
             # the training trajectory is identical with evaluation on or off,
             # and a resumed run replays the same matches it would have played.
-            result = sealbot_match(
+            result, per_game = sealbot_match(
                 m,
                 cfg.device,
                 args.eval_games,
@@ -372,6 +401,10 @@ def main(argv=None) -> None:
                 args.eval_time,
                 args.sealbot,
                 max_depth=args.eval_depth,
+            )
+            record_match(
+                telemetry, result, per_game,
+                variant="current", source="driver", iteration=done,
             )
             return {
                 "eval_score": result["win_rate"],

@@ -7,8 +7,10 @@ visible — the checkout is machine-local, deliberately not vendored here.
 
 from __future__ import annotations
 
+import json
 import os
 
+import hexo_py
 import numpy as np
 import pytest
 
@@ -57,7 +59,7 @@ def test_sealbot_match_smoke():
     # a monotone march off SealBot's board. Untrained-but-varied is the
     # scenario wanted here, so give the head real weights.
     torch.nn.init.normal_(model.mlp_p.out.weight, std=0.1)
-    result = sealbot_match(
+    result, per_game = sealbot_match(
         model, "cpu", games=2, ply_cap=80, rng=np.random.default_rng(0),
         time_limit=0.02, sealbot_root=SEALBOT,
     )
@@ -66,3 +68,63 @@ def test_sealbot_match_smoke():
     assert result["score_as_p0"] + result["score_as_p1"] == result["score"]
     assert result["capped"] + result["avg_plies"] >= 0
     assert result["ci_lo"] <= result["win_rate"] <= result["ci_hi"]
+
+    # The per-game detail is the summary, unaggregated: same seats, same
+    # score, and each game's moves start with the opening it was paired on.
+    assert [g["seat"] for g in per_game] == [0, 1]
+    assert sum(g["score"] for g in per_game) == result["score"]
+    for g in per_game:
+        assert len(g["moves"]) == len(set(g["moves"])) <= 80
+        assert g["opening_len"] <= len(g["moves"])
+        assert (g["winner"] is None) == g["capped"]
+
+
+def test_a_real_match_lands_in_the_telemetry_database(tmp_path):
+    """The capture side of the yardstick: a match becomes one opponent row,
+    one match row, and its games — replayable, and keyed on the opponent
+    rather than on SealBot being the opponent."""
+    import torch
+
+    from mantisnet import MantisConfig, MantisNet
+    from mantisnet.klent import telemetry as tel
+    from mantisnet.klent.sealbot import _checkpoint_iteration, record_match, sealbot_match
+
+    torch.manual_seed(0)
+    model = MantisNet(
+        MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5)
+    )
+    torch.nn.init.normal_(model.mlp_p.out.weight, std=0.1)
+    result, per_game = sealbot_match(
+        model, "cpu", games=2, ply_cap=60, rng=np.random.default_rng(1),
+        time_limit=0.02, sealbot_root=SEALBOT, max_depth=1,
+    )
+    with tel.open_telemetry(tmp_path) as writer:
+        writer.begin_run({"iterations": 0}, {"v": 1}, 0)
+        record_match(
+            writer, result, per_game, variant="current", source="driver", iteration=7
+        )
+
+    conn = tel.connect(tmp_path)
+    (opponent,) = conn.execute("SELECT * FROM opponents").fetchall()
+    assert opponent["name"] == "sealbot"
+    assert json.loads(opponent["config_json"]) == {
+        "max_depth": 1, "time_limit": 0.02, "variant": "current"
+    }
+    (match,) = tel.strength_curve(conn)
+    assert match["iteration"] == 7 and match["checkpoint"] is None
+    assert match["source"] == "driver"
+    assert match["games"] == 2 and match["win_rate"] == result["win_rate"]
+
+    games = tel.search_games(conn, kind="eval")
+    assert len(games) == 2
+    for game, detail in zip(games, per_game, strict=True):
+        full = tel.fetch_game(conn, game["game_id"])
+        assert full["moves"] == detail["moves"]
+        assert full["match"] == match["match_id"]
+        assert full["model_seat"] == detail["seat"]
+        # The moves replay through the engine to the winner that was stored.
+        assert hexo_py.Position.replay(full["moves"]).winner == game["winner"]
+    conn.close()
+
+    assert _checkpoint_iteration(tmp_path / "checkpoint_000250.pt") == 250
+    assert _checkpoint_iteration(tmp_path / "best.pt") is None

@@ -113,7 +113,7 @@ def test_eval_in_driver_leaves_training_untouched(tmp_path):
         return model, torch.optim.Adam(model.parameters())
 
     cfg = KlentConfig(games_per_iteration=2, ply_cap=24, batch_size=64)
-    fake_eval = lambda m, done: {"eval_score": 0.5, "eval_capped": 0, "eval_games": 2}  # noqa: E731
+    fake_eval = lambda m, done, tel: {"eval_score": 0.5, "eval_capped": 0, "eval_games": 2}  # noqa: E731
     for name, eval_every in (("plain", 0), ("evaled", 1)):
         model, opt = build()
         run_mod.run_training(
@@ -144,11 +144,12 @@ def test_crossplay_plays_every_checkpoint_pair(tmp_path):
           "--iterations", "2", "--games", "2", "--cap", "16", "--batch", "64",
           "--device", "cpu"])
 
-    matrix = cross_play(out, games=2, ply_cap=12, device="cpu", seed=0)
-    pair = "checkpoint_000001.pt vs checkpoint_000002.pt"
-    assert pair in matrix
-    assert 0.0 <= matrix[pair]["score_a"] <= 1.0
-    assert matrix[pair]["capped"] <= 2
+    rows = cross_play(out, games=2, ply_cap=12, device="cpu", seed=0)
+    assert [(r["a"], r["b"]) for r in rows] == [
+        ("checkpoint_000001.pt", "checkpoint_000002.pt")
+    ]
+    assert 0.0 <= rows[0]["score_a"] <= 1.0
+    assert rows[0]["capped"] <= 2
 
 
 def test_starvation_stops_the_run(tmp_path, monkeypatch):

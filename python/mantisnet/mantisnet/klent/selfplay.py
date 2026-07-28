@@ -9,6 +9,11 @@ acting-time `v̂` (K6) that the λ-return will consume. What is excluded is
 exactly what it excludes: terminal positions never exist as samples, and
 every ply of a capped episode (K4) — the reference implementation's
 NaN-masked unterminated tail, as a whole-episode drop.
+
+Each ply also carries the four scalars `telemetry.py` stores — π′'s KL to
+π_θ, its normalized entropy, its maximum, and its value at the sampled
+move. They are reduced here because here the whole cohort's π′ is flat and
+in hand; anywhere later they cost a replay and another forward.
 """
 
 from __future__ import annotations
@@ -30,7 +35,12 @@ Evaluate = Callable[[object], tuple[torch.Tensor, torch.Tensor]]
 
 @dataclass
 class Episode:
-    """One episode from the empty board; per-ply records for every ply."""
+    """One episode from the empty board; per-ply records for every ply.
+
+    Everything through ``v_hats`` is what fitting consumes. The four lists
+    after it are the telemetry capture: per-position reductions of π′ that
+    the database stores in place of π′ itself.
+    """
 
     moves: list = field(default_factory=list)
     winner: int | None = None  # None exactly when the cap hit
@@ -39,6 +49,10 @@ class Episode:
     ranks: list = field(default_factory=list)  # per ply, the action's legal rank
     improved: list = field(default_factory=list)  # per ply, π′ over the legal set
     v_hats: list = field(default_factory=list)  # per ply, E_{π′}[Q] at acting time
+    kls: list = field(default_factory=list)  # per ply, D_KL(π′ ‖ π_θ)
+    norm_entropies: list = field(default_factory=list)  # per ply, H(π′)/log|A|
+    pi_top1: list = field(default_factory=list)  # per ply, max π′
+    pi_chosen: list = field(default_factory=list)  # per ply, π′ of the sampled move
 
 
 @dataclass
@@ -125,6 +139,11 @@ def play_episodes(
             ranks = np.clip(ranks, 0, widths - 1)
             stored = np.split(flat.astype(np.float32), offsets[1:-1])
             v_hats = imp.v_hat.numpy()
+            # The telemetry reductions, taken while π′ is still one flat
+            # array: its maximum and its value at the drawn rank.
+            pi_top1 = np.maximum.reduceat(flat, offsets[:-1])
+            pi_chosen = flat[offsets[:-1] + ranks]
+            kls, norm_entropies = imp.kl.numpy(), imp.norm_entropy.numpy()
 
             for slot, i in enumerate(chunk):
                 ep, pos = episodes[i], positions[i]
@@ -134,6 +153,10 @@ def play_episodes(
                 ep.ranks.append(rank)
                 ep.improved.append(stored[slot])
                 ep.v_hats.append(float(v_hats[slot]))
+                ep.kls.append(float(kls[slot]))
+                ep.norm_entropies.append(float(norm_entropies[slot]))
+                ep.pi_top1.append(float(pi_top1[slot]))
+                ep.pi_chosen.append(float(pi_chosen[slot]))
 
                 move = pos.nth_legal(rank)
                 pos.advance(*move)

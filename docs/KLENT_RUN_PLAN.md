@@ -361,6 +361,62 @@ iteration).
 
 ---
 
+## 4a. Telemetry — the dashboard's substrate
+
+`metrics.jsonl` answers "is the run healthy". It cannot answer "which
+games", "which plies", "what did the policy believe there", or "was the
+card the bottleneck" — every question §3's post-mortems actually needed and
+had to reconstruct by hand. So every run now also writes
+`runs/<name>/telemetry.db`: one SQLite file, WAL, one transaction per
+iteration, always on. **It is the substrate a web dashboard will be built
+on**; this pass is capture and query only, with no frontend.
+
+What it holds is in the mantisnet README's Telemetry section. The four
+decisions worth recording here, because they constrain what can be asked
+later:
+
+- **π′ is not stored, it is recomputed.** Per ply the database keeps five
+  scalars (v̂, π′'s KL to π_θ, its normalized entropy, its maximum, and its
+  value at the sampled move); `klent.inspect.inspect_position` reproduces
+  the whole array from a checkpoint and the move prefix, through the
+  training path's own loader and closed form. Storing π′ would be kilobytes
+  a ply for something derivable exactly. This is what makes a policy
+  debugger and a branch-and-play view possible without a storage decision
+  in front of them.
+- **Per-ply KL and entropy, not just their iteration means.** The §13 row
+  reports averages; the *distributions* are what distinguish a policy that
+  is uniformly uncertain from one that is confident everywhere except the
+  positions that matter. Both are columns now, so both are queries.
+- **The opponent is a row, not a column.** Nothing SealBot-specific is in
+  the schema. An `opponents` row is a name plus its config, so SealBot at
+  depth 1 and depth 3 are two opponents and a stronger engine — the
+  intended eventual replacement — needs no schema change to get a curve.
+- **Calibration and blunders are derivable, not precomputed.** The §9 bias
+  instrument is a `GROUP BY` over `plies` joined to its game's realized
+  outcome, bucketed by v̂, by ply, or by game length; a "blunder" is a v̂
+  swing across consecutive plies read in the mover's own frame. Neither is
+  a stored metric, so neither needs a rerun when the question changes.
+
+Measured cost at the operating point (1024 games, ~30 k plies): ~72 ms an
+iteration to write, ~1% of the loop, and ~78 bytes a ply — about 1.4 GB an
+hour. **That growth rate is the standing decision to revisit**: a multi-day
+run at this setting produces tens of GB, and the levers are dropping a
+scalar column, quantizing the four bounded ones, or recording plies for a
+sample of games rather than for all of them.
+
+Per-iteration hardware columns come from a background sampler (NVML +
+psutil, 1 s period, mean/max per iteration): GPU utilization, power,
+temperature, VRAM in both the NVML and torch-allocator views, process
+CPU/threads/RSS, host RAM. The throughput plateau of §4 was diagnosed with
+an ad-hoc profile; the next one will be a query.
+
+Deliberately not built here: the frontend, corpus-novelty tracking (the
+branching factor makes position repeats too rare to be a signal), and any
+cross-run join key (runs are independent files; comparing two is opening
+two connections).
+
+---
+
 ## 5. The ladder to production-ready
 
 In order; each rung is small and none blocks the one above it being useful.

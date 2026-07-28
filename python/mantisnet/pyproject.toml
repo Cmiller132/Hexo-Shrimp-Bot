@@ -7,6 +7,11 @@ dependencies = [
     "numpy>=2",
     "torch>=2.8",
     "hexo-py",
+    # The telemetry hardware trace: NVML for the card's counters (the
+    # `pynvml` module comes from nvidia-ml-py, which is the maintained
+    # package under that import name), psutil for the process and the host.
+    "nvidia-ml-py>=13",
+    "psutil>=6",
     "triton-windows>=3.7.1.post27 ; sys_platform == 'win32'",
 ]
 
