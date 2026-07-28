@@ -37,11 +37,18 @@ class KlentConfig:
     seed_fraction: float = 1.0  # §5.2: anneal toward zero as f allows
     seed_cut: tuple = (1, 8)  # plies cut from a won seed game's end
     seed_noise: float = 0.1
-    batch_size: int = 4096  # paper's fitting batch
+    batch_size: int = 4096  # paper's fitting batch — a per-step *maximum*
     lr: float = 1e-3  # paper's Adam rate
     device: str = "cpu"
     autocast: bool = False  # bf16 autocast for the network passes
     compile: bool = False  # torch.compile the policy/Q pass (one-time cost)
+    # VRAM is budgeted, not hoped for: every network batch — fit chunk or
+    # collection cohort — is packed under both measured memory axes, so the
+    # peak is set here rather than by whatever the corpus happens to contain.
+    # Attention memory is quadratic in the batch's longest position (padding),
+    # decoder memory linear in its total legal cells.
+    pair_budget: int = 8_000_000  # padded (stones + token)^2 pairs per batch
+    cell_budget: int = 400_000  # legal cells (decoder rows) per batch
 
 
 def _policy_q(model, batch):
@@ -94,14 +101,44 @@ def _rebuild(samples: list[Sample]):
     return batch
 
 
+def _pack(samples: list[Sample], order, cfg: KlentConfig) -> list[list[int]]:
+    """Pack sample indices into fit chunks under ``batch_size`` and both
+    memory budgets. Sorted by position size (descending, ties in ``order``'s
+    random order), so a chunk's padded attention cost is exact — everyone
+    pads to its first element — and one long sample can no longer pad a
+    whole mixed chunk up to its own square. A sample too big for the budgets
+    alone still gets its own chunk: the buffer is never silently dropped."""
+    idx = sorted(order, key=lambda i: samples[i].t, reverse=True)
+    chunks: list[list[int]] = []
+    chunk: list[int] = []
+    chunk_t, cells = 0, 0
+    for i in idx:
+        t_pad = samples[i].t + 1  # + the global token row
+        c = len(samples[i].improved)
+        if chunk and (
+            len(chunk) == cfg.batch_size
+            or (len(chunk) + 1) * chunk_t * chunk_t > cfg.pair_budget
+            or cells + c > cfg.cell_budget
+        ):
+            chunks.append(chunk)
+            chunk, cells = [], 0
+        if not chunk:
+            chunk_t = t_pad
+        chunk.append(int(i))
+        cells += c
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
 def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.random.Generator):
     """One epoch over the buffer. Returns the mean loss components."""
     model.train()
     policy_q = _policy_q_fn(cfg)
-    order = rng.permutation(len(samples))
+    chunks = _pack(samples, rng.permutation(len(samples)), cfg)
     policy_sum, q_sum, steps = 0.0, 0.0, 0
-    for start in range(0, len(order), cfg.batch_size):
-        chunk = [samples[i] for i in order[start : start + cfg.batch_size]]
+    for k in rng.permutation(len(chunks)):
+        chunk = [samples[i] for i in chunks[k]]
         batch = _rebuild(chunk).to(cfg.device)
         target = torch.from_numpy(np.concatenate([s.improved for s in chunk])).to(cfg.device)
         ranks = torch.tensor([s.rank for s in chunk], device=cfg.device)
@@ -134,7 +171,14 @@ def iterate(model, optimizer, cfg: KlentConfig, rng: np.random.Generator) -> dic
     ]
     model.eval()
     episodes, metrics = play_episodes(
-        network_evaluate(model, cfg), prefixes, cfg.ply_cap, cfg.tau, cfg.lam, rng
+        network_evaluate(model, cfg),
+        prefixes,
+        cfg.ply_cap,
+        cfg.tau,
+        cfg.lam,
+        rng,
+        pair_budget=cfg.pair_budget,
+        cell_budget=cfg.cell_budget,
     )
     metrics.update(collection_stats(episodes))
 

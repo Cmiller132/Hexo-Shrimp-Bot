@@ -52,6 +52,29 @@ class Sample:
     g: float  # λ-return, in the mover-at-t's frame
 
 
+def _chunk_live(positions, live: list[int], pair_budget: int, cell_budget: int):
+    """Split the live cohort into consecutive runs under the memory budgets
+    (attention pairs are ``count × padded_T²``, decoder rows are legal
+    cells). Consecutive, never reordered: the sampling RNG must consume its
+    draws in the same game order no matter how the cohort is chunked."""
+    chunks: list[list[int]] = []
+    chunk: list[int] = []
+    max_t, cells = 0, 0
+    for i in live:
+        t_pad = positions[i].stone_count + 1  # + the global token row
+        c = positions[i].legal_count
+        t = max(max_t, t_pad)
+        if chunk and ((len(chunk) + 1) * t * t > pair_budget or cells + c > cell_budget):
+            chunks.append(chunk)
+            chunk, max_t, cells = [], 0, 0
+            t = t_pad
+        chunk.append(i)
+        max_t, cells = t, cells + c
+    if chunk:
+        chunks.append(chunk)
+    return chunks
+
+
 def play_episodes(
     evaluate: Evaluate,
     prefixes: list[list],
@@ -59,6 +82,8 @@ def play_episodes(
     tau: float,
     lam: float,
     rng: np.random.Generator,
+    pair_budget: int = 8_000_000,
+    cell_budget: int = 400_000,
 ) -> tuple[list[Episode], dict]:
     """Play one episode per prefix (empty prefix = unseeded), in lockstep.
 
@@ -90,35 +115,36 @@ def play_episodes(
     live = list(range(len(episodes)))
     kl_sum, ent_sum, decisions = 0.0, 0.0, 0
     while live:
-        batch = collate_positions([positions[i] for i in live])
-        policy_logits, q_values = evaluate(batch)
-        imp = improved_policy(policy_logits, q_values, batch.legal_offsets, tau, lam)
-
-        offsets = batch.legal_offsets.tolist()
-        kl_sum += float(imp.kl.sum())
-        ent_sum += float(imp.norm_entropy.sum())
-        decisions += len(live)
-
         still_live = []
-        for slot, i in enumerate(live):
-            ep, pos = episodes[i], positions[i]
-            probs = imp.probs[offsets[slot] : offsets[slot + 1]].numpy().astype(np.float64)
-            rank = int(rng.choice(len(probs), p=probs / probs.sum()))
+        for chunk in _chunk_live(positions, live, pair_budget, cell_budget):
+            batch = collate_positions([positions[i] for i in chunk])
+            policy_logits, q_values = evaluate(batch)
+            imp = improved_policy(policy_logits, q_values, batch.legal_offsets, tau, lam)
 
-            ep.moves_remaining.append(pos.moves_remaining)
-            ep.movers.append(pos.current_player)
-            ep.ranks.append(rank)
-            ep.improved.append(probs.astype(np.float32))
-            ep.v_hats.append(float(imp.v_hat[slot]))
+            offsets = batch.legal_offsets.tolist()
+            kl_sum += float(imp.kl.sum())
+            ent_sum += float(imp.norm_entropy.sum())
+            decisions += len(chunk)
 
-            move = pos.nth_legal(rank)
-            pos.advance(*move)
-            ep.moves.append(move)
+            for slot, i in enumerate(chunk):
+                ep, pos = episodes[i], positions[i]
+                probs = imp.probs[offsets[slot] : offsets[slot + 1]].numpy().astype(np.float64)
+                rank = int(rng.choice(len(probs), p=probs / probs.sum()))
 
-            if pos.is_terminal:
-                ep.winner = pos.winner
-            elif len(ep.moves) < ply_cap:
-                still_live.append(i)
+                ep.moves_remaining.append(pos.moves_remaining)
+                ep.movers.append(pos.current_player)
+                ep.ranks.append(rank)
+                ep.improved.append(probs.astype(np.float32))
+                ep.v_hats.append(float(imp.v_hat[slot]))
+
+                move = pos.nth_legal(rank)
+                pos.advance(*move)
+                ep.moves.append(move)
+
+                if pos.is_terminal:
+                    ep.winner = pos.winner
+                elif len(ep.moves) < ply_cap:
+                    still_live.append(i)
         live = still_live
 
     metrics = {

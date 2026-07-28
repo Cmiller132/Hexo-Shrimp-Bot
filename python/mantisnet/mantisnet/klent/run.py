@@ -145,7 +145,15 @@ def main(argv=None) -> None:
     ap.add_argument("--lam-ret", type=float, default=KlentConfig.lam_ret)
     ap.add_argument("--seed-fraction", type=float, default=1.0)
     ap.add_argument("--seed-cut", type=int, nargs=2, default=[1, 8], metavar=("LO", "HI"))
-    ap.add_argument("--batch", type=int, default=1024, help="fitting batch size")
+    ap.add_argument("--batch", type=int, default=1024, help="max samples per fit step")
+    ap.add_argument(
+        "--pair-budget", type=int, default=KlentConfig.pair_budget,
+        help="attention pairs per network batch — the VRAM knob",
+    )
+    ap.add_argument(
+        "--cell-budget", type=int, default=KlentConfig.cell_budget,
+        help="legal cells (decoder rows) per network batch — the other VRAM knob",
+    )
     ap.add_argument("--lr", type=float, default=KlentConfig.lr)
     ap.add_argument("--checkpoint-every", type=int, default=25)
     ap.add_argument(
@@ -168,6 +176,8 @@ def main(argv=None) -> None:
         seed_fraction=args.seed_fraction,
         seed_cut=tuple(args.seed_cut),
         batch_size=args.batch,
+        pair_budget=args.pair_budget,
+        cell_budget=args.cell_budget,
         lr=args.lr,
         device=args.device,
         autocast=args.device == "cuda",

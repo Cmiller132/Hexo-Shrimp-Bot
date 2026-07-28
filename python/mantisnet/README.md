@@ -185,6 +185,7 @@ metrics = iterate(model, opt, cfg, np.random.default_rng(0))  # f, KL, H/log|A|,
 | Checkpoint I/O | The manifest and probe protocol are `hexo-model`'s, and arrive with the package. |
 | Test-time Gumbel MCTS | Design doc §15: the paper's best number, but it measures the search, not the algorithm. |
 | Hand-written Triton kernels | Measured out, for now: after `torch.compile` (which generates fused Triton kernels itself) the forward is no longer the bottleneck, and the remaining costs are memory-bound scatters Inductor already fuses. Revisit if a profile ever shows one kernel dominating. |
+| FlexAttention for the §4.1 distance bias | Measured out (2026-07-27): a `score_mod` computing buckets from coordinates in-kernel was built and proven exactly equivalent (outputs ~2e-6, `dist_bias` grads ~2e-8), but at this model's sizes it ran **5× slower in fit and 2.7× slower in collection** for ≤0.2 GiB saved — once batches are budget-packed, attention is no longer the memory driver, and flex under dynamic shapes needed 128-padded lengths plus an eager block mask to compile at all. Revisit only if H or D_MAX grow enough to make the bias tensor dominant again. |
 
 ## Performance
 
@@ -207,18 +208,27 @@ first process *on a machine* pays the compile — measured ~15 min cold under
 Windows Triton at training sizes, disk-cached thereafter — plus one extra
 specialisation the first time a 0/1-sized dimension appears.
 
-Two operational hazards, measured rather than guessed
-(`docs/KLENT_RUN_PLAN.md` §3 has the probe table):
+**VRAM is budgeted, not hoped for.** Every network batch — fit chunk or
+collection cohort — is packed under two `KlentConfig` knobs before it is
+built: `pair_budget` bounds the attention's materialised per-pair bias (the
+axis quadratic in stone count) and `cell_budget` bounds decoder rows (the
+axis linear in legal cells), so `batch_size` is a per-step *maximum* and the
+peak is set by config rather than by whatever the corpus contains. Fit
+chunks are packed length-sorted (a chunk pads to its own longest sample, so
+one 500-stone position can no longer square-inflate a mixed chunk);
+collection cohorts split in game order, which the chunking-invariance test
+pins. Measured on the iteration-0 worst-case corpus (~5.5 k legal
+cells/sample, games to ply 500) at the defaults: **collection peaks at
+0.36 GiB, a fit epoch at ~2.9 GiB — and runs ~2× faster** than the unpacked
+batch-256 fit, because homogeneous-length chunks stop paying padding. Both
+knobs scale the peak roughly linearly if a card needs to give back more.
+The sample buffer itself never touches VRAM: samples are numpy arrays and
+move prefixes in host memory.
 
-- **The fitting batch is VRAM-bound by the early-training corpus.** An
-  untrained policy lets games drift for hundreds of plies, legal sets reach
-  ~5–14 k cells, and the attention's materialised per-pair bias is quadratic
-  in stone count: on 12 GiB, `--batch 256` fits with headroom, 512 does not,
-  and the paper's 4096 is far out of reach until games shorten.
-- **Windows VRAM overruns fail slow, not loud.** The driver spills to system
-  RAM at PCIe speed instead of raising OOM — a ~50× slowdown with no error.
-  Watch `torch.cuda.max_memory_allocated()` against capacity; Linux (the
-  deploy target) raises OOM honestly.
+One hazard remains worth knowing: **Windows VRAM overruns fail slow, not
+loud.** The driver spills to system RAM at PCIe speed instead of raising
+OOM — a ~50× slowdown with no error. The budgets exist to keep the run out
+of that regime; Linux (the deploy target) raises OOM honestly.
 
 **Platforms.** The deploy target is Linux (WSL2 / the container of
 `CONTAINER_SPEC.md`), where the torch wheel bundles Triton; the

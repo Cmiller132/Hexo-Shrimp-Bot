@@ -92,12 +92,18 @@ instead of raising OOM, so a too-big batch reads as a mysterious 20–60×
 slowdown — watch peak memory, not just for crashes. And **the first process
 on a machine pays a cold `torch.compile`** of these graphs (~15 min under
 Windows Triton at these sizes; cached on disk thereafter, and much faster on
-the Linux deploy target). The whole constraint is a transient: once Q learns
-to finish the seeded lines, games shorten, positions shrink, and larger
-batches become trivially affordable — if a later corpus ever justifies it,
-re-probe rather than trust this table. Token-budget batching (chunk by
-Σcells / padded T² cost rather than sample count) is the principled fix if
-the transient ever needs to be fast.
+the Linux deploy target).
+
+> **Superseded the same evening: memory is now budgeted, not probed for.**
+> Token-budget packing landed (`KlentConfig.pair_budget` / `cell_budget`,
+> README Performance): every network batch is packed under both measured
+> memory axes, `--batch` is a per-step maximum, and the table above is the
+> record of why. At the defaults, the same worst-case corpus peaks at
+> 0.36 GiB in collection and ~2.9 GiB in fit — and the fit epoch runs ~2×
+> faster than the packed-by-count 256 batch, because homogeneous-length
+> chunks stop paying padding. FlexAttention was built and measured against
+> this as an alternative (exactly equivalent, 5× slower here) and deleted;
+> the README's "deliberately absent" table records the numbers.
 
 **The machinery verdict: solid.** 100 iterations completed; `config.json`,
 114 metrics rows, and ten checkpoints landed as designed. The crash-resume
@@ -210,11 +216,12 @@ In order; each rung is small and none blocks the one above it being useful.
   game somebody won within the cap. Watched via `f` and game lengths; not
   patched.
 - **The iteration-0 transient** (§3): long drifting games, ballooned legal
-  sets, quadratic attention memory. Survived by batch sizing today;
-  token-budget batching is the named fix if it ever needs to be fast.
+  sets, quadratic attention memory. Bounded by the memory budgets
+  (`pair_budget` / `cell_budget`) — a corpus can now cost time, never VRAM.
 - **VRAM overruns fail slow on Windows** (driver spill to system RAM), and
   loud on Linux. A run that suddenly runs ~50× slower without erroring has
-  overrun; peak-memory checks, not crash logs, are the detector.
+  overrun; peak-memory checks, not crash logs, are the detector. The
+  budgets exist to keep runs out of that regime entirely.
 - **Compile warmup** is paid once per machine, not per iteration (cold
   Windows-Triton compile of these graphs measured ~15 min; disk-cached
   thereafter). A recompile that recurs *per iteration* is a bug —

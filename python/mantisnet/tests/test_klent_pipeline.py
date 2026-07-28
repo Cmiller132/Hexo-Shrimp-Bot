@@ -23,7 +23,7 @@ from mantisnet.klent import (
 )
 from mantisnet.klent.evaluate import argmax_choose
 from mantisnet.klent.seeds import line_scores, seed_prefix
-from mantisnet.klent.train import fit, network_evaluate
+from mantisnet.klent.train import _pack, fit, network_evaluate
 
 
 def heuristic_evaluate(batch):
@@ -41,6 +41,40 @@ def _tiny_model():
             policy_hidden=32, value_hidden=32,
         )
     )
+
+
+def test_fit_packing_respects_budgets_and_loses_nothing():
+    from types import SimpleNamespace
+
+    rng = np.random.default_rng(0)
+    samples = [
+        SimpleNamespace(t=int(t), improved=np.zeros(int(c), dtype=np.float32))
+        for t, c in zip(rng.integers(1, 500, 300), rng.integers(1, 8000, 300))
+    ]
+    cfg = KlentConfig(batch_size=32, pair_budget=2_000_000, cell_budget=30_000)
+    chunks = _pack(samples, rng.permutation(len(samples)), cfg)
+
+    assert sorted(i for c in chunks for i in c) == list(range(len(samples)))
+    for chunk in chunks:
+        assert len(chunk) <= cfg.batch_size
+        t_pad = max(samples[i].t for i in chunk) + 1
+        assert t_pad == samples[chunk[0]].t + 1  # descending: first is widest
+        if len(chunk) > 1:  # a lone oversized sample is kept, never dropped
+            assert len(chunk) * t_pad * t_pad <= cfg.pair_budget
+            assert sum(len(samples[i].improved) for i in chunk) <= cfg.cell_budget
+
+
+def test_collection_is_chunking_invariant():
+    """Budgets change how the cohort is split across evaluate calls, and
+    nothing else: with a per-position evaluator the episodes are identical."""
+    outcomes = []
+    for budgets in ({}, {"pair_budget": 2_000, "cell_budget": 400}):
+        rng = np.random.default_rng(11)
+        episodes, _ = play_episodes(
+            heuristic_evaluate, [[] for _ in range(5)], 60, 0.1, 0.03, rng, **budgets
+        )
+        outcomes.append([(e.moves, e.winner) for e in episodes])
+    assert outcomes[0] == outcomes[1]
 
 
 def test_heuristic_selfplay_terminates_and_buffers_correctly():
