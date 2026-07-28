@@ -5,16 +5,17 @@ losses — plus the KLENT training path of `docs/KLENT_DESIGN.md`: the
 closed-form policy improvement that replaces tree search, implemented
 faithful-first against that document.
 
-**Status: implemented and green.** The model is 1.25 M parameters at the §2
-defaults — the spec's 1.2 M plus the appendix-B Q head — with the spec's §12
-obligations as tests; KLENT carries the design
-doc's §4.7 obligations as its own. On the 4070 Ti a steady-state KLENT
-iteration (32 seeded games → buffer → fit) runs in ~3 s: batch building is
-Rust and rayon-parallel (~0.1 ms/position) and the forward is
-`torch.compile`d (~2.1× over eager) — the Performance section below has the
-numbers. **Not yet a `ModelPackage`:** no
-encoder, no evaluator, no sessions, no checkpoints, and no record/runner
-integration — the KLENT buffer is in-memory per iteration, as the paper's is.
+**Status: implemented, green, and past its first training run.** The model
+is 1.25 M parameters at the §2 defaults — the spec's 1.2 M plus the
+appendix-B Q head — with the spec's §12 obligations as tests; KLENT carries
+the design doc's §4.7 obligations as its own. Batch building is Rust and
+rayon-parallel (~0.1 ms/position), the forward is `torch.compile`d (~2.1×
+over eager), and a full KLENT iteration at the design's settings (64 games,
+cap 512) runs in ~36 s at its iteration-0 worst on the 4070 Ti — the
+Performance section below has the numbers and the two hazards worth knowing.
+**Not yet a `ModelPackage`:** no encoder, no evaluator, no sessions, and no
+record/runner integration — the KLENT buffer is in-memory per iteration, as
+the paper's is.
 
 ## Shape
 
@@ -153,11 +154,14 @@ deviation from it can be measured.
   per turn. `docs/KLENT_RUN_PLAN.md` §2 records both resolutions.
 - **A run is its directory.** `python -m mantisnet.klent.run --out runs/<name>
   --iterations N` writes `config.json` (knobs + versions), `metrics.jsonl`
-  (the §13 metrics per iteration, including the v̂-vs-outcome calibration
-  that watches the §9 bias), and resumable checkpoints; `--resume` continues
-  after a crash and refuses a checkpoint from other versions. Evaluation is
-  deliberately absent for now — `docs/KLENT_RUN_PLAN.md` plans it and the
-  shakeout run.
+  (strict JSON, one row per iteration: the §13 metrics including the
+  v̂-vs-outcome calibration that watches the §9 bias), and resumable
+  checkpoints; `--resume` continues after a crash and refuses a checkpoint
+  from other versions. `--eval-every N` plays `argmax π_θ` against the line
+  builder at pinned noise — seat balanced, caps scored ½ and kept visible —
+  with an eval RNG derived from (run seed, iteration) so the training
+  trajectory is identical with evaluation on or off.
+  `docs/KLENT_RUN_PLAN.md` is the operational plan around this driver.
 
 ```python
 from mantisnet import MantisConfig, MantisNet
@@ -193,13 +197,28 @@ pool (worst-case-dense positions):
 | Batch build, Python reference (single thread) | ~0.6 k pos/s |
 | Forward, compiled, bf16 autocast | ~9.4 k pos/s (27 ms/batch) |
 | Forward, eager, bf16 autocast | ~4.4 k pos/s |
-| KLENT iteration, steady state (32 games, cap 200) | ~3 s (was ~30 s eager + Python builder) |
+| KLENT iteration (32 games, cap 200, steady state) | ~3 s (was ~30 s eager + Python builder) |
+| KLENT iteration (64 games, cap 512, iteration 0) | ~36 s — the capped-tail worst case |
 
 `KlentConfig.compile` turns on one `torch.compile(dynamic=True)` graph shared
 by collection and fitting. Sizes inside the forward come from tensor shapes,
 not the `Batch`'s ints, so one symbolic graph serves every batch shape; the
-first process pays the compile (tens of seconds, partly cached across runs),
-plus one extra specialisation the first time a 0/1-sized dimension appears.
+first process *on a machine* pays the compile — measured ~15 min cold under
+Windows Triton at training sizes, disk-cached thereafter — plus one extra
+specialisation the first time a 0/1-sized dimension appears.
+
+Two operational hazards, measured rather than guessed
+(`docs/KLENT_RUN_PLAN.md` §3 has the probe table):
+
+- **The fitting batch is VRAM-bound by the early-training corpus.** An
+  untrained policy lets games drift for hundreds of plies, legal sets reach
+  ~5–14 k cells, and the attention's materialised per-pair bias is quadratic
+  in stone count: on 12 GiB, `--batch 256` fits with headroom, 512 does not,
+  and the paper's 4096 is far out of reach until games shorten.
+- **Windows VRAM overruns fail slow, not loud.** The driver spills to system
+  RAM at PCIe speed instead of raising OOM — a ~50× slowdown with no error.
+  Watch `torch.cuda.max_memory_allocated()` against capacity; Linux (the
+  deploy target) raises OOM honestly.
 
 **Platforms.** The deploy target is Linux (WSL2 / the container of
 `CONTAINER_SPEC.md`), where the torch wheel bundles Triton; the

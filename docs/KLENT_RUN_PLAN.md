@@ -11,12 +11,11 @@ document as they complete — it is a plan, not a changelog.
 ## 1. Where things stand
 
 The baseline is implemented and green (`python/mantisnet/README.md`): model,
-KLENT loop, 54 tests on Windows and WSL2, ~3 s per steady-state iteration at
-32 games on the 4070 Ti. The run driver (`mantisnet.klent.run`) persists what
-a run is: `config.json` with every knob and version, `metrics.jsonl` with the
-§13 metrics per iteration, and resumable checkpoints carrying model,
-optimizer, and RNG state. No evaluation runs yet (§4), and nothing here is a
-`ModelPackage` (§5, rung 6).
+KLENT loop, 55 tests on Windows and WSL2. The run driver (`mantisnet.klent.run`)
+persists what a run is: `config.json` with every knob and version,
+`metrics.jsonl` with the §13 metrics per iteration, and resumable checkpoints
+carrying model, optimizer, and RNG state. Evaluation runs in the driver
+(`--eval-every`, §4). Nothing here is a `ModelPackage` (§5, rung 5).
 
 ---
 
@@ -60,66 +59,114 @@ tensors is a packaging question that arrives with the `ModelPackage` wiring
 
 ---
 
-## 3. The shakeout run
+## 3. The shakeout — ran 2026-07-27, `runs/shakeout-1`
 
-Purpose: not strength — **stability and instrumentation**. One command,
-~100 iterations, a few hours, gating the first long run.
+Purpose was stability and instrumentation, not strength, and it delivered
+both — including one real bug and one real dynamics finding. The command:
 
 ```
 uv run python -m mantisnet.klent.run --out runs/shakeout-1 \
-    --iterations 100 --games 64 --checkpoint-every 10 --seed 1
+    --iterations 100 --games 64 --checkpoint-every 10 --seed 1 \
+    --batch 256 --eval-every 10 --eval-games 64
 ```
 
-(`--cap` defaults to the design's 512; the fitting batch defaults to 1024 —
-see the probe below.)
+**The batch-size probe ran (2026-07-27), and the paper's 4096 is out.** The
+probe's premise — "~1,000 legal cells per sample" — was itself wrong at
+iteration 0: an untrained π′ is near-uniform, the seeded near-win almost
+never gets completed, and games drift for ~160–500 plies while the radius-8
+frontier balloons. The measured iteration-0 corpus (64 games, seed 0) is
+13.5 k samples at **~5,600 legal cells per sample** (max ~14 k), and fit
+memory is dominated by the attention's materialised per-pair bias, quadratic
+in stone count. On the 4070 Ti (12 GiB), against that corpus:
 
-Before it: **the batch-size probe.** The paper's fitting batch is 4096; at
-Hexo's ~1,000 legal cells per sample that is ~4 M decoder rows per step and
-untested against 12 GB. Run a few fit steps at `--batch 4096` and `2048` on
-shakeout data; keep the largest that fits with headroom, record it here.
+| `--batch` | s/step | peak alloc | verdict |
+| --- | --- | --- | --- |
+| 128 | 0.23 | 2.5 GiB | fits |
+| **256** | 1.41 | 5.7 GiB | **chosen: fits with headroom** |
+| 512 | 88 | 17.1 GiB | silent spill to system RAM, ~60× slower |
+| 1024–4096 | — | 25 GiB+ | OOM even with spill |
 
-What to watch, per iteration in `metrics.jsonl`:
+Two hazards worth naming beyond the numbers. **Windows fails slow, not
+loud:** the driver spills VRAM overflow into system RAM at PCIe speed
+instead of raising OOM, so a too-big batch reads as a mysterious 20–60×
+slowdown — watch peak memory, not just for crashes. And **the first process
+on a machine pays a cold `torch.compile`** of these graphs (~15 min under
+Windows Triton at these sizes; cached on disk thereafter, and much faster on
+the Linux deploy target). The whole constraint is a transient: once Q learns
+to finish the seeded lines, games shorten, positions shrink, and larger
+batches become trivially affordable — if a later corpus ever justifies it,
+re-probe rather than trust this table. Token-budget batching (chunk by
+Σcells / padded T² cost rather than sample count) is the principled fix if
+the transient ever needs to be fast.
 
-| Metric | Healthy | Alarming |
-| --- | --- | --- |
-| `f_seeded` | high from the start (near-terminal starts) | falling toward 0 — seeds too long or policy degrading |
-| `f_unseeded` | 0 early; *any* sustained rise is real progress | — |
-| `acting_norm_entropy` | drifting down from ~0.9 as Q sharpens | pinned ≥0.95 forever (Q never bites) or collapsed ≈0 while `v_hat_mae` stays bad (§9 noise-latching) |
-| `acting_kl` | small and steady — updates are gradual | growing without bound |
-| `v_hat_mae` / winner-vs-loser means | MAE falling; means separating (+/−) | means converging or inverted — the §9 bias, or a sign bug K1 would have caused (tests exclude the latter) |
-| `p0_win_rate` | near the seeded games' natural split | pinned 0 or 1 |
-| `first_stone_win_rate` | strictly between 0 and 1 | 0 or 1 exactly — K2's freeze path uncovered |
-| `seconds` | flat after iteration ~2 | growing — recompile churn or a leak |
-| `buffer_samples` | roughly `f · games · mean length` | 0 for many iterations — fitting starved |
+**The machinery verdict: solid.** 100 iterations completed; `config.json`,
+114 metrics rows, and ten checkpoints landed as designed. The crash-resume
+path was exercised twice *on real wreckage* — both crashes were the same
+bug: the policy-target sum-to-1 guard accusing its own fp32 accumulator on
+flat-phase positions ~14 k cells wide (|sum−1| = 1.3e-4, zero NaN/Inf —
+the guard's error message now reports deviation, width, and non-finite
+counts, which is what settled the diagnosis). Fixed by accumulating the
+check in f64; the final stretch ran the same regime clean. No leaks and no
+recompile churn: `seconds` tracks *game length* (0.3 s sharp-phase, ~2 min
+flat-phase), which supersedes the old watch-table reading of "growing
+seconds = leak".
 
-Abort and diagnose on: OOM, any NaN loss, `seconds` trending up across tens
-of iterations, or `f_seeded` collapsing. Afterwards: resume once from the
-last checkpoint and confirm the metrics line continues where it stopped —
-that exercises the crash path on purpose.
+**The dynamics verdict: the loop trains, and the baseline is unstable at
+the paper's knobs.** One seed, so observations rather than conclusions:
 
-Wall-clock arithmetic for sizing runs, from measured steady state
-(~3 ms/sample end to end): iteration cost ≈ `f · games · mean_length · 3 ms`
-+ ~0.5 s overhead. 64 games at ~70-ply wins and `f ≈ 0.9` is ~13 s/iteration;
-100 iterations ≈ 25 minutes. A first *real* run at 256 games is ~1 min per
-iteration, ~1,400 iterations/day.
+- The iteration-0 transient dies by iteration 4 (won lengths 177 → 60 → 20
+  plies; the initial +1.8 Q bias corrected in one fit).
+- Then an **entropy-breathing cycle** (`H/log|A|` 0.13 ↔ 0.92, ~10-iteration
+  period): seeds give Q spread near wins → π′ sharpens → games shorten →
+  Q values compress → the λ-entropy term flattens π′ *below* π_θ — where
+  Q spread ≪ τ+λ, eq. 3 makes π′ ∝ π_θ^0.77, strictly flatter — and the
+  loop drifts toward uniform. From iteration ~65 it sat in that **uniform
+  fixed point** for long stretches: `H ≈ 0.91`, `KL(π′‖π_θ) ≈ 0.003` (no
+  improvement signal left), policy CE ≈ ln|A|, `f` down to 0.64.
+- Eval against the anchor peaked at **0.688** (iteration 39), then **0.000
+  from iteration 69 onward** — even after collection re-sharpened and every
+  collection metric looked healthy again. The deployed artefact is the
+  policy head, and collection health does not measure it: **eval in the
+  driver is not optional.**
+- The §9 instrument shows no runaway overestimation (winner-side v̂ means
+  stay ≤ ~0.4 after iteration 1) but weak discrimination all run:
+  `v_hat_mae` never below ~0.7, winner/loser means barely separated. Q
+  learns that a win is near, not whose.
+
+What this buys rung 1 (§5): the baseline curves that gate every rung-2
+deviation now exist, and they point at named knobs — λ down or τ up (§2.1's
+"at or above 0.77" now has a mechanism behind it: the flattening operator),
+A2's Bernoulli critic for Q discrimination, A3's entropy controller aimed
+squarely at the breathing. Watch-table amendments for the next run, learned
+here: `H` pinned ≥ 0.9 **with `KL ≈ 0`** is the uniform-fixed-point
+signature and the strongest abort-and-retune signal there is; `seconds`
+spikes mean long games, not leaks; `eval_score` at 0 while `f = 1.00` means
+the policy head died, not the run.
+
+Sizing note for real runs: collection cost is dominated by the *longest
+game* (lockstep), so flat phases cost ~2 min/iteration at 64 games while
+sharp phases cost 0.3 s. Size from the shakeout's own `seconds` column, not
+per-sample arithmetic.
 
 ---
 
-## 4. Evaluation — deferred, and what it will be
+## 4. Evaluation — in the driver, and what it still isn't
 
-Nothing measures strength yet, on purpose: the shakeout's health metrics do
-not need it, and bolting eval on later costs nothing (the pieces —
-`play_match`, `argmax_choose`, the line builder as opponent — already exist
-and are tested). When it lands, in the run driver as `--eval-every N`:
+`--eval-every N` plays `argmax π_θ` (no search) against **anchor zero: the
+line builder at pinned noise** (`ANCHOR_NOISE` in `klent/evaluate.py` —
+pinned because an anchor whose randomness drifts is not an anchor). Seat
+balanced; capped games score ½ and stay visible as `eval_capped`. The score
+joins that iteration's `metrics.jsonl` row, and the eval RNG derives from
+(run seed, iteration) rather than the training stream — a run's training
+trajectory is bit-identical with evaluation on or off, tested.
 
-- **Anchor zero is the line builder at pinned noise** (an anchor whose
-  randomness drifts is not an anchor); the first strong checkpoint replaces
-  it as the frozen anchor the design doc §11 wants, never retrained.
-- Agent plays `argmax π_θ`, no search; **seat balanced**; capped games score
-  ½ and are reported separately, not folded in.
-- Enough games per point for the interval to mean something (the paper used
-  1024; scale to budget).
-- Later, `KLENT_PROPOSALS.md` A7: the checkpoint cross-play matrix, as a
+Still future, deliberately:
+
+- The first strong checkpoint replaces the line builder as the frozen
+  anchor the design doc §11 wants, never retrained.
+- Games per point scale with budget (the paper used 1024; `--eval-games`
+  defaults to 64, a health signal rather than a rating).
+- `KLENT_PROPOSALS.md` A7: the checkpoint cross-play matrix, as a
   diagnostic for cyclic forgetting — checkpoints already exist, so it is
   cheap when wanted.
 
@@ -129,27 +176,26 @@ and are tested). When it lands, in the run driver as `--eval-every N`:
 
 In order; each rung is small and none blocks the one above it being useful.
 
-1. **Eval in the driver** (§4), after the shakeout proves the loop stable.
-2. **First real run** (256+ games/iteration, days of wall clock), seed
+1. **First real run** (256+ games/iteration, days of wall clock), seed
    annealing by hand from the metrics; automate the anneal only if manual
    proves tedious.
-3. **Measured deviations from the baseline**, each gated on the baseline's
+2. **Measured deviations from the baseline**, each gated on the baseline's
    own curves and staged per `KLENT_PROPOSALS.md` A4 (screen at ~10% budget,
    promote on improvement): the λ_intra split (A1), the Bernoulli
    win-probability critic (A2, the cheapest §9 mitigation), the
    normalized-entropy dual controller (A3, one dimension at fixed ρ).
-4. **Artefact hygiene**: the value-head decision (§2.4), a checkpoint
+3. **Artefact hygiene**: the value-head decision (§2.4), a checkpoint
    retention policy, and pruning `runs/` deliberately.
-5. **Provenance**: per-game seeds minted from stable ids (the B4 shape) so a
+4. **Provenance**: per-game seeds minted from stable ids (the B4 shape) so a
    run reproduces, and the buffer's records written through `hexo-records`
    (B2's per-move blob) instead of living only in memory — at which point
    dropped-episode records become revisitable data, as design doc §12 notes.
-6. **The `ModelPackage`**: encoder/evaluator over the hexo-search seam,
+5. **The `ModelPackage`**: encoder/evaluator over the hexo-search seam,
    manifest + probe hash, the container image of `CONTAINER_SPEC.md` — the
    point where this Python stops being a side tree and becomes the package
    the Rust container drives. The forward, builder, and checkpoints all
    survive unchanged; what is added is the seam plumbing.
-7. **Test-time Gumbel MCTS** (design doc §15), once there is a checkpoint
+6. **Test-time Gumbel MCTS** (design doc §15), once there is a checkpoint
    worth searching with — as a DAG, per K8, and outside every comparable
    number this plan produces before it.
 
@@ -159,10 +205,17 @@ In order; each rung is small and none blocks the one above it being useful.
 
 - **§9 overestimation bias** is the predicted failure of this design at
   b ≈ 1000. Its instrument (v̂ calibration) is in every iteration's metrics;
-  its cheapest mitigations are rung 3's A2 and a higher ρ.
+  its cheapest mitigations are rung 2's A2 and a higher ρ.
 - **Corpus conditioning** (§5.1 of the design): everything trained on is a
   game somebody won within the cap. Watched via `f` and game lengths; not
   patched.
-- **Compile warmup** (~1 min per process) is paid once per run, not per
-  iteration; a recompile that recurs *per iteration* is a bug — `seconds`
-  in the metrics is the detector.
+- **The iteration-0 transient** (§3): long drifting games, ballooned legal
+  sets, quadratic attention memory. Survived by batch sizing today;
+  token-budget batching is the named fix if it ever needs to be fast.
+- **VRAM overruns fail slow on Windows** (driver spill to system RAM), and
+  loud on Linux. A run that suddenly runs ~50× slower without erroring has
+  overrun; peak-memory checks, not crash logs, are the detector.
+- **Compile warmup** is paid once per machine, not per iteration (cold
+  Windows-Triton compile of these graphs measured ~15 min; disk-cached
+  thereafter). A recompile that recurs *per iteration* is a bug —
+  `seconds` in the metrics is the detector.
