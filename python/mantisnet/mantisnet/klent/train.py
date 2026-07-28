@@ -10,6 +10,8 @@ nowhere: KLENT has no state-value head, and v̂ = E_{π′}[Q] does its job.
 
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -17,8 +19,8 @@ import torch
 
 from ..builder import collate_prefixes
 from ..losses import policy_loss
-from .seeds import line_evaluate, seed_prefix
-from .selfplay import Sample, collection_stats, episode_samples, play_episodes
+from .seeds import line_evaluate, seed_prefixes
+from .selfplay import Sample, collection_stats, play_episodes
 
 
 @dataclass
@@ -53,7 +55,10 @@ class KlentConfig:
     # Attention memory is quadratic in the batch's longest position (padding),
     # decoder memory linear in its total legal cells.
     pair_budget: int = 8_000_000  # padded (stones + token)^2 pairs per batch
-    cell_budget: int = 400_000  # legal cells (decoder rows) per batch
+    # 800k cells ≈ 5.8 GiB worst-case fit peak on the iteration-0 corpus —
+    # still comfortable on 12 GiB, and half the chunk count (so half the
+    # per-chunk Python and launch overhead) of the original 400k.
+    cell_budget: int = 800_000  # legal cells (decoder rows) per batch
 
 
 def _policy_q(model, batch):
@@ -65,6 +70,14 @@ def _policy_q(model, batch):
 # One symbolic-shape graph serves every batch; compiled lazily, shared by
 # collection and fitting (the same graph gets the compiled backward).
 _policy_q_compiled = None
+
+# Every compiled-callable invocation holds this lock. The GPU work was
+# serialized on one stream anyway; what the lock buys is that when dynamo
+# (re)compiles on one thread — sporadic new shape buckets keep this possible
+# at any iteration — the other thread sleeps at the lock instead of
+# thrashing the GIL against the trace, which was measured to stretch a
+# seconds-long compile into a minutes-long crawl.
+_gpu_lock = threading.Lock()
 
 
 def _policy_q_fn(cfg: KlentConfig):
@@ -82,10 +95,11 @@ def network_evaluate(model, cfg: KlentConfig):
     policy_q = _policy_q_fn(cfg)
 
     def evaluate(batch):
-        b = batch.to(cfg.device)
-        with torch.no_grad(), torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
-            policy, q = policy_q(model, b)
-        return policy.float().cpu(), q.float().cpu()
+        with _gpu_lock:
+            b = batch.to(cfg.device)
+            with torch.no_grad(), torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
+                policy, q = policy_q(model, b)
+            return policy.float().cpu(), q.float().cpu()
 
     return evaluate
 
@@ -144,7 +158,13 @@ def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.rando
     and the optimizer steps once — the paper's batch statistics under the
     packing. A step's gradient equals the mean loss over its whole
     accumulated batch, so the chunking is an implementation detail of memory
-    and not of optimization. Returns the sample-weighted mean losses."""
+    and not of optimization. Returns the sample-weighted mean losses.
+
+    Two throughput facts. Chunk *preparation* (the Rust replay rebuild and
+    the target tensors) runs one chunk ahead on a worker thread, so the GPU
+    never waits on it. And the loss scalars accumulate on-device — the only
+    host sync is the single read at the end; per-chunk ``float()`` reads
+    were measured to stall the stream once per chunk."""
     model.train()
     policy_q = _policy_q_fn(cfg)
     chunks = _pack(samples, rng.permutation(len(samples)), cfg)
@@ -161,43 +181,63 @@ def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.rando
     if group:
         groups.append((group, count))
 
-    policy_sum, q_sum, total = 0.0, 0.0, 0
-    for group, group_n in groups:
-        optimizer.zero_grad(set_to_none=True)
-        for k in group:
-            chunk = [samples[i] for i in chunks[k]]
-            batch = _rebuild(chunk).to(cfg.device)
-            target = torch.from_numpy(np.concatenate([s.improved for s in chunk])).to(cfg.device)
-            ranks = torch.tensor([s.rank for s in chunk], device=cfg.device)
-            returns = torch.tensor([s.g for s in chunk], dtype=torch.float32, device=cfg.device)
+    def prep(k: int):
+        chunk = [samples[i] for i in chunks[k]]
+        batch = _rebuild(chunk)
+        target = torch.from_numpy(np.concatenate([s.improved for s in chunk]))
+        ranks = torch.tensor([s.rank for s in chunk])
+        returns = torch.tensor([s.g for s in chunk], dtype=torch.float32)
+        return chunk, batch, target, ranks, returns
 
-            with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
-                policy_logits, q_values = policy_q(model, batch)
-            ce = policy_loss(policy_logits.float(), batch.legal_offsets, target)
-            taken = q_values.float().index_select(0, batch.legal_offsets[:-1] + ranks)
-            q_mse = (taken - returns).square().mean()
+    order = [k for group, _ in groups for k in group]
+    policy_sum = torch.zeros((), device=cfg.device)
+    q_sum = torch.zeros((), device=cfg.device)
+    total = 0
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        prepped = {k: pool.submit(prep, k) for k in order[:1]}
+        consumed = 0
+        for group, group_n in groups:
+            optimizer.zero_grad(set_to_none=True)
+            for k in group:
+                if consumed + 1 < len(order):
+                    nxt = order[consumed + 1]
+                    prepped[nxt] = pool.submit(prep, nxt)
+                chunk, batch, target, ranks, returns = prepped.pop(k).result()
+                consumed += 1
+                with _gpu_lock:
+                    batch = batch.to(cfg.device)
+                    target = target.to(cfg.device)
+                    ranks = ranks.to(cfg.device)
+                    returns = returns.to(cfg.device)
 
-            ((ce + q_mse) * (len(chunk) / group_n)).backward()
-            policy_sum += float(ce.detach()) * len(chunk)
-            q_sum += float(q_mse.detach()) * len(chunk)
-        optimizer.step()
-        total += group_n
+                    with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
+                        policy_logits, q_values = policy_q(model, batch)
+                    ce = policy_loss(policy_logits.float(), batch.legal_offsets, target)
+                    taken = q_values.float().index_select(
+                        0, batch.legal_offsets[:-1] + ranks
+                    )
+                    q_mse = (taken - returns).square().mean()
+
+                    ((ce + q_mse) * (len(chunk) / group_n)).backward()
+                    policy_sum += ce.detach() * len(chunk)
+                    q_sum += q_mse.detach() * len(chunk)
+            optimizer.step()
+            total += group_n
     return {
-        "policy_loss": policy_sum / total,
-        "q_loss": q_sum / total,
+        "policy_loss": float(policy_sum) / total,
+        "q_loss": float(q_sum) / total,
         "fit_steps": len(groups),
     }
 
 
 def generate_prefixes(seed: int, n: int, seed_fraction: float, seed_cut, seed_noise):
-    """One iteration's seed prefixes, from a self-contained RNG — the run
-    driver generates them on a worker thread while the previous iteration
-    still fits, because prefixes depend on nothing the model learns."""
+    """One iteration's seed prefixes, from a self-contained RNG. The seed
+    games play in lockstep (`seed_prefixes`) — generating them one at a
+    time was the loop's single largest measured cost."""
     prng = np.random.default_rng(seed)
-    return [
-        seed_prefix(prng, seed_cut, seed_noise) if prng.random() < seed_fraction else []
-        for _ in range(n)
-    ]
+    seeded = prng.random(n) < seed_fraction
+    drawn = iter(seed_prefixes(prng, int(seeded.sum()), seed_cut, seed_noise))
+    return [next(drawn) if s else [] for s in seeded]
 
 
 def ground_count(cfg: KlentConfig, warm: bool) -> int:
@@ -206,29 +246,31 @@ def ground_count(cfg: KlentConfig, warm: bool) -> int:
     return 0 if warm else round(cfg.ground_fraction * cfg.games_per_iteration)
 
 
-def iterate(
+def collect_episodes(
     model,
-    optimizer,
     cfg: KlentConfig,
     rng: np.random.Generator,
     warm: bool = False,
     prefixes: list | None = None,
     opponent=None,
-) -> dict:
-    """One full KLENT iteration. Returns the §13 first-class metrics; an
-    empty buffer (f = 0) skips fitting rather than failing — that outcome is
-    the signal the seeding knobs exist to move.
+) -> tuple[list, dict]:
+    """One iteration's corpus: episodes plus the §13 collection metrics.
+
+    Worker-safe by construction — it draws only from the ``rng`` it is
+    given and mutates only the episodes it creates, which is what lets the
+    run driver collect iteration ``i+1`` on a weight snapshot while
+    iteration ``i`` fits on the live model.
 
     ``warm`` is the bootstrap phase: collection acts through the line
     builder's scores instead of the network, because an honestly-initialized
     π′ is near-uniform and finishes almost no seeded games — measured, not
-    supposed. Warm returns are pure Monte-Carlo outcomes (λ_ret = 1): the
-    heuristic's v̂ lives on an arbitrary scale and must not bootstrap.
+    supposed. (Warm episodes must also fit against pure Monte-Carlo returns
+    — the heuristic's v̂ lives on an arbitrary scale and must not bootstrap;
+    the driver owns that choice of ``lam_ret``.)
 
     ``prefixes`` covers the *self-play* games only — ``ground_count`` games
     are grounded against ``opponent`` (unseeded, alternating seats) and take
-    no prefix. The driver pre-generates prefixes on a worker thread; left
-    ``None``, they are drawn here from ``rng``."""
+    no prefix. Left ``None``, they are drawn here from ``rng``."""
     n_ground = ground_count(cfg, warm)
     if n_ground and opponent is None:
         raise ValueError("ground_fraction > 0 needs an opponent")
@@ -261,11 +303,4 @@ def iterate(
     )
     metrics.update(collection_stats(episodes))
     metrics["warm"] = int(warm)
-
-    samples = [
-        s for e in episodes for s in episode_samples(e, 1.0 if warm else cfg.lam_ret)
-    ]
-    metrics["buffer_samples"] = len(samples)
-    if samples:
-        metrics.update(fit(model, samples, optimizer, cfg, rng))
-    return metrics
+    return episodes, metrics

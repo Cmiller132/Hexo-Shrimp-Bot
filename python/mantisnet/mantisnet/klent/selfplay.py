@@ -172,29 +172,36 @@ def play_episodes(
             policy_logits, q_values = evaluate(batch)
             imp = improved_policy(policy_logits, q_values, batch.legal_offsets, tau, lam)
 
-            offsets = batch.legal_offsets.tolist()
             kl_sum += float(imp.kl.sum())
             ent_sum += float(imp.norm_entropy.sum())
             decisions += len(chunk)
 
+            # All per-cell math runs flat over the chunk. Renormalized in
+            # f64 before storage: the fp32 softmax's accumulated denominator
+            # leaves |sum−1| ≈ N·1e-8, which at 10^4-cell positions crosses
+            # policy_loss's corruption gate. The sampler and the stored
+            # target see the same numbers. Sampling is one uniform per game
+            # against the segment's slice of one flat CDF.
+            offsets = batch.legal_offsets.numpy()
             flat = imp.probs.numpy().astype(np.float64)
+            widths = np.diff(offsets)
+            flat /= np.repeat(np.add.reduceat(flat, offsets[:-1]), widths)
+            cdf = np.cumsum(flat)
+            base = np.concatenate(([0.0], cdf[offsets[1:-1] - 1]))
             draws = rng.random(len(chunk))  # one uniform per game, in game order
+            ranks = np.searchsorted(cdf, base + draws) - offsets[:-1]
+            ranks = np.clip(ranks, 0, widths - 1)
+            stored = np.split(flat.astype(np.float32), offsets[1:-1])
+            v_hats = imp.v_hat.numpy()
+
             for slot, i in enumerate(chunk):
                 ep, pos = episodes[i], positions[i]
-                # Renormalized in f64 before storage: the fp32 softmax's
-                # accumulated denominator leaves |sum−1| ≈ N·1e-8, which at
-                # 10^4-cell positions crosses policy_loss's corruption gate.
-                # The sampler and the stored target see the same numbers.
-                probs = flat[offsets[slot] : offsets[slot + 1]]
-                probs /= probs.sum()
-                cdf = np.cumsum(probs)
-                rank = min(int(np.searchsorted(cdf, draws[slot])), len(cdf) - 1)
-
+                rank = int(ranks[slot])
                 ep.moves_remaining.append(pos.moves_remaining)
                 ep.movers.append(pos.current_player)
                 ep.ranks.append(rank)
-                ep.improved.append(probs.astype(np.float32))
-                ep.v_hats.append(float(imp.v_hat[slot]))
+                ep.improved.append(stored[slot])
+                ep.v_hats.append(float(v_hats[slot]))
                 ep.ts.append(len(ep.moves))
 
                 move = pos.nth_legal(rank)

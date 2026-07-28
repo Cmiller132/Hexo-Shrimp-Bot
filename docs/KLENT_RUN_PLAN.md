@@ -290,11 +290,28 @@ is orchestration-bound); 512 chosen — double the grounded games per
 iteration of 256, twice the improvement rounds per hour of 1024.
 
 The first grounding ablation (running as this is written): three arms
-forked from `overnight-3/checkpoint_002062`, 1300 iterations at games
-512, `--ground-fraction` 0 / 0.25 / 0.5 (`runs/abl-gnd0`,
-`runs/abl-gnd25`, `runs/abl-gnd50`), judged by the depth-1 SealBot curve
-over each arm's checkpoints plus the anchor eval for regression. The
-winner's setting carries into the next long run.
+forked from `overnight-3/checkpoint_002062`, 1300 iterations,
+`--ground-fraction` 0 / 0.25 / 0.5 (`runs/abl-gnd0`, `runs/abl-gnd25`,
+`runs/abl-gnd50`), judged by the depth-1 SealBot curve over each arm's
+checkpoints plus the anchor eval for regression. The winner's setting
+carries into the next long run.
+
+### The pipelined loop (landed the same afternoon)
+
+A phase profile found the sequential loop's ~3.2 k samples/s ceiling was
+CPU orchestration — half of it seed-prefix generation playing games one
+at a time — with the GPU at ~6% duty. The loop was rewritten as the only
+path: seed games play in lockstep cohorts, iteration ``i+1`` collects on
+a worker thread against a weight snapshot while iteration ``i`` fits (the
+corpus runs **one fit behind** the paper's strict alternation — the
+recorded algorithmic cost of the overlap), sampling is vectorized per
+chunk, and fit preps chunks one ahead with on-device loss accumulation.
+Measured: **~6.3 k samples/s at games 1024 (2.3 s/iteration, GPU bursts
+90–98%, ~5 GiB VRAM)** — 2× — with games 1024 the new operating point
+(~1,540 improvement rounds/hour at double the corpus of the old 512).
+The mantisnet README's Performance section records the two threading
+hazards this depends on (the compile lock and the sequential first
+iteration).
 
 ---
 

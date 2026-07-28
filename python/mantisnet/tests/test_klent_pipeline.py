@@ -15,14 +15,14 @@ import torch
 from mantisnet import MantisConfig, MantisNet
 from mantisnet.klent import (
     KlentConfig,
+    collect_episodes,
     episode_samples,
-    iterate,
     play_episodes,
     play_match,
 )
 from mantisnet.klent.evaluate import argmax_choose
 from mantisnet.klent.seeds import line_evaluate, line_scores, seed_prefix
-from mantisnet.klent.train import _pack, fit, iterate, network_evaluate
+from mantisnet.klent.train import _pack, fit, network_evaluate
 
 # The line builder's scoring through the evaluator seam, so games terminate
 # and the buffer rules are observable without a trained model — the same
@@ -46,10 +46,12 @@ def test_warm_iteration_trains_through_the_line_evaluator():
     model = _tiny_model()
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
     cfg = KlentConfig(games_per_iteration=8, ply_cap=200, batch_size=256)
-    metrics = iterate(model, opt, cfg, np.random.default_rng(9), warm=True)
+    episodes, metrics = collect_episodes(model, cfg, np.random.default_rng(9), warm=True)
     assert metrics["warm"] == 1
-    assert metrics["buffer_samples"] > 0, "line play must terminate games"
-    assert metrics["fit_steps"] >= 1
+    samples = [s for e in episodes for s in episode_samples(e, 1.0)]
+    assert samples, "line play must terminate games"
+    out = fit(model, samples, opt, cfg, np.random.default_rng(9))
+    assert out["fit_steps"] >= 1
     assert any(
         p.grad is not None and float(p.grad.abs().sum()) > 0
         for p in model.mlp_q.parameters()
@@ -223,24 +225,24 @@ def test_grounded_returns_are_outcomes_and_caps_are_draws():
     assert episode_samples(capped_self[0], 0.939) == []
 
 
-def test_iterate_grounds_a_fraction_and_reports_it():
+def test_collection_grounds_a_fraction_and_reports_it():
     model = _tiny_model()
     cfg = KlentConfig(
         games_per_iteration=6, ground_fraction=0.5, ply_cap=200,
         batch_size=64, seed_fraction=1.0, seed_cut=(1, 3),
     )
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    metrics = iterate(
-        model, optimizer, cfg, np.random.default_rng(16), opponent=_scripted_opponent
+    episodes, metrics = collect_episodes(
+        model, cfg, np.random.default_rng(16), opponent=_scripted_opponent
     )
+    assert sum(e.opponent_seat is not None for e in episodes) == 3
     assert metrics["f_grounded"] == metrics["f_grounded"]  # grounded games exist
     assert 0.0 <= metrics["grounded_score"] <= 1.0
-    assert metrics["buffer_samples"] > 0
+    assert any(episode_samples(e, cfg.lam_ret) for e in episodes)
 
     import pytest
 
     with pytest.raises(ValueError, match="opponent"):
-        iterate(model, optimizer, cfg, np.random.default_rng(16))
+        collect_episodes(model, cfg, np.random.default_rng(16))
 
 
 def test_seeded_prefix_plies_stay_out_of_the_buffer():
@@ -281,18 +283,19 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
             assert p.grad is not None, f"{name} received no gradient"
 
 
-def test_iterate_runs_end_to_end():
+def test_collect_and_fit_end_to_end():
     model = _tiny_model()
     cfg = KlentConfig(
         games_per_iteration=4, ply_cap=60, batch_size=64, seed_fraction=1.0, seed_cut=(1, 3)
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    metrics = iterate(model, optimizer, cfg, np.random.default_rng(12))
-    for key in ("f_seeded", "f_unseeded", "acting_kl", "acting_norm_entropy", "buffer_samples"):
+    episodes, metrics = collect_episodes(model, cfg, np.random.default_rng(12))
+    for key in ("f_seeded", "f_unseeded", "acting_kl", "acting_norm_entropy"):
         assert key in metrics
-    assert metrics["buffer_samples"] >= 0
-    if metrics["buffer_samples"]:
-        assert "policy_loss" in metrics
+    samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret)]
+    if samples:
+        out = fit(model, samples, optimizer, cfg, np.random.default_rng(12))
+        assert np.isfinite(out["policy_loss"])
 
 
 def test_network_evaluate_matches_forward():

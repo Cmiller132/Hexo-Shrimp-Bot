@@ -22,6 +22,7 @@ run directory is found automatically).
 from __future__ import annotations
 
 import argparse
+import copy
 import dataclasses
 import json
 import time
@@ -35,7 +36,8 @@ from concurrent.futures import ThreadPoolExecutor
 from ..builder import MODEL_REPR_VERSION
 from ..model import MantisConfig, MantisNet
 from .evaluate import ANCHOR_NOISE, anchor_match, argmax_choose
-from .train import KlentConfig, generate_prefixes, ground_count, iterate
+from .selfplay import episode_samples
+from .train import KlentConfig, collect_episodes, fit, generate_prefixes, ground_count
 
 
 def _versions() -> dict:
@@ -120,7 +122,15 @@ def run_training(
     anneal: bool = False,
     opponent=None,
 ) -> None:
-    """Loop `iterate`, appending metrics and checkpointing as it goes.
+    """The pipelined loop: while iteration ``i`` fits on the main thread,
+    iteration ``i+1``'s prefixes generate and its episodes collect on a
+    worker, acting through a snapshot of the weights as they stood *before*
+    fit ``i``. The corpus therefore runs one fit behind the paper's strict
+    alternation — the deliberate cost of overlapping the loop's CPU half
+    with its GPU half, recorded here because it is an algorithmic property,
+    not an implementation detail. Collection draws from its own
+    per-iteration stream (seeded off the main one at submission), so a
+    resumed run replays the same corpus.
 
     ``evaluate_fn(model, done) -> dict`` runs every ``eval_every`` completed
     iterations and its fields join that iteration's metrics row.
@@ -137,40 +147,49 @@ def run_training(
     from the endgame instead of parking on trivial near-terminal stubs —
     measured to happen with a static cut: self-play stays perfect while
     strength against a real opponent dies. The live ceiling is recorded in
-    every metrics row as ``seed_cut_hi``.
+    every metrics row as ``seed_cut_hi``, and it is applied to the
+    *collection being submitted*, so a walk step reaches the corpus one
+    iteration later.
     """
     starved = 0
     cut_lo, cut_hi = cfg.seed_cut
     out_dir.mkdir(parents=True, exist_ok=True)
+    # The collection actor: a persistent clone the worker forwards through
+    # while fit mutates the live model. Reloaded (cheap, on-device copies)
+    # at each submission, when the worker is idle by construction.
+    snapshot = copy.deepcopy(model)
 
-    def submit_prefixes(pool, for_iteration):
-        # Knobs are frozen at submission (the anneal mutates cfg between
-        # iterations) and the worker seed comes off the main stream, so a
-        # resumed run regenerates the same prefixes. Prefixes cover the
-        # self-play games only — the consuming iteration's grounded games
-        # (none while it is warm) start empty.
-        n_self = cfg.games_per_iteration - ground_count(cfg, for_iteration < warm_iterations)
-        return pool.submit(
-            generate_prefixes,
-            int(rng.integers(2**63)),
-            n_self,
-            cfg.seed_fraction,
-            cfg.seed_cut,
-            cfg.seed_noise,
-        )
+    def submit_collect(pool, for_iteration):
+        warm = for_iteration < warm_iterations
+        frozen = dataclasses.replace(cfg)  # the anneal mutates cfg between iterations
+        prefix_seed = int(rng.integers(2**63))
+        play_seed = int(rng.integers(2**63))
+        if not warm:
+            snapshot.load_state_dict(model.state_dict())
+
+        def job():
+            prefixes = generate_prefixes(
+                prefix_seed,
+                frozen.games_per_iteration - ground_count(frozen, warm),
+                frozen.seed_fraction,
+                frozen.seed_cut,
+                frozen.seed_noise,
+            )
+            return collect_episodes(
+                snapshot, frozen, np.random.default_rng(play_seed),
+                warm=warm, prefixes=prefixes, opponent=opponent,
+            ), warm
+
+        return pool.submit(job)
 
     with (
         (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file,
         ThreadPoolExecutor(max_workers=1) as pool,
     ):
-        pending = submit_prefixes(pool, start_iteration)
+        pending = submit_collect(pool, start_iteration)
         for i in range(start_iteration, iterations):
             t0 = time.perf_counter()
-            prefixes = pending.result()
-            metrics = iterate(
-                model, optimizer, cfg, rng,
-                warm=i < warm_iterations, prefixes=prefixes, opponent=opponent,
-            )
+            (episodes, metrics), was_warm = pending.result()
             metrics["iteration"] = i
             if anneal and i >= warm_iterations:
                 f = metrics["f_seeded"]
@@ -180,7 +199,24 @@ def run_training(
                     cut_hi = max(cut_lo, cut_hi - 4)
                 cfg.seed_cut = (cut_lo, cut_hi)
             metrics["seed_cut_hi"] = cut_hi
-            pending = submit_prefixes(pool, i + 1)  # overlaps eval, write, next collect
+            # The first processed iteration stays sequential: its fit is the
+            # train-graph torch.compile, and a concurrent collection hitting
+            # the same compiled callable mid-compile was measured to livelock
+            # the two threads on the GIL. From the second iteration on, both
+            # graphs exist and collection overlaps fit.
+            overlap = i > start_iteration
+            if overlap and i + 1 < iterations:
+                pending = submit_collect(pool, i + 1)  # overlaps the fit below
+            samples = [
+                s
+                for e in episodes
+                for s in episode_samples(e, 1.0 if was_warm else cfg.lam_ret)
+            ]
+            metrics["buffer_samples"] = len(samples)
+            if samples:
+                metrics.update(fit(model, samples, optimizer, cfg, rng))
+            if not overlap and i + 1 < iterations:
+                pending = submit_collect(pool, i + 1)
             metrics["seconds"] = time.perf_counter() - t0  # eval kept out: this
             done = i + 1  # column is the recompile/leak detector and must stay flat
             if eval_every and evaluate_fn is not None and done % eval_every == 0:

@@ -69,32 +69,59 @@ def line_builder_choose(pos, rng: np.random.Generator, noise: float = 0.1):
     return line_builder_choose_batch([pos], rng, noise)[0]
 
 
-def line_builder_game(rng: np.random.Generator, noise: float = 0.1, cap: int = 512):
-    """A whole line-builder game from the empty board.
+def line_builder_games(rng: np.random.Generator, n: int, noise: float = 0.1, cap: int = 512):
+    """``n`` whole line-builder games from the empty board, in lockstep —
+    one collate and one scoring pass per ply serve the entire cohort.
+    Playing them one at a time was measured at ~0.9 s per training
+    iteration of batch-of-one collates, the loop's single largest cost.
 
-    Returns ``(moves, winner)`` with ``winner`` ``None`` if the cap hit —
+    Returns ``(moves, winners)`` with a winner ``None`` where the cap hit —
     rare at low noise, but a capped seed game must not be used as if won.
     """
     import hexo_py
 
-    pos = hexo_py.Position()
-    moves: list[tuple[int, int]] = []
-    while not pos.is_terminal and len(moves) < cap:
-        move = line_builder_choose(pos, rng, noise)
-        pos.advance(*move)
-        moves.append(move)
-    return moves, pos.winner
+    positions = [hexo_py.Position() for _ in range(n)]
+    moves: list[list[tuple[int, int]]] = [[] for _ in range(n)]
+    winners: list[int | None] = [None] * n
+    live = list(range(n))
+    while live:
+        picked = line_builder_choose_batch([positions[i] for i in live], rng, noise)
+        still = []
+        for i, move in zip(live, picked):
+            positions[i].advance(*move)
+            moves[i].append(move)
+            if positions[i].is_terminal:
+                winners[i] = positions[i].winner
+            elif len(moves[i]) < cap:
+                still.append(i)
+        live = still
+    return moves, winners
 
 
-def seed_prefix(rng: np.random.Generator, cut_range: tuple[int, int], noise: float = 0.1):
-    """A prefix of a *won* line-builder game, cut ``cut ∈ [lo, hi]`` plies
-    before its end. ``cut >= 1`` guarantees the prefix is non-terminal."""
+def line_builder_game(rng: np.random.Generator, noise: float = 0.1, cap: int = 512):
+    """One whole line-builder game — the cohort player, cohort of one."""
+    moves, winners = line_builder_games(rng, 1, noise, cap)
+    return moves[0], winners[0]
+
+
+def seed_prefixes(
+    rng: np.random.Generator, count: int, cut_range: tuple[int, int], noise: float = 0.1
+):
+    """``count`` prefixes of *won* line-builder games, each cut
+    ``cut ∈ [lo, hi]`` plies before its end (``cut >= 1`` guarantees a
+    non-terminal prefix). Games play in lockstep; the rare capped ones are
+    replayed until enough have finished."""
     lo, hi = cut_range
     if lo < 1 or hi < lo:
         raise ValueError(f"cut range must satisfy 1 <= lo <= hi, got {cut_range}")
-    while True:
-        moves, winner = line_builder_game(rng, noise)
-        if winner is None:
-            continue
-        cut = int(rng.integers(lo, hi + 1))
-        return moves[: max(len(moves) - cut, 0)]
+    won: list[list[tuple[int, int]]] = []
+    while len(won) < count:
+        games, winners = line_builder_games(rng, count - len(won), noise)
+        won += [m for m, w in zip(games, winners) if w is not None]
+    cuts = rng.integers(lo, hi + 1, size=count)
+    return [m[: max(len(m) - int(c), 0)] for m, c in zip(won, cuts)]
+
+
+def seed_prefix(rng: np.random.Generator, cut_range: tuple[int, int], noise: float = 0.1):
+    """One seed prefix — the cohort generator, cohort of one."""
+    return seed_prefixes(rng, 1, cut_range, noise)[0]

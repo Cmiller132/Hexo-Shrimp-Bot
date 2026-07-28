@@ -172,10 +172,10 @@ def test_starvation_stops_the_run(tmp_path, monkeypatch):
     from mantisnet.klent.train import KlentConfig
 
     starved = {
-        "f_seeded": 0.0, "f_unseeded": float("nan"), "buffer_samples": 0,
+        "f_seeded": 0.0, "f_unseeded": float("nan"), "warm": 0,
         "acting_kl": 0.0, "acting_norm_entropy": 0.99,
     }
-    monkeypatch.setattr(run_mod, "iterate", lambda *a, **k: dict(starved))
+    monkeypatch.setattr(run_mod, "collect_episodes", lambda *a, **k: ([], dict(starved)))
 
     torch.manual_seed(0)
     model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
@@ -204,13 +204,13 @@ def test_anneal_walks_the_cut_by_measured_f(tmp_path, monkeypatch):
     cfg = KlentConfig(games_per_iteration=8, seed_cut=(1, 8), ply_cap=64)
     fs = iter([1.0, 1.0, 1.0, 0.1, 0.1, float("nan"), 1.0])
 
-    def fake_iterate(model, opt, c, rng, warm=False, prefixes=None, opponent=None):
-        return {
-            "f_seeded": next(fs), "f_unseeded": 1.0, "buffer_samples": 99,
+    def fake_collect(model, c, rng, warm=False, prefixes=None, opponent=None):
+        return [], {
+            "f_seeded": next(fs), "f_unseeded": 1.0, "warm": 0,
             "acting_kl": 0.0, "acting_norm_entropy": 0.5,
         }
 
-    monkeypatch.setattr(run_mod, "iterate", fake_iterate)
+    monkeypatch.setattr(run_mod, "collect_episodes", fake_collect)
     torch.manual_seed(0)
     model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
     run_mod.run_training(

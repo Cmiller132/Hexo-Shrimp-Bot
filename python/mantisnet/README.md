@@ -239,7 +239,7 @@ pool (worst-case-dense positions):
 | Forward, compiled, bf16 autocast | ~9.4 k pos/s (27 ms/batch) |
 | Forward, eager, bf16 autocast | ~4.4 k pos/s |
 | Collection, steady state (256 games, trained policy) | ~9.3 k pos/s (~0.35 s) |
-| KLENT iteration, steady state (256 games) | ~1.1–1.5 s at 3–4.5 k samples (~3 k samples/s end to end) |
+| KLENT iteration, pipelined (1024 games, ground 0.25) | ~2.3 s at ~14.8 k samples (~6.3 k samples/s end to end) |
 | Anchor eval, 128 games | ~0.3 s (was ~6 s sequential) |
 | KLENT iteration (64 games, cap 512, iteration 0, untrained) | ~36 s — the capped-tail worst case |
 
@@ -252,14 +252,38 @@ the previous iteration — they depend on nothing the model learns, so their
 stream for resume-reproducibility). **Sampling is one uniform per game**
 against the stored π′ CDF rather than a per-game `rng.choice`.
 
-**End-to-end throughput plateaus at ~3.2 k samples/s** (measured 2026-07-28
-at games 256 / 512 / 1024: ~1.1 s / ~2.0 s / ~4.2 s per iteration, same
-samples/s): the loop is CPU-orchestration-bound, so more games per
-iteration raises GPU duty (spikes reach ~99% at 1024, VRAM ~4.4 GiB) but
-not throughput, while halving policy-improvement rounds per hour each
-doubling. 512 is the operating point. Depth-1 SealBot grounding at
-fraction 0.25 costs ~nothing (~1 ms/turn). The next real lever is
-pipelining collection against fitting, not more games.
+**The loop is pipelined: collection overlaps fitting** (2026-07-28, after
+a phase-level profile). The sequential loop plateaued at ~3.2 k samples/s
+whatever the game count, and the profile said why: ~0.9 s of every 2 s
+iteration was *prefix generation* playing seed games one at a time
+(4,000+ batch-of-one collates), another ~0.3 s was fit-side Python and a
+per-chunk GPU sync, and the GPU idled at ~6% between small bursts. The
+fixes, in measured order of value: seed games now play in lockstep
+cohorts (`line_builder_games` — prefix cost ~10× down); iteration
+``i+1``'s prefixes + collection run on a worker thread against a weight
+snapshot while iteration ``i`` fits on the live model (the corpus runs
+one fit behind the strict alternation — an algorithmic property,
+documented in `run_training`); the per-game sampling loop is one flat
+CDF + one vectorized `searchsorted` per chunk; fit preps each chunk one
+ahead on a worker and accumulates its loss scalars on-device (one host
+sync per iteration, not per chunk).
+
+Measured at the operating point (games 1024, ground 0.25, warm caches):
+**2.34 s/iteration at ~14.8 k samples — ~6.3 k samples/s end to end, 2×
+the sequential loop** — scaling with games again (512 → ~4.8 k/s), GPU
+bursting to 90–98% with ~5.0 GiB reserved. Depth-1 SealBot grounding
+still costs ~nothing (~1 ms/turn).
+
+Two threading facts the pipeline depends on. **Every compiled-callable
+invocation holds one lock** (`train._gpu_lock`): a dynamo (re)compile on
+one thread while the other runs Python was measured to stretch a
+seconds-long compile into a minutes-long GIL-thrashing crawl — under the
+lock the other side sleeps, and sporadic new-shape-bucket recompiles cost
+seconds again. And **the first processed iteration stays sequential**, so
+both graphs compile without a concurrent collector. Cold-cache processes
+also transiently over-reserve VRAM during compile/autotune (once measured
+18.9 GiB reserved at a 6.6 GiB allocated peak); warm steady state sits at
+~5 GiB for both.
 
 `KlentConfig.compile` turns on one `torch.compile(dynamic=True)` graph shared
 by collection and fitting. Sizes inside the forward come from tensor shapes,

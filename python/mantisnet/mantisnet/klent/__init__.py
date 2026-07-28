@@ -11,7 +11,7 @@ from .improve import ImprovedPolicy, improved_policy
 from .returns import lambda_returns, signs_from_moves_remaining
 from .seeds import line_builder_choose, line_builder_game
 from .selfplay import Episode, Sample, collection_stats, episode_samples, play_episodes
-from .train import KlentConfig, fit, iterate
+from .train import KlentConfig, collect_episodes, fit
 from .evaluate import anchor_match, play_match
 from .run import run_training
 
@@ -28,8 +28,8 @@ __all__ = [
     "episode_samples",
     "play_episodes",
     "KlentConfig",
+    "collect_episodes",
     "fit",
-    "iterate",
     "anchor_match",
     "play_match",
     "run_training",
