@@ -26,6 +26,7 @@ python/mantisnet/
     __init__.py       # flat re-exports, MODEL_REPR_VERSION
     builder.py        # §3-§4, §9: graphs, index tables, collation
     model.py          # §5-§7, §10 + appendix B: trunk, policy/Q/value heads
+    attention.py      # fused coordinate-biased attention + SDPA fallback/backward
     losses.py         # §6, §7, §10: targets, cross-entropies, decay grouping
     segments.py       # ragged per-position reductions, shared by losses and klent
     klent/
@@ -284,7 +285,7 @@ if samples:
 | Records / runner integration for the buffer | Design doc §12/§14. The in-memory per-iteration buffer is the paper's own shape; persistence arrives with B2's per-move blob, not with a private writer here. |
 | Checkpoint I/O | The manifest and probe protocol are `hexo-model`'s, and arrive with the package. |
 | Test-time Gumbel MCTS | Design doc §15: the paper's best number, but it measures the search, not the algorithm. |
-| Hand-written Triton kernels | The earlier "measured out" verdict was conditioned on the forward not being the bottleneck. That condition ended with the auto-reset collector (2026-07-28): collection is now ~96 % forward-path wall clock, so a hand attention kernel — padding-aware key bounds, the distance bucket computed in-kernel from coordinates, the bias table's pad row as the mask — is the active work item. |
+| Further hand-written Triton kernels | Block attention is the one kernel that landed: distance buckets and the learned per-head bias are computed in-kernel, each row stops at its live key prefix, and dense SDPA remains only for CPU/failed-shape fallback and fit's recompute backward. Its fixed 64×64, four-warp, three-stage launch passed parity but improved the complete long-position forward only ~1.04×, below the 1.4× target; add another kernel only after a new profile identifies a larger isolated cost. |
 | FlexAttention for the §4.1 distance bias | Measured out (2026-07-27): a `score_mod` computing buckets from coordinates in-kernel was built and proven exactly equivalent (outputs ~2e-6, `dist_bias` grads ~2e-8), but at this model's sizes it ran **5× slower in fit and 2.7× slower in collection** for ≤0.2 GiB saved — once batches are budget-packed, attention is no longer the memory driver, and flex under dynamic shapes needed 128-padded lengths plus an eager block mask to compile at all. Revisit only if H or D_MAX grow enough to make the bias tensor dominant again. |
 
 ## Performance
@@ -296,9 +297,32 @@ pool (worst-case-dense positions):
 | --- | --- |
 | Batch build, Rust (`collate_positions`, all cores) | ~9.5 k pos/s (~0.10 ms/pos) |
 | Batch build, Python reference (single thread) | ~0.6 k pos/s |
-| Forward, compiled, bf16 autocast | ~9.4 k pos/s (27 ms/batch) |
+| Forward, compiled, bf16 autocast (random-playout shape mix) | ~9.4 k pos/s (27 ms/batch) |
 | Forward, eager, bf16 autocast | ~4.4 k pos/s |
-| Collection (1024 slots, 4096-game quota, trained policy) | ~145 k samples in ~42 s cold / ~30 s warm (~4.9 k samples/s steady) |
+| Collection (1024 slots, 4096-game quota, trained policy) | ~144 k samples in 59.88 s from empty compiler caches / 17.55 s warm (2.42 k / 8.16 k samples/s) |
+
+**Fused attention is a measured negative against its 1.4× whole-forward
+target** (2026-07-28). The target-card sweep chose a fixed 64×64 tile,
+four warps, and three stages. Complete compiled bf16 forward time was:
+
+| Stones | Cohort | Dense SDPA | Fused | Speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 256 | 33.1 ms | 32.9 ms | 1.01× |
+| 50 | 1024 | 136.0 ms | 134.0 ms | 1.01× |
+| 200 | 256 | 112.9 ms | 111.1 ms | 1.02× |
+| 200 | 1024 | 455.1 ms | 445.4 ms | 1.02× |
+| 400 | 256 | 214.6 ms | 206.4 ms | 1.04× |
+| 400 | 1024 | 860.1 ms | 822.8 ms | 1.05× |
+
+At 400 stones peak allocation fell from 2.32 to 2.05 GiB, but removing
+the dense bias and padded-key work moved the complete forward only ~4%,
+so the latency target was not met. Collection shows the cache tradeoff:
+the dense-SDPA baseline was 41.8 s / 3.48 k samples/s cold; fused attention
+was 59.88 s / 2.42 k cold but 17.55 s / 8.16 k warm, with 15.76 s of warm
+network busy time. A real compiled fit epoch was effectively flat: 8,215
+samples in 0.86 s (9,569 samples/s) dense versus 7,784 in 0.82 s (9,487
+samples/s) fused, a normalized -0.9%; the two receipts used separate
+collector corpora rather than a paired sample set.
 
 Two loop-level facts behind those numbers. **Choosers are batched**
 (`choose(positions, rng) -> moves`): `play_match` advances every live game
@@ -326,11 +350,13 @@ empty board that step), stops at a completion quota, and carries in-flight
 games to the next call. Inside each step, chunks pipeline across three
 lanes — collate worker → GPU → sampling worker — so the CPU phases hide
 behind the forward (measured: 6.1 s of CPU busy against 4.4 s of
-wall-clock overhang at the operating point). Net: **~671 samples/s
-production average before → ~4.9 k samples/s steady after (~7×), with
-iteration wall clock bounded by construction.** The loop is now
-network-bound (~96 % of wall in the forward path), which is where the
-next round of work goes.
+wall-clock overhang at the operating point). Net from the collector rewrite:
+**~671 samples/s production average before → ~4.9 k samples/s steady after
+(~7×), with iteration wall clock bounded by construction.** On the fused
+attention tree the same harness reaches 8.16 k samples/s warm (2.42 k/s from
+empty compiler caches). The warm loop remains network-bound (~90% of wall),
+but the attention sweep above shows that forward-path share is not the same
+as attention's share.
 
 Two threading facts the pipeline depends on. **Every compiled-callable
 invocation holds one lock** (`train._gpu_lock`): a dynamo (re)compile on
@@ -346,26 +372,30 @@ also transiently over-reserve VRAM during compile/autotune (once measured
 `KlentConfig.compile` turns on one `torch.compile(dynamic=True)` graph shared
 by collection and fitting. Sizes inside the forward come from tensor shapes,
 not the `Batch`'s ints, so one symbolic graph serves every batch shape; the
-first process *on a machine* pays the compile — measured ~15 min cold under
-Windows Triton at training sizes, disk-cached thereafter — plus one extra
+attention custom op remains an opaque call inside that graph, including
+during fit. Its first dtype/head-dimension execution compiles the fixed
+kernel, and a failed shape is warned once and permanently routed through
+SDPA. The first process *on a machine* still pays graph compilation — a
+historical full collection-plus-fit cold compile at training sizes measured
+~15 min under Windows Triton, disk-cached thereafter — plus one extra
 specialisation the first time a 0/1-sized dimension appears.
 
 **VRAM is budgeted, not hoped for.** Every network batch — fit chunk or
 collection cohort — is packed under two `KlentConfig` knobs before it is
-built: `pair_budget` bounds the attention's materialised per-pair bias (the
-axis quadratic in stone count) and `cell_budget` bounds decoder rows (the
-axis linear in legal cells), so `batch_size` is a per-step *maximum* and the
-peak is set by config rather than by whatever the corpus contains. Fit
-chunks are packed length-sorted (a chunk pads to its own longest sample, so
-one 500-stone position can no longer square-inflate a mixed chunk);
-collection cohorts split in game order, which the chunking-invariance test
-pins. Measured on the iteration-0 worst-case corpus (~5.5 k legal
-cells/sample, games to ply 500) at the defaults: **collection peaks at
-0.36 GiB, a fit epoch at ~2.9 GiB — and runs ~2× faster** than the unpacked
-batch-256 fit, because homogeneous-length chunks stop paying padding. Both
-knobs scale the peak roughly linearly if a card needs to give back more.
-The sample buffer itself never touches VRAM: samples are numpy arrays and
-move prefixes in host memory.
+built: `pair_budget` caps padded attention work and, during fit, the dense
+recompute-backward pair tensors; `cell_budget` caps decoder rows. In no-grad
+collection the fused kernel no longer materialises a per-pair bias, so its
+pair budget is primarily a work/latency bound. `batch_size` is a per-step
+*maximum* and the peak is set by config rather than by whatever the corpus
+contains. Fit chunks are packed length-sorted (a chunk pads to its own
+longest sample, so one 500-stone position can no longer square-inflate a
+mixed chunk); collection cohorts split in game order, which the
+chunking-invariance test pins. Measured on the iteration-0 worst-case corpus
+(~5.5 k legal cells/sample, games to ply 500) at the defaults:
+**collection peaks at 0.36 GiB, a fit epoch at ~2.9 GiB — and runs ~2×
+faster** than the unpacked batch-256 fit, because homogeneous-length chunks
+stop paying padding. The sample buffer itself never touches VRAM: samples
+are numpy arrays and move prefixes in host memory.
 
 One hazard remains worth knowing: **Windows VRAM overruns fail slow, not
 loud.** The driver spills to system RAM at PCIe speed instead of raising
@@ -375,12 +405,13 @@ of that regime; Linux (the deploy target) raises OOM honestly.
 **Platforms.** The destination is Docker on Linux for *everything* —
 training, self-play, and evaluation, not just serving — and the
 environment exists: `docker/` at the repo root (owner pulled it forward
-2026-07-28; see `docker/README.md`). Measured on identical code and the
-same card, the container ran collection **1.44× faster than
-Windows-native** (5.0 k vs 3.5 k samples/s, cold-compile-inclusive) — the
-gain is the Linux compiler stack, and it is where all Triton work
-happens. Windows-native runs remain a convenience for tests and quick
-checks; there the `triton-windows` dependency is marked
+2026-07-28; see `docker/README.md`). On the pre-fused-attention tree,
+identical code on the same card ran collection **1.44× faster in the
+container than Windows-native** (5.0 k vs 3.5 k samples/s,
+cold-compile-inclusive). The fused kernel above was implemented and
+measured Windows-native; remeasure that platform ratio before using it as
+a current projection. Windows-native runs remain a convenience for tests
+and quick checks; there the `triton-windows` dependency is marked
 `sys_platform == 'win32'`. Outside the container under bare WSL, keep the
 two trees separate from the Windows ones: build `hexo-py` with
 `CARGO_TARGET_DIR=target-wsl` (the repo's convention) and give uv its own

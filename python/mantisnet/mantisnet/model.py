@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .attention import fused_attention
 from .builder import NEAREST_BUCKETS, NUM_PATTERNS, Batch
 
 
@@ -46,9 +47,8 @@ class MantisConfig:
 
     # Bucket indices of the attention bias table (§4.1): distances 1..D_MAX
     # occupy 0..D_MAX-1, then SELF, then TOKEN. TOKEN wins on the token-token
-    # pair. PAD is not a table entry — it indexes the sentinel column the
-    # forward appends, so padded keys read -inf-class bias straight from the
-    # gather and no separate mask tensor ever exists.
+    # pair. PAD is not a parameter row: attention appends its finite sentinel
+    # after casting the learned table to the compute dtype.
     @property
     def self_bucket(self) -> int:
         return self.d_max
@@ -130,7 +130,7 @@ class _Block(nn.Module):
         self.drop = nn.Dropout(cfg.dropout)
 
     def forward(
-        self, s: Tensor, w: Tensor, g: Tensor, batch: Batch, bucket: Tensor
+        self, s: Tensor, w: Tensor, g: Tensor, batch: Batch, seq_lens: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.cfg
         # Sizes come from tensor shapes, not the Batch's ints: under
@@ -162,14 +162,10 @@ class _Block(nn.Module):
         k = self.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         v = self.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
 
-        # The bias table plus its PAD sentinel, cast *before* the gather: the
-        # (P, A, T, T) tensor is built exactly once, in the compute dtype.
-        table = self.dist_bias.to(q.dtype)
-        table = torch.cat(
-            [table, table.new_full((cfg.heads, 1), torch.finfo(q.dtype).min)], dim=1
-        )
-        mask = table[:, bucket].permute(1, 0, 2, 3)  # (P, A, T, T)
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        # Coordinates become distance buckets inside the attention kernel.
+        # Each position's key loop stops at its live prefix instead of doing
+        # quadratic work over padding.
+        out = fused_attention(q, k, v, batch.coords, seq_lens, self.dist_bias)
         out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(p * max_t, cfg.h)
         s = s + self.drop(out.index_select(0, batch.stone_slot))
         g = g + self.drop(out.index_select(0, token_slot))
@@ -241,36 +237,15 @@ class MantisNet(nn.Module):
             nn.init.zeros_(head.out.weight)
             nn.init.zeros_(head.out.bias)
 
-    def _buckets(self, batch: Batch) -> Tensor:
-        """Distance buckets for every padded row pair, once per forward (§4.1).
-
-        Arithmetic stays in the builder's int32 — the (P, T, T) intermediates
-        are pure memory traffic and need no promotion. Padded keys land in
-        ``pad_bucket``, whose sentinel bias column is the attention mask; the
-        final ``long()`` is the one int64 tensor, required by the gather."""
-        cfg = self.cfg
-        c = batch.coords
-        dq = c[:, :, None, 0] - c[:, None, :, 0]
-        dr = c[:, :, None, 1] - c[:, None, :, 1]
-        d = torch.maximum(dq.abs(), torch.maximum(dr.abs(), (dq + dr).abs()))
-        bucket = d.clamp(1, cfg.d_max) - 1
-        t = c.shape[1]
-        eye = torch.eye(t, dtype=torch.bool, device=c.device)
-        bucket = bucket.masked_fill(eye, cfg.self_bucket)
-        bucket[:, 0, :] = cfg.token_bucket
-        bucket[:, :, 0] = cfg.token_bucket
-        bucket = torch.where(batch.attn_valid[:, None, :], bucket, cfg.pad_bucket)
-        return bucket.long()
-
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""
         s = self.stone_table(batch.stone_own)
         w = self.window_table(batch.window_feat)
         g = self.token_base + self.token_moves(batch.moves_idx)
 
-        bucket = self._buckets(batch)
+        seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         for block in self.blocks:
-            s, w, g = block(s, w, g, batch, bucket)
+            s, w, g = block(s, w, g, batch, seq_lens)
         return self.ln_out(s), self.ln_out(w), self.ln_out(g)
 
     def _decode_cells(
