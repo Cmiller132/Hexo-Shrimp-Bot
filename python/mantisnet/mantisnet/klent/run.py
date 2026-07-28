@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from ..builder import MODEL_REPR_VERSION
 from ..model import MantisConfig, MantisNet
 from .evaluate import ANCHOR_NOISE, anchor_match, argmax_choose
-from .train import KlentConfig, generate_prefixes, iterate
+from .train import KlentConfig, generate_prefixes, ground_count, iterate
 
 
 def _versions() -> dict:
@@ -82,8 +82,11 @@ def load_model(path: Path, device: str = "cpu"):
     return model
 
 
-def load_checkpoint(path: Path, model, optimizer, rng) -> int:
+def load_checkpoint(path: Path, model, optimizer, rng=None) -> int:
     """Restore into the given model/optimizer/rng; returns iterations done.
+
+    ``rng=None`` restores the learner halves only — how ``--init-from``
+    forks a fresh run (own seed, iteration 0) from a trained state.
 
     Version mismatches are refused: a checkpoint from other rules or another
     representation would train on silently, which is the failure worth a
@@ -96,7 +99,8 @@ def load_checkpoint(path: Path, model, optimizer, rng) -> int:
         )
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
-    rng.bit_generator.state = ckpt["rng_state"]
+    if rng is not None:
+        rng.bit_generator.state = ckpt["rng_state"]
     return ckpt["iteration"]
 
 
@@ -114,6 +118,7 @@ def run_training(
     starve_limit: int = 10,
     warm_iterations: int = 0,
     anneal: bool = False,
+    opponent=None,
 ) -> None:
     """Loop `iterate`, appending metrics and checkpointing as it goes.
 
@@ -138,14 +143,17 @@ def run_training(
     cut_lo, cut_hi = cfg.seed_cut
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    def submit_prefixes(pool):
+    def submit_prefixes(pool, for_iteration):
         # Knobs are frozen at submission (the anneal mutates cfg between
         # iterations) and the worker seed comes off the main stream, so a
-        # resumed run regenerates the same prefixes.
+        # resumed run regenerates the same prefixes. Prefixes cover the
+        # self-play games only — the consuming iteration's grounded games
+        # (none while it is warm) start empty.
+        n_self = cfg.games_per_iteration - ground_count(cfg, for_iteration < warm_iterations)
         return pool.submit(
             generate_prefixes,
             int(rng.integers(2**63)),
-            cfg.games_per_iteration,
+            n_self,
             cfg.seed_fraction,
             cfg.seed_cut,
             cfg.seed_noise,
@@ -155,12 +163,13 @@ def run_training(
         (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file,
         ThreadPoolExecutor(max_workers=1) as pool,
     ):
-        pending = submit_prefixes(pool)
+        pending = submit_prefixes(pool, start_iteration)
         for i in range(start_iteration, iterations):
             t0 = time.perf_counter()
             prefixes = pending.result()
             metrics = iterate(
-                model, optimizer, cfg, rng, warm=i < warm_iterations, prefixes=prefixes
+                model, optimizer, cfg, rng,
+                warm=i < warm_iterations, prefixes=prefixes, opponent=opponent,
             )
             metrics["iteration"] = i
             if anneal and i >= warm_iterations:
@@ -171,7 +180,7 @@ def run_training(
                     cut_hi = max(cut_lo, cut_hi - 4)
                 cfg.seed_cut = (cut_lo, cut_hi)
             metrics["seed_cut_hi"] = cut_hi
-            pending = submit_prefixes(pool)  # overlaps eval, write, next collect
+            pending = submit_prefixes(pool, i + 1)  # overlaps eval, write, next collect
             metrics["seconds"] = time.perf_counter() - t0  # eval kept out: this
             done = i + 1  # column is the recompile/leak detector and must stay flat
             if eval_every and evaluate_fn is not None and done % eval_every == 0:
@@ -194,6 +203,9 @@ def run_training(
                 f"buffer {metrics['buffer_samples']} | "
                 f"H/log|A| {metrics['acting_norm_entropy']:.3f}"
             )
+            gnd = metrics.get("grounded_score")
+            if gnd is not None and gnd == gnd:
+                line += f" | gnd {gnd:.2f}"
             if "eval_score" in metrics:
                 line += (
                     f" | eval {metrics['eval_score']:.3f}"
@@ -261,11 +273,36 @@ def main(argv=None) -> None:
         "--anneal", action="store_true",
         help="deepen the seed cut while f_seeded holds (design doc §5.2)",
     )
+    ap.add_argument(
+        "--ground-fraction", type=float, default=0.0,
+        help="fraction of each iteration's games grounded against SealBot",
+    )
+    ap.add_argument(
+        "--sealbot", type=Path, default=None,
+        help="SealBot checkout root (required when --ground-fraction > 0)",
+    )
+    ap.add_argument(
+        "--ground-depth", type=int, default=1,
+        help="the grounding opponent's search-depth cap",
+    )
+    ap.add_argument(
+        "--ground-time", type=float, default=0.05,
+        help="the grounding opponent's per-turn time limit (rarely binds under the depth cap)",
+    )
+    ap.add_argument(
+        "--init-from", type=Path, default=None,
+        help="fork a fresh run from a checkpoint's model+optimizer (iteration 0, own seed)",
+    )
     ap.add_argument("--seed", type=int, default=0, help="the run's RNG seed")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-compile", action="store_true")
     ap.add_argument("--resume", action="store_true", help="continue from the run dir's latest checkpoint")
     args = ap.parse_args(argv)
+
+    if args.ground_fraction > 0 and args.sealbot is None:
+        raise SystemExit("--ground-fraction > 0 needs --sealbot")
+    if args.resume and args.init_from is not None:
+        raise SystemExit("--resume and --init-from are exclusive")
 
     cfg = KlentConfig(
         tau=args.tau,
@@ -275,6 +312,7 @@ def main(argv=None) -> None:
         games_per_iteration=args.games,
         seed_fraction=args.seed_fraction,
         seed_cut=tuple(args.seed_cut),
+        ground_fraction=args.ground_fraction,
         batch_size=args.batch,
         pair_budget=args.pair_budget,
         cell_budget=args.cell_budget,
@@ -302,6 +340,9 @@ def main(argv=None) -> None:
         start = load_checkpoint(checkpoints[-1], model, optimizer, rng)
         print(f"resumed {checkpoints[-1].name}: {start} iterations done")
     else:
+        if args.init_from is not None:
+            forked = load_checkpoint(args.init_from, model, optimizer)
+            print(f"initialized from {args.init_from} ({forked} iterations trained)")
         out.mkdir(parents=True, exist_ok=True)
         config = {
             "klent": dataclasses.asdict(cfg),
@@ -312,6 +353,10 @@ def main(argv=None) -> None:
             "eval_games": args.eval_games,
             "eval_anchor_noise": ANCHOR_NOISE,
             "seed": args.seed,
+            "init_from": str(args.init_from) if args.init_from else None,
+            "sealbot": str(args.sealbot) if args.sealbot else None,
+            "ground_depth": args.ground_depth,
+            "ground_time": args.ground_time,
             "versions": _versions(),
         }
         (out / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -329,6 +374,10 @@ def main(argv=None) -> None:
         "starve_limit": args.starve_limit,
         "warm_iterations": args.warm_iterations,
         "anneal": args.anneal,
+        "init_from": str(args.init_from) if args.init_from else None,
+        "sealbot": str(args.sealbot) if args.sealbot else None,
+        "ground_depth": args.ground_depth,
+        "ground_time": args.ground_time,
         "seed": args.seed,
         "klent": dataclasses.asdict(cfg),
         "versions": _versions(),
@@ -339,6 +388,14 @@ def main(argv=None) -> None:
     opponent = None
     if args.eval_anchor is not None:
         opponent = argmax_choose(load_model(args.eval_anchor, cfg.device), cfg.device)
+
+    ground_opponent = None
+    if args.ground_fraction > 0:
+        from .sealbot import sealbot_opponent
+
+        ground_opponent = sealbot_opponent(
+            args.sealbot, depth=args.ground_depth, time_limit=args.ground_time
+        )
 
     def evaluate_fn(m, done):
         # Seeded from (run seed, iteration), never the training stream: the
@@ -367,6 +424,7 @@ def main(argv=None) -> None:
         starve_limit=args.starve_limit,
         warm_iterations=args.warm_iterations,
         anneal=args.anneal,
+        opponent=ground_opponent,
     )
 
 

@@ -155,6 +155,94 @@ def test_samples_replay_to_their_positions():
         assert np.isclose(s.improved.sum(), 1.0, atol=1e-5)
 
 
+def _scripted_opponent(pos, moves):
+    """A whole-turn opponent for the grounding tests: the first legal move,
+    up to the turn's remaining placements — deterministic and rules-honest."""
+    p = pos.copy()
+    turn = []
+    for _ in range(p.moves_remaining):
+        move = p.nth_legal(0)
+        turn.append(move)
+        p.advance(*move)
+        if p.is_terminal:
+            break
+    return turn
+
+
+def test_grounded_games_record_model_plies_only():
+    """Grounded games: the opponent's plies enter the move list but never
+    the records, samples replay to model-to-move positions, and both seats
+    appear across games."""
+    rng = np.random.default_rng(14)
+    seats = [0, 1, None]
+    episodes, _ = play_episodes(
+        heuristic_evaluate, [[], [], []], 200, 0.1, 0.03, rng,
+        opponent=_scripted_opponent, opponent_seats=seats,
+    )
+    for ep, seat in zip(episodes, seats):
+        assert ep.opponent_seat == seat
+        if seat is None:
+            continue
+        assert ep.winner is not None, "a line-scorer vs the first-legal bot finishes"
+        model_seat = 1 - seat
+        assert all(m == model_seat for m in ep.movers)
+        assert len(ep.ts) == len(ep.ranks) < len(ep.moves)
+        for j in (0, len(ep.ts) - 1):
+            pos = hexo_py.Position.replay(list(ep.moves[: ep.ts[j]]))
+            assert pos.current_player == model_seat
+            assert pos.nth_legal(ep.ranks[j]) == tuple(ep.moves[ep.ts[j]])
+
+
+def test_grounded_returns_are_outcomes_and_caps_are_draws():
+    """Grounded returns are Monte-Carlo whatever lam_ret says — the bootstrap
+    chain breaks at unrecorded opponent plies — and a capped grounded episode
+    yields g = 0 samples where a capped self-play one yields none."""
+    rng = np.random.default_rng(15)
+    episodes, _ = play_episodes(
+        heuristic_evaluate, [[]], 200, 0.1, 0.03, rng,
+        opponent=_scripted_opponent, opponent_seats=[0],
+    )
+    ep = episodes[0]
+    assert ep.winner is not None
+    z = 1.0 if ep.winner == 1 else -1.0
+    for lam_ret in (1.0, 0.5):
+        samples = episode_samples(ep, lam_ret)
+        assert len(samples) == len(ep.ranks)
+        assert all(s.g == z for s in samples)
+
+    capped_ground, _ = play_episodes(
+        heuristic_evaluate, [[]], 8, 0.1, 0.03, np.random.default_rng(15),
+        opponent=_scripted_opponent, opponent_seats=[0],
+    )
+    capped_self, _ = play_episodes(
+        heuristic_evaluate, [[]], 8, 0.1, 0.03, np.random.default_rng(15),
+    )
+    assert capped_ground[0].winner is None and capped_self[0].winner is None
+    draws = episode_samples(capped_ground[0], 0.939)
+    assert draws and all(s.g == 0.0 for s in draws)
+    assert episode_samples(capped_self[0], 0.939) == []
+
+
+def test_iterate_grounds_a_fraction_and_reports_it():
+    model = _tiny_model()
+    cfg = KlentConfig(
+        games_per_iteration=6, ground_fraction=0.5, ply_cap=200,
+        batch_size=64, seed_fraction=1.0, seed_cut=(1, 3),
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    metrics = iterate(
+        model, optimizer, cfg, np.random.default_rng(16), opponent=_scripted_opponent
+    )
+    assert metrics["f_grounded"] == metrics["f_grounded"]  # grounded games exist
+    assert 0.0 <= metrics["grounded_score"] <= 1.0
+    assert metrics["buffer_samples"] > 0
+
+    import pytest
+
+    with pytest.raises(ValueError, match="opponent"):
+        iterate(model, optimizer, cfg, np.random.default_rng(16))
+
+
 def test_seeded_prefix_plies_stay_out_of_the_buffer():
     rng = np.random.default_rng(9)
     prefix = seed_prefix(rng, (1, 4))

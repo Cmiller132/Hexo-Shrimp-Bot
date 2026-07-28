@@ -40,6 +40,25 @@ def test_rules_agree_over_line_builder_games():
     assert finished >= 5, "the line builder should usually finish games"
 
 
+def test_sealbot_opponent_grounds_collection():
+    """Real SealBot as the grounding opponent: legal whole turns, finished
+    games, records on the model side only."""
+    from mantisnet.klent import play_episodes
+    from mantisnet.klent.sealbot import sealbot_opponent
+
+    from .test_klent_pipeline import heuristic_evaluate
+
+    opponent = sealbot_opponent(SEALBOT, depth=1, time_limit=0.05)
+    episodes, _ = play_episodes(
+        heuristic_evaluate, [[], []], 200, 0.1, 0.03, np.random.default_rng(3),
+        opponent=opponent, opponent_seats=[0, 1],
+    )
+    for ep, seat in zip(episodes, (0, 1)):
+        assert ep.winner is not None, "SealBot finishes games"
+        assert all(m == 1 - seat for m in ep.movers)
+        assert len(ep.ts) < len(ep.moves)
+
+
 def test_sealbot_match_smoke():
     """A tiny untrained model survives a real paired match: legal moves
     only, agreed winners, sane accounting."""

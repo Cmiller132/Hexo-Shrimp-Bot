@@ -191,6 +191,34 @@ def _play_wave(states, choose, game_mod, rng, ply_cap):
         live = still
 
 
+def sealbot_opponent(root: Path, depth: int | None = 1, time_limit: float = 0.05,
+                     variant: str = "current"):
+    """A whole-turn *collection* opponent for grounded games:
+    ``opponent(position, moves) -> [(q, r), ...]``.
+
+    One engine is shared across every game — its transposition table is
+    position-keyed, so entries from other games are either irrelevant or
+    exact, and sharing keeps 256 concurrent games at one table (~32 MiB)
+    instead of gigabytes. The depth cap is the strength/speed knob
+    (~1 ms/turn at depth 1); the time limit is a backstop that rarely binds
+    under it. Eval matches (`sealbot_match`) deliberately do the opposite —
+    a fresh engine per game — because a measurement wants independence more
+    than throughput."""
+    game_mod, MinimaxBot = load_sealbot(root, variant)
+    bot = MinimaxBot(time_limit)
+    if depth is not None:
+        bot.max_depth = depth
+
+    def opponent(position, moves):
+        if any(max(abs(int(q)), abs(int(r))) > _COORD_LIMIT for q, r in moves):
+            raise RuntimeError(
+                f"game left SealBot's coordinate range (±{_COORD_LIMIT})"
+            )
+        return [(int(q), int(r)) for q, r in bot.get_move(_mirror(game_mod, moves))]
+
+    return opponent
+
+
 def _wilson(score: float, n: int, z: float = 1.96):
     p = score / n
     denom = 1 + z * z / n

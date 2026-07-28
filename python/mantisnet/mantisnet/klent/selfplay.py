@@ -8,6 +8,13 @@ consume. What is excluded is exactly what it excludes: terminal positions
 never exist as samples, every ply of a capped episode (K4), and every seeded
 prefix ply — those are replayed before collection starts, so they are never
 recorded at all.
+
+Grounded games (KLENT_PROPOSALS' opponent grounding) put an external
+whole-turn opponent in one seat: its plies enter the move list but are never
+recorded, so the buffer holds only the model's decisions, judged by a real
+outcome an opponent enforced. Self-play conditioning was measured to look
+perfect while strength against any real opponent died — grounded games are
+the corpus-side answer.
 """
 
 from __future__ import annotations
@@ -29,9 +36,9 @@ Evaluate = Callable[[object], tuple[torch.Tensor, torch.Tensor]]
 
 @dataclass
 class Episode:
-    """One self-play episode; per-ply records cover acted plies only."""
+    """One episode; per-ply records cover the model's acted plies only."""
 
-    moves: list  # the whole move list, seed prefix included
+    moves: list  # the whole move list: seed prefix and opponent plies included
     seed_len: int  # plies replayed before π′ took over
     winner: int | None  # None exactly when the cap hit
     moves_remaining: list  # per acted ply, at acting time
@@ -39,6 +46,8 @@ class Episode:
     ranks: list  # per acted ply, the action's legal rank
     improved: list  # per acted ply, π′ as float32 over the legal set
     v_hats: list  # per acted ply, E_{π′}[Q] at acting time
+    ts: list  # per acted ply, its absolute index into ``moves``
+    opponent_seat: int | None = None  # a grounded game's external seat
 
 
 @dataclass
@@ -84,17 +93,32 @@ def play_episodes(
     rng: np.random.Generator,
     pair_budget: int = 8_000_000,
     cell_budget: int = 400_000,
+    opponent=None,
+    opponent_seats: list | None = None,
 ) -> tuple[list[Episode], dict]:
     """Play one episode per prefix (empty prefix = unseeded), in lockstep.
+
+    ``opponent_seats`` marks grounded games: entry ``i`` is the seat an
+    external ``opponent(position, moves) -> [(q, r), ...]`` plays in game
+    ``i`` (``None`` = self-play). Opponent turns are whole turns — applied
+    first each lockstep step, every placement checked legal, never recorded —
+    so every position the evaluator sees below has the model to move.
 
     Returns the episodes plus the acting-time means of the §13 diagnostics:
     `D_KL(π′ ‖ π_θ)` and `H(π′)/log|A|`.
     """
     import hexo_py
 
+    if opponent_seats is None:
+        opponent_seats = [None] * len(prefixes)
+    if len(opponent_seats) != len(prefixes):
+        raise ValueError("opponent_seats must align one-to-one with prefixes")
+    if opponent is None and any(s is not None for s in opponent_seats):
+        raise ValueError("opponent_seats given without an opponent")
+
     episodes = []
     positions = []
-    for prefix in prefixes:
+    for prefix, seat in zip(prefixes, opponent_seats):
         pos = hexo_py.Position.replay(list(prefix))
         if pos.is_terminal:
             raise ValueError("a seed prefix must leave a live game")
@@ -108,6 +132,8 @@ def play_episodes(
                 ranks=[],
                 improved=[],
                 v_hats=[],
+                ts=[],
+                opponent_seat=seat,
             )
         )
         positions.append(pos)
@@ -115,6 +141,31 @@ def play_episodes(
     live = list(range(len(episodes)))
     kl_sum, ent_sum, decisions = 0.0, 0.0, 0
     while live:
+        model_to_move = []
+        for i in live:
+            ep, pos = episodes[i], positions[i]
+            seat = ep.opponent_seat
+            if seat is not None and pos.current_player == seat:
+                turn = opponent(pos, ep.moves)
+                if not turn:
+                    raise RuntimeError("opponent returned no moves for a live position")
+                for move in turn:
+                    if pos.is_terminal or pos.current_player != seat:
+                        break
+                    move = (int(move[0]), int(move[1]))
+                    if move not in set(pos.legal_moves()):
+                        raise RuntimeError(
+                            f"opponent move {move} is illegal at ply {len(ep.moves)}"
+                        )
+                    pos.advance(*move)
+                    ep.moves.append(move)
+                if pos.is_terminal:
+                    ep.winner = pos.winner
+                    continue
+                if len(ep.moves) >= ply_cap:
+                    continue
+            model_to_move.append(i)
+        live = model_to_move
         still_live = []
         for chunk in _chunk_live(positions, live, pair_budget, cell_budget):
             batch = collate_positions([positions[i] for i in chunk])
@@ -144,6 +195,7 @@ def play_episodes(
                 ep.ranks.append(rank)
                 ep.improved.append(probs.astype(np.float32))
                 ep.v_hats.append(float(imp.v_hat[slot]))
+                ep.ts.append(len(ep.moves))
 
                 move = pos.nth_legal(rank)
                 pos.advance(*move)
@@ -166,11 +218,18 @@ def collection_stats(episodes: list[Episode]) -> dict:
     """The §13 collection-side metrics: the terminating fractions that decide
     whether training data exists, seat and win-half coverage, seed-curriculum
     state, and the v̂-vs-outcome calibration that makes the §9 overestimation
-    bias visible. Calibration reads won episodes only — a capped episode has
-    no grounded outcome to calibrate against."""
-    won = [e for e in episodes if e.winner is not None]
-    seeded = [e for e in episodes if e.seed_len > 0]
-    unseeded = [e for e in episodes if e.seed_len == 0]
+    bias visible. The f/seat/seed stats read self-play episodes only — an
+    external opponent terminates its games regardless of what the policy
+    knows, so mixing them in would flatter exactly the signals the anneal
+    walks on. Grounded games report their own pair: ``f_grounded`` and the
+    model's ``grounded_score`` (win 1, cap ½ — the free per-iteration
+    strength reading). Calibration pools every episode with an outcome: a
+    grounded loss is precisely the outcome self-play v̂ never sees."""
+    selfplay = [e for e in episodes if e.opponent_seat is None]
+    grounded = [e for e in episodes if e.opponent_seat is not None]
+    won = [e for e in selfplay if e.winner is not None]
+    seeded = [e for e in selfplay if e.seed_len > 0]
+    unseeded = [e for e in selfplay if e.seed_len == 0]
 
     def fraction(eps):
         return sum(e.winner is not None for e in eps) / len(eps) if eps else float("nan")
@@ -180,15 +239,24 @@ def collection_stats(episodes: list[Episode]) -> dict:
         return sum(values) / len(values) if values else float("nan")
 
     v_win, v_loss, abs_err = [], [], []
-    for e in won:
+    for e in episodes:
+        if e.winner is None:
+            continue
         for mover, v in zip(e.movers, e.v_hats):
             z = 1.0 if mover == e.winner else -1.0
             (v_win if z > 0 else v_loss).append(v)
             abs_err.append(abs(v - z))
 
+    def grounded_outcome(e):
+        if e.winner is None:
+            return 0.5
+        return float(e.winner != e.opponent_seat)
+
     return {
         "f_seeded": fraction(seeded),
         "f_unseeded": fraction(unseeded),
+        "f_grounded": fraction(grounded),
+        "grounded_score": mean(grounded_outcome(e) for e in grounded),
         "won_length_mean": mean(len(e.moves) for e in won),
         "seed_len_mean": mean(e.seed_len for e in seeded),
         "seed_len_max": max((e.seed_len for e in seeded), default=0),
@@ -202,16 +270,29 @@ def collection_stats(episodes: list[Episode]) -> dict:
 
 
 def episode_samples(episode: Episode, lam_ret: float) -> list[Sample]:
-    """The buffer entries of one episode: empty for a capped one (§5.1)."""
-    if episode.winner is None:
-        return []
-    signs = signs_from_moves_remaining(episode.moves_remaining)
-    returns = lambda_returns(signs, episode.v_hats, lam_ret)
+    """The buffer entries of one episode: empty for a capped self-play one
+    (§5.1).
+
+    Grounded episodes take pure Monte-Carlo outcomes whatever ``lam_ret``
+    says: the λ-return's bootstrap chain runs over consecutive recorded
+    plies, and an opponent's unrecorded turns break it. And a *capped*
+    grounded episode is a draw (g = 0) rather than dropped — against a real
+    opponent, surviving to the cap is an outcome, and it is the only
+    gradient toward defense while wins are out of reach."""
+    if episode.opponent_seat is None:
+        if episode.winner is None:
+            return []
+        signs = signs_from_moves_remaining(episode.moves_remaining)
+        returns = lambda_returns(signs, episode.v_hats, lam_ret)
+    elif episode.winner is None:
+        returns = np.zeros(len(episode.ranks))
+    else:
+        returns = np.where(np.asarray(episode.movers) == episode.winner, 1.0, -1.0)
     moves = tuple(episode.moves)
     return [
         Sample(
             moves=moves,
-            t=episode.seed_len + j,
+            t=episode.ts[j],
             rank=episode.ranks[j],
             improved=episode.improved[j],
             g=float(returns[j]),

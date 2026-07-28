@@ -35,6 +35,11 @@ class KlentConfig:
     ply_cap: int = 512  # §5: capped episodes are dropped whole
     games_per_iteration: int = 128
     seed_fraction: float = 1.0  # §5.2: anneal toward zero as f allows
+    # Opponent grounding: this fraction of each iteration's games puts an
+    # external whole-turn opponent in one (alternating) seat, unseeded. Only
+    # the model's plies are recorded, with Monte-Carlo outcomes; capped
+    # grounded games are draws. 0 = pure self-play.
+    ground_fraction: float = 0.0
     seed_cut: tuple = (1, 8)  # plies cut from a won seed game's end
     seed_noise: float = 0.1
     batch_size: int = 4096  # paper's *effective* batch: chunks accumulate to it
@@ -195,6 +200,12 @@ def generate_prefixes(seed: int, n: int, seed_fraction: float, seed_cut, seed_no
     ]
 
 
+def ground_count(cfg: KlentConfig, warm: bool) -> int:
+    """How many of an iteration's games are grounded: none during warm —
+    the bootstrap clones the line builder before any opponent can judge it."""
+    return 0 if warm else round(cfg.ground_fraction * cfg.games_per_iteration)
+
+
 def iterate(
     model,
     optimizer,
@@ -202,6 +213,7 @@ def iterate(
     rng: np.random.Generator,
     warm: bool = False,
     prefixes: list | None = None,
+    opponent=None,
 ) -> dict:
     """One full KLENT iteration. Returns the §13 first-class metrics; an
     empty buffer (f = 0) skips fitting rather than failing — that outcome is
@@ -213,26 +225,39 @@ def iterate(
     supposed. Warm returns are pure Monte-Carlo outcomes (λ_ret = 1): the
     heuristic's v̂ lives on an arbitrary scale and must not bootstrap.
 
-    ``prefixes`` may be supplied (the driver pre-generates them on a worker
-    thread); left ``None``, they are drawn here from ``rng``."""
+    ``prefixes`` covers the *self-play* games only — ``ground_count`` games
+    are grounded against ``opponent`` (unseeded, alternating seats) and take
+    no prefix. The driver pre-generates prefixes on a worker thread; left
+    ``None``, they are drawn here from ``rng``."""
+    n_ground = ground_count(cfg, warm)
+    if n_ground and opponent is None:
+        raise ValueError("ground_fraction > 0 needs an opponent")
+    n_self = cfg.games_per_iteration - n_ground
     if prefixes is None:
         prefixes = generate_prefixes(
             int(rng.integers(2**63)),
-            cfg.games_per_iteration,
+            n_self,
             cfg.seed_fraction,
             cfg.seed_cut,
             cfg.seed_noise,
         )
+    if len(prefixes) != n_self:
+        raise ValueError(
+            f"{len(prefixes)} prefixes for {n_self} self-play games "
+            f"({n_ground} of {cfg.games_per_iteration} are grounded)"
+        )
     model.eval()
     episodes, metrics = play_episodes(
         line_evaluate if warm else network_evaluate(model, cfg),
-        prefixes,
+        [[]] * n_ground + list(prefixes),
         cfg.ply_cap,
         cfg.tau,
         cfg.lam,
         rng,
         pair_budget=cfg.pair_budget,
         cell_budget=cfg.cell_budget,
+        opponent=opponent,
+        opponent_seats=[g % 2 for g in range(n_ground)] + [None] * n_self,
     )
     metrics.update(collection_stats(episodes))
     metrics["warm"] = int(warm)
