@@ -373,14 +373,18 @@ OOM — a ~50× slowdown with no error. The budgets exist to keep the run out
 of that regime; Linux (the deploy target) raises OOM honestly.
 
 **Platforms.** The destination is Docker on Linux for *everything* —
-training, self-play, and evaluation, not just serving — deferred until the
-model is stable (`KLENT_RUN_PLAN.md` §5 rung 5); Windows-native runs on the
-dev box are an interim convenience. Under Linux the torch wheel bundles
-Triton; the `triton-windows` dependency is marked `sys_platform == 'win32'`
-and exists only for the Windows dev box. Under WSL, keep the two trees separate from the
-Windows ones: build `hexo-py` with `CARGO_TARGET_DIR=target-wsl` (the repo's
-convention) and give uv its own environment, e.g.
-`UV_PROJECT_ENVIRONMENT=$HOME/.venvs/mantisnet uv sync`.
+training, self-play, and evaluation, not just serving — and the
+environment exists: `docker/` at the repo root (owner pulled it forward
+2026-07-28; see `docker/README.md`). Measured on identical code and the
+same card, the container ran collection **1.44× faster than
+Windows-native** (5.0 k vs 3.5 k samples/s, cold-compile-inclusive) — the
+gain is the Linux compiler stack, and it is where all Triton work
+happens. Windows-native runs remain a convenience for tests and quick
+checks; there the `triton-windows` dependency is marked
+`sys_platform == 'win32'`. Outside the container under bare WSL, keep the
+two trees separate from the Windows ones: build `hexo-py` with
+`CARGO_TARGET_DIR=target-wsl` (the repo's convention) and give uv its own
+environment, e.g. `UV_PROJECT_ENVIRONMENT=$HOME/.venvs/mantisnet uv sync`.
 
 ## Connections
 

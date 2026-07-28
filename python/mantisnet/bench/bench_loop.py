@@ -86,18 +86,12 @@ def _vram_peak_gib(device: str) -> float:
 
 
 def bench_sweep(args) -> None:
-    cfg = KlentConfig(
-        device=args.device,
-        autocast=args.device == "cuda",
-        compile=args.compile,
-        pair_budget=args.pair_budget,
-        cell_budget=args.cell_budget,
-    )
+    cfg = _cfg(args)
     evaluate = network_evaluate(_load_or_fresh(args), cfg)
 
     print(
         f"device {args.device} compile {args.compile} | budgets: "
-        f"{cfg.pair_budget:,} pairs, {cfg.cell_budget:,} cells"
+        f"{cfg.collect_pair_budget:,} pairs, {cfg.collect_cell_budget:,} cells"
     )
     header = (
         "stones cohort chunks  legal/pos   collate      forward   improve+samp"

@@ -456,16 +456,17 @@ In order; each rung is small and none blocks the one above it being useful.
    run reproduces, and the buffer's records written through `hexo-records`
    (B2's per-move blob) instead of living only in memory — at which point
    dropped-episode records become revisitable data, as design doc §12 notes.
-5. **Everything into Docker** (owner intent, stated 2026-07-28): training,
-   self-play, evaluation — the whole loop, not just serving — runs in a
-   Linux container as its permanent home. **Deliberately deferred until the
-   model is stable**: containerizing a loop whose dynamics are still being
-   debugged would add a variable while the experiment needs one at a time.
-   The pieces are already in place — the stack is WSL2-validated at
-   identical throughput, the venv/target separation is documented in the
-   mantisnet README, and Linux turns the Windows VRAM-spill hazard into
-   honest OOMs. Until then, Windows-native runs on the dev box are a
-   convenience, not the destination.
+5. **Everything into Docker** (owner intent, stated 2026-07-28; pulled
+   forward and **landed the same day** as part of the performance push):
+   training, self-play, evaluation — the whole loop, not just serving —
+   runs in a Linux container as its permanent home. `docker/` at the repo
+   root is the environment (deps-only image, repo bind-mounted;
+   `docker/README.md` is the workflow). Measured: the container runs
+   collection **1.44× faster than Windows-native on identical code**
+   (5.0 k vs 3.5 k samples/s) — the Linux compiler stack is the gain —
+   and it is where the Triton kernel work happens. Still open inside
+   this rung: a Linux build of SealBot's `minimax_cpp` so evals run
+   in-container, and moving live runs there when the owner relaunches.
 6. **The `ModelPackage`**: encoder/evaluator over the hexo-search seam,
    manifest + probe hash, the container image of `CONTAINER_SPEC.md` — the
    point where this Python stops being a side tree and becomes the package

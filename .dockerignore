@@ -1,0 +1,6 @@
+.git
+target
+target-wsl
+python/mantisnet/.venv
+python/mantisnet/runs
+python/mantisnet/**/__pycache__

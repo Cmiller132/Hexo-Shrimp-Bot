@@ -1,0 +1,20 @@
+services:
+  train:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: mantisnet-train
+    runtime: nvidia
+    shm_size: 8gb
+    stdin_open: true
+    tty: true
+    volumes:
+      - /mnt/d/Hexo-Shrimp-Bot:/workspace
+      - /mnt/d/SealBot:/sealbot:ro
+    environment:
+      - SEALBOT_ROOT=/sealbot
+      - NVIDIA_VISIBLE_DEVICES=all
+      # The deps venv deliberately omits the project (it lives on the
+      # mount); scripts like bench/ find it through the path instead.
+      - PYTHONPATH=/workspace/python/mantisnet
+    working_dir: /workspace/python/mantisnet
