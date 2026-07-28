@@ -10,11 +10,13 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 
 /// What a checkpoint says about itself.
 ///
-/// The fields are `docs/CONTAINER_SPEC.md` §10's list and nothing more. In
-/// particular the manifest **does not describe the architecture**: how many
-/// layers there are and what shape they have is the package's business, carried
-/// inside its own weight file. The container's manifest answers only which
-/// package wrote this, which version, and whether it is compatible with this
+/// The common fields are `docs/CONTAINER_SPEC.md` §10's list. A package can
+/// additionally state the semantic configuration its weights require in
+/// [`Manifest::package_metadata`]. That value is deliberately opaque here: the
+/// package writes and validates it, while the container merely preserves it.
+/// Layer counts and tensor shapes still belong in the package's weight file.
+/// The container's manifest answers only which package wrote this, which
+/// versions and package semantics apply, and whether it is compatible with this
 /// binary — which is exactly what makes adding a GNN package a new crate and one
 /// registry entry rather than a schema change here.
 ///
@@ -65,6 +67,12 @@ pub struct Manifest {
     /// Which epoch of the run produced this checkpoint. Epoch 0 is the
     /// untrained checkpoint [`crate::ModelPackage::init`] writes.
     pub epoch: u32,
+    /// Package-owned semantic configuration required to interpret the weights.
+    ///
+    /// This crate neither names nor validates fields inside the JSON value. A
+    /// package that changes their meaning bumps its package version and checks
+    /// the value during load. Packages with no additional metadata write `{}`.
+    pub package_metadata: serde_json::Value,
     /// The probe hash of these weights (`docs/CONTAINER_SPEC.md` §10.2).
     ///
     /// Serialised as a `0x`-prefixed, zero-padded, 16-digit lowercase hex
@@ -97,8 +105,19 @@ impl Manifest {
             action_order_version: hexo_engine::ACTION_ORDER_VERSION,
             protocol_version: hexo_runner::PROTOCOL_VERSION,
             epoch,
+            package_metadata: serde_json::json!({}),
             probe_hash,
         }
+    }
+
+    /// Attach package-owned semantic metadata to a manifest being written.
+    ///
+    /// The value is opaque to this crate. A package is responsible for choosing
+    /// a stable shape and validating it when loading its checkpoint.
+    #[must_use]
+    pub fn with_package_metadata(mut self, package_metadata: serde_json::Value) -> Self {
+        self.package_metadata = package_metadata;
+        self
     }
 
     /// Write `manifest.json` into an existing `dir`.
@@ -148,7 +167,9 @@ impl Manifest {
     /// [`PackageError::PackageName`], [`PackageError::PackageVersion`],
     /// [`PackageError::EncoderVersion`], [`PackageError::RulesVersion`],
     /// [`PackageError::ActionOrderVersion`], or
-    /// [`PackageError::ProtocolVersion`], whichever disagrees first.
+    /// [`PackageError::ProtocolVersion`], whichever disagrees first. Package
+    /// metadata is opaque here and is validated by the owning package after
+    /// these common checks.
     pub fn validate(
         &self,
         package_name: &str,

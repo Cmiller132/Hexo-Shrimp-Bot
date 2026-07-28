@@ -8,6 +8,7 @@ members = [
     "crates/hexo-records",
     "crates/hexo-model",
     "crates/models/mock",
+    "crates/models/mantisnet",
     "crates/hexo-bot",
     # Not a crate of the project: `cargo xtask` defines the verification gates
     # so that CI and a local run cannot disagree about what they are. It is a
@@ -32,11 +33,16 @@ hexo-search = { path = "crates/hexo-search" }
 hexo-records = { path = "crates/hexo-records" }
 hexo-model = { path = "crates/hexo-model" }
 hexo-model-mock = { path = "crates/models/mock" }
+hexo-model-mantisnet = { path = "crates/models/mantisnet" }
 # Container-side crates only (`hexo-model`, `hexo-bot`): manifests and metrics.
 # The logic crates stay dependency-free, and the engine stays serde-free by
 # design — a position deserialiser is a rule-bypass hole.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The live Torch crossing belongs only to the leaf `hexo-bot` executable. Keep
+# PyO3's proc-macro defaults off: the boundary uses its safe embedding API, and
+# the workspace forbids unsafe code in its own crates.
+pyo3 = { version = "0.26", default-features = false }
 # `unsafe_code = "forbid"` rules out hand-rolled signal handlers, so the binary
 # takes the one small crate that owns that unsafety.
 ctrlc = { version = "3", features = ["termination"] }

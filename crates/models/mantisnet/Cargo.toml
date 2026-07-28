@@ -1,0 +1,26 @@
+[package]
+name = "hexo-model-mantisnet"
+description = "The MantisNet model package and its shared position encoder."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "hexo_model_mantisnet"
+path = "src/lib.rs"
+
+[dependencies]
+hexo-engine.workspace = true
+hexo-model.workspace = true
+hexo-search.workspace = true
+rayon = "1"
+# The encoder's inner loops are hash probes; SipHash would be most of them.
+rustc-hash = "2"
+serde_json.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -7,10 +7,12 @@
 //! [`Evaluator`], and the selection policy, and this crate supplies the
 //! machinery between them. It is the settled form of `docs/SUGGESTIONS.md` S3.
 //!
-//! Two implementations of [`DecisionSession`] ship. [`PolicySession`] asks one
-//! question per move; [`MctsSession`] runs PUCT with virtual loss and an
-//! in-flight cap. They are the same trait so that policy-only training and tree
-//! search are the same driver loop rather than two that drift.
+//! Three implementations of [`DecisionSession`] ship. [`PolicySession`] asks
+//! one question per move; [`MctsSession`] runs PUCT with virtual loss and an
+//! in-flight cap; [`GumbelSession`] spends a fixed budget deepening sampled root
+//! lines by sequential halving. They are the same trait so that policy-only
+//! training and either search are the same driver loop rather than paths that
+//! drift.
 //!
 //! ```
 //! use hexo_engine::{Action, Position};
@@ -100,6 +102,7 @@
 //! assert!(result.is_contested());
 //! ```
 
+pub mod gumbel;
 pub mod mcts;
 pub mod policy;
 pub mod rng;
@@ -107,6 +110,7 @@ pub mod seam;
 pub mod select;
 pub mod session;
 
+pub use gumbel::{GumbelConfig, GumbelSession, GumbelTrace};
 pub use mcts::{MctsConfig, MctsSession};
 pub use policy::PolicySession;
 pub use rng::SplitMix64;

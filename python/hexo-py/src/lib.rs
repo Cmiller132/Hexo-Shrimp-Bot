@@ -9,13 +9,12 @@
 //! is the same argument `ENGINE_SPEC.md` §12 makes for the engine itself.
 
 use hexo_engine as engine;
+use hexo_model_mantisnet::{MODEL_REPR_VERSION, encoder};
 use numpy::PyArray1;
 use numpy::PyArrayMethods;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-
-mod graph;
 
 /// A Hexo position. Wraps `hexo_engine::Position` one-to-one.
 #[pyclass]
@@ -189,7 +188,7 @@ impl Position {
 
 /// A collated `RawBatch` as a dict of numpy arrays, keyed by the field names
 /// `mantisnet.builder.Batch` uses.
-fn raw_to_dict<'py>(py: Python<'py>, raw: graph::RawBatch) -> PyResult<Bound<'py, PyDict>> {
+fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'py, PyDict>> {
     let (p, max_t, max_w) = (raw.n_pos, raw.max_t, raw.max_w);
     let d = PyDict::new(py);
     d.set_item("stone_own", PyArray1::from_vec(py, raw.stone_own))?;
@@ -234,7 +233,7 @@ fn build_batch<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let owned: Vec<engine::Position> = positions.iter().map(|p| p.inner.clone()).collect();
     let raw = py
-        .detach(|| graph::build_batch(&owned))
+        .detach(|| encoder::build_batch(&owned))
         .map_err(PyValueError::new_err)?;
     raw_to_dict(py, raw)
 }
@@ -248,7 +247,7 @@ fn build_batch_prefixes<'py>(
     ts: Vec<usize>,
 ) -> PyResult<Bound<'py, PyDict>> {
     let raw = py
-        .detach(|| graph::build_batch_prefixes(&games, &ts))
+        .detach(|| encoder::build_batch_prefixes(&games, &ts))
         .map_err(PyValueError::new_err)?;
     raw_to_dict(py, raw)
 }
@@ -263,5 +262,6 @@ fn hexo_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("RULES_VERSION", engine::RULES_VERSION)?;
     m.add("ACTION_ORDER_VERSION", engine::ACTION_ORDER_VERSION)?;
     m.add("LEGAL_RADIUS", engine::LEGAL_RADIUS)?;
+    m.add("MODEL_REPR_VERSION", MODEL_REPR_VERSION)?;
     Ok(())
 }

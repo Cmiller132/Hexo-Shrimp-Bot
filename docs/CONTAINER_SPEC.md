@@ -1,19 +1,18 @@
 # Container spec
 
-**Status: built and green for the Rust half.** The five crates this document
-names — `hexo-search`, `hexo-records`, `hexo-model`, `crates/models/mock`, and
-`hexo-bot` — are implemented, and `train` and `match` both run against the mock
-model package. **There is no image, and no Python-backed model package has
-been written.** No Dockerfile exists and nothing in the cargo workspace
-depends on PyO3. The Python that now exists lives outside the workspace, in
-`python/`: the MantisNet model itself (`docs/MODEL_SPEC.md`, forward and
-builder and losses, tested) and `python/hexo-py`, the PyO3 leaf crate the
-root README promised. Neither is wired to the evaluator seam yet — that
-wiring is the Python-backed package this document describes, and where the
-document describes it, it states the target it will be built to, not
-something that runs today.
+**Status: built through the first real package.** `hexo-search`,
+`hexo-records`, `hexo-model`, `crates/models/mock`, and `hexo-bot` are
+implemented, and `train` and `match` run against the mock package. MantisNet is
+now the first network-backed package, at `crates/models/mantisnet`: its Rust
+encoder, KLENT-improved evaluator opinion, sessions, diagnostics, Torch
+checkpoint sealing, and proving loads all run through the same container
+seams. `hexo-bot` owns the live PyO3/Torch crossing, while every logic crate
+remains Python-free. The `mantisnet-train` image and compose environment live
+under `docker/`; Python training remains the production KLENT loop under
+`python/mantisnet`, because the package deliberately declines container-side
+`fit` rather than supplying a second, partial trainer.
 
-This is the normative design target for the container and for those five crates,
+This is the normative design target for the container crates,
 and it has been trued up against the code as built. Nothing here constrains
 `hexo-engine`, whose contract remains `ENGINE_SPEC.md`. It still says nothing
 about how any particular model works — the trunk, the encoder, and the training
@@ -46,10 +45,11 @@ nothing here is shaped by them either.
 Windows paths reach WSL over 9p and are an order of magnitude slower than ext4.
 That difference dominates every other I/O decision in this spec.
 
-- Build cache, records, checkpoints, and metrics live in **named Docker
-  volumes**. Never a `/mnt/d` bind mount.
-- Source is copied into the image at build time. A read-only bind mount of the
-  working tree is a dev-loop convenience only.
+- Long-lived build cache, records, checkpoints, and metrics belong in
+  **named Docker volumes**, never a `/mnt/d` bind mount.
+- The as-built dependency image bind-mounts source at `/workspace` for the
+  development and proof loop. A source-free release image may copy the built
+  binary later; that packaging change does not create another model runtime.
 
 ---
 
@@ -61,23 +61,26 @@ forward pass, which the workspace rule against dual paths forbids, and which
 could silently disagree with the first. The image is large; that is the price of
 having one implementation.
 
-Multi-stage build: a Rust stage compiles the binary, a runtime stage carries the
-binary plus the CUDA and Python stack. No source, no toolchain, and no build
-cache in the runtime image. Runs as a non-root user.
+The as-built `docker/Dockerfile` produces the `mantisnet-train` image: CUDA,
+the locked `/opt/venv` Python/PyTorch environment, and the Rust/maturin tools
+needed to compile mounted source. `docker/compose.yaml` mounts the checkout at
+`/workspace`; `REPO_ROOT` lets a worktree supply that checkout, and
+`CARGO_TARGET_DIR=/workspace/target-wsl` keeps Linux artefacts separate from
+the Windows target directory. This is the development and training image in
+use today. A source-free, binary-only release image can harden deployment
+later without introducing a second model runtime.
 
-The image records the versions it was built against —
-`hexo_engine::RULES_VERSION`, `ACTION_ORDER_VERSION`,
-`hexo_runner::PROTOCOL_VERSION`, and the image's own build id. A checkpoint
-whose manifest disagrees with any of them is a startup failure, not a warning.
+The binary and checkpoint manifests record the versions that govern behaviour:
+`hexo_engine::RULES_VERSION`, `ACTION_ORDER_VERSION`, and
+`hexo_runner::PROTOCOL_VERSION`, plus package and encoder versions. A
+checkpoint whose manifest disagrees with any of them is a startup failure, not
+a warning. The image carries the locked Python runtime that executes the same
+MantisNet module as training; there is no exported ONNX or TorchScript graph.
 
-**The image arrives with the first Python-backed model package.** Everything in
-it that is not the Rust binary — CUDA, Python, PyTorch — is there to serve a
-package written in Python, and the only package that exists is the mock, which
-is Rust and wants none of it. Building the image now would produce a
-multi-gigabyte runtime with nothing to serve, built against a boundary (§4) that
-no code has crossed yet. Until then the loop runs as a native binary, which is
-not a second deployment shape — it is the same binary before there is anything
-to wrap it around.
+**The image arrived with the first Python-backed model package.** Everything
+large in it — CUDA, Python, and PyTorch — serves MantisNet's existing training
+and live-forward implementation. The mock package still needs none of it and
+continues to exercise the complete logic path without Python.
 
 **This settles `OPEN_DECISIONS.md` C6.**
 
@@ -122,6 +125,15 @@ against each other over one set of weights — rather than a deployment shape, a
 it writes no records (§11). `crates/hexo-bot/README.md` states its flags and its
 seat grammar.
 
+`init` is the other utility subcommand, also not a mode. It asks one package to
+write an epoch-0 checkpoint under a sibling `.incomplete` directory and
+atomically renames it into place; an existing destination is refused. For
+MantisNet, package config
+`tau=<F>,lambda=<F>,source=<training-checkpoint.pt>` copies the authoritative
+Python `.pt`, loads that copy through the live evaluator, and writes the
+manifest and probe hash that make later loads provable. It constructs no game
+and claims no new authority.
+
 ---
 
 ## 4. The Rust/Python boundary
@@ -156,35 +168,49 @@ to recompile.
 
 **PyO3 stays a leaf dependency.** `hexo-bot` is a leaf binary crate that nothing
 depends on, and no logic crate mentions Python, even optionally. This is the
-root `README.md`'s standing rule and it is not re-argued here — it is what keeps
-`cargo test` free of a Python toolchain and keeps `hexo-engine` compilable to
+root `README.md`'s standing rule and it is not re-argued here. Logic-crate tests
+remain free of a Python toolchain, and `hexo-engine` remains compilable to
 `wasm32`, which the `wasm32` gate checks on every run and which is precisely the
 gate that would fail if a native-only dependency crept downward.
 
-None of this is built. No crate in the workspace depends on PyO3 today, and the
-mock package (§5) deliberately needs nothing from this section — which is what
-let the entire loop be built and tested before the boundary exists.
+The boundary is now built. `crates/models/mantisnet` defines Python-free
+`ForwardLoader` and `Forward` traits over its Rust `RawBatch` and flat ragged
+`RawOutputs`. The package owns all evaluator logic; the executable injects the
+only implementation that loads `mantisnet.klent.run.load_model`, constructs CPU
+Torch tensors, performs one live-module call for the whole batch, and returns
+the policy logits and Q values unchanged. The package then applies KLENT
+equation 3 and produces the public `Evaluation`. No `Position`, evaluator
+semantics, Python object, tensor, GIL token, or device type crosses that trait.
+
+PyO3 is an unconditional dependency of the `hexo-bot` leaf rather than a Cargo
+feature. Thus the ordinary binary and the container build have the same
+registry and boundary; there is no feature-unification shape in which MantisNet
+silently disappears. `PYO3_PYTHON` chooses the interpreter at build time.
+`HEXO_PYTHON` may name the same interpreter at runtime so the binary discovers
+its `sys.path` and refuses a major/minor mismatch; otherwise PyO3's configured
+interpreter is used. The mock and every logic crate still run without loading
+an interpreter.
 
 ---
 
 ## 5. Model packages
 
-A model is a crate. Packages live under `crates/models/<name>/`; the first is
-`crates/models/mock`. Each one implements the `ModelPackage` trait from
-`crates/hexo-model`, and the container's whole knowledge of a model is that
-trait plus a name registry in `hexo-bot`.
+A model is a crate. Packages live under `crates/models/<name>/`; the registry
+currently carries `mock` and `mantisnet`. Each one implements the
+`ModelPackage` trait from `crates/hexo-model`, and the container's whole
+knowledge of a model is that trait plus the registry in `hexo-bot`.
 
 A package owns, and the container never has an opinion about:
 
 | What it owns | Why it is the package's |
 | --- | --- |
 | Its encoder, and the encoder version | Features are a modelling decision. The engine exposes state; nothing else may decide what a plane means (S5) |
-| Its evaluator | The forward pass, and the only code that touches a network |
+| Its evaluator | The model opinion and the raw-forward trait it delegates through |
 | Its two session constructors, one per mode | Search shape and parameters are part of the model, not the harness |
 | Its move-selection policies | Sampling, temperature, and greediness are the model's, as its encoding is |
 | Its diagnostics format | The bytes on `PlyRecord`; written and read by the same crate |
 | Its checkpoint weight format | The container stores a file and a manifest, not a description of layers |
-| Its `fit` | The training objective, the optimiser, and the data pipeline |
+| Its `fit`, or its explicit refusal | The training objective, optimiser, and data pipeline cannot be invented by the container |
 
 `train --package <name>` selects one at startup, and a `match` seat names its
 own; either way the name is written into every shard header and every checkpoint
@@ -196,6 +222,14 @@ package is touched.
 The registry is not a museum. A package that is no longer built against the
 current record format and the current seam comes out in the same change that
 obsoletes it, exactly as any other superseded implementation does.
+
+`fit` has no implementation default, but an implementation may return
+`PackageError::Unsupported` when the production training loop still lives
+elsewhere. That refusal is sanctioned only when it names the real loop and the
+owner decision needed to move it. MantisNet does exactly that:
+`mantisnet.klent.run` remains the production KLENT trainer, and the package
+does not scaffold a container trainer that would consume records without
+faithfully reproducing it.
 
 **The two session constructors are required and have no defaults**, one for
 self-play and one for evaluation, for the reason `hexo-player` gives for
@@ -221,13 +255,22 @@ of them gets to decide it, and the ordering is versioned
 a change to it invalidates the artefacts it would have silently corrupted.
 
 **The mock package is not a placeholder to be deleted.** It is a deterministic,
-weightless evaluator that exercises every seam the container has — encoder,
-evaluator, both session kinds, diagnostics, shard writing, checkpoint write and
+weightless evaluator that exercises every required package seam — encoder,
+evaluator, both session modes, diagnostics, shard writing, checkpoint write and
 load, the probe hash, and `fit` — with no network, no GPU, and no Python. It is
 what makes the whole loop testable in CI, and it is the package the container is
 built against first precisely because it can be wrong in none of the ways a real
 model can. A package the entire container is exercised against on every run
 earns its place permanently.
+
+**MantisNet is the first real package.** Its worker encoder and the
+`python/hexo-py` extension call one Rust representation implementation, and
+`MODEL_REPR_VERSION` is owned by that package alone. Its self-play session
+samples the improved policy π′; its evaluation session uses the shared
+`GumbelSession` at 32 simulations and 16 root candidates. Its exact variant
+grammar is `policy`, `mcts:visits=..,inflight=..,cpuct=..`, and
+`gumbel:sims=..,m=..`. Its nine diagnostic bytes carry a version, v̂, and π′
+entropy for the acted self-play position.
 
 ---
 
@@ -243,11 +286,13 @@ into a queue, nothing has to be made `Send` that is not already, and the queues
 carry buffer handles rather than positions, tensors, or Python objects.
 Encoding is also the one part of an evaluation that is pure CPU work, so running
 it on the worker parallelises it across the whole pool for free instead of
-serialising it in front of the GPU.
+serialising it at the forward boundary.
 
 **`Evaluator` — package-owned, runs batcher-side.** One call answers one whole
-batch. That call is the single Python and GPU crossing (§4), and it is the only
-place in the system where either is touched.
+batch. That call contains the single Python/device crossing (§4), and it is the
+only place in the system where either may be touched. The current MantisNet
+boundary loads and forwards on CPU; changing device placement remains inside
+the injected forward and does not move the seam.
 
 **`Evaluation` — the answer for one position.** Priors over that position's
 legal actions **in canonical order**, and a value in `[-1, 1]` **from the
@@ -263,6 +308,20 @@ flips it trains against targets that are exactly wrong and produces a bot that
 plays to lose. No shape check sees that, no round-trip test sees it, and the
 loss curve looks fine.
 
+MantisNet resolves the leaf rule by splitting mechanics from semantics. Its
+encoder bytes decode and collate into a Python-free `RawBatch`; one injected
+`Forward::forward(&RawBatch)` returns flat policy-logit and Q-value vectors,
+ragged by the batch's canonical legal offsets. The evaluator refuses malformed
+lengths and applies
+
+`π′(a) ∝ exp((Q(a) + τ log π(a)) / (τ + λ))`
+
+per position. It returns `priors = π′` and
+`value = v̂ = E_π′[Q]`, still in the universal side-to-move convention.
+Keeping this improvement in the package is what makes policy-session sampling
+reproduce KLENT acting while leaving the forward boundary free of model
+opinion.
+
 ---
 
 ## 7. Sessions, and why nothing blocks
@@ -276,7 +335,7 @@ diagnostics bytes, and the driver submits the decision verbatim, because a
 driver that filled in either field would be deleting the desync detector or
 inventing the training annotations.
 
-Two implementations behind one seam:
+Three implementations behind one seam:
 
 - **`MctsSession`** — PUCT, virtual loss on the path to each leaf in flight, and
   a cap on how many leaves one session may have outstanding at once.
@@ -286,6 +345,22 @@ Two implementations behind one seam:
   training runs are policy-only, and a separate driver for them would leave the
   driver that eventually carries every run as the least exercised code in the
   system.
+- **`GumbelSession`** — package-agnostic Gumbel-top-*m* root candidates (capped
+  by the legal count and half the simulation budget) followed by sequential
+  halving. It consumes only an `Evaluation`; for MantisNet those priors happen
+  to be π′, but the search knows nothing about KLENT or that package.
+
+Gumbel search extends deterministic **lines**, not a tree: revisiting the same
+transition reveals no new information, so budget buys depth. Root candidates
+rank by `g_a + log prior_a`; the root evaluation is outside the simulation
+budget. There are up to `ceil(log2 m)` rounds, each giving every survivor an
+equal, nonzero deepening share before retaining the stronger ceiling-half.
+Extension follows the child evaluation's prior argmax for the next ply, and
+each leaf value is signed to the root mover; terminal lines freeze at their
+exact root-frame value. The final score is
+`g + log prior + (50 + max_visits) · 1.0 · q̂`. Injected Gumbel vectors make
+cross-language fixture parity testable without pretending NumPy and SplitMix64
+share an RNG stream.
 
 **Waiting is data, not a blocked thread.** A session with leaves outstanding is
 a struct holding a few vectors, so a game in flight costs bytes rather than a
@@ -318,7 +393,7 @@ in whether the seat is allowed to ask something mid-answer.
   +--------------------------------------+
   | batcher, 1 thread                    |
   |   fills a batch of B                 |
-  |   one Evaluator::evaluate call -----------> embedded PyTorch -> GPU
+  |   one Evaluator::evaluate call -----------> embedded PyTorch -> device
   |   scatters results back to slots     |
   +--------------------------------------+
 
@@ -327,15 +402,16 @@ in whether the seat is allowed to ask something mid-answer.
 
 The worker pool is sized to the silicon rather than to the game count:
 `--threads`, defaulting to the host's parallelism less three so that the
-batcher, the writer, and — once there is one — the interpreter's own pools have
+batcher, the writer, and the interpreter's own pools have
 somewhere to run (§13). On this machine that is a number to set deliberately
 rather than inherit, at about 13 of the 16 cores, once PyTorch's pools are
-budgeted against the same 32 threads. One batcher thread owns the GPU crossing,
-because that crossing has to be serialised anyway and a second batcher would
-only contend for the same lock and the same device. One writer thread owns
-records, so the format has exactly one writer and no worker ever touches a file.
-Every queue is bounded in both directions: a saturated GPU applies backpressure
-to the workers rather than growing a queue until the process is killed.
+budgeted against the same 32 threads. One batcher thread owns the forward
+crossing, because that crossing has to be serialised anyway and a second
+batcher would only contend for the same lock and the same device. One writer
+thread owns records, so the format has exactly one writer and no worker ever
+touches a file. Every queue is bounded in both directions: a saturated
+evaluator applies backpressure to the workers rather than growing a queue
+until the process is killed.
 
 `crates/hexo-bot/README.md` states this topology in the shapes it took — lanes
 checked out of a ready queue, two bounded channels, and the token argument that
@@ -344,12 +420,13 @@ is why it cannot deadlock.
 ### 7.2 G and B are different numbers
 
 **The batch size B and the game count G are chosen from different constraints
-and are two flags, `--batch` and `--games`, not one.** B comes from what the GPU
-wants: the batch at which the 4070 Ti is saturated, and beyond which latency
-grows faster than throughput. G comes from RAM, and from how many leaves per
-game should be in flight. Tying
-them together would mean either running the GPU at a batch size it does not want
-or sizing host memory from a device number.
+and are two flags, `--batch` and `--games`, not one.** B comes from what the
+evaluator wants: today the MantisNet forward is CPU, while a device-backed
+forward would choose the batch that saturates that device without paying excess
+latency. G comes from RAM, and from how many leaves per game should be in
+flight. Tying them together would mean either running the evaluator at a batch
+size it does not want or sizing host memory from an unrelated throughput
+number.
 
 The second constraint on G is the one that is easy to miss, and it is the real
 reason to run a thousand games rather than a hundred and twenty-eight. A batch
@@ -357,8 +434,8 @@ is filled from leaves and leaves come from games. With few games, each one has t
 contribute many leaves at once to fill a batch — and every leaf in flight is a
 virtual-loss penalty on a path whose true value is not known yet, so the search
 is being steered by a placeholder. With many games, each contributes one or two
-and the distortion nearly vanishes. Throughput is bounded by the GPU either way;
-what more games buy is search quality per unit of compute.
+and the distortion nearly vanishes. Throughput is bounded by the evaluator
+either way; what more games buy is search quality per unit of compute.
 
 For a policy-only package the arithmetic is simpler and the conclusion is the
 same. Every game contributes exactly one root request per move, so filling a
@@ -393,12 +470,21 @@ per process, not once per epoch. Over hundreds of epochs that is the difference
 between a minor overhead and a dominant one.
 
 **Why the phases can share one process at all.** The two phases never run at the
-same time, so the single GPU is never contended: no time-slicing, no MPS, no
-VRAM partitioning. Records are produced and consumed within one epoch, so
-nothing has to outlive the process except checkpoints and metrics.
+same time, so a package that uses the single GPU for both never contends it:
+no time-slicing, no MPS, no VRAM partitioning. Records are produced and
+consumed within one epoch, so nothing has to outlive the process except
+checkpoints and metrics. The current MantisNet container forward is CPU and its
+fit is external; neither fact changes that scheduling invariant.
 
 The phases are not separately invocable. There is one implementation of the
 loop, not a loop plus a set of pieces that could drift from it.
+
+That loop is complete for packages which implement `fit`, including the mock.
+MantisNet intentionally stops at the package's explicit unsupported-fit error:
+its live encoder, evaluator, self-play, matches, sessions, checkpoints, and
+proving loads are container-side, while production fitting remains
+`mantisnet.klent.run`. This is a package capability refusal, not a second
+container phase or a silent no-op.
 
 Records are written per epoch into that epoch's own directory, and the directory
 is removed once the fit that consumed it has succeeded. Not before — a failed
@@ -444,11 +530,14 @@ fail.
 | Kind | Examples | Where |
 | --- | --- | --- |
 | Baked | binary, CUDA/Python stack, version constants, the package registry | the image |
-| Injected | run directory, run id, package name and its config, checkpoint reference, epochs, G, B, game spec | flags; nothing is read from the environment |
+| Injected | run directory, run id, package name and its config, checkpoint reference, epochs, G, B, game spec | flags; no run behaviour is read from the environment |
 | Accumulated | checkpoints, metrics, records | the run directory, on a volume |
 
-Injected values are never guessed. A missing or unparseable one is a loud
-startup failure.
+Run-behaviour values are never guessed or read from the environment. A missing
+or unparseable one is a loud startup failure. `PYO3_PYTHON` and `HEXO_PYTHON`
+are deployment plumbing for selecting the binary's one interpreter (§4), not
+run or model configuration; they cannot change a game, session, or checkpoint
+meaning.
 
 `--run-dir` names the root of the accumulated state, and the container maps a
 named volume onto it. A flag rather than a compiled-in `/var/lib/hexo`, because
@@ -484,6 +573,8 @@ A checkpoint is weights plus a manifest. The manifest pins:
 - the **encoder version** — the package's own, bumped whenever the bytes its
   encoder writes change meaning;
 - `RULES_VERSION`, `ACTION_ORDER_VERSION`, and `PROTOCOL_VERSION`;
+- opaque **package metadata** whose shape and validation belong to the package;
+  MantisNet records the τ and λ that turn raw heads into its opinion;
 - the **probe hash** (§10.2).
 
 A checkpoint whose manifest disagrees with the binary on any of them is a
@@ -491,8 +582,17 @@ startup failure, not a warning (§2).
 
 The manifest does not describe the architecture. How many layers there are and
 what shape they have is the package's business, carried inside its own weight
-file; the container's manifest answers only which package wrote this, which
-version, and whether it is compatible with this binary.
+file; package metadata records only semantic configuration required to
+interpret those weights. `hexo-model` preserves that JSON without understanding
+it, and the package refuses a mismatch. The common manifest answers which
+package wrote this, which versions apply, and whether it is compatible with
+this binary.
+
+MantisNet's weight file is the authoritative Torch `.pt` the Python trainer
+writes. `hexo-bot init` seals it as `weights.pt` beside the manifest, probes the
+copy through the live evaluator, and atomically places the directory. Every
+later load uses the production version-refusing
+`mantisnet.klent.run.load_model` path before comparing the computed probe.
 
 A checkpoint is named by a **reference**: a filesystem path, a
 `<run-id>/<epoch>` pair, `latest`, or a baked-in default. Shipping a
@@ -515,10 +615,19 @@ host-to-device copy. Replacing the module invalidates that state and re-pays the
 entire warm-up. Embedding a live interpreter (§4) is what makes this the natural
 operation rather than a trick.
 
-Older checkpoints for evaluation use a **slot pool**: weights are small enough
-to keep many on disk, but each live module carries expensive compiled state, so
-the number of live slots is capped (current, opponent, anchor) and an opponent's
-weights are copied into a slot on demand.
+The current CPU MantisNet boundary has no captured serve graph to preserve. A
+load therefore builds and probes a candidate live module, then publishes it
+only after every refusal point; a failed load leaves the previously proved
+module intact. In-place copying remains the required shape when a compiled
+long-lived serve slot lands, rather than a claim that the present CPU loader
+already maintains such a slot.
+
+A compiled serve implementation will use a **slot pool** for older checkpoints:
+weights are small enough to keep many on disk, but each live module carries
+expensive compiled state, so the number of live slots is capped (current,
+opponent, anchor) and an opponent's weights are copied into a slot on demand.
+That optimisation is not present in the current per-package-instance CPU
+loader.
 
 ### 10.2 The probe hash
 
@@ -575,15 +684,16 @@ and the match report are what carry it; a shard nobody reads would be the
 largest artefact in a run written for no reader. Every shard written so far
 therefore says self-play in its header.
 
-**One implementation, in Rust.** When `fit` needs to read records, the Python
-side calls this reader through the embedded interpreter (§4) rather than growing
-a parser of its own. A second parser is a second definition of the format, and
-the two would disagree exactly where it is hardest to notice — a diagnostics
-blob's length prefix, the end of a ragged ply list, an unset optional. Binary
-and versioned rather than JSON because a shard is the largest artefact this
-system writes and the fastest thing it re-reads, and because a strict reader
-that refuses an unknown version is worth more than one that tolerates two
-shapes.
+**One implementation, in Rust.** The mock's container-side `fit` reads through
+`hexo-records`; MantisNet currently declines container fitting, so no Python
+record reader exists. If that production loop migrates, Python will call this
+Rust reader through the embedded boundary (§4) rather than grow a parser of its
+own. A second parser is a second definition of the format, and the two would
+disagree exactly where it is hardest to notice — a diagnostics blob's length
+prefix, the end of a ragged ply list, an unset optional. Binary and versioned
+rather than JSON because a shard is the largest artefact this system writes and
+the fastest thing it re-reads, and because a strict reader that refuses an
+unknown version is worth more than one that tolerates two shapes.
 
 The detailed statement of the format belongs in `crates/hexo-records/README.md`;
 this section says only what the container needs from it.
@@ -627,8 +737,10 @@ Four, and three of them bite in a container specifically.
 - **WSL2 memory ceiling.** The distro, the Docker engine, and every container
   share the one budget set in `.wslconfig` — the ~20 GB of §1. It is what bounds
   G.
-- **12 GB of VRAM** is the hard ceiling on the device side. It decides B, along
-  with the resident modules of the slot pool (§10.1). It does not decide G.
+- **12 GB of VRAM** is the hard ceiling for a future device-backed forward. It
+  would decide B, along with resident modules in the slot pool (§10.1), but
+  never G. The current MantisNet forward is CPU-only and consumes none of that
+  budget.
 
 ---
 
@@ -645,7 +757,4 @@ sweep and no multi-run scheduler: a run is one process and one directory.
   `play`. A line-oriented stdio protocol remains the default assumption, and the
   constraint from `ENGINE_RL_AUDIT.md` stands with it: stdio is for external
   interoperability, never for self-play.
-- **The Dockerfile itself.** It arrives with the first Python-backed package,
-  for the reason §2 gives — until then it would carry a CUDA and Python stack
-  for a loop that uses neither.
 - **B4** — seed ownership, deferred against a seam that already exists (§12).

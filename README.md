@@ -2,23 +2,25 @@
 
 A Hexo engine and bot-training framework, built ground up.
 
-> **Status: the training loop runs, against a mock package.** The engine ships
+> **Status: the container stack runs through its first real package.** The
+> engine ships
 > the full rule machine, make/unmake search, and its test suite; the runner ships
 > the nonblocking game state machine and the result and adjudication model;
 > `hexo-player` ships the seat seam a human, a scripted bot, or a transport
 > adapter plugs into. Above them, `hexo-search` ships the evaluator seam and the
 > nonblocking decision sessions, `hexo-records` the on-disk shard format,
 > `hexo-model` the model-package trait and the probe that holds a checkpoint
-> honest, `crates/models/mock` the first package built to it, and `hexo-bot` the
-> binary, whose `train` and `match` subcommands both run end to end. **A mock
-> loop is not a trained bot:** the only registered package is a weightless salt
-> that learns nothing, and there is no image. The first real network now exists
-> under `python/` — MantisNet (`docs/MODEL_SPEC.md`), a PyTorch model with its
-> builder, losses, and test suite, reaching the engine through the `hexo-py`
-> PyO3 leaf crate — together with its intended training path: a faithful
-> baseline of KLENT (`docs/KLENT_DESIGN.md`), the search-free closed-form
-> policy improvement. Neither is yet a `ModelPackage`, and nothing in the
-> cargo workspace depends on Python.
+> honest, `crates/models/mock` the deterministic package built to it, and
+> `hexo-bot` the binary, whose `init`, `train`, and `match` subcommands run.
+> `crates/models/mantisnet` is the first network-backed package: it shares one
+> Rust encoder with `python/hexo-py`, turns the live network's raw heads into
+> KLENT's π′/v̂ opinion, uses policy self-play and shared Gumbel evaluation,
+> and seals and proves the Python trainer's Torch checkpoints. PyO3/Torch live
+> only in the `hexo-bot` executable boundary; logic crates remain Python-free.
+> MantisNet deliberately declines container-side `fit`: its production trainer
+> remains the faithful KLENT loop under `python/mantisnet`, pending an owner
+> decision to migrate that loop. The `mantisnet-train` image and compose
+> environment live under `docker/`.
 
 ## Layout
 
@@ -32,12 +34,13 @@ Hexo-Shrimp-Bot/
     hexo-search/          the evaluator seam, and the nonblocking sessions
     hexo-records/         the on-disk shard format, written once, read strictly
     hexo-model/           the model-package trait, the manifest, and the probe
-    models/               model packages, one crate each; `mock` is the first
-    hexo-bot/             the binary: `train` and `match`
+    models/               model packages, one crate each: `mock`, `mantisnet`
+    hexo-bot/             the binary: `init`, `train`, and `match`
   xtask/                  the verification gates, defined once; `cargo xtask`
   python/
-    hexo-py/              PyO3 bindings to hexo-engine; a leaf crate outside the workspace
+    hexo-py/              PyO3 engine/shared-encoder bindings; detached leaf crate
     mantisnet/            the MantisNet model: builder, network, losses, tests, bench
+  docker/                 the mantisnet-train image and WSL compose environment
   docs/
     ENGINE_SPEC.md        normative implementation target for hexo-engine
     MODEL_SPEC.md         normative target for the MantisNet network
@@ -63,17 +66,20 @@ with a win check after each, six-in-a-row windows, frontier-radius legality.
 `docs/ENGINE_SPEC.md` states them normatively; nothing in this workspace is
 free to reinterpret them.
 
-**Rust owns the engine and the match loop.** Where the Rust/Python boundary
-ultimately falls is deliberately undecided — Python earns its place in plenty of
-roles, and picking the line before there is anything to put on either side of it
-would be guessing.
+**Rust owns the engine and the match loop; the live forward is the one Python
+crossing.** MantisNet's package injects Python-free `ForwardLoader` and
+`Forward` traits into its evaluator. The `hexo-bot` executable implements them
+with PyO3, loads the production `MantisNet` module, and crosses the interpreter
+once per batch. Encoder bytes and KLENT improvement semantics stay in Rust.
 
-**PyO3 will be a leaf crate, never a feature flag.** When Python bindings
-arrive they get their own crate that depends on the logic crates. No logic crate
-ever mentions PyO3, even optionally. This keeps `cargo test` free of any Python
-toolchain, keeps compiles fast, avoids Cargo feature-unification surprises, and
-leaves `hexo-engine` compilable to `wasm32` — which is what would let a web
-frontend run the real rules instead of a reimplementation.
+**PyO3 is a leaf dependency, never a feature flag.** `hexo-bot` carries the
+embedded boundary unconditionally, and `python/hexo-py` is the detached binding
+over the same Rust encoder core. No logic crate ever mentions PyO3, even
+optionally. Logic-crate tests therefore need no Python runtime, Cargo cannot
+feature-unify Python into them, and `hexo-engine` remains compilable to
+`wasm32` — which is what lets a web frontend run the real rules instead of a
+reimplementation. Building the full workspace, which includes the leaf binary,
+uses the selected Python interpreter.
 
 **The engine owns canonical state; players get their own copy.** Only the runner
 may advance the authoritative position. Players receive a position of their own
@@ -128,7 +134,10 @@ it: the probe hash is recomputed over the bytes the evaluator actually returns
 and a mismatch refuses the load.
 [crates/hexo-model/README.md](crates/hexo-model/README.md) argues the trait and
 the probe; [crates/models/mock/README.md](crates/models/mock/README.md) is the
-exemplar the whole loop is exercised against.
+deterministic exemplar the whole loop is exercised against, and
+[crates/models/mantisnet/README.md](crates/models/mantisnet/README.md) states
+the real package's shared encoder, injected forward, sessions, diagnostics,
+checkpoint metadata, and explicit external-fit refusal.
 
 **The evaluator seam is three types, and no session blocks.** The package's
 encoder runs worker-side, so a leaf position never crosses a thread and the
@@ -154,21 +163,23 @@ orchestrator running matches between containers. One authority implementation,
 two deployment shapes. Exactly one authority exists per game — a container
 answering someone else's protocol runs as a player and does not adjudicate.
 
-**The binary ships the subcommands that work.** `hexo-bot train` is a whole
-training run — batched self-play, fit, checkpoint, evaluation — in one
-long-lived process, and `hexo-bot match` is the local head-to-head that pits two
-checkpoints, or two search shapes over one checkpoint, against each other. One
-driver serves both. `serve` and `play` are absent rather than stubbed: both are
-entirely wire protocol and there is no wire protocol yet, so a stub would
-publish a command line before the thing behind it is designed and its guessed
-flags would become the constraint the real implementation has to argue its way
-out of. [crates/hexo-bot/README.md](crates/hexo-bot/README.md) argues both
-halves.
+**The binary ships the subcommands that work.** `hexo-bot init` atomically
+seals a package checkpoint; `train` is a whole training run — batched
+self-play, fit, checkpoint, evaluation — in one long-lived process; and
+`match` is the local head-to-head that pits two checkpoints, or two search
+shapes over one checkpoint, against each other. One driver serves both game
+paths. `serve` and `play` are absent rather than stubbed: both are entirely wire
+protocol and there is no wire protocol yet, so a stub would publish a command
+line before the thing behind it is designed and its guessed flags would become
+the constraint the real implementation has to argue its way out of.
+[crates/hexo-bot/README.md](crates/hexo-bot/README.md) argues the boundary and
+all three commands.
 
-**One build backend, one workspace.** Cargo workspace for Rust; when Python
-arrives, a `uv` workspace and maturin. One backend and one dependency graph, so
-that "how is this built" has a single answer and no step assembles a
-`PYTHONPATH` by hand.
+**One build backend per language, one dependency graph per tree.** Cargo owns
+the Rust workspace; `python/mantisnet` is a locked `uv` project and maturin
+builds the detached `hexo-py` extension. `PYO3_PYTHON` and `HEXO_PYTHON` select
+one interpreter for the embedded binary rather than assembling a private model
+path in a logic crate.
 
 **The engine is checked against oracles written independently of it.**
 `Position::audit()`, the independent oracles in `crates/hexo-engine/tests/common`,
@@ -208,6 +219,6 @@ Building the same tree from both Windows and WSL collides on `target/`. Set
 | --- | --- |
 | [docs/ENGINE_SPEC.md](docs/ENGINE_SPEC.md) | **Normative.** The single implementation target for `crates/hexo-engine`: rules, state, storage, growth policy, error precedence, invariants, and test obligations. |
 | [docs/ENGINE_RL_AUDIT.md](docs/ENGINE_RL_AUDIT.md) | Review findings on readiness for massively parallel self-play, with each one's resolution recorded next to it. A snapshot with annotations, not a live plan. |
-| [docs/CONTAINER_SPEC.md](docs/CONTAINER_SPEC.md) | **Normative** for the five container crates: how a bot is packaged, deployed, and run — one binary, where state lives, and what a long-lived training process has to guarantee. Trued up against the code as built: the Rust half runs, the image and the Python half do not exist. |
+| [docs/CONTAINER_SPEC.md](docs/CONTAINER_SPEC.md) | **Normative** for the container crates: how a bot is packaged, deployed, and run — one binary, where state lives, and what a long-lived training process has to guarantee. Trued up through the MantisNet package, embedded live-forward boundary, shared Gumbel session, checkpoint sealing, and image. |
 | [docs/OPEN_DECISIONS.md](docs/OPEN_DECISIONS.md) | Questions that *must* be answered before the code depending on them exists. A settled one leaves, and the file records where its answer went — the engine's, the runner's, and the record format's are all settled; seeds and the wire protocol are not. |
 | [docs/SUGGESTIONS.md](docs/SUGGESTIONS.md) | *Optional* design proposals with status, rationale, and trade-offs. Accepted items graduate to the `README.md` of whatever they decided. |

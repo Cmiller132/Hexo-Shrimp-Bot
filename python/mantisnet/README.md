@@ -13,9 +13,13 @@ rayon-parallel (~0.1 ms/position), the forward is `torch.compile`d (~2.1×
 over eager), and a full KLENT iteration at the design's settings (64 games,
 cap 512) runs in ~36 s at its iteration-0 worst on the 4070 Ti — the
 Performance section below has the numbers and the two hazards worth knowing.
-**Not yet a `ModelPackage`:** no encoder, no evaluator, no sessions, and no
-record/runner integration — the KLENT buffer is in-memory per iteration, as
-the paper's is.
+**Now consumed by a `ModelPackage`:** `crates/models/mantisnet` supplies the
+container-side encoder, KLENT-improved evaluator opinion, policy/Gumbel
+sessions, diagnostics, and proving checkpoint loads. `hexo-bot` calls this same
+live Torch module through its leaf PyO3 boundary. The production KLENT trainer
+remains here and its buffer remains in-memory per iteration, as the paper's is;
+the package explicitly declines container-side `fit` rather than duplicating
+that loop.
 
 ## Shape
 
@@ -23,8 +27,8 @@ the paper's is.
 python/mantisnet/
   pyproject.toml      # uv project; torch from the cu128 index, hexo-py by path
   mantisnet/
-    __init__.py       # flat re-exports, MODEL_REPR_VERSION
-    builder.py        # §3-§4, §9: graphs, index tables, collation
+    __init__.py       # flat re-exports; shared Rust MODEL_REPR_VERSION
+    builder.py        # §3-§4, §9: independent reference graphs and collation
     model.py          # §5-§7, §10 + appendix B: trunk, policy/Q/value heads
     attention.py      # fused coordinate-biased attention + SDPA fallback/backward
     decoder.py        # the cell-head incidence pass: segment kernel + scatter fallback
@@ -59,7 +63,7 @@ uv run python bench/bench_forward.py # throughput on CPU and the local GPU
 
 | Module | Role |
 | --- | --- |
-| `builder` | `build` (raw §11 inputs to a `PositionGraph`), `from_position` (the `hexo_py` wrapper), `collate` (graphs to one `Batch` of index tensors). Owns `MODEL_REPR_VERSION` and every index convention. |
+| `builder` | `build` (raw §11 inputs to a `PositionGraph`), `from_position` (the `hexo_py` wrapper), `collate` (graphs to one `Batch` of index tensors). It is the independent parity reference and imports `MODEL_REPR_VERSION` from the shared Rust owner. |
 | `model` | `MantisConfig` (the §2 named parameters), `MantisNet`, `ModelOutput`. `trunk`, `cell_heads`, and `value_head` are separate so a caller pays only for the heads it reads; `policy_head` is the one-head entry the argmax chooser wants. |
 | `decoder` | `aggregate` (the pass over the decoder incidence both cell heads read) and `head_matrix` (a head's projection and embedding tables folded into the matrix reading an aggregate row). Holds no parameters. |
 | `losses` | `value_target` (two-hot projection), `value_loss`, `policy_loss` (segmented CE over ragged engine-order logits), `param_groups` (§10 decay split). |
@@ -68,17 +72,20 @@ uv run python bench/bench_forward.py # throughput on CPU and the local GPU
 
 ## Design notes
 
-- **Two builders, one representation, and a parity detector between them.**
-  The Python builder (`build`/`collate`) is the normative reference: it never
+- **One production encoder, one independent reference, and a parity detector
+  between them.** `crates/models/mantisnet/src/encoder.rs` is the shared Rust
+  implementation and the sole owner of `MODEL_REPR_VERSION`; the container
+  package calls it directly and `hexo-py` is a thin binding over it. The Python
+  builder (`build`/`collate`) remains the normative reference: it never
   calls the engine's window walk, which is what keeps `windows_through` an
   *independent* oracle for §12.1 — a builder built on the engine's enumeration
   would agree with it by construction, the deleted-detector failure `CLAUDE.md`
-  warns about. The production path (`collate_positions`/`collate_prefixes`) is
-  Rust in `hexo-py`: rayon-parallel with the GIL released, ~16× the Python
-  path at batch 256, and *allowed* to use the engine's walk precisely because
-  `test_rust_builder.py` holds it exactly equal to the Python output, field
-  for field — the §12.7-style detector a second implementation owes. Both are
-  covered by one `MODEL_REPR_VERSION`.
+  warns about. The production path
+  (`collate_positions`/`collate_prefixes`) is rayon-parallel Rust with the GIL
+  released, ~16× the Python path at batch 256, and *allowed* to use the
+  engine's walk precisely because `test_rust_builder.py` holds it exactly equal
+  to the Python output, field for field — the §12.7-style detector an
+  independent reference owes.
 
 - **34 canonical patterns, not the spec draft's 32.** The 62 nonempty, nonfull
   6-bit masks fold to `(62 + 6 palindromes) / 2 = 34` orbits under reversal.
@@ -282,12 +289,13 @@ if samples:
 
 | Omitted | Why |
 | --- | --- |
-| Encoder / evaluator / sessions | Wiring MantisNet to `hexo-search`'s seam is the Python-backed package of `CONTAINER_SPEC.md`, a change to be made there, not here. KLENT's training loop deliberately needs none of it — no search during training is the algorithm's point. |
+| Python-owned encoder / evaluator / sessions | These now live in the Python-free `crates/models/mantisnet` package. `hexo-py` binds the package's shared encoder core, and `hexo-bot` injects only the live Torch forward. KLENT's production training loop deliberately needs none of the container session machinery — no search during training is the algorithm's point. |
 | The aux window head (spec appendix A) | Optional by spec, and adding it later touches no input — it reads trunk output. |
 | `KLENT_PROPOSALS.md`'s accepted items | Diffs against a baseline that must exist first. Each is a small, named change when wanted. |
 | Records / runner integration for the buffer | Design doc §12/§14. The in-memory per-iteration buffer is the paper's own shape; persistence arrives with B2's per-move blob, not with a private writer here. |
-| Checkpoint I/O | The manifest and probe protocol are `hexo-model`'s, and arrive with the package. |
-| Test-time Gumbel MCTS | Design doc §15: the paper's best number, but it measures the search, not the algorithm. |
+| Container-side `fit` | The package returns a loud unsupported-operation error. Production fitting is `mantisnet.klent.run`; migrating it is an owner decision, and no partial trainer is scaffolded. |
+| A second checkpoint format | Python training continues to write the authoritative Torch `.pt`. `hexo-bot init` seals that same file with the package manifest, τ/λ metadata, and a probe hash; there is no exported model or translated weight format. |
+| Python-owned test-time search | Shared `hexo-search::GumbelSession` now supplies package evaluation. Python search code is a parity reference, not a second container search path. |
 | Further hand-written Triton kernels | Two have landed. Block attention computes distance buckets and the learned per-head bias in-kernel and stops each row at its live key prefix, but its fixed 64×64, four-warp, three-stage launch improved the complete long-position forward only ~1.04×, below the 1.4× target. The decoder aggregation is the one that paid: a single-warp segment reduction over the incidence, 1.39–1.82× on the forward. Dense SDPA and an `index_add_` scatter remain as the CPU/failed-shape fallbacks and for fit's recompute backward. The profile now puts the trunk's §5.1/§5.2 message passing on top at ~19 %, and everything below it is under 10 %. The same segment reduction applies to §5.1 directly (`inc_window` is emitted in window order) but not to §5.2, whose `inc_stone` is not sorted — that half would need a permutation the builder does not currently produce. |
 | FlexAttention for the §4.1 distance bias | Measured out (2026-07-27): a `score_mod` computing buckets from coordinates in-kernel was built and proven exactly equivalent (outputs ~2e-6, `dist_bias` grads ~2e-8), but at this model's sizes it ran **5× slower in fit and 2.7× slower in collection** for ≤0.2 GiB saved — once batches are budget-packed, attention is no longer the memory driver, and flex under dynamic shapes needed 128-padded lengths plus an eager block mask to compile at all. Revisit only if H or D_MAX grow enough to make the bias tensor dominant again. |
 

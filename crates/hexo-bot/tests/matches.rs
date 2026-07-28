@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{count, field, init_checkpoint, match_config};
+use common::{count, field, init_checkpoint, match_config, registry};
 use hexo_bot::Outcome;
 use serde_json::Value;
 
@@ -38,7 +38,7 @@ fn two_searches_over_the_same_weights_produce_a_report_that_accounts_for_every_g
         &format!("package=mock;checkpoint={weights};config=search=policy;variant={TREE_SEARCH}"),
     ]);
 
-    let played = hexo_bot::play_match(&config).expect("the match runs");
+    let played = hexo_bot::play_match(&config, &registry()).expect("the match runs");
     assert_eq!(played.outcome, Outcome::Completed);
 
     let report = played.report.to_json();
@@ -141,7 +141,7 @@ fn an_unknown_variant_name_surfaces_the_packages_own_refusal() {
         &format!("package=mock;checkpoint={weights};config=search=policy;variant=greedy"),
     ]);
 
-    let error = hexo_bot::play_match(&config).expect_err("the mock has no `greedy`");
+    let error = hexo_bot::play_match(&config, &registry()).expect_err("the mock has no `greedy`");
     let message = error.to_string();
     assert!(
         message.contains("greedy") && message.contains("variant"),
@@ -168,7 +168,7 @@ fn a_seat_naming_no_package_lists_the_packages_there_are() {
         &format!("package=mock;checkpoint={weights};config=search=policy"),
     ]);
 
-    let error = hexo_bot::play_match(&config).expect_err("there is no `gnn`");
+    let error = hexo_bot::play_match(&config, &registry()).expect_err("there is no `gnn`");
     let message = error.to_string();
     assert!(
         message.contains("gnn") && message.contains("mock"),

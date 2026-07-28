@@ -1,8 +1,9 @@
 """MantisNet: the stone/window graph network of ``docs/MODEL_SPEC.md``.
 
-The builder owns the representation (`MODEL_REPR_VERSION`), the model owns the
-weights, and the losses pin what the outputs mean. Search integration is
-elsewhere and later.
+The shared Rust encoder owns the representation and ``MODEL_REPR_VERSION``;
+this package's Python builder is its independent parity reference. The model
+owns the weights, the losses pin the raw heads, and the Python-free container
+package owns the improved evaluator opinion and sessions.
 """
 
 from .builder import (

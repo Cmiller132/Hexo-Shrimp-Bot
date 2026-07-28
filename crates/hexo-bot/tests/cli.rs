@@ -40,9 +40,27 @@ fn minimal_train() -> Vec<&'static str> {
 fn no_subcommand_says_which_subcommands_there_are() {
     let message = refused(&[]);
     assert!(
-        message.contains("train") && message.contains("match"),
+        message.contains("init") && message.contains("train") && message.contains("match"),
         "{message}"
     );
+}
+
+#[test]
+fn init_requires_only_package_and_checkpoint_and_preserves_package_config() {
+    let Ok(Command::Init(config)) = hexo_bot::parse([
+        "init",
+        "--package",
+        "mantisnet",
+        "--checkpoint",
+        "sealed",
+        "--package-config",
+        "tau=0.1,lambda=0.03,source=raw.pt",
+    ]) else {
+        panic!("the documented init command parses");
+    };
+    assert_eq!(config.package, "mantisnet");
+    assert_eq!(config.checkpoint.to_string_lossy(), "sealed");
+    assert_eq!(config.package_config, "tau=0.1,lambda=0.03,source=raw.pt");
 }
 
 #[test]
@@ -193,7 +211,8 @@ fn a_seat_segment_that_is_not_a_pair_is_refused() {
 
 #[test]
 fn an_unknown_package_name_lists_the_ones_there_are() {
-    let Err(error) = hexo_bot::registry::construct("gnn", "") else {
+    let registry = hexo_bot::registry::PackageRegistry::without_mantisnet_runtime();
+    let Err(error) = registry.construct("gnn", "") else {
         panic!("there is no `gnn` package");
     };
     assert!(matches!(error, BotError::UnknownPackage { .. }));
@@ -208,7 +227,8 @@ fn an_unknown_package_name_lists_the_ones_there_are() {
 fn an_empty_package_config_is_the_packages_refusal_and_not_the_registrys() {
     // Absence is not a guess: the container hands the string over and the
     // package decides. The mock has one required key and no default shape.
-    let Err(error) = hexo_bot::registry::construct("mock", "") else {
+    let registry = hexo_bot::registry::PackageRegistry::without_mantisnet_runtime();
+    let Err(error) = registry.construct("mock", "") else {
         panic!("the mock has no default search shape");
     };
     assert!(matches!(error, BotError::Package(_)), "{error}");

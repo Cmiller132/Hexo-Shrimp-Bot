@@ -13,5 +13,9 @@ path = "src/lib.rs"
 hexo-engine.workspace = true
 hexo-runner.workspace = true
 
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+
 [lints]
 workspace = true

@@ -63,6 +63,11 @@ pub enum BotError {
         /// The run directory.
         path: PathBuf,
     },
+    /// `init` was pointed at a checkpoint directory that already exists.
+    CheckpointExists {
+        /// The destination that was deliberately left untouched.
+        path: PathBuf,
+    },
     /// `--resume` was given for a run directory that does not exist.
     NoRun {
         /// Where the run was looked for.
@@ -154,6 +159,11 @@ impl core::fmt::Display for BotError {
             Self::RunExists { path } => write!(
                 f,
                 "{} already holds a run; pass --resume to continue it, or choose another --run-id",
+                path.display(),
+            ),
+            Self::CheckpointExists { path } => write!(
+                f,
+                "{} already exists; checkpoint init never overwrites an artefact",
                 path.display(),
             ),
             Self::NoRun { path } => write!(

@@ -24,10 +24,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-
-# Covers everything in this file: liveness rule, pattern canonicalization,
-# slot classes, bucket tables, incidence and decoder layout (MODEL_SPEC §11).
-MODEL_REPR_VERSION = 1
+from hexo_py import MODEL_REPR_VERSION
 
 WINDOW_LEN = 6
 # Unit steps of the engine's axes, in canonical order Q, R, QR.

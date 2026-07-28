@@ -1,5 +1,4 @@
-//! The command line: two subcommands, and the configuration each of them parses
-//! into.
+//! The command line and the configuration each subcommand parses into.
 //!
 //! `docs/CONTAINER_SPEC.md` §3 ships only the subcommands that work. `serve` and
 //! `play` are not here, not even as stubs that print "not implemented": both are
@@ -24,6 +23,8 @@ use std::time::Duration;
 /// How to invoke the binary, printed with every usage error.
 pub const USAGE: &str = "\
 usage:
+  hexo-bot init --package <name> --checkpoint <dir> [--package-config <string>]
+
   hexo-bot train --run-dir <dir> --run-id <id> --package <name> --epochs <n> --games <n>
                  [--package-config <string>] [--batch <n>] [--threads <n>]
                  [--batch-wait-ms <n>] [--ply-cap <n>] [--eval-every <n>]
@@ -64,6 +65,8 @@ const RESERVED_THREADS: usize = 3;
 /// A parsed command line.
 #[derive(Debug)]
 pub enum Command {
+    /// Seal a package's epoch-0 checkpoint and manifest.
+    Init(InitConfig),
     /// A whole training run: self-play, fit, checkpoint, and evaluation, in one
     /// long-lived process.
     Train(TrainConfig),
@@ -76,10 +79,29 @@ impl Command {
     #[must_use]
     pub fn stop(&self) -> &Arc<AtomicBool> {
         match self {
+            Self::Init(config) => &config.stop,
             Self::Train(config) => &config.stop,
             Self::Match(config) => &config.stop,
         }
     }
+}
+
+/// Everything `init` was told.
+///
+/// The package owns what initialisation means. For MantisNet, `package_config`
+/// includes `source=PATH` naming a Python training `.pt`; the package copies it
+/// into the checkpoint and computes the manifest probe through the live
+/// evaluator. The container owns only atomic directory placement.
+#[derive(Debug)]
+pub struct InitConfig {
+    /// Registry name of the package writing the checkpoint.
+    pub package: String,
+    /// Package configuration, handed over verbatim.
+    pub package_config: String,
+    /// Destination checkpoint directory, which must not already exist.
+    pub checkpoint: PathBuf,
+    /// Set if initialisation is interrupted before the atomic rename.
+    pub stop: Arc<AtomicBool>,
 }
 
 /// Everything `train` was told.
@@ -180,19 +202,32 @@ where
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(BotError::usage(format!(
-            "no subcommand; this binary has `train` and `match`.\n{USAGE}"
+            "no subcommand; this binary has `init`, `train`, and `match`.\n{USAGE}"
         )));
     };
     let mut flags = Flags::split(rest)?;
     match subcommand.as_str() {
+        "init" => Ok(Command::Init(init(&mut flags)?)),
         "train" => Ok(Command::Train(train(&mut flags)?)),
         "match" => Ok(Command::Match(matches(&mut flags)?)),
         other => Err(BotError::usage(format!(
-            "unknown subcommand {other:?}; this binary has `train` and `match`. `serve` and \
+            "unknown subcommand {other:?}; this binary has `init`, `train`, and `match`. `serve` and \
              `play` are not built: they are entirely wire protocol, and there is no wire \
              protocol yet (docs/CONTAINER_SPEC.md §3).\n{USAGE}"
         ))),
     }
+}
+
+/// Read `init`'s flags.
+fn init(flags: &mut Flags) -> Result<InitConfig, BotError> {
+    let config = InitConfig {
+        package: flags.required("--package")?,
+        package_config: flags.optional("--package-config")?.unwrap_or_default(),
+        checkpoint: PathBuf::from(flags.required("--checkpoint")?),
+        stop: Arc::new(AtomicBool::new(false)),
+    };
+    flags.finish("init")?;
+    Ok(config)
 }
 
 /// Read `train`'s flags.

@@ -1,12 +1,13 @@
 # hexo-py
 
 Python bindings for `hexo-engine` — the read surface a model builder needs and
-nothing that could bypass the rules — plus the production MantisNet batch
-builder, in Rust because that is the training loop's hot path.
+nothing that could bypass the rules — plus a thin binding over the shared Rust
+MantisNet encoder.
 
-**Status: implemented.** One class, two batch builders, three module
-constants. It is the PyO3 leaf crate the root `README.md` promised — it
-depends on `hexo-engine` and nothing depends on it.
+**Status: implemented.** One class, two batch builders, and four module
+constants. It is the extension-module PyO3 leaf: Python calls in here, while
+the native `hexo-bot` binary owns the separate embedding boundary that calls
+out to live Torch.
 
 ## Shape
 
@@ -20,12 +21,16 @@ path dependency); `cargo xtask verify` neither builds nor gates it.
 
 ```
 python/hexo-py/
-  Cargo.toml      # own [workspace]; hexo-engine by path, pyo3 with abi3-py312,
-                  # numpy + rayon + rustc-hash for the batch builder
+  Cargo.toml      # own [workspace]; engine + shared MantisNet crate by path,
+                  # pyo3 with abi3-py312, numpy for returned arrays
   pyproject.toml  # maturin build backend (release profile), module hexo_py
   src/lib.rs      # Position, the two batch entry points, numpy conversion
-  src/graph.rs    # the batched graph builder itself
 ```
+
+The graph implementation lives once at
+`crates/models/mantisnet/src/encoder.rs`. A path dependency across the detached
+workspace boundary is intentional: both Cargo workspaces compile the same Rust
+source instead of carrying implementations that merely intend to agree.
 
 Building under WSL: set `CARGO_TARGET_DIR=target-wsl` (the repo's convention —
 the Windows and Linux toolchains fight over one `target/`).
@@ -46,7 +51,8 @@ the Windows and Linux toolchains fight over one `target/`).
 | `windows_through(q, r)` | `windows_through` | see below |
 | `legal_count`, `current_player`, `moves_remaining`, `is_terminal`, `winner`, `stone_count`, `zobrist` | getters | `moves_remaining` derives from `TurnPhase`: `FirstStone` is 2, `Opening` and `SecondStone` are 1 |
 
-Module constants: `RULES_VERSION`, `ACTION_ORDER_VERSION`, `LEGAL_RADIUS`.
+Module constants: `RULES_VERSION`, `ACTION_ORDER_VERSION`, `LEGAL_RADIUS`, and
+the shared encoder owner's `MODEL_REPR_VERSION`.
 
 Module functions, the batch builder:
 
@@ -59,8 +65,8 @@ Module functions, the batch builder:
 
 ## Design notes
 
-- **The batch builder is the production twin of `mantisnet.builder`, and the
-  Python builder is its oracle.** Two implementations of one representation
+- **The shared Rust encoder is the production twin of `mantisnet.builder`, and
+  the Python builder is its oracle.** Two implementations of one representation
   are only tolerable with an exact parity detector between them:
   `mantisnet/tests/test_rust_builder.py` holds every emitted array exactly
   equal to the Python path's, field for field. That test is also what frees
@@ -87,6 +93,7 @@ Module functions, the batch builder:
 
 - `python/mantisnet` consumes it: the builder's inputs (`MODEL_SPEC.md` §11)
   and every engine position its tests replay.
-- The Python-backed `ModelPackage` of `CONTAINER_SPEC.md` §4 is **not** this
-  crate and will not be: that boundary crosses the other way (Rust embedding
-  Python), lives in `hexo-bot`'s process, and arrives with the package itself.
+- `crates/models/mantisnet` is the container package and the owner of the
+  encoder this extension exposes.
+- The live-Torch boundary crosses the other way (Rust embedding Python) and
+  remains private to the `hexo-bot` executable.

@@ -108,3 +108,27 @@ fn the_inherited_refusal_reads_as_a_sentence() {
         r#"bare has no session variant named "greedy""#
     );
 }
+
+#[test]
+fn an_unsupported_operation_says_why_it_does_not_exist() {
+    let error = PackageError::Unsupported {
+        package: "mantisnet",
+        operation: "fit",
+        reason: "training remains in mantisnet.klent.run",
+    };
+    assert_eq!(
+        error.to_string(),
+        "mantisnet does not support fit: training remains in mantisnet.klent.run"
+    );
+}
+
+#[test]
+fn package_metadata_mismatches_keep_both_opaque_values() {
+    let error = PackageError::PackageMetadata {
+        expected: serde_json::json!({"tau": 0.1, "lambda": 0.03}),
+        found: serde_json::json!({"tau": 0.2, "lambda": 0.03}),
+    };
+    let rendered = error.to_string();
+    assert!(rendered.contains(r#""tau":0.1"#), "{rendered}");
+    assert!(rendered.contains(r#""tau":0.2"#), "{rendered}");
+}

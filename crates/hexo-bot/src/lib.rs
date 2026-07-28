@@ -3,18 +3,19 @@
 //!
 //! `docs/CONTAINER_SPEC.md` is the normative target. The binary is a thin shell
 //! over this library — it parses a command line, installs a stop handler, calls
-//! one of two entry points, and maps what comes back onto an exit code — so the
+//! one of three entry points, and maps what comes back onto an exit code — so the
 //! loop is driven in-process by the test suite rather than by spawning a
 //! process and reading its output.
 //!
-//! # Two subcommands, and why not four
+//! # Three subcommands, and why not five
 //!
-//! [`train`] and [`play_match`] are the whole surface. `serve` and `play` are
-//! named by §3 of the spec and are deliberately *not* here, not even as stubs
-//! that parse a flag and exit: both are entirely wire protocol, there is no wire
-//! protocol yet, and a stub would publish a command line before the thing behind
-//! it is designed — after which the flags it guessed become the constraint the
-//! real implementation has to argue its way out of.
+//! [`init_checkpoint`], [`train`], and [`play_match`] are the whole surface.
+//! `serve` and `play` are named by §3 of the spec and are deliberately *not*
+//! here, not even as stubs that parse a flag and exit: both are entirely wire
+//! protocol, there is no wire protocol yet, and a stub would publish a command
+//! line before the thing behind it is designed — after which the flags it
+//! guessed become the constraint the real implementation has to argue its way
+//! out of.
 //!
 //! # The shape of a run
 //!
@@ -36,13 +37,15 @@ pub mod registry;
 
 mod driver;
 mod error;
+mod init;
 mod matches;
 mod metrics;
 mod run;
 mod train;
 
-pub use cli::{Command, MatchConfig, SeatSpec, TrainConfig, USAGE, parse, seat};
+pub use cli::{Command, InitConfig, MatchConfig, SeatSpec, TrainConfig, USAGE, parse, seat};
 pub use error::BotError;
+pub use init::init_checkpoint;
 pub use matches::{MatchReport, MatchRun, SeatReport, play_match};
 pub use train::train;
 

@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{checkpoint, count, field, metrics, run_root, train_config};
+use common::{checkpoint, count, field, metrics, registry, run_root, train_config};
 use hexo_bot::Outcome;
 use std::sync::atomic::Ordering;
 
@@ -44,7 +44,7 @@ fn a_policy_run_leaves_a_checkpoint_per_epoch_and_a_metrics_line_per_epoch() {
         "12",
     ]);
 
-    let outcome = hexo_bot::train(&config).expect("the run completes");
+    let outcome = hexo_bot::train(&config, &registry()).expect("the run completes");
     assert_eq!(outcome, Outcome::Completed);
 
     let root = run_root(dir.path(), "policy");
@@ -129,7 +129,7 @@ fn a_tree_search_run_carries_multi_leaf_sessions_across_the_worker_pool() {
         "11",
     ]);
 
-    let outcome = hexo_bot::train(&config).expect("the run completes");
+    let outcome = hexo_bot::train(&config, &registry()).expect("the run completes");
     assert_eq!(outcome, Outcome::Completed);
 
     let lines = metrics(dir.path(), "mcts");
@@ -193,7 +193,7 @@ fn a_stop_before_the_first_epoch_writes_nothing_past_the_run_setup() {
     // true.
     config.stop.store(true, Ordering::Relaxed);
 
-    let outcome = hexo_bot::train(&config).expect("a stopped run is not a failed one");
+    let outcome = hexo_bot::train(&config, &registry()).expect("a stopped run is not a failed one");
     assert_eq!(outcome, Outcome::Stopped);
 
     let root = run_root(dir.path(), "halted");
@@ -250,7 +250,7 @@ fn a_stop_during_a_run_leaves_no_epoch_half_written() {
         stop.store(true, Ordering::Relaxed);
     });
 
-    let outcome = hexo_bot::train(&config).expect("a stopped run is not a failed one");
+    let outcome = hexo_bot::train(&config, &registry()).expect("a stopped run is not a failed one");
     arm.join().expect("the arming thread");
     assert_eq!(outcome, Outcome::Stopped);
 

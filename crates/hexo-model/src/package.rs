@@ -204,13 +204,20 @@ pub trait ModelPackage {
     /// wrote, through the same [`ModelPackage::load`] as any other checkpoint,
     /// which is what puts the fit's own output behind the probe.
     ///
+    /// A package may deliberately decline container-side fitting with
+    /// [`PackageError::Unsupported`] when its production training loop remains
+    /// elsewhere. That refusal must name the real loop and the owner decision
+    /// required to move it; a partial trainer that accepts shards but does not
+    /// implement the production algorithm is not an implementation.
+    ///
     /// # Errors
     ///
     /// [`PackageError::NoTrainingData`] if there were no shards or no games,
     /// [`PackageError::Io`] for a shard or checkpoint the filesystem refuses,
     /// [`PackageError::Failed`] wrapping whatever the package's own reader or
     /// trainer raised, and [`PackageError::NotLoaded`] if the package fits from
-    /// weights it does not have.
+    /// weights it does not have. [`PackageError::Unsupported`] when the package
+    /// deliberately keeps fitting in an external production loop.
     fn fit(
         &mut self,
         shards: &[PathBuf],

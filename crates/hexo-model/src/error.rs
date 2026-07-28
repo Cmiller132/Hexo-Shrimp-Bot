@@ -87,6 +87,17 @@ pub enum PackageError {
         /// What the checkpoint states.
         found: u32,
     },
+    /// Package-owned checkpoint metadata disagrees with this package instance.
+    ///
+    /// The JSON is opaque to this crate; carrying both values lets the package
+    /// report the mismatch without flattening its configuration to a string or
+    /// teaching the container what any field means.
+    PackageMetadata {
+        /// What the running package requires.
+        expected: serde_json::Value,
+        /// What the checkpoint states.
+        found: serde_json::Value,
+    },
     /// The loaded weights do not answer the probe the way the manifest says
     /// they should.
     ///
@@ -157,6 +168,19 @@ pub enum PackageError {
         shards: usize,
         /// How many games it found in them.
         games: usize,
+    },
+    /// The package deliberately does not implement this operation.
+    ///
+    /// This is distinct from a failed attempt: no partial work was started and
+    /// the reason names the owner decision required before the operation can
+    /// exist honestly.
+    Unsupported {
+        /// The package that declined.
+        package: &'static str,
+        /// The operation it does not implement.
+        operation: &'static str,
+        /// Why the package declines it.
+        reason: &'static str,
     },
     /// A package-internal operation failed, carrying the package's own error.
     ///
@@ -231,6 +255,11 @@ impl core::fmt::Display for PackageError {
                 "the checkpoint states runner protocol version {found}, but this build links \
                  protocol version {expected}"
             ),
+            Self::PackageMetadata { expected, found } => write!(
+                f,
+                "the checkpoint's package metadata {found} does not match the running package's \
+                 required metadata {expected}"
+            ),
             Self::ProbeMismatch { expected, computed } => write!(
                 f,
                 "the loaded weights answer the probe with {computed:#018x}, but the manifest \
@@ -259,6 +288,11 @@ impl core::fmt::Display for PackageError {
                 "{package} was asked to fit on {shards} shard(s) holding {games} game(s); a fit \
                  that consumed nothing would produce weights nothing trained"
             ),
+            Self::Unsupported {
+                package,
+                operation,
+                reason,
+            } => write!(f, "{package} does not support {operation}: {reason}"),
             Self::Failed {
                 package,
                 doing,

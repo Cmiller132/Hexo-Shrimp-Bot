@@ -17,7 +17,10 @@ fn read_back(dir: &Path, json: &str) -> Result<Manifest, PackageError> {
 #[test]
 fn a_manifest_survives_a_write_and_a_read_unchanged() {
     let dir = tempfile::tempdir().expect("a scratch directory");
-    let manifest = agreeing();
+    let manifest = agreeing().with_package_metadata(serde_json::json!({
+        "lambda": 0.03,
+        "tau": 0.1
+    }));
     manifest.write(dir.path()).expect("written");
     assert_eq!(Manifest::read(dir.path()).expect("read"), manifest);
 }
@@ -35,6 +38,7 @@ fn a_new_manifest_takes_its_linked_versions_from_the_build_it_was_made_in() {
     assert_eq!(manifest.package_version, 3);
     assert_eq!(manifest.encoder_version, 7);
     assert_eq!(manifest.epoch, 12);
+    assert_eq!(manifest.package_metadata, serde_json::json!({}));
 }
 
 #[test]

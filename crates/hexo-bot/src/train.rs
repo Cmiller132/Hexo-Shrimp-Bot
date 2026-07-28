@@ -6,7 +6,7 @@ use crate::cli::TrainConfig;
 use crate::driver::{LaneSeats, RecordSink, Sweep, SweepReport, run_sweep};
 use crate::error::BotError;
 use crate::metrics::{EpochMetrics, EvalResult, Timing};
-use crate::registry;
+use crate::registry::PackageRegistry;
 use crate::run::{self, RunLayout};
 use hexo_model::{MANIFEST_FILE, ModelPackage};
 use hexo_records::{ShardHeader, ShardMode};
@@ -52,9 +52,9 @@ const OPPONENT: usize = 1;
 /// [`BotError::Package`] for anything the package refuses — including a
 /// checkpoint that does not prove — [`BotError::Record`] for a shard that
 /// cannot be written, and [`BotError::Io`] for the filesystem.
-pub fn train(config: &TrainConfig) -> Result<Outcome, BotError> {
+pub fn train(config: &TrainConfig, registry: &PackageRegistry) -> Result<Outcome, BotError> {
     let layout = RunLayout::new(&config.run_dir, &config.run_id);
-    let mut package = registry::construct(&config.package, &config.package_config)?;
+    let mut package = registry.construct(&config.package, &config.package_config)?;
 
     if layout.root().exists() {
         if !config.resume {
@@ -126,7 +126,7 @@ pub fn train(config: &TrainConfig) -> Result<Outcome, BotError> {
 
         // (4) Evaluation, if this epoch is one of them.
         let started = Instant::now();
-        let evals = evaluate(config, package.as_ref(), &layout, epoch)?;
+        let evals = evaluate(config, registry, package.as_ref(), &layout, epoch)?;
         timing.eval = started.elapsed();
 
         // (5) One line, appended as it happens.
@@ -223,6 +223,7 @@ fn self_play(
 /// consumes would be the largest artefact in the run written for no reader.
 fn evaluate(
     config: &TrainConfig,
+    registry: &PackageRegistry,
     package: &dyn ModelPackage,
     layout: &RunLayout,
     epoch: u32,
@@ -241,7 +242,7 @@ fn evaluate(
         if stopping(config) {
             break;
         }
-        let report = pairing(config, package, layout, opponent_epoch)?;
+        let report = pairing(config, registry, package, layout, opponent_epoch)?;
         results.push(EvalResult {
             opponent_epoch,
             games: report.tally.games,
@@ -266,11 +267,12 @@ fn evaluate(
 /// first package whose modules are expensive enough to be worth pooling.
 fn pairing(
     config: &TrainConfig,
+    registry: &PackageRegistry,
     package: &dyn ModelPackage,
     layout: &RunLayout,
     opponent_epoch: u32,
 ) -> Result<SweepReport, BotError> {
-    let mut opponent = registry::construct(&config.package, &config.package_config)?;
+    let mut opponent = registry.construct(&config.package, &config.package_config)?;
     let path = layout.checkpoint(opponent_epoch);
     opponent
         .load(&path)

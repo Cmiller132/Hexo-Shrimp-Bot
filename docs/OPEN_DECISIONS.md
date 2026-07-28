@@ -69,7 +69,6 @@ data, which is how formats change here, rather than a redesign of the loop.
 | C1 | Transport and wire format. A line-oriented stdio protocol is the default: trivial to containerise, debuggable by hand, close to what tournament harnesses expect. |
 | C2 | Handshake fields: protocol version, rules version, action-encoding version, seat, seed, budget. |
 
-`CONTAINER_SPEC.md` §15 is the same list from the other side. It carries C1 and
-C2, B4 above, and one item that is the container's rather than the code's: the
-**Dockerfile**, which arrives with the first Python-backed package, because
-until then it would carry a CUDA and Python stack for a loop that uses neither.
+`CONTAINER_SPEC.md` §15 is the same list from the other side: C1, C2, and B4
+above. The Dockerfile left that list with the first Python-backed package and
+now lives under `docker/`.

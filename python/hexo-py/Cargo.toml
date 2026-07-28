@@ -11,14 +11,12 @@ crate-type = ["cdylib"]
 
 [dependencies]
 hexo-engine = { path = "../../crates/hexo-engine" }
+hexo-model-mantisnet = { path = "../../crates/models/mantisnet" }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py312"] }
 numpy = "0.26"
-rayon = "1"
-# The builder's inner loops are hash probes; SipHash would be most of them.
-rustc-hash = "2"
 
-# Detached from the root cargo workspace on purpose. The workspace forbids
-# unsafe code and stays free of a Python toolchain (CONTAINER_SPEC §4); this
-# crate exists exactly to cross that boundary, so it stands alone and is built
-# by maturin from the Python side rather than by `cargo xtask verify`.
+# Detached from the root cargo workspace on purpose. This Python extension has
+# the cdylib-only `extension-module`/abi3 build shape and is built by maturin
+# from the Python side. The root workspace's other Python boundary is the
+# opposite shape: PyO3 embedding belongs only to the `hexo-bot` binary leaf.
 [workspace]

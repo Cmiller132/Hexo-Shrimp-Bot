@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{checkpoint, metrics, run_root, train_config};
+use common::{checkpoint, metrics, registry, run_root, train_config};
 use hexo_bot::{BotError, Outcome};
 use std::path::Path;
 
@@ -44,7 +44,7 @@ fn resuming_extends_a_run_without_refitting_the_epochs_it_already_has() {
 
     let first = train_config(&flags(&run_dir, "1", "4"));
     assert_eq!(
-        hexo_bot::train(&first).expect("the first run completes"),
+        hexo_bot::train(&first, &registry()).expect("the first run completes"),
         Outcome::Completed,
     );
     let epoch_one = manifest_bytes(&checkpoint(dir.path(), "r", 1));
@@ -54,7 +54,7 @@ fn resuming_extends_a_run_without_refitting_the_epochs_it_already_has() {
     extended.push("--resume");
     let second = train_config(&extended);
     assert_eq!(
-        hexo_bot::train(&second).expect("the resumed run completes"),
+        hexo_bot::train(&second, &registry()).expect("the resumed run completes"),
         Outcome::Completed,
     );
 
@@ -84,11 +84,12 @@ fn resuming_with_a_changed_flag_refuses_and_names_the_field() {
     let run_dir = dir.path().to_string_lossy().into_owned();
 
     let first = train_config(&flags(&run_dir, "1", "4"));
-    hexo_bot::train(&first).expect("the first run completes");
+    hexo_bot::train(&first, &registry()).expect("the first run completes");
 
     let mut changed = flags(&run_dir, "1", "8");
     changed.push("--resume");
-    let error = hexo_bot::train(&train_config(&changed)).expect_err("the run was redefined");
+    let error =
+        hexo_bot::train(&train_config(&changed), &registry()).expect_err("the run was redefined");
     match &error {
         BotError::ResumeMismatch { field, .. } => assert_eq!(field, "games"),
         other => panic!("expected a resume mismatch, got {other}"),
@@ -104,11 +105,13 @@ fn resuming_may_not_shorten_a_run() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let run_dir = dir.path().to_string_lossy().into_owned();
 
-    hexo_bot::train(&train_config(&flags(&run_dir, "2", "4"))).expect("the first run completes");
+    hexo_bot::train(&train_config(&flags(&run_dir, "2", "4")), &registry())
+        .expect("the first run completes");
 
     let mut shorter = flags(&run_dir, "1", "4");
     shorter.push("--resume");
-    let error = hexo_bot::train(&train_config(&shorter)).expect_err("a resume does not shrink");
+    let error = hexo_bot::train(&train_config(&shorter), &registry())
+        .expect_err("a resume does not shrink");
     match error {
         BotError::ResumeMismatch { field, .. } => assert_eq!(field, "epochs"),
         other => panic!("expected a resume mismatch on epochs, got {other}"),
@@ -120,10 +123,11 @@ fn starting_a_run_on_top_of_one_refuses_rather_than_writing_into_it() {
     let dir = tempfile::tempdir().expect("a scratch directory");
     let run_dir = dir.path().to_string_lossy().into_owned();
 
-    hexo_bot::train(&train_config(&flags(&run_dir, "1", "4"))).expect("the first run completes");
+    hexo_bot::train(&train_config(&flags(&run_dir, "1", "4")), &registry())
+        .expect("the first run completes");
 
-    let error =
-        hexo_bot::train(&train_config(&flags(&run_dir, "1", "4"))).expect_err("the run exists");
+    let error = hexo_bot::train(&train_config(&flags(&run_dir, "1", "4")), &registry())
+        .expect_err("the run exists");
     assert!(
         matches!(error, BotError::RunExists { .. }),
         "expected a refusal to overwrite, got {error}",
@@ -141,7 +145,8 @@ fn resuming_a_run_that_does_not_exist_refuses() {
 
     let mut absent = flags(&run_dir, "1", "4");
     absent.push("--resume");
-    let error = hexo_bot::train(&train_config(&absent)).expect_err("there is nothing to resume");
+    let error = hexo_bot::train(&train_config(&absent), &registry())
+        .expect_err("there is nothing to resume");
     assert!(
         matches!(error, BotError::NoRun { .. }),
         "expected a refusal to resume nothing, got {error}",

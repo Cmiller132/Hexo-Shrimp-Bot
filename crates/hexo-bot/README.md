@@ -3,17 +3,18 @@
 The one binary: the training loop that drives batched self-play, fitting,
 checkpoints, and evaluation from a single long-lived process.
 
-**Status: implemented, against the mock package.** `train` and `match` both run.
-There is no image, no Dockerfile, and no Python — `docs/CONTAINER_SPEC.md` §2
-says why the image waits for the first Python-backed package, and until then
-this is a native binary, which is not a second deployment shape but the same
-binary before there is anything to wrap it around.
+**Status: implemented through the first real package.** `init`, `train`, and
+`match` ship; the registry carries `mock` and `mantisnet`. MantisNet's
+encoder/evaluator/checkpoint/session logic remains Python-free in its package,
+and this leaf binary owns the one live PyO3/Torch crossing. The
+`mantisnet-train` image and compose environment are under `docker/`.
 
 ## Shape
 
 A thin `main.rs` over a library, so the loop is driven in-process by the test
 suite rather than by spawning a child and parsing its output. `main` parses a
-command line, installs the stop handler, calls one of two entry points, and maps
+command line, installs the stop handler, injects the executable-only MantisNet
+forward loader into the registry, calls one of three entry points, and maps
 what comes back onto an exit code; everything else is here.
 
 ```
@@ -21,10 +22,12 @@ crates/hexo-bot/
   Cargo.toml
   README.md
   src/
-    lib.rs        # crate root, Outcome, the two entry points
+    lib.rs        # crate root, Outcome, the three entry points
     main.rs       # argv, the ctrlc handler, exit codes, the error chain
     cli.rs        # the flags, the seat-spec grammar, and every refusal
-    registry.rs   # the one place a package name becomes code
+    registry.rs   # names become packages; the binary injects the live loader
+    mantisnet_python.rs # executable-only PyO3/Torch ForwardLoader + Forward
+    init.rs       # seal and atomically place one package checkpoint
     run.rs        # the run directory: layout, run manifest, resume, placement
     driver.rs     # the batched sweep: lanes, workers, batcher, writer
     train.rs      # the epoch loop
@@ -33,6 +36,7 @@ crates/hexo-bot/
     error.rs      # BotError
   tests/
     common/mod.rs # parsing a command line, and reading a run back off disk
+    init.rs       # atomic checkpoint creation and every refusal
     train.rs      # two whole runs, and both stop paths
     resume.rs     # what a resume continues, refuses, and must not redo
     matches.rs    # two searches over one checkpoint, and the seat grammar
@@ -43,14 +47,124 @@ crates/hexo-bot/
 
 | Module | Role |
 | --- | --- |
-| `cli` | `parse`, `TrainConfig`, `MatchConfig`, `SeatSpec`. Hand-rolled: two subcommands and fourteen flags do not need a parser generator, and the refusals are the part worth writing by hand. |
-| `registry` | `PACKAGES` and `construct`. One `match` from a name to a `Box<dyn ModelPackage>`. |
+| `cli` | `parse`, `InitConfig`, `TrainConfig`, `MatchConfig`, `SeatSpec`. Hand-rolled: three subcommands and their small flag grammars do not need a parser generator, and the refusals are the part worth writing by hand. |
+| `registry` | `PackageRegistry`, `PACKAGES`, and `construct`. One `match` from a name to a `Box<dyn ModelPackage>`, with the binary's MantisNet forward loader injected at construction. |
+| `mantisnet_python` | The executable-only PyO3 boundary: interpreter discovery, the production version-refusing loader, CPU `Batch` tensors, one live-module call, and raw head extraction. |
+| `init` | Atomic creation of one package checkpoint outside a training run. |
 | `run` | `<run-dir>/runs/<run-id>` and everything under it: the paths, the run manifest, the resume check, temporary-then-rename checkpoint placement, and clearing what a crash left. |
 | `driver` | The sweep. One implementation, shared verbatim by self-play, evaluation, and `match`. |
 | `train` | The epoch loop and the stop contract. |
 | `matches` | Two seats, fixed weights, one JSON report. |
 | `metrics` | `Tally` — wins by slot *and* by colour — and the epoch line. |
 | `error` | `BotError`. Every variant carries what locates the problem. |
+
+## Registry and the Python boundary
+
+`PackageRegistry` carries the runtime dependency that only one package needs.
+The executable injects `PythonForwardLoader`; Python-free in-process tests use
+`without_mantisnet_runtime()`, which still constructs and parses MantisNet but
+fails loudly if a test actually tries to load it. There is no global Python
+handle and no model-private alternate registry.
+
+The MantisNet package owns its Rust encoder, strict batch decoder, KLENT
+equation-3 improvement, sessions, diagnostics, and checkpoint rules. Its
+injected `ForwardLoader`/`Forward` traits mention only paths, Rust batch data,
+and flat `f32` heads. `mantisnet_python` supplies the executable-only
+implementation:
+
+1. load `weights.pt` through
+   `mantisnet.klent.run.load_model(path, "cpu")`, including that production
+   loader's version refusal;
+2. build the Python `Batch` as CPU tensors;
+3. call the live `MantisNet` once under inference mode for the whole encoded
+   batch; and
+4. return ragged policy logits and Q values to the package unchanged.
+
+That is one interpreter attachment and one model call per batch. No logic crate
+mentions PyO3, Torch, a GIL token, or a device type. PyO3 is an unconditional
+dependency of the leaf executable — there is no Cargo feature that can produce a
+different registry—while the `wasm32` engine gate remains Python-free.
+
+`PYO3_PYTHON` selects the interpreter used while building `hexo-bot`.
+`HEXO_PYTHON` selects the runtime environment whose `sys.path` is installed
+before MantisNet is imported; the binary refuses it if its Python major/minor
+does not match the embedded interpreter. Set both to the same executable.
+These are the exact CPU-only setups.
+
+Windows PowerShell, from the repository root:
+
+```powershell
+$python = (Resolve-Path .\python\mantisnet\.venv\Scripts\python.exe).Path
+$pythonBase = & $python -c "import sys; print(sys.base_prefix)"
+$pythonScripts = Split-Path -Parent $python
+$env:Path = "$pythonBase;$pythonBase\DLLs;$pythonScripts;$env:Path"
+$env:PYO3_PYTHON = $python
+$env:HEXO_PYTHON = $python
+$env:CUDA_VISIBLE_DEVICES = "-1"
+cargo build -p hexo-bot
+```
+
+The base-Python `PATH` entries are a runtime requirement on Windows:
+`hexo-bot.exe` must find `python313.dll` before Rust `main` can run. The venv's
+own `python.exe` knows its base installation, but the Windows loader resolving
+an embedded DLL does not.
+
+The `/opt/venv` container, from `/workspace`:
+
+```sh
+export PYO3_PYTHON=/opt/venv/bin/python
+export HEXO_PYTHON=/opt/venv/bin/python
+python_lib="$("$PYO3_PYTHON" -c \
+  'import sysconfig; print(sysconfig.get_config_var("LIBDIR") or "")')"
+export LD_LIBRARY_PATH="$python_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CUDA_VISIBLE_DEVICES=-1
+cargo build -p hexo-bot
+```
+
+If `HEXO_PYTHON` is absent, PyO3's configured interpreter discovery is used.
+The explicit form is preferred for a venv because it makes both the linked
+minor version and import path visible at invocation.
+
+## `init`
+
+```
+hexo-bot init --package <name> --checkpoint <dir> [--package-config <string>]
+```
+
+`init` asks the package to write epoch zero under
+`<checkpoint>.incomplete`, then renames that directory into place. It refuses
+an existing destination, and clears only its own incomplete sibling after an
+interrupted attempt. Success prints the checkpoint, package, and probe hash as
+JSON.
+
+For MantisNet, the exact package config is
+`tau=F,lambda=F[,source=PATH]`; `source` is required by `init` and names the
+authoritative Python training `.pt`. Initialisation copies that file to
+`weights.pt`, loads the copy through the live evaluator, and writes a manifest
+carrying `tau`, `lambda`, every common version, and the computed probe. For
+example, after setting the environment above:
+
+```powershell
+cargo run -p hexo-bot -- init `
+  --package mantisnet `
+  --checkpoint .\scratch\checkpoints\mantisnet `
+  --package-config "tau=0.1,lambda=0.03,source=D:\path\to\checkpoint.pt"
+```
+
+Under `/opt/venv`, after the container environment block above, the same
+operation is:
+
+```sh
+cargo run -p hexo-bot -- init \
+  --package mantisnet \
+  --checkpoint /workspace/scratch/checkpoints/mantisnet \
+  --package-config \
+  "tau=0.1,lambda=0.03,source=/workspace/path/to/checkpoint.pt"
+```
+
+Loading is proving: the package validates manifest metadata and versions,
+builds a candidate live module, recomputes the probe through its real
+evaluator, and publishes that module only after the hash agrees.
 
 ## The driver
 
@@ -214,6 +328,14 @@ hexo-bot train --run-dir <dir> --run-id <id> --package <name> --epochs <n> --gam
 | `--eval-games` | 32 | Games per evaluation pairing. Lanes are capped at `--games`, so a larger number plays successive games on the same lanes. |
 | `--resume` | off | Continue an existing run rather than refusing its directory. |
 
+MantisNet implements the container's encoder, evaluator, self-play, checkpoint,
+and evaluation phases, but deliberately returns `PackageError::Unsupported`
+when this loop reaches `fit`. Its production trainer is
+`mantisnet.klent.run`; migrating that KLENT loop requires an owner decision,
+and a partial record-consuming trainer would be worse than a loud refusal.
+Consequently a complete `train` run is currently the mock's proof path, while
+MantisNet checkpoints and play are exercised through `init` and `match`.
+
 ### The run directory
 
 ```
@@ -299,7 +421,7 @@ hexo-bot match --games <n> --seat <spec> --seat <spec>
 A seat spec is `;`-separated `key=value`:
 
 ```
-package=mock;checkpoint=<dir>[;config=<package config>][;variant=<name>]
+package=<name>;checkpoint=<dir>[;config=<package config>][;variant=<name>]
 ```
 
 Semicolons, not commas, because a package configuration string and a session
@@ -310,14 +432,23 @@ unknown key, a repeated key, a segment that is not a pair, and a missing
 empty string and the package decides what to make of it; `variant` defaults to
 absent, which means the package's `eval_session()`.
 
+MantisNet requires `config=tau=F,lambda=F` when loading a sealed checkpoint
+(`source` is only for `init`). Its default evaluation session is shared Gumbel
+search at 32 simulations and 16 candidates. Its exact variants are `policy`,
+`mcts:visits=N,inflight=N,cpuct=F`, and `gumbel:sims=N,m=N`:
+
+```
+package=mantisnet;checkpoint=<dir>;config=tau=0.1,lambda=0.03;variant=gumbel:sims=32,m=16
+```
+
 **Both seats may name the same checkpoint**, and that is the point of the
 subcommand rather than a curiosity: same weights, two searches, which is how a
 search shape is compared without a training run in between. Each seat still gets
 its own package instance, because a package holds the weights that answer and the
 container has no way to know whether two of them could share one — the mock's
-evaluators are independent copies of a salt, and a Python-backed package's would
-be a live module, which is what §10.1's slot pool exists for and what will make
-sharing an optimisation rather than an assumption.
+evaluators are independent copies of a salt, and MantisNet's is a live module,
+which is what §10.1's slot pool exists for and what will make sharing an
+optimisation rather than an assumption.
 
 Colours alternate: the first `--seat` is `P0` in even-numbered lanes, and a lane
 that plays more than one game swaps colours between them, so the first-move
@@ -335,7 +466,7 @@ each colour, because that is the question a bare win count cannot answer.
 | Separately invocable phases | §8: there is one implementation of the loop, not a loop plus a set of pieces that could drift from it. |
 | A checkpoint-reference resolver for `latest` or `<run-id>/<epoch>` | §10 names those forms and nothing needs them yet: `train` resolves its own checkpoints from the run layout, and `match` takes a directory. It would land here, next to `RunLayout`. |
 | A second batcher, or a batcher per worker | The crossing has to be serialised anyway; a second one would only contend for the same lock and the same device. |
-| A slot pool sharing one live module between seats | §10.1. It is an optimisation for packages whose modules carry expensive compiled state, and the only package that exists carries eight bytes. |
+| A slot pool sharing one live module between seats | §10.1. MantisNet currently proves and owns one CPU live module per package instance. Sharing compiled modules is a later optimisation and must not become an assumption about package internals. |
 | A dashboard, a scraping endpoint, or a metrics service | §8.1 and §14: one line per epoch appended to a file is the whole of "observable without stopping". |
 
 ## Connections
@@ -351,7 +482,9 @@ each colour, because that is the question a bare win count cannot answer.
   else about the shape changed.
 - `hexo-model` supplies `ModelPackage`, `Manifest`, and the probe behind every
   load. `crates/models/mock` is the package the whole loop is exercised against
-  on every CI run.
+  on every CI run; `crates/models/mantisnet` supplies the first real encoder,
+  improved evaluator opinion, sessions, checkpoint semantics, and the
+  Python-free forward traits this executable implements.
 - `hexo-records` supplies `ShardWriter` and the format; a package's `fit` reads
   the shards back through the same crate.
 - `hexo-engine` supplies the rules underneath all of it, and three of the four

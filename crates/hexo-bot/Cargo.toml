@@ -20,7 +20,9 @@ hexo-search.workspace = true
 hexo-records.workspace = true
 hexo-model.workspace = true
 hexo-model-mock.workspace = true
+hexo-model-mantisnet.workspace = true
 serde_json.workspace = true
+pyo3.workspace = true
 ctrlc.workspace = true
 
 [dev-dependencies]

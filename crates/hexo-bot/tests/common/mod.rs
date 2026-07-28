@@ -7,7 +7,8 @@
 
 #![allow(dead_code)]
 
-use hexo_bot::{Command, MatchConfig, TrainConfig};
+use hexo_bot::registry::PackageRegistry;
+use hexo_bot::{Command, InitConfig, MatchConfig, TrainConfig};
 use hexo_model::{ModelPackage, PackageError};
 use hexo_model_mock::MockPackage;
 use serde_json::Value;
@@ -17,6 +18,17 @@ use std::path::{Path, PathBuf};
 pub fn train_config(args: &[&str]) -> TrainConfig {
     match hexo_bot::parse(args.iter().copied()) {
         Ok(Command::Train(config)) => config,
+        Ok(Command::Init(_)) => panic!("these flags parsed as checkpoint init"),
+        Ok(Command::Match(_)) => panic!("these flags parsed as a match"),
+        Err(error) => panic!("these flags do not parse: {error}"),
+    }
+}
+
+/// Parse an `init` command line, or say which flag it fell over on.
+pub fn init_config(args: &[&str]) -> InitConfig {
+    match hexo_bot::parse(args.iter().copied()) {
+        Ok(Command::Init(config)) => config,
+        Ok(Command::Train(_)) => panic!("these flags parsed as a train run"),
         Ok(Command::Match(_)) => panic!("these flags parsed as a match"),
         Err(error) => panic!("these flags do not parse: {error}"),
     }
@@ -26,9 +38,15 @@ pub fn train_config(args: &[&str]) -> TrainConfig {
 pub fn match_config(args: &[&str]) -> MatchConfig {
     match hexo_bot::parse(args.iter().copied()) {
         Ok(Command::Match(config)) => config,
+        Ok(Command::Init(_)) => panic!("these flags parsed as checkpoint init"),
         Ok(Command::Train(_)) => panic!("these flags parsed as a train run"),
         Err(error) => panic!("these flags do not parse: {error}"),
     }
+}
+
+/// A Python-free registry for tests that load only the mock package.
+pub fn registry() -> PackageRegistry {
+    PackageRegistry::without_mantisnet_runtime()
 }
 
 /// Where a run's accumulated state lives.

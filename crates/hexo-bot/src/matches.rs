@@ -4,7 +4,7 @@ use crate::Outcome;
 use crate::cli::{MatchConfig, SeatSpec};
 use crate::driver::{LaneSeats, Sweep, run_sweep};
 use crate::error::BotError;
-use crate::registry;
+use crate::registry::PackageRegistry;
 use hexo_model::ModelPackage;
 use hexo_runner::{Budget, FailurePolicy, GameSpec};
 use hexo_search::{DecisionSession, Encoder};
@@ -106,10 +106,10 @@ fn seat_json(seat: &SeatReport) -> Value {
 /// [`BotError::UnknownPackage`] for a seat naming no package,
 /// [`BotError::Package`] for a configuration, a checkpoint, or a variant name
 /// the package refuses, and [`BotError::Io`] if `--report` cannot be written.
-pub fn play_match(config: &MatchConfig) -> Result<MatchRun, BotError> {
+pub fn play_match(config: &MatchConfig, registry: &PackageRegistry) -> Result<MatchRun, BotError> {
     let packages = [
-        seat_package(&config.seats[0])?,
-        seat_package(&config.seats[1])?,
+        seat_package(registry, &config.seats[0])?,
+        seat_package(registry, &config.seats[1])?,
     ];
 
     let games = config.games.get();
@@ -183,8 +183,11 @@ pub fn play_match(config: &MatchConfig) -> Result<MatchRun, BotError> {
 }
 
 /// Build and load one seat's package.
-fn seat_package(spec: &SeatSpec) -> Result<Box<dyn ModelPackage>, BotError> {
-    let mut package = registry::construct(&spec.package, &spec.config)?;
+fn seat_package(
+    registry: &PackageRegistry,
+    spec: &SeatSpec,
+) -> Result<Box<dyn ModelPackage>, BotError> {
+    let mut package = registry.construct(&spec.package, &spec.config)?;
     package
         .load(&spec.checkpoint)
         .map_err(|source| BotError::UnloadableCheckpoint {

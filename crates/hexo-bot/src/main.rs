@@ -4,6 +4,9 @@
 //! exists to run is exercised in-process by the test suite instead of by
 //! spawning a child and parsing its output.
 
+mod mantisnet_python;
+
+use hexo_bot::registry::PackageRegistry;
 use hexo_bot::{BotError, Command, Outcome};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -25,6 +28,7 @@ fn main() -> ExitCode {
 /// Everything the binary does, with one place for failure to come out.
 fn run() -> Result<Outcome, BotError> {
     let command = hexo_bot::parse(std::env::args().skip(1))?;
+    let registry = PackageRegistry::new(Arc::new(mantisnet_python::PythonForwardLoader));
 
     // `unsafe_code = "forbid"` rules out a hand-rolled handler, so the flag is
     // set by the one small crate that owns that unsafety. With the `termination`
@@ -34,9 +38,21 @@ fn run() -> Result<Outcome, BotError> {
     ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed)).map_err(BotError::Signal)?;
 
     match command {
-        Command::Train(config) => hexo_bot::train(&config),
+        Command::Init(config) => {
+            let manifest = hexo_bot::init_checkpoint(&config, &registry)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "checkpoint": config.checkpoint,
+                    "package": manifest.package,
+                    "probe_hash": format!("{:#018x}", manifest.probe_hash),
+                })
+            );
+            Ok(Outcome::Completed)
+        }
+        Command::Train(config) => hexo_bot::train(&config, &registry),
         Command::Match(config) => {
-            let played = hexo_bot::play_match(&config)?;
+            let played = hexo_bot::play_match(&config, &registry)?;
             println!("{}", played.report.to_json());
             Ok(played.outcome)
         }
