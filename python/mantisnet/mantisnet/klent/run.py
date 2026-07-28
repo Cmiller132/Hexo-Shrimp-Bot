@@ -109,12 +109,20 @@ def run_training(
     start_iteration: int = 0,
     eval_every: int = 0,
     evaluate_fn=None,
+    starve_limit: int = 10,
 ) -> None:
     """Loop `iterate`, appending metrics and checkpointing as it goes.
 
     ``evaluate_fn(model, done) -> dict`` runs every ``eval_every`` completed
     iterations and its fields join that iteration's metrics row.
+
+    ``starve_limit`` is the unattended-run guard: a policy that has collapsed
+    to uniform stops finishing seeded games, and every further iteration is
+    ~`ply_cap` plies of collection for an empty buffer. After this many
+    consecutive iterations yielding under one sample per game, the run stops
+    loudly (checkpointing first) instead of burning the night. 0 disables.
     """
+    starved = 0
     out_dir.mkdir(parents=True, exist_ok=True)
     with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file:
         for i in range(start_iteration, iterations):
@@ -150,6 +158,19 @@ def run_training(
                 )
             print(line, flush=True)
 
+            starved = starved + 1 if metrics["buffer_samples"] < cfg.games_per_iteration else 0
+            if starve_limit and starved >= starve_limit:
+                save_checkpoint(
+                    out_dir / f"checkpoint_{done:06d}.pt", model, optimizer, done, rng
+                )
+                print(
+                    f"stopping starved: {starved} consecutive iterations under "
+                    f"one sample per game — the policy has collapsed; "
+                    f"checkpoint_{done:06d}.pt written",
+                    flush=True,
+                )
+                return
+
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -184,6 +205,10 @@ def main(argv=None) -> None:
     ap.add_argument(
         "--eval-anchor", type=Path, default=None,
         help="a frozen checkpoint as the eval opponent (default: the line builder)",
+    )
+    ap.add_argument(
+        "--starve-limit", type=int, default=10,
+        help="stop after N consecutive starved iterations (0 = never)",
     )
     ap.add_argument("--seed", type=int, default=0, help="the run's RNG seed")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -250,6 +275,7 @@ def main(argv=None) -> None:
         "eval_every": args.eval_every,
         "eval_games": args.eval_games,
         "eval_anchor": str(args.eval_anchor) if args.eval_anchor else None,
+        "starve_limit": args.starve_limit,
         "seed": args.seed,
         "klent": dataclasses.asdict(cfg),
         "versions": _versions(),
@@ -285,6 +311,7 @@ def main(argv=None) -> None:
         start_iteration=start,
         eval_every=args.eval_every,
         evaluate_fn=evaluate_fn,
+        starve_limit=args.starve_limit,
     )
 
 

@@ -162,6 +162,36 @@ def test_frozen_anchor_and_crossplay(tmp_path):
     assert matrix[pair]["capped"] <= 2
 
 
+def test_starvation_stops_the_run(tmp_path, monkeypatch):
+    """The unattended-run guard: consecutive empty-buffer iterations end the
+    run with a checkpoint instead of collecting dead games until morning."""
+    from mantisnet import MantisConfig, MantisNet
+    from mantisnet.klent import run as run_mod
+    from mantisnet.klent.train import KlentConfig
+
+    starved = {
+        "f_seeded": 0.0, "f_unseeded": float("nan"), "buffer_samples": 0,
+        "acting_kl": 0.0, "acting_norm_entropy": 0.99,
+    }
+    monkeypatch.setattr(run_mod, "iterate", lambda *a: dict(starved))
+
+    torch.manual_seed(0)
+    model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
+    run_mod.run_training(
+        model,
+        torch.optim.Adam(model.parameters()),
+        KlentConfig(games_per_iteration=8),
+        iterations=50,
+        out_dir=tmp_path,
+        rng=np.random.default_rng(0),
+        checkpoint_every=100,
+        starve_limit=3,
+    )
+    lines = (tmp_path / "metrics.jsonl").read_text().splitlines()
+    assert len(lines) == 3  # the limit, not the 50 requested
+    assert (tmp_path / "checkpoint_000003.pt").exists()
+
+
 def test_checkpoint_refuses_version_drift(tmp_path):
     from mantisnet import MantisConfig, MantisNet
 
