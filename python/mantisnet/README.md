@@ -294,10 +294,12 @@ loud.** The driver spills to system RAM at PCIe speed instead of raising
 OOM — a ~50× slowdown with no error. The budgets exist to keep the run out
 of that regime; Linux (the deploy target) raises OOM honestly.
 
-**Platforms.** The deploy target is Linux (WSL2 / the container of
-`CONTAINER_SPEC.md`), where the torch wheel bundles Triton; the
-`triton-windows` dependency is marked `sys_platform == 'win32'` and exists
-only for the Windows dev box. Under WSL, keep the two trees separate from the
+**Platforms.** The destination is Docker on Linux for *everything* —
+training, self-play, and evaluation, not just serving — deferred until the
+model is stable (`KLENT_RUN_PLAN.md` §5 rung 5); Windows-native runs on the
+dev box are an interim convenience. Under Linux the torch wheel bundles
+Triton; the `triton-windows` dependency is marked `sys_platform == 'win32'`
+and exists only for the Windows dev box. Under WSL, keep the two trees separate from the
 Windows ones: build `hexo-py` with `CARGO_TARGET_DIR=target-wsl` (the repo's
 convention) and give uv its own environment, e.g.
 `UV_PROJECT_ENVIRONMENT=$HOME/.venvs/mantisnet uv sync`.

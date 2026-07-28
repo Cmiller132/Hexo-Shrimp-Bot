@@ -379,12 +379,22 @@ In order; each rung is small and none blocks the one above it being useful.
    run reproduces, and the buffer's records written through `hexo-records`
    (B2's per-move blob) instead of living only in memory — at which point
    dropped-episode records become revisitable data, as design doc §12 notes.
-5. **The `ModelPackage`**: encoder/evaluator over the hexo-search seam,
+5. **Everything into Docker** (owner intent, stated 2026-07-28): training,
+   self-play, evaluation — the whole loop, not just serving — runs in a
+   Linux container as its permanent home. **Deliberately deferred until the
+   model is stable**: containerizing a loop whose dynamics are still being
+   debugged would add a variable while the experiment needs one at a time.
+   The pieces are already in place — the stack is WSL2-validated at
+   identical throughput, the venv/target separation is documented in the
+   mantisnet README, and Linux turns the Windows VRAM-spill hazard into
+   honest OOMs. Until then, Windows-native runs on the dev box are a
+   convenience, not the destination.
+6. **The `ModelPackage`**: encoder/evaluator over the hexo-search seam,
    manifest + probe hash, the container image of `CONTAINER_SPEC.md` — the
    point where this Python stops being a side tree and becomes the package
    the Rust container drives. The forward, builder, and checkpoints all
    survive unchanged; what is added is the seam plumbing.
-6. **Test-time Gumbel MCTS** (design doc §15), once there is a checkpoint
+7. **Test-time Gumbel MCTS** (design doc §15), once there is a checkpoint
    worth searching with — as a DAG, per K8, and outside every comparable
    number this plan produces before it.
 
