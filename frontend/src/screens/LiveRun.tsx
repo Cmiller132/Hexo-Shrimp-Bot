@@ -1,0 +1,117 @@
+import { useEffect, useMemo, useState } from "react";
+import { api, useApi } from "../api";
+import Chart from "../components/Chart";
+import { Empty, ErrorBox, format, Metric, Panel } from "../components/Ui";
+import type { Run } from "../types";
+
+const METRICS = ["f", "acting_kl", "acting_norm_entropy", "buffer_samples", "seconds"] as const;
+const DIAGNOSTICS = ["policy_loss", "q_loss", "fit_steps", "samples_per_s", "v_hat_mae", "won_length_mean"];
+const HARDWARE = ["cpu_percent_mean", "rss_max", "sys_ram_used_mean", "gpu_util_mean", "gpu_power_w_mean", "gpu_mem_used_max"];
+type Row = Record<string, number | null>;
+
+export default function LiveRun({ run, refreshRuns }: { run?: Run; refreshRuns: () => void }) {
+  const [metric, setMetric] = useState<(typeof METRICS)[number]>("f");
+  const [window, setWindow] = useState(100);
+  const [events, setEvents] = useState<Array<{ kind: string; data: Record<string, unknown> }>>([]);
+  const [paused, setPaused] = useState(false);
+  const [message, setMessage] = useState<string>();
+  const columns = [...METRICS, ...DIAGNOSTICS, ...HARDWARE].join(",");
+  const lo = run ? Math.max(0, run.iteration - window) : 0;
+  const series = useApi<Row[]>(run ? `/api/runs/${run.name}/iterations?columns=${columns}&from_iteration=${lo}` : null, [run?.iteration, window]);
+  const strength = useApi<Array<Record<string, unknown>>>(run ? `/api/runs/${run.name}/strength` : null, [run?.iteration]);
+  const manifest = useApi<{ config: Record<string, unknown>; invocations: Record<string, unknown>[] }>(run ? `/api/runs/${run.name}/manifest` : null, [run?.name]);
+
+  useEffect(() => {
+    if (!run || paused) return;
+    const stream = new EventSource(`/api/runs/${run.name}/events`);
+    const kinds = ["iteration", "heartbeat", "eval", "checkpoint", "log", "lifecycle"];
+    kinds.forEach((kind) => stream.addEventListener(kind, (event) => {
+      const data = JSON.parse((event as MessageEvent).data);
+      setEvents((current) => [...current.slice(-79), { kind, data }]);
+      if (kind === "iteration") { void series.refresh(); void strength.refresh(); refreshRuns(); }
+    }));
+    stream.onerror = () => setMessage("Event stream disconnected; retrying.");
+    return () => stream.close();
+  }, [run?.name, paused, series.refresh, strength.refresh, refreshRuns]);
+
+  const latest = series.data?.at(-1);
+  const latestEval = strength.data?.at(-1);
+  const slots = run?.heartbeat?.collect?.slot_plies ?? [];
+  const bins = useMemo(() => {
+    const counts = [0, 0, 0, 0, 0];
+    slots.forEach((ply) => counts[ply >= 512 ? 4 : ply >= 96 ? 3 : ply >= 32 ? 2 : ply >= 8 ? 1 : 0]++);
+    return counts;
+  }, [slots]);
+
+  async function control(action: "checkpoint" | "stop" | "kill") {
+    if (!run) return;
+    if (action === "kill" && !globalThis.confirm(`SIGTERM ${run.name}? This bypasses the graceful sentinel.`)) return;
+    try {
+      await api(`/api/runs/${run.name}/${action}`, { method: "POST", body: action === "kill" ? '{"confirm":true}' : undefined });
+      setMessage(`${action} request accepted`);
+      refreshRuns();
+    } catch (reason) { setMessage(reason instanceof Error ? reason.message : String(reason)); }
+  }
+
+  if (!run) return <Empty>No run directories were found. Launch one from the header.</Empty>;
+  return <div className="screen-grid live-screen">
+    <div className="main-column">
+      <div className="status-strip">
+        <Metric label="state" value={run.working ? "working" : run.state} />
+        <Metric label="iteration" value={`${run.iteration} / ${run.iterations}`} />
+        <Metric label="collect" value={run.heartbeat?.collect ? `${run.heartbeat.collect.finished}/${run.heartbeat.collect.quota}` : "idle"} />
+        <Metric label="fit" value={run.heartbeat?.fit ? `${run.heartbeat.fit.chunk}/${run.heartbeat.fit.chunks}` : "idle"} />
+        <Metric label="eval" value={run.heartbeat?.eval ? `iteration ${run.heartbeat.eval.iteration}` : "idle"} />
+      </div>
+      <ErrorBox message={series.error ?? message} />
+      <Panel title="Iteration telemetry" action={<div className="inline-controls">
+        <select value={metric} onChange={(event) => setMetric(event.target.value as typeof metric)}>{METRICS.map((name) => <option key={name}>{name}</option>)}</select>
+        <select value={window} onChange={(event) => setWindow(Number(event.target.value))}>{[25, 100, 500, 2000].map((n) => <option key={n} value={n}>last {n}</option>)}</select>
+      </div>}>
+        <Chart rows={series.data ?? []} column={metric} />
+        <div className="metric-row"><Metric label="latest" value={format(latest?.[metric])} /><Metric label="points" value={series.data?.length ?? 0} /><Metric label="seconds / iteration" value={format(latest?.seconds)} /></div>
+      </Panel>
+      <Panel title="Pipeline">
+        <div className="pipeline">
+          <div className={run.heartbeat?.collect ? "active" : ""}><span>COLLECT</span><strong>{run.heartbeat?.collect?.steps ?? "—"} steps</strong></div>
+          <b>→</b><div className={run.heartbeat?.fit ? "active" : ""}><span>FIT</span><strong>{run.heartbeat?.fit ? `${run.heartbeat.fit.chunk}/${run.heartbeat.fit.chunks}` : "idle"}</strong></div>
+          <b>→</b><div className={run.heartbeat?.eval ? "active" : ""}><span>EVAL</span><strong>{run.heartbeat?.eval ? "running" : "cadence"}</strong></div>
+        </div>
+      </Panel>
+      <div className="two-column">
+        <Panel title="Latest evaluation">
+          {latestEval ? <div className="metric-row wrap">
+            <Metric label="score" value={format(latestEval.win_rate)} />
+            <Metric label="95% CI" value={`${format(latestEval.ci_lo)}–${format(latestEval.ci_hi)}`} />
+            <Metric label="Elo" value={format(latestEval.elo, 1)} />
+            <Metric label="as P0 / P1" value={`${format(latestEval.score_as_p0)} / ${format(latestEval.score_as_p1)}`} />
+          </div> : <Empty />}
+        </Panel>
+        <Panel title="Diagnostics">
+          <div className="data-list">{DIAGNOSTICS.map((name) => <div key={name}><span>{name}</span><b>{format(latest?.[name])}</b></div>)}</div>
+        </Panel>
+      </div>
+      <Panel title="Hardware">
+        <div className="metric-row wrap">{HARDWARE.map((name) => <Metric key={name} label={name} value={format(latest?.[name])} />)}</div>
+      </Panel>
+    </div>
+    <aside className="side-column">
+      <Panel title="Run controls">
+        <div className="stack-buttons"><button onClick={() => void control("checkpoint")}>Checkpoint now</button><button onClick={() => void control("stop")}>Stop after iteration</button><button className="danger" onClick={() => void control("kill")}>Kill process</button></div>
+      </Panel>
+      <Panel title={`Collector slots · ${slots.length}`}>
+        <div className="slot-grid">{slots.map((ply, index) => <i key={index} title={`slot ${index}: ${ply} plies`} data-band={ply >= 512 ? 4 : ply >= 96 ? 3 : ply >= 32 ? 2 : ply >= 8 ? 1 : 0} />)}</div>
+        <div className="slot-legend">{["0–7", "8–31", "32–95", "96–511", "at cap"].map((label, index) => <span key={label}><i data-band={index} />{label} ({bins[index]})</span>)}</div>
+      </Panel>
+      <Panel title="Artifacts">
+        <div className="timeline">{run.checkpoints.map((checkpoint) => <div key={checkpoint.path}><i /><span>{checkpoint.name}</span><small>{new Date(checkpoint.modified).toLocaleString()}</small></div>)}</div>
+      </Panel>
+      <Panel title="Manifest">
+        <pre className="manifest">{manifest.data ? JSON.stringify({ config: manifest.data.config, latest_invocation: manifest.data.invocations.at(-1) }, null, 2) : "Loading…"}</pre>
+      </Panel>
+      <Panel title="Event stream" action={<button onClick={() => setPaused(!paused)}>{paused ? "Resume" : "Pause"}</button>}>
+        <div className="event-stream">{events.length ? [...events].reverse().map((event, index) => <div key={index}><b>{event.kind}</b><span>{JSON.stringify(event.data)}</span></div>) : <Empty />}</div>
+      </Panel>
+    </aside>
+  </div>;
+}

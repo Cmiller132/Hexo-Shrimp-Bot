@@ -1,39 +1,44 @@
-# Shrimp Control Deck
+# Shrimp Control Deck frontend
 
-Design draft for the Hexo Shrimp Bot frontend. It is intentionally driven by
-realistic mock data and local UI state rather than backend APIs.
+The client-only React 19 SPA for `mantisnet.deck`. It is plain Vite +
+TypeScript + Tailwind v4's CSS toolchain + lucide-react: no Next, RSC, vinext,
+Wrangler, or worker runtime remains.
 
-## Screens
+The four screens are real-data surfaces:
 
-- **Play** — human vs checkpoint, bot vs bot, baseline opponents, quick suites,
-  search settings, board overlays, candidate moves, and a queued pairing.
-- **Game history** — archive metrics, search and filters, a dense game table,
-  replay controls, tags, notes, and position handoff to the lab.
-- **Live run** — learner and actor health, promotion gates, losses, checkpoint
-  lifecycle, utilization, worker status, and a live event stream.
-- **Model lab** — position editing, checkpoint comparison, policy/value
-  readouts, attention, activations, search, input planes, and saved probes.
+- **Play** creates engine-authoritative server sessions, posts human moves,
+  renders checkpoint inspection overlays, and launches recorded arena jobs.
+- **Game history** pages and filters telemetry games, replays move blobs with
+  their ply scalars, persists tags/notes, and shows calibration, blunders, and
+  the D6-canonical opening atlas.
+- **Live run** follows heartbeat and typed SSE, queries iteration/evaluation
+  series, renders collector cohorts and artifacts, and drives the sentinel and
+  kill controls.
+- **Model lab** edits move prefixes, compares checkpoints, captures reference
+  SDPA attention, runs the 12-way D6 check, and saves probes in `deck.db`.
 
-The persistent compare tray and command palette are shared across screens.
+`src/api.ts` is the one JSON client. `src/components/Board.tsx` and
+`Chart.tsx` are shared real-data renderers; each screen lives in
+`src/screens/`. `app/globals.css` retains the design draft's visual tokens and
+shell, with the wired module styles at its end. There are no mock datasets in
+the shipped source or bundle.
 
-## Run locally
+## Development
 
-Requires Node.js 22.13 or newer.
+Run the FastAPI service on port 8000, then:
 
-```bash
-npm install
-npm run dev -- --host 0.0.0.0
+```sh
+npm ci
+npm run dev
 ```
 
-The `--host 0.0.0.0` flag makes the draft reachable from other devices on the
-LAN. This repository does not add authentication or expose a public deployment.
+Vite proxies every `/api` request, including SSE, to port 8000. Production:
 
-## Validate
-
-```bash
+```sh
 npm test
 ```
 
-The production build and rendered shell test should both pass. Backend actions,
-live telemetry, persistence, and destructive run controls are deliberately
-inert in this draft.
+The build emits `dist/`. The test compiles the SPA and verifies that the built
+HTML and client bundle carry all four deck surfaces without the removed
+vinext/worker layer. In the intended environment, use the Compose
+`frontend-build` service so the `deck` service can serve that directory.

@@ -42,10 +42,55 @@ python/mantisnet/
       telemetry.py    # the run's SQLite capture + the queries over it, + CLI
       hardware.py     # the GPU/process/host counter trace behind an iteration
       inspect.py      # the policy debugger: one checkpoint's view of one position
+    deck/
+      app.py          # FastAPI routes, SSE, static SPA, play/match orchestration
+      service.py      # run registry, child lifecycle, read-only queries, checkpoint LRU
+      state.py        # schema-versioned deck.db annotations, probes, presets, match jobs
   tests/              # the two specs' obligations, one file per concern
   bench/
     bench_forward.py  # builder and forward throughput at spec defaults
 ```
+
+## Deck
+
+`mantisnet.deck` is the LAN-trusted control surface described by
+`docs/DECK_SPEC.md`. It runs in the training container, owns port 8000, serves
+the built React SPA, and launches training as child processes. Start it through
+the Compose `deck` service; there is deliberately no Windows-native serving
+path and no authentication layer.
+
+The run registry treats a directory below `runs/` as a run exactly when it has
+`config.json`. It consumes the driver's public artifacts rather than reaching
+into the loop:
+
+| Artifact | Deck contract |
+| --- | --- |
+| `config.json`, `invocations.jsonl` | resolved knobs, versions, and resume history |
+| `status.json` | at-most-once-per-second collect/fit/eval heartbeat |
+| `telemetry.db` | query-only SQLite connection for every dashboard read |
+| `metrics.jsonl` | durable human-readable iteration record; not re-parsed by the API |
+| `checkpoint_*.pt` | eager inference, at most two checkpoints resident |
+| `STOP`, `CHECKPOINT` | graceful lifecycle requests written by the deck |
+| `deck-console.log` | captured child stdout/stderr and the SSE log source |
+
+Run annotations, saved probes, play presets, and match-job history live in
+`runs/deck.db`. That database is WAL, schema-versioned, and refused on a version
+mismatch. It never shares tables or transactions with telemetry. The only
+telemetry write initiated by the deck is a completed SealBot match, through
+`klent.sealbot.record_match`; all query endpoints open `telemetry.db` in SQLite
+`mode=ro` with `query_only` enabled.
+
+The service module map:
+
+| Module | Role |
+| --- | --- |
+| `deck.app` | REST models/routes, structured errors, run and match SSE, reference-attention and D6 lab endpoints, SPA fallback |
+| `deck.service` | registry state machine, child process boundary, sentinels, checkpoint inference LRU, authoritative play sessions |
+| `deck.state` | the deck-owned SQLite schema and its small persistence API |
+
+The API uses `DECK_RUNS_ROOT`, `DECK_FRONTEND_DIST`, `DECK_DEVICE`, and
+`SEALBOT_ROOT` in the container. Analysis is one position at a time; match
+requests are capped at 64 games and only one job runs at once.
 
 Run everything from this directory:
 
