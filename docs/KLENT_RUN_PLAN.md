@@ -255,24 +255,39 @@ named mitigations) is the next staged deviation if pure-2 holds its climb.
 
 ## 4. Evaluation — SealBot, in the driver
 
-`--eval-every N` plays `argmax π_θ` (no search) in seat-balanced paired
-matches against **SealBot** (`--sealbot <root>`, depth capped by
-`--eval-depth`, per-turn time by `--eval-time` — pinned per run in
-`config.json`, because an anchor whose strength drifts is not an anchor).
+`--eval-every N` plays a 32-simulation Gumbel sequential-halving line search
+in seat-balanced paired matches against **SealBot** (`--sealbot <root>`).
+The in-loop opponent is full-strength iterative deepening: no depth cap and
+0.1 s per move by default. `--eval-depth N` is an optional weaker rung;
+`--eval-sims 0` is exact policy argmax. All three resolved settings land in
+`config.json` and `invocations.jsonl`, because an anchor whose strength
+drifts is not an anchor.
+
+At the root the model samples
+`m = min(16, simulations // 2, |A_legal|)` candidates by policy logit plus
+Gumbel noise, then spends the budget extending deterministic lines. Interior
+moves take the same `π′` argmax used for KLENT acting, leaf values are mapped
+back to the root mover, and sequential halving drops the worse half. There
+are no tree statistics or PUCT: hundreds of legal root cells make full-width
+tiny-budget PUCT hopeless, and revisiting a deterministic path learns
+nothing. This search exists only in evaluation; collection and fitting are
+unchanged and the KLENT operator remains the only training-time improvement.
+
 Capped games score ½ and stay visible as `eval_capped`. The score joins that
 iteration's `metrics.jsonl` row, and the eval RNG derives from (run seed,
-iteration) rather than the training stream — a run's training trajectory is
-bit-identical with evaluation on or off, tested. The line-builder anchor
-("anchor zero") is gone with the seeding: a self-made heuristic anchor was
-measured to flatter exactly the failure it existed to catch.
+iteration) rather than the training stream — including the Gumbel draws — so
+a resumed run replays the same match and training stays bit-identical with
+evaluation on or off. The line-builder anchor ("anchor zero") is gone with
+the seeding: a self-made heuristic anchor was measured to flatter exactly
+the failure it existed to catch.
 
-Still future, deliberately:
+Scale note and adjacent diagnostic:
 
 - Games per point scale with budget (the paper used 1024; `--eval-games`
   defaults to 64, a health signal rather than a rating).
-- `KLENT_PROPOSALS.md` A7: the checkpoint cross-play matrix, as a
-  diagnostic for cyclic forgetting — checkpoints already exist, so it is
-  cheap when wanted.
+- `mantisnet.klent.crossplay` provides the A7 checkpoint matrix as a
+  diagnostic for cyclic forgetting; it is separate from the anchored
+  opponent score.
 
 ### The external yardstick — SealBot (measured 2026-07-28)
 
@@ -283,10 +298,14 @@ alpha-beta bot for this exact game (owner-supplied, machine-local checkout,
 implementation (asserted to agree with `hexo-engine` on every placement and
 every winner), a hand-tuned 729-pattern eval, real search — which makes it
 the first strength measurement that self-play conditioning cannot flatter.
-Games run in seat-balanced pairs from shared line-builder openings, since
-argmax-vs-searcher is otherwise near-deterministic; `--max-depth` caps its
-search for weaker rungs, `--run <dir>` sweeps a checkpoint curve to
-`sealbot_curve.jsonl`.
+Games run in seat-balanced pairs from shared uniform-random short openings,
+since model-vs-searcher is otherwise near-deterministic. The generic match accepts
+an opponent identity/config plus a batched chooser; SealBot's independent
+rules oracle and 16-game memory cap live behind that adapter. A future
+champion network needs one adapter and can immediately use both in-loop and
+offline evaluation. Offline `--max-depth` caps SealBot for weaker rungs,
+`--sims` defaults to zero for historical comparability, and `--run <dir>`
+sweeps a checkpoint curve to `sealbot_curve.jsonl`.
 
 What it measured, 64 games per point:
 
@@ -296,7 +315,8 @@ What it measured, 64 games per point:
 | overnight-3 it 250 (≈ warm clone) | 0/64 | — | 15 |
 | overnight-3 it 2000–2062 | 0–2/64 | 0/64 | 22–24 |
 
-Reading: the run's eval-vs-anchor climb (0.65 → 0.87) is real — survival
+These are historical pre-search, depth-1 measurements. Reading: the run's
+eval-vs-anchor climb (0.65 → 0.87) is real — survival
 against SealBot moved from anchor-level to clearly above it, and late
 checkpoints steal the occasional game from both seats. But even a
 *depth-1* SealBot (one turn of search plus mate-threat quiescence over its
@@ -409,9 +429,10 @@ later:
   is uniformly uncertain from one that is confident everywhere except the
   positions that matter. Both are columns now, so both are queries.
 - **The opponent is a row, not a column.** Nothing SealBot-specific is in
-  the schema. An `opponents` row is a name plus its config, so SealBot at
-  depth 1 and depth 3 are two opponents and a stronger engine — the
-  intended eventual replacement — needs no schema change to get a curve.
+  the schema. An `opponents` row is a name plus its config, so uncapped
+  SealBot at 0.1 s and a depth-capped rung are two opponents; a stronger
+  engine — the intended eventual replacement — needs no schema change to get
+  a curve.
 - **Calibration and blunders are derivable, not precomputed.** The §9 bias
   instrument is a `GROUP BY` over `plies` joined to its game's realized
   outcome, bucketed by v̂, by ply, or by game length; a "blunder" is a v̂
@@ -472,9 +493,11 @@ In order; each rung is small and none blocks the one above it being useful.
    point where this Python stops being a side tree and becomes the package
    the Rust container drives. The forward, builder, and checkpoints all
    survive unchanged; what is added is the seam plumbing.
-7. **Test-time Gumbel MCTS** (design doc §15), once there is a checkpoint
-   worth searching with — as a DAG, per K8, and outside every comparable
-   number this plan produces before it.
+7. **Evaluation search and the opponent seam — landed 2026-07-28.**
+   Gumbel root sampling plus sequential halving spends 32 simulations on
+   deterministic lines; full-strength SealBot is the in-loop default, depth
+   caps and zero-search remain offline rungs, and a future champion network
+   supplies one chooser adapter rather than another match loop.
 
 ---
 

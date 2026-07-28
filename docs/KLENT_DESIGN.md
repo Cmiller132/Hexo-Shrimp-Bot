@@ -137,13 +137,13 @@ entirely**. They return only at test time (§14).
 | `(τ, λ) = (0.1, 0.03)`, verified against the paper | **Starting values, expected to move** (§8). |
 | `λ_ret = e^{-1/16} ≈ 0.939`, rescaled from the paper's `e^{-1/8}` | **Tweaked — necessary.** The paper's horizon is 8 transitions = 8 turns; 8 Hexo transitions is 4 turns, so carrying 0.883 would halve the strategic horizon (`KLENT_PROPOSALS.md` A1's correction). |
 | Adam, lr 1e-3, batch 4096 | **Unchanged as starting values.** |
-| Evaluate with `argmax π_θ`, no search | **Unchanged** (§11). |
+| Evaluate with `argmax π_θ`, no search | **Upgraded after training**: evaluation uses a 32-simulation Gumbel line search; zero simulations remains the parity anchor (§11). |
 | Anchored pretrained opponent | **Unchanged** — a fixed pretrained checkpoint (§11). |
-| Test-time Gumbel MCTS | **Unchanged in intent**, outside the baseline (§14). |
+| Test-time Gumbel MCTS | **Landed as deterministic line search**, not a general tree: Gumbel root sampling plus sequential halving (§11). |
 
 Nothing else changes. In particular there is no reward shaping, no adjudication,
-no auxiliary task, no symmetry augmentation, and no test-time search in the
-baseline.
+no auxiliary task, no symmetry augmentation, and no search in collection or
+fitting. The KLENT operator remains the only training-time policy improvement.
 
 ---
 
@@ -579,19 +579,25 @@ scope here. Outside the baseline either way (§15).
 
 ## 11. Evaluation
 
-The anchor is **SealBot** (`mantisnet.klent.sealbot`), an independent C++
+The default anchor is **SealBot** (`mantisnet.klent.sealbot`), an independent C++
 alpha-beta bot for this exact game: never trained, never a training opponent,
 sharing no code or heuristic with this repo — the same role the paper fills
-with Pgx's pretrained baseline checkpoints. It is the *only* evaluation
-(owner decision, 2026-07-28); a self-made heuristic anchor was measured to
-flatter exactly the failure it existed to catch. Its settings — per-turn time
-limit and search-depth cap — are pinned per run in `config.json`, because an
-anchor whose strength drifts is not an anchor.
+with Pgx's pretrained baseline checkpoints. A self-made heuristic anchor was
+measured to flatter exactly the failure it existed to catch. In-loop SealBot
+uses uncapped iterative deepening at 0.1 s per move; optional depth caps remain
+offline ladder rungs. Time and depth are pinned per run in `config.json`,
+because an anchor whose strength drifts is not an anchor.
 
 Protocol, following the paper so the curves are comparable:
 
-- The agent plays **`argmax π_θ`** over the legal set, with no search. `π′` is
-  training-only.
+- The agent gets a **32-simulation Gumbel sequential-halving line search**.
+  It samples `m = min(16, simulations // 2, |A_legal|)` root candidates by
+  `g_a + logit_a`, deepens every survivor by the interior `π′` argmax, and
+  halves by the leaf value mapped back to the root mover. Deterministic
+  transitions make lines the useful unit: re-walking an identical tree path
+  buys no information, while spending that visit on depth does. Zero
+  simulations is exactly `argmax π_θ` and remains the offline comparison
+  anchor.
 - **Seat balanced.** Every match played from both seats, because Hexo's seats are
   structurally asymmetric even though the encoding is not (§4.2).
 - Enough matches per point to make the interval meaningful — the paper used 1024
@@ -604,6 +610,10 @@ Protocol, following the paper so the curves are comparable:
 - Capped games during evaluation are scored as half-wins, the paper's draw
   convention, and reported separately so the number is visible rather than folded
   in.
+- Opponents enter through one identity-plus-chooser seam. SealBot's independent
+  `HexGame` assertions and memory-bounded waves are adapter details. A future
+  champion network supplies one batched chooser adapter plus its name/config and
+  can be seated by the same in-loop and offline match code.
 
 ---
 
@@ -712,9 +722,12 @@ runs on. Still needed:
 
 ## 15. Outside the baseline
 
+Test-time Gumbel search moved into §11 on 2026-07-28. It is intentionally a
+small deterministic line search rather than the previously proposed general
+DAG: the evaluation budget buys depth, while training remains search-free.
+
 | Item | Why it is not in the faithful version |
 | --- | --- |
-| **Test-time Gumbel MCTS** | The paper's own best result (77.2% vs 53.6%), and the trained artefact is a policy *and* a `Q`, which is what a search wants as priors. But it measures the search, not the algorithm, and the search-free number is the one that is comparable. Two notes for when it lands: `Search` is the session built for it, and this is where the audit's arena-inflation and clone-cost P1s come back; and it should be a **DAG, not a tree**, because each turn's two stones commute, which is exactly why `zobrist()` is position-only and excludes `SecondStone::first`. A tree forfeits a 2x merge per turn. |
 | **D6 / colour augmentation or equivariance** | §10. Free upside, but it multiplies an efficiency that has to exist first. |
 | **Dueling `Q = V + A`** | §9. The known `1/b` coverage problem, written down rather than pre-emptively patched. Deviates from the paper's Table 4. |
 | **Turn-commutativity consistency loss** | K8. A real constraint, but a second objective added before the first one works is a way to not know which is broken. |
@@ -764,9 +777,12 @@ runs on. Still needed:
 13. **Records and training samples are one artefact.** B2's opaque per-move blob
     *is* the buffer sample; a parallel shard writer alongside it is the thing
     being ruled out.
-14. **The anchor is SealBot, external and never a training opponent.** Pinned
-    time/depth settings, seat-balanced paired matches, `argmax π_θ` with no
-    search (2026-07-28; supersedes the earlier fixed-checkpoint wording).
+14. **The default anchor is SealBot, external and never a training opponent.**
+    In-loop: uncapped iterative deepening at 0.1 s/move against the model's
+    32-simulation Gumbel line search. Offline depth caps and zero-simulation
+    argmax remain comparison rungs. The opponent identity/chooser seam keeps
+    the same paired match available to a future champion network adapter
+    (2026-07-28; supersedes the earlier depth-1/argmax wording).
 15. **Collection is a persistent auto-reset cohort with a completion quota**
     (2026-07-28). The reference implementation's own shape — a fixed set of
     environment slots, a finished game's slot restarting from the empty

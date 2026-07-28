@@ -458,8 +458,11 @@ def test_eval_matches_key_on_the_opponent_not_on_sealbot(tmp_path):
             "score": score, "games": 2, "capped": 0, "win_rate": score / 2,
             "ci_lo": 0.0, "ci_hi": 1.0, "elo": 0.0, "elo_lo": -1.0, "elo_hi": 1.0,
             "score_as_p0": score, "score_as_p1": 0.0, "avg_plies": 12.0,
-            "seconds": 1.0, "sealbot_depth_mean": 1.5,
-            "sealbot_time_limit": 0.05, "sealbot_max_depth": depth,
+            "seconds": 1.0, "opponent_depth_mean": 1.5,
+            "opponent_name": "sealbot",
+            "opponent_config": {
+                "variant": "current", "time_limit": 0.05, "max_depth": depth
+            },
         }
         games = [
             {"seat": 0, "winner": 0, "capped": False, "score": 1.0, "opening_len": 2,
@@ -474,7 +477,7 @@ def test_eval_matches_key_on_the_opponent_not_on_sealbot(tmp_path):
         for score, depth, iteration in ((1.0, 1, 10), (2.0, 1, 20), (0.0, 3, 20)):
             result, games, it = match(score, depth, iteration)
             record_match(
-                writer, result, games, variant="current", source="cli",
+                writer, result, games, source="cli",
                 iteration=it, checkpoint=f"checkpoint_{it:06d}.pt",
             )
 

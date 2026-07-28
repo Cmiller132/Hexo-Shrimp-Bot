@@ -13,7 +13,9 @@ exactly from a checkpoint and a move prefix — which is what
 query needs (its KL to π_θ, its normalized entropy, its maximum, and its
 value at the sampled move) and recomputes the rest on demand. That is the
 storage decision this schema is built around; everything else follows from
-having chosen scalars over arrays.
+having chosen scalars over arrays. Evaluation's model-side Gumbel simulation
+count is recorded in ``config.json`` and ``invocations.jsonl``, not duplicated
+in this telemetry schema.
 
 Writes are one transaction per iteration into a WAL database, so a crash
 loses at most the iteration in flight and never the file, and a dashboard

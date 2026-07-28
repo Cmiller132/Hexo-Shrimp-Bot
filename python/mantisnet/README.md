@@ -35,10 +35,12 @@ python/mantisnet/
       returns.py      # the sign on mover change, the λ-return
       selfplay.py     # batched collection, acting-time v̂, buffer rules, stats
       train.py        # KlentConfig, the fit epoch, the iteration
-      evaluate.py     # the argmax chooser, seat-balanced match machinery
+      evaluate.py     # the zero-search argmax chooser and simple cross-play
+      search.py       # evaluation-only Gumbel root sampling + line halving
+      opponents.py    # the evaluation-opponent seam and SealBot adapter
       run.py          # the run driver: config.json, metrics.jsonl, checkpoints
       crossplay.py    # the A7 checkpoint round-robin, the forgetting detector
-      sealbot.py      # the one evaluation: matches vs a SealBot checkout
+      sealbot.py      # SealBot CLI and telemetry recording
       telemetry.py    # the run's SQLite capture + the queries over it, + CLI
       hardware.py     # the GPU/process/host counter trace behind an iteration
       inspect.py      # the policy debugger: one checkpoint's view of one position
@@ -165,6 +167,13 @@ a foreign corpus *before* KLENT begins, not machinery inside the loop.
   `λ_ret = e^{-1/16}`, the paper's 8-turn horizon at Hexo's two placements
   per turn. `docs/KLENT_RUN_PLAN.md` §2/§3 record the verification and the
   measured history.
+- **Evaluation search is Gumbel sequential halving over deterministic
+  lines.** The root samples at most 16 candidates by policy logit plus
+  Gumbel noise, then spends the simulation budget deepening surviving lines
+  by interior `π′` argmax. The in-loop default is 32 simulations; zero is
+  exact policy argmax for historical offline comparisons. This is
+  evaluation-only: collection and fitting import no search code, and the
+  KLENT operator remains the only training-time improvement.
 - **A run is its directory.** `python -m mantisnet.klent.run --out runs/<name>
   --iterations N` writes `config.json` (knobs + versions), `metrics.jsonl`
   (strict JSON, one row per iteration: the §13 metrics including the
@@ -175,14 +184,15 @@ a foreign corpus *before* KLENT begins, not machinery inside the loop.
   resumable checkpoints; `--resume` continues after a crash and refuses a
   checkpoint from other versions; `--init-from` forks a fresh run (own
   seed, iteration 0) from a trained checkpoint. `--eval-every N` plays the
-  SealBot match in-driver (`--sealbot <root>`, `--eval-depth`) and merges
-  the score into that iteration's metrics row, with an eval RNG derived
+  SealBot match in-driver (`--sealbot <root>`, uncapped `--eval-time 0.1`
+  by default, optional `--eval-depth`, and `--eval-sims 32`) and merges the
+  score into that iteration's metrics row, with an eval RNG derived
   from (run seed, iteration) so the training trajectory is identical with
   evaluation on or off. `--starve-limit` ends a collapsed run with a
   checkpoint instead of a burned night, and `mantisnet.klent.crossplay`
   plays the A7 checkpoint round-robin. `docs/KLENT_RUN_PLAN.md` is the
   operational plan, §3 of it the measured history, around this driver.
-- **`mantisnet.klent.sealbot` is the one evaluation** — seat-balanced
+- **`mantisnet.klent.sealbot` is the default anchored evaluation** — seat-balanced
   paired matches against [SealBot](https://github.com/Ramora0/SealBot), an
   independent C++ alpha-beta bot for this exact game, from a machine-local
   checkout (`--sealbot <root>`; build its `minimax_cpp` there first —
@@ -193,8 +203,14 @@ a foreign corpus *before* KLENT begins, not machinery inside the loop.
   to agree with `hexo-engine` on every placement and winner (a live
   second-implementation oracle; setting `SEALBOT_ROOT` enables the tests),
   its moves are asserted legal, and `hexo_py` stays authoritative.
-  `--max-depth` caps its search for graded rungs; `--run <dir> --every N`
-  writes a strength curve to `sealbot_curve.jsonl`. First measurement
+  The match itself accepts an opponent identity/config plus a batched
+  chooser; a future champion network needs one adapter and then works in
+  both the driver and offline sweeps without another match loop.
+  The in-loop opponent is its uncapped iterative-deepening search at
+  0.1 s/turn. `--max-depth` remains an offline weaker-rung knob, while
+  offline `--sims` defaults to zero so old argmax curves stay comparable;
+  `--run <dir> --every N` writes a strength curve to
+  `sealbot_curve.jsonl`. First measurement
   (2026-07-28): the overnight-3 endpoint loses 0/64 even at depth 1 — the
   run plan §4 has the table and what it says about racing vs defending.
 
@@ -221,7 +237,7 @@ other shape here follows from having chosen scalars over arrays.
 | `iterations` | iteration | every `metrics.jsonl` field as its own column (so a threshold query needs no JSON parse), the row verbatim in `metrics_json`, and the hardware trace |
 | `games` | game, self-play *and* evaluation | winner, length, capped, eval seat/opening, and the move list as a blob |
 | `plies` | self-play ply | mover, `moves_remaining`, `legal_count`, the taken `rank`, and the five acting-time scalars |
-| `opponents` | opponent *at a setting* | `name` + `config_json`; SealBot at depth 1 and depth 3 are two opponents |
+| `opponents` | opponent *at a setting* | `name` + `config_json`; uncapped SealBot at 0.1 s and a depth-capped rung are two opponents |
 | `eval_matches` | match | score, Wilson interval, Elo, per-seat split — keyed by opponent and by iteration or checkpoint |
 | `crossplay` | A7 pairing | replaced wholesale by each run of it, as `crossplay.json` is |
 
@@ -282,12 +298,11 @@ if samples:
 
 | Omitted | Why |
 | --- | --- |
-| Encoder / evaluator / sessions | Wiring MantisNet to `hexo-search`'s seam is the Python-backed package of `CONTAINER_SPEC.md`, a change to be made there, not here. KLENT's training loop deliberately needs none of it — no search during training is the algorithm's point. |
+| Encoder / evaluator / sessions | Wiring MantisNet to `hexo-search`'s serving seam is the Python-backed package of `CONTAINER_SPEC.md`, a change to be made there, not here. Evaluation has its local Gumbel line search; KLENT training deliberately has no search, and its operator remains the only training-time improvement. |
 | The aux window head (spec appendix A) | Optional by spec, and adding it later touches no input — it reads trunk output. |
 | `KLENT_PROPOSALS.md`'s accepted items | Diffs against a baseline that must exist first. Each is a small, named change when wanted. |
 | Records / runner integration for the buffer | Design doc §12/§14. The in-memory per-iteration buffer is the paper's own shape; persistence arrives with B2's per-move blob, not with a private writer here. |
 | Checkpoint I/O | The manifest and probe protocol are `hexo-model`'s, and arrive with the package. |
-| Test-time Gumbel MCTS | Design doc §15: the paper's best number, but it measures the search, not the algorithm. |
 | Further hand-written Triton kernels | Two have landed. Block attention computes distance buckets and the learned per-head bias in-kernel and stops each row at its live key prefix, but its fixed 64×64, four-warp, three-stage launch improved the complete long-position forward only ~1.04×, below the 1.4× target. The decoder aggregation is the one that paid: a single-warp segment reduction over the incidence, 1.39–1.82× on the forward. Dense SDPA and an `index_add_` scatter remain as the CPU/failed-shape fallbacks and for fit's recompute backward. The profile now puts the trunk's §5.1/§5.2 message passing on top at ~19 %, and everything below it is under 10 %. The same segment reduction applies to §5.1 directly (`inc_window` is emitted in window order) but not to §5.2, whose `inc_stone` is not sorted — that half would need a permutation the builder does not currently produce. |
 | FlexAttention for the §4.1 distance bias | Measured out (2026-07-27): a `score_mod` computing buckets from coordinates in-kernel was built and proven exactly equivalent (outputs ~2e-6, `dist_bias` grads ~2e-8), but at this model's sizes it ran **5× slower in fit and 2.7× slower in collection** for ≤0.2 GiB saved — once batches are budget-packed, attention is no longer the memory driver, and flex under dynamic shapes needed 128-padded lengths plus an eager block mask to compile at all. Revisit only if H or D_MAX grow enough to make the bias tensor dominant again. |
 

@@ -69,6 +69,9 @@ def test_run_resume_and_artifacts(tmp_path):
 
     config = json.loads((out / "config.json").read_text())
     assert config["klent"]["tau"] == 0.1 and config["klent"]["lam"] == 0.03
+    assert config["eval_time"] == 0.1
+    assert config["eval_depth"] is None
+    assert config["eval_sims"] == 32
     assert "MODEL_REPR_VERSION" in config["versions"]
     lines = (out / "metrics.jsonl").read_text().splitlines()
     assert len(lines) == 2
@@ -79,7 +82,10 @@ def test_run_resume_and_artifacts(tmp_path):
 
     # Resume finds the latest checkpoint and appends rather than restarting;
     # a knob changed on resume lands on the record.
-    main(args + ["--iterations", "3", "--resume", "--lam", "0.05"])
+    main(args + [
+        "--iterations", "3", "--resume", "--lam", "0.05",
+        "--eval-time", "0.2", "--eval-depth", "3", "--eval-sims", "0",
+    ])
     lines = (out / "metrics.jsonl").read_text().splitlines()
     assert len(lines) == 3
     assert json.loads(lines[-1])["iteration"] == 2
@@ -91,6 +97,9 @@ def test_run_resume_and_artifacts(tmp_path):
     assert [inv["start_iteration"] for inv in invocations] == [0, 2]
     assert invocations[0]["klent"]["lam"] == 0.03
     assert invocations[1]["klent"]["lam"] == 0.05
+    assert invocations[1]["eval_time"] == 0.2
+    assert invocations[1]["eval_depth"] == 3
+    assert invocations[1]["eval_sims"] == 0
 
     # A fresh start into a used directory is refused.
     with pytest.raises(SystemExit, match="not empty"):
@@ -99,6 +108,12 @@ def test_run_resume_and_artifacts(tmp_path):
     # In-driver eval is SealBot or nothing.
     with pytest.raises(SystemExit, match="sealbot"):
         main(["--out", str(tmp_path / "x"), "--iterations", "1", "--eval-every", "1"])
+    with pytest.raises(SystemExit, match="eval-depth"):
+        main(["--out", str(tmp_path / "y"), "--iterations", "1", "--eval-depth", "0"])
+    with pytest.raises(SystemExit, match="eval-sims"):
+        main(["--out", str(tmp_path / "z"), "--iterations", "1", "--eval-sims", "-1"])
+    with pytest.raises(SystemExit, match="eval-time"):
+        main(["--out", str(tmp_path / "w"), "--iterations", "1", "--eval-time", "0"])
 
 
 def test_eval_in_driver_leaves_training_untouched(tmp_path):
