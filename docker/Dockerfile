@@ -26,8 +26,8 @@ COPY python/mantisnet/pyproject.toml python/mantisnet/uv.lock /tmp/lock/
 # hexo-py is a path dependency in the lock; it is built from the mounted
 # tree by maturin at run time, so the deps layer skips it.
 RUN cd /tmp/lock && uv venv /opt/venv --python 3.13 \
-    && uv sync --frozen --no-install-project --no-install-package hexo-py \
-    && uv pip install --python /opt/venv maturin \
+    && uv sync --frozen --all-groups --no-install-project --no-install-package hexo-py \
+    && uv pip install --python /opt/venv maturin setuptools pybind11 \
     && rm -rf /tmp/lock
 
 WORKDIR /workspace/python/mantisnet

@@ -17,6 +17,9 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8"]
+# The control deck's service layer (docs/DECK_SPEC.md). Grouped so the
+# training path never imports it; installed in the container image.
+deck = ["fastapi>=0.115", "uvicorn[standard]>=0.32", "httpx>=0.28"]
 
 [tool.uv.sources]
 hexo-py = { path = "../hexo-py" }

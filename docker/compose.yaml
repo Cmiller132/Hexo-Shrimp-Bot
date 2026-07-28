@@ -9,8 +9,12 @@ services:
     stdin_open: true
     tty: true
     volumes:
-      - /mnt/d/Hexo-Shrimp-Bot:/workspace
-      - /mnt/d/SealBot:/sealbot:ro
+      # REPO_ROOT lets a worktree stand in for the repo during development;
+      # production is always the canonical checkout.
+      - ${REPO_ROOT:-/mnt/d/Hexo-Shrimp-Bot}:/workspace
+      # Writable: the in-container SealBot build drops its Linux .so
+      # (setup.py build_ext --inplace) beside the Windows .pyd.
+      - /mnt/d/SealBot:/sealbot
     environment:
       - SEALBOT_ROOT=/sealbot
       - NVIDIA_VISIBLE_DEVICES=all
