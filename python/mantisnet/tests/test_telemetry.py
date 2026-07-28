@@ -296,11 +296,91 @@ def _fixture_db(tmp_path):
     conn.executemany(
         "INSERT INTO plies (game_id, t, mover, moves_remaining, legal_count,"
         " rank, v_hat, kl, norm_entropy, pi_top1, pi_chosen)"
-        " VALUES (?, ?, ?, 1, 7, 0, ?, 0.0, 0.5, 0.5, 0.5)",
-        plies,
+        " VALUES (?, ?, ?, 1, 7, 0, ?, 0, 5000, 5000, 5000)",
+        [(g, t, m, round(v * tel._Q)) for g, t, m, v in plies],
     )
     conn.commit()
     return writer
+
+
+# The v1 shape, frozen: what convert regenerates from. Only the parts the
+# converter reads; REAL ply scalars and no forfeit columns are the point.
+_V1_SCHEMA = """
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+CREATE TABLE runs (id INTEGER PRIMARY KEY, created TEXT NOT NULL,
+    start_iteration INTEGER NOT NULL, iterations INTEGER NOT NULL,
+    config_json TEXT NOT NULL, versions_json TEXT NOT NULL);
+CREATE TABLE opponents (opponent_id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+    config_json TEXT NOT NULL, UNIQUE (name, config_json));
+CREATE TABLE eval_matches (match_id INTEGER PRIMARY KEY, created TEXT NOT NULL,
+    source TEXT NOT NULL, opponent INTEGER NOT NULL, iteration INTEGER,
+    checkpoint TEXT, games INTEGER NOT NULL, score REAL NOT NULL,
+    win_rate REAL NOT NULL, capped INTEGER NOT NULL,
+    ci_lo REAL, ci_hi REAL, elo REAL, elo_lo REAL, elo_hi REAL,
+    score_as_p0 REAL, score_as_p1 REAL, opponent_depth_mean REAL,
+    avg_plies REAL, seconds REAL);
+CREATE TABLE games (game_id INTEGER PRIMARY KEY, kind TEXT NOT NULL,
+    iteration INTEGER, match INTEGER, game_index INTEGER NOT NULL,
+    winner INTEGER, length INTEGER NOT NULL, capped INTEGER NOT NULL,
+    model_seat INTEGER, opening_len INTEGER, opponent_depth_mean REAL,
+    moves BLOB NOT NULL);
+CREATE TABLE plies (game_id INTEGER NOT NULL, t INTEGER NOT NULL,
+    mover INTEGER NOT NULL, moves_remaining INTEGER NOT NULL,
+    legal_count INTEGER NOT NULL, rank INTEGER NOT NULL, v_hat REAL NOT NULL,
+    kl REAL NOT NULL, norm_entropy REAL NOT NULL, pi_top1 REAL NOT NULL,
+    pi_chosen REAL NOT NULL, PRIMARY KEY (game_id, t)) WITHOUT ROWID;
+CREATE TABLE crossplay (checkpoint_a TEXT NOT NULL, checkpoint_b TEXT NOT NULL,
+    games INTEGER NOT NULL, score_a REAL NOT NULL, capped INTEGER NOT NULL,
+    ply_cap INTEGER NOT NULL, seed INTEGER NOT NULL, created TEXT NOT NULL,
+    PRIMARY KEY (checkpoint_a, checkpoint_b));
+"""
+
+
+def test_convert_regenerates_a_v1_database(tmp_path):
+    import sqlite3
+
+    path = tmp_path / tel.DB_NAME
+    v1 = sqlite3.connect(path)
+    with v1:
+        v1.executescript(_V1_SCHEMA)
+        v1.execute("INSERT INTO schema_version VALUES (1)")
+        v1.execute("INSERT INTO runs VALUES (1, 'then', 0, 5, '{}', '{}')")
+        v1.execute("INSERT INTO opponents VALUES (1, 'sealbot', '{}')")
+        v1.execute(
+            "INSERT INTO eval_matches VALUES (1, 'then', 'driver', 1, 5, NULL,"
+            " 2, 1.5, 0.75, 0, 0.3, 0.9, 190.8, NULL, NULL, 1.0, 0.5, 3.5,"
+            " 40.0, 12.0)"
+        )
+        v1.execute(
+            "INSERT INTO games VALUES (0, 'selfplay', 4, NULL, 0, 1, 2, 0,"
+            " NULL, NULL, NULL, ?)",
+            (tel.pack_moves([(0, 0), (1, 0)]),),
+        )
+        v1.executemany(
+            "INSERT INTO plies VALUES (0, ?, ?, 1, 9, 0, ?, ?, ?, ?, ?)",
+            [
+                (0, 0, 0.31418, 0.021, 0.5, 0.25, 0.125),
+                (1, 1, -0.90071, 0.002, 0.9, 0.75, 0.5),
+            ],
+        )
+    v1.close()
+
+    tel.convert_v1(tmp_path)
+    assert (tmp_path / "telemetry.db.v1.bak").exists()
+
+    conn = tel.connect(tmp_path)  # a v2 open proves the version
+    game = tel.fetch_game(conn, 0)
+    assert game["moves"] == [(0, 0), (1, 0)]
+    assert game["plies"][0]["v_hat"] == pytest.approx(0.31418, abs=0.5 / tel._Q)
+    assert game["plies"][1]["v_hat"] == pytest.approx(-0.90071, abs=0.5 / tel._Q)
+    assert game["plies"][1]["pi_chosen"] == pytest.approx(0.5)
+    row = dict(conn.execute("SELECT * FROM eval_matches").fetchone())
+    assert row["win_rate"] == 0.75 and row["forfeits"] is None
+    assert dict(conn.execute("SELECT * FROM runs").fetchone())["iterations"] == 5
+    conn.close()
+
+    with pytest.raises(ValueError, match="v1 databases only"):
+        tel.convert_v1(tmp_path)  # already v2
 
 
 def test_calibration_matches_arithmetic_by_hand(tmp_path):
@@ -356,8 +436,8 @@ def test_calibration_buckets_floor_exactly_across_the_sign(tmp_path):
     conn.executemany(
         "INSERT INTO plies (game_id, t, mover, moves_remaining, legal_count, rank,"
         " v_hat, kl, norm_entropy, pi_top1, pi_chosen)"
-        " VALUES (0, ?, 0, 1, 1, 0, ?, 0, 0, 1, 1)",
-        list(enumerate(values)),
+        " VALUES (0, ?, 0, 1, 1, 0, ?, 0, 0, 10000, 10000)",
+        [(t, round(v * tel._Q)) for t, v in enumerate(values)],
     )
     conn.commit()
     writer.close()
@@ -458,8 +538,11 @@ def test_eval_matches_key_on_the_opponent_not_on_sealbot(tmp_path):
             "score": score, "games": 2, "capped": 0, "win_rate": score / 2,
             "ci_lo": 0.0, "ci_hi": 1.0, "elo": 0.0, "elo_lo": -1.0, "elo_hi": 1.0,
             "score_as_p0": score, "score_as_p1": 0.0, "avg_plies": 12.0,
-            "seconds": 1.0, "sealbot_depth_mean": 1.5,
-            "sealbot_time_limit": 0.05, "sealbot_max_depth": depth,
+            "seconds": 1.0, "opponent_depth_mean": 1.5,
+            "opponent_name": "sealbot",
+            "opponent_config": {
+                "variant": "current", "time_limit": 0.05, "max_depth": depth
+            },
         }
         games = [
             {"seat": 0, "winner": 0, "capped": False, "score": 1.0, "opening_len": 2,
@@ -474,7 +557,7 @@ def test_eval_matches_key_on_the_opponent_not_on_sealbot(tmp_path):
         for score, depth, iteration in ((1.0, 1, 10), (2.0, 1, 20), (0.0, 3, 20)):
             result, games, it = match(score, depth, iteration)
             record_match(
-                writer, result, games, variant="current", source="cli",
+                writer, result, games, source="cli",
                 iteration=it, checkpoint=f"checkpoint_{it:06d}.pt",
             )
 
@@ -614,12 +697,15 @@ def test_inspect_position_reproduces_a_recorded_ply(tmp_path):
     game = tel.fetch_game(conn, tel.search_games(conn)[0]["game_id"])
     conn.close()
     assert game["plies"]
+    # Stored scalars are quantized to 1/_Q; the reproduction is exact, so
+    # the tolerance is the quantization half-step plus float noise.
+    q = 0.5 / tel._Q + 1e-6
     for ply in game["plies"][:3]:
         out = inspect_position(actor, game["moves"], ply["t"], cfg.tau, cfg.lam)
         probs = [e["improved"] for e in out["legal"]]
         assert out["legal_count"] == ply["legal_count"]
-        assert out["v_hat"] == pytest.approx(ply["v_hat"], abs=1e-5)
-        assert out["kl"] == pytest.approx(ply["kl"], abs=1e-5)
-        assert out["norm_entropy"] == pytest.approx(ply["norm_entropy"], abs=1e-5)
-        assert max(probs) == pytest.approx(ply["pi_top1"], abs=1e-5)
-        assert probs[ply["rank"]] == pytest.approx(ply["pi_chosen"], abs=1e-5)
+        assert out["v_hat"] == pytest.approx(ply["v_hat"], abs=q)
+        assert out["kl"] == pytest.approx(ply["kl"], abs=q)
+        assert out["norm_entropy"] == pytest.approx(ply["norm_entropy"], abs=q)
+        assert max(probs) == pytest.approx(ply["pi_top1"], abs=q)
+        assert probs[ply["rank"]] == pytest.approx(ply["pi_chosen"], abs=q)

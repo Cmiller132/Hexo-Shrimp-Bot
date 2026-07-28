@@ -13,7 +13,9 @@ exactly from a checkpoint and a move prefix — which is what
 query needs (its KL to π_θ, its normalized entropy, its maximum, and its
 value at the sampled move) and recomputes the rest on demand. That is the
 storage decision this schema is built around; everything else follows from
-having chosen scalars over arrays.
+having chosen scalars over arrays. Evaluation's model-side Gumbel simulation
+count is recorded in ``config.json`` and ``invocations.jsonl``, not duplicated
+in this telemetry schema.
 
 Writes are one transaction per iteration into a WAL database, so a crash
 loses at most the iteration in flight and never the file, and a dashboard
@@ -41,9 +43,19 @@ from pathlib import Path
 import numpy as np
 
 # Covers every table, column, and packing below. Bumped, never migrated.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DB_NAME = "telemetry.db"
+
+# Per-ply scalars are stored quantized: integers in units of 1/_Q (v2). The
+# five REALs were 40 bytes of a ~71-byte row and SQLite has no float32; at
+# 1e-4 resolution a typical value is a 2-3 byte varint and no consumer's
+# noise floor is anywhere near the rounding. Writers multiply, readers
+# divide, and both live in this file — nothing outside sees an integer.
+_Q = 10_000
+
+# The five quantized columns, in schema order.
+_PLY_SCALARS = ("v_hat", "kl", "norm_entropy", "pi_top1", "pi_chosen")
 
 # The §13 metrics that become their own iteration columns. Everything in the
 # metrics row is also kept verbatim in ``metrics_json``; these are the ones a
@@ -148,6 +160,8 @@ CREATE TABLE eval_matches (
     capped     INTEGER NOT NULL,
     ci_lo REAL, ci_hi REAL, elo REAL, elo_lo REAL, elo_hi REAL,
     score_as_p0 REAL, score_as_p1 REAL,
+    forfeits INTEGER,          -- opponent's unplayable proposals, scored as wins
+    opponent_retries INTEGER,  -- recovered re-consultations behind them
     opponent_depth_mean REAL,
     avg_plies REAL,
     seconds REAL
@@ -179,6 +193,8 @@ CREATE INDEX games_search ON games(kind, winner, length);
 
 -- Acting-time scalars, self-play only: an evaluation game plays argmax
 -- π_θ and has no π′ to reduce.
+-- The five scalar columns hold integers in units of 1/10000 (see _Q): the
+-- write path quantizes, every read path in this file dequantizes.
 CREATE TABLE plies (
     game_id         INTEGER NOT NULL REFERENCES games(game_id),
     t               INTEGER NOT NULL,
@@ -186,11 +202,11 @@ CREATE TABLE plies (
     moves_remaining INTEGER NOT NULL,
     legal_count     INTEGER NOT NULL,
     rank            INTEGER NOT NULL,
-    v_hat           REAL NOT NULL,
-    kl              REAL NOT NULL,
-    norm_entropy    REAL NOT NULL,
-    pi_top1         REAL NOT NULL,
-    pi_chosen       REAL NOT NULL,
+    v_hat           INTEGER NOT NULL,
+    kl              INTEGER NOT NULL,
+    norm_entropy    INTEGER NOT NULL,
+    pi_top1         INTEGER NOT NULL,
+    pi_chosen       INTEGER NOT NULL,
     PRIMARY KEY (game_id, t)
 ) WITHOUT ROWID;
 
@@ -523,15 +539,17 @@ class Telemetry:
         produces; whatever made *this* opponent what it is belongs in its
         `opponents` row, not here.
         """
-        if source not in ("driver", "cli"):
-            raise ValueError(f"eval match source must be 'driver' or 'cli': {source!r}")
+        if source not in ("driver", "cli", "deck"):
+            raise ValueError(
+                f"eval match source must be 'driver', 'cli', or 'deck': {source!r}"
+            )
         with self._conn:
             cur = self._conn.execute(
                 "INSERT INTO eval_matches (created, source, opponent, iteration,"
                 " checkpoint, games, score, win_rate, capped, ci_lo, ci_hi, elo,"
-                " elo_lo, elo_hi, score_as_p0, score_as_p1, opponent_depth_mean,"
-                " avg_plies, seconds)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " elo_lo, elo_hi, score_as_p0, score_as_p1, forfeits,"
+                " opponent_retries, opponent_depth_mean, avg_plies, seconds)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     _now(),
                     source,
@@ -549,6 +567,10 @@ class Telemetry:
                     result["elo_hi"],
                     result["score_as_p0"],
                     result["score_as_p1"],
+                    # NULL for match kinds without the concept (a
+                    # checkpoint-vs-checkpoint summary carries neither).
+                    result.get("forfeits"),
+                    result.get("opponent_retries"),
                     depth_mean,
                     result["avg_plies"],
                     result["seconds"],
@@ -624,6 +646,8 @@ def _ply_rows(ids, episodes):
                 f"episode's per-ply records disagree on length: {n} ranks vs "
                 f"{sorted(lengths)}"
             )
+        # round() on a NaN raises: no per-ply scalar may be NaN, and the
+        # quantization is where that would otherwise slip through as NULL.
         yield from zip(
             itertools.repeat(game_id, n),
             range(n),
@@ -631,16 +655,75 @@ def _ply_rows(ids, episodes):
             ep.moves_remaining,
             map(len, ep.improved),
             ep.ranks,
-            ep.v_hats,
-            ep.kls,
-            ep.norm_entropies,
-            ep.pi_top1,
-            ep.pi_chosen,
+            (round(v * _Q) for v in ep.v_hats),
+            (round(v * _Q) for v in ep.kls),
+            (round(v * _Q) for v in ep.norm_entropies),
+            (round(v * _Q) for v in ep.pi_top1),
+            (round(v * _Q) for v in ep.pi_chosen),
         )
 
 
 # --------------------------------------------------------------------------
 # Reading: the queries a dashboard needs first
+
+
+def convert_v1(run_dir) -> None:
+    """Regenerate a v1 database as v2, deliberately and once.
+
+    There are no migrations-on-open — a version mismatch refuses, always.
+    But a finished run's telemetry is history that cannot be replayed, so
+    "regenerate the data" for it means this: build a fresh v2 file, copy
+    every table across (plies quantizing REAL to 1/_Q units; the two v2
+    match columns are NULL — v1 never measured them), swap it in, and keep
+    the original beside it as ``telemetry.db.v1.bak``. Never run it against
+    a database a live process is writing.
+    """
+    path = db_path(run_dir)
+    if not path.exists():
+        raise FileNotFoundError(f"no telemetry database at {path}")
+    src = sqlite3.connect(path)
+    try:
+        found = src.execute("SELECT version FROM schema_version").fetchone()[0]
+    finally:
+        src.close()
+    if found != 1:
+        raise ValueError(f"convert regenerates v1 databases only; {path} is v{found}")
+
+    fresh_path = path.with_suffix(".v2.tmp")
+    fresh_path.unlink(missing_ok=True)
+    conn = _connect(fresh_path)  # builds the v2 schema
+    try:
+        conn.execute("ATTACH DATABASE ? AS v1", (str(path),))
+        with conn:
+            conn.execute("INSERT INTO runs SELECT * FROM v1.runs")
+            conn.execute("INSERT INTO opponents SELECT * FROM v1.opponents")
+            conn.execute(
+                "INSERT INTO eval_matches (created, source, opponent, iteration,"
+                " checkpoint, games, score, win_rate, capped, ci_lo, ci_hi, elo,"
+                " elo_lo, elo_hi, score_as_p0, score_as_p1, opponent_depth_mean,"
+                " avg_plies, seconds)"
+                " SELECT created, source, opponent, iteration, checkpoint, games,"
+                " score, win_rate, capped, ci_lo, ci_hi, elo, elo_lo, elo_hi,"
+                " score_as_p0, score_as_p1, opponent_depth_mean, avg_plies,"
+                " seconds FROM v1.eval_matches"
+            )
+            conn.execute("INSERT INTO games SELECT * FROM v1.games")
+            conn.execute(
+                "INSERT INTO plies SELECT game_id, t, mover, moves_remaining,"
+                f" legal_count, rank, CAST(ROUND(v_hat * {_Q}) AS INTEGER),"
+                f" CAST(ROUND(kl * {_Q}) AS INTEGER),"
+                f" CAST(ROUND(norm_entropy * {_Q}) AS INTEGER),"
+                f" CAST(ROUND(pi_top1 * {_Q}) AS INTEGER),"
+                f" CAST(ROUND(pi_chosen * {_Q}) AS INTEGER) FROM v1.plies"
+            )
+            conn.execute("INSERT INTO crossplay SELECT * FROM v1.crossplay")
+        conn.execute("DETACH DATABASE v1")
+    finally:
+        conn.close()
+    backup = path.with_suffix(".db.v1.bak")
+    path.replace(backup)
+    fresh_path.replace(path)
+    print(f"{path}: regenerated as schema v2; v1 original at {backup}")
 
 
 def _rows(conn, sql: str, params=()) -> list[dict]:
@@ -751,9 +834,12 @@ def fetch_game(conn, game_id: int) -> dict:
         raise KeyError(f"no game {game_id}")
     game = dict(row)
     game["moves"] = unpack_moves(game["moves"])
-    game["plies"] = _rows(
-        conn, "SELECT * FROM plies WHERE game_id = ? ORDER BY t", (game_id,)
-    )
+    game["plies"] = [
+        {**ply, **{k: ply[k] / _Q for k in _PLY_SCALARS}}
+        for ply in _rows(
+            conn, "SELECT * FROM plies WHERE game_id = ? ORDER BY t", (game_id,)
+        )
+    ]
     return game
 
 
@@ -772,10 +858,11 @@ def calibration(conn, *, by="v_hat", bucket=0.1, iterations=None) -> list[dict]:
     # truncates toward zero, and a negative value not landing on a bucket
     # edge is one bucket short of it. The other two axes are non-negative,
     # where truncation is already the floor.
+    v = f"(p.v_hat / {_Q}.0)"  # the stored integer back in value units
     axes = {
         "v_hat": (
-            "CAST(p.v_hat / ? AS INTEGER) - (CASE WHEN p.v_hat < 0"
-            " AND CAST(p.v_hat / ? AS INTEGER) * ? <> p.v_hat THEN 1 ELSE 0 END)",
+            f"CAST({v} / ? AS INTEGER) - (CASE WHEN {v} < 0"
+            f" AND CAST({v} / ? AS INTEGER) * ? <> {v} THEN 1 ELSE 0 END)",
             3,
         ),
         "ply": ("CAST(p.t / ? AS INTEGER)", 1),
@@ -791,7 +878,7 @@ def calibration(conn, *, by="v_hat", bucket=0.1, iterations=None) -> list[dict]:
         "SELECT bucket, bucket * ? AS bucket_lo, COUNT(*) AS plies,"
         " AVG(v_hat) AS v_hat_mean, AVG(z) AS outcome_mean,"
         " AVG(ABS(v_hat - z)) AS mae FROM ("
-        f"  SELECT {expr} AS bucket, p.v_hat AS v_hat, {z} AS z"
+        f"  SELECT {expr} AS bucket, {v} AS v_hat, {z} AS z"
         "   FROM plies p JOIN games g ON g.game_id = p.game_id"
         "   WHERE g.kind = 'selfplay' AND g.winner IS NOT NULL"
         + (f" AND {where}" if where else "")
@@ -803,7 +890,10 @@ def calibration(conn, *, by="v_hat", bucket=0.1, iterations=None) -> list[dict]:
 # The mover's own assessment of the next position: v̂ is in the frame of
 # whoever is to move, so a seat change between plies flips its sign before
 # the two are comparable.
-_SWING = "(CASE WHEN a.mover = b.mover THEN b.v_hat ELSE -b.v_hat END) - a.v_hat"
+_SWING = (
+    f"((CASE WHEN a.mover = b.mover THEN b.v_hat ELSE -b.v_hat END)"
+    f" - a.v_hat) / {_Q}.0"
+)
 
 
 def blunders(conn, *, threshold=0.5, iterations=None, limit=50) -> list[dict]:
@@ -817,9 +907,11 @@ def blunders(conn, *, threshold=0.5, iterations=None, limit=50) -> list[dict]:
     where, params = _iteration_range(iterations, "g")
     return _rows(
         conn,
-        f"SELECT a.game_id, g.iteration, a.t, a.mover, a.v_hat AS v_hat,"
-        f" b.v_hat AS v_hat_next, {_SWING} AS swing, a.rank, a.legal_count,"
-        " a.norm_entropy, a.pi_chosen"
+        f"SELECT a.game_id, g.iteration, a.t, a.mover,"
+        f" a.v_hat / {_Q}.0 AS v_hat,"
+        f" b.v_hat / {_Q}.0 AS v_hat_next, {_SWING} AS swing, a.rank,"
+        f" a.legal_count, a.norm_entropy / {_Q}.0 AS norm_entropy,"
+        f" a.pi_chosen / {_Q}.0 AS pi_chosen"
         " FROM plies a"
         " JOIN plies b ON b.game_id = a.game_id AND b.t = a.t + 1"
         " JOIN games g ON g.game_id = a.game_id"
@@ -972,7 +1064,15 @@ def main(argv=None) -> None:
     one = sub.add_parser("game", help="one game's moves and plies")
     one.add_argument("game_id", type=int)
 
+    sub.add_parser(
+        "convert",
+        help="regenerate a v1 database as v2 in place (v1 original kept as .v1.bak)",
+    )
+
     args = ap.parse_args(argv)
+    if args.command == "convert":
+        convert_v1(args.run)
+        return
     conn = connect(args.run)
     try:
         if args.command == "summary":

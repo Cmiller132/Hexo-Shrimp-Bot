@@ -39,17 +39,64 @@ python/mantisnet/
       returns.py      # the sign on mover change, the λ-return
       selfplay.py     # batched collection, acting-time v̂, buffer rules, stats
       train.py        # KlentConfig, the fit epoch, the iteration
-      evaluate.py     # the argmax chooser, seat-balanced match machinery
+      evaluate.py     # the zero-search argmax chooser and simple cross-play
+      search.py       # evaluation-only Gumbel root sampling + line halving
+      opponents.py    # the evaluation-opponent seam and SealBot adapter
       run.py          # the run driver: config.json, metrics.jsonl, checkpoints
       crossplay.py    # the A7 checkpoint round-robin, the forgetting detector
-      sealbot.py      # the one evaluation: matches vs a SealBot checkout
+      sealbot.py      # SealBot CLI and telemetry recording
       telemetry.py    # the run's SQLite capture + the queries over it, + CLI
       hardware.py     # the GPU/process/host counter trace behind an iteration
       inspect.py      # the policy debugger: one checkpoint's view of one position
+    deck/
+      app.py          # FastAPI routes, SSE, static SPA, play/match orchestration
+      service.py      # run registry, child lifecycle, read-only queries, checkpoint LRU
+      state.py        # schema-versioned deck.db annotations, probes, presets, match jobs
   tests/              # the two specs' obligations, one file per concern
   bench/
     bench_forward.py  # builder and forward throughput at spec defaults
 ```
+
+## Deck
+
+`mantisnet.deck` is the LAN-trusted control surface described by
+`docs/DECK_SPEC.md`. It runs in the training container, owns port 8000, serves
+the built React SPA, and launches training as child processes. Start it through
+the Compose `deck` service; there is deliberately no Windows-native serving
+path and no authentication layer.
+
+The run registry treats a directory below `runs/` as a run exactly when it has
+`config.json`. It consumes the driver's public artifacts rather than reaching
+into the loop:
+
+| Artifact | Deck contract |
+| --- | --- |
+| `config.json`, `invocations.jsonl` | resolved knobs, versions, and resume history |
+| `status.json` | at-most-once-per-second collect/fit/eval heartbeat |
+| `telemetry.db` | query-only SQLite connection for every dashboard read |
+| `metrics.jsonl` | durable human-readable iteration record; not re-parsed by the API |
+| `checkpoint_*.pt` | eager inference, at most two checkpoints resident |
+| `STOP`, `CHECKPOINT` | graceful lifecycle requests written by the deck |
+| `deck-console.log` | captured child stdout/stderr and the SSE log source |
+
+Run annotations, saved probes, play presets, and match-job history live in
+`runs/deck.db`. That database is WAL, schema-versioned, and refused on a version
+mismatch. It never shares tables or transactions with telemetry. The only
+telemetry write initiated by the deck is a completed SealBot match, through
+`klent.sealbot.record_match`; all query endpoints open `telemetry.db` in SQLite
+`mode=ro` with `query_only` enabled.
+
+The service module map:
+
+| Module | Role |
+| --- | --- |
+| `deck.app` | REST models/routes, structured errors, run and match SSE, reference-attention and D6 lab endpoints, SPA fallback |
+| `deck.service` | registry state machine, child process boundary, sentinels, checkpoint inference LRU, authoritative play sessions |
+| `deck.state` | the deck-owned SQLite schema and its small persistence API |
+
+The API uses `DECK_RUNS_ROOT`, `DECK_FRONTEND_DIST`, `DECK_DEVICE`, and
+`SEALBOT_ROOT` in the container. Analysis is one position at a time; match
+requests are capped at 64 games and only one job runs at once.
 
 Run everything from this directory:
 
@@ -172,6 +219,13 @@ a foreign corpus *before* KLENT begins, not machinery inside the loop.
   `λ_ret = e^{-1/16}`, the paper's 8-turn horizon at Hexo's two placements
   per turn. `docs/KLENT_RUN_PLAN.md` §2/§3 record the verification and the
   measured history.
+- **Evaluation search is Gumbel sequential halving over deterministic
+  lines.** The root samples at most 16 candidates by policy logit plus
+  Gumbel noise, then spends the simulation budget deepening surviving lines
+  by interior `π′` argmax. The in-loop default is 32 simulations; zero is
+  exact policy argmax for historical offline comparisons. This is
+  evaluation-only: collection and fitting import no search code, and the
+  KLENT operator remains the only training-time improvement.
 - **A run is its directory.** `python -m mantisnet.klent.run --out runs/<name>
   --iterations N` writes `config.json` (knobs + versions), `metrics.jsonl`
   (strict JSON, one row per iteration: the §13 metrics including the
@@ -182,14 +236,15 @@ a foreign corpus *before* KLENT begins, not machinery inside the loop.
   resumable checkpoints; `--resume` continues after a crash and refuses a
   checkpoint from other versions; `--init-from` forks a fresh run (own
   seed, iteration 0) from a trained checkpoint. `--eval-every N` plays the
-  SealBot match in-driver (`--sealbot <root>`, `--eval-depth`) and merges
-  the score into that iteration's metrics row, with an eval RNG derived
+  SealBot match in-driver (`--sealbot <root>`, uncapped `--eval-time 0.1`
+  by default, optional `--eval-depth`, and `--eval-sims 32`) and merges the
+  score into that iteration's metrics row, with an eval RNG derived
   from (run seed, iteration) so the training trajectory is identical with
   evaluation on or off. `--starve-limit` ends a collapsed run with a
   checkpoint instead of a burned night, and `mantisnet.klent.crossplay`
   plays the A7 checkpoint round-robin. `docs/KLENT_RUN_PLAN.md` is the
   operational plan, §3 of it the measured history, around this driver.
-- **`mantisnet.klent.sealbot` is the one evaluation** — seat-balanced
+- **`mantisnet.klent.sealbot` is the default anchored evaluation** — seat-balanced
   paired matches against [SealBot](https://github.com/Ramora0/SealBot), an
   independent C++ alpha-beta bot for this exact game, from a machine-local
   checkout (`--sealbot <root>`; build its `minimax_cpp` there first —
@@ -200,8 +255,14 @@ a foreign corpus *before* KLENT begins, not machinery inside the loop.
   to agree with `hexo-engine` on every placement and winner (a live
   second-implementation oracle; setting `SEALBOT_ROOT` enables the tests),
   its moves are asserted legal, and `hexo_py` stays authoritative.
-  `--max-depth` caps its search for graded rungs; `--run <dir> --every N`
-  writes a strength curve to `sealbot_curve.jsonl`. First measurement
+  The match itself accepts an opponent identity/config plus a batched
+  chooser; a future champion network needs one adapter and then works in
+  both the driver and offline sweeps without another match loop.
+  The in-loop opponent is its uncapped iterative-deepening search at
+  0.1 s/turn. `--max-depth` remains an offline weaker-rung knob, while
+  offline `--sims` defaults to zero so old argmax curves stay comparable;
+  `--run <dir> --every N` writes a strength curve to
+  `sealbot_curve.jsonl`. First measurement
   (2026-07-28): the overnight-3 endpoint loses 0/64 even at depth 1 — the
   run plan §4 has the table and what it says about racing vs defending.
 
@@ -228,7 +289,7 @@ other shape here follows from having chosen scalars over arrays.
 | `iterations` | iteration | every `metrics.jsonl` field as its own column (so a threshold query needs no JSON parse), the row verbatim in `metrics_json`, and the hardware trace |
 | `games` | game, self-play *and* evaluation | winner, length, capped, eval seat/opening, and the move list as a blob |
 | `plies` | self-play ply | mover, `moves_remaining`, `legal_count`, the taken `rank`, and the five acting-time scalars |
-| `opponents` | opponent *at a setting* | `name` + `config_json`; SealBot at depth 1 and depth 3 are two opponents |
+| `opponents` | opponent *at a setting* | `name` + `config_json`; uncapped SealBot at 0.1 s and a depth-capped rung are two opponents |
 | `eval_matches` | match | score, Wilson interval, Elo, per-seat split — keyed by opponent and by iteration or checkpoint |
 | `crossplay` | A7 pairing | replaced wholesale by each run of it, as `crossplay.json` is |
 
@@ -264,11 +325,20 @@ is **~72 ms an iteration**, ~1% of a 5–7 s iteration, on the driver thread
 between the fit and the wait for the next collection — and it draws nothing
 from the training RNG, which `tests/test_telemetry.py` pins by running the
 same seed with the writer stubbed out and comparing `metrics.jsonl` line for
-line. Storage is **~78 bytes a ply** (71 of it the `plies` row; five `REAL`
-columns are 40 of those, and SQLite has no `float32`), so the operating
-point writes ~1.4 GB an hour. That is the number to watch on a multi-day
-run: the levers, in order, are dropping a scalar column, quantizing the four
-bounded ones, or recording plies for a sample of games rather than all.
+line. **The per-ply scalars are stored quantized** (schema v2, owner
+directive 2026-07-28): integers in units of 1e-4, defined once as
+`telemetry._Q` — the five `REAL` columns were 40 bytes of a ~71-byte row
+and SQLite has no `float32`; as 2–3-byte varints the same row is ~40
+bytes, and 5e-5 of rounding is far below every consumer's noise floor.
+Writers multiply and readers divide inside `telemetry.py`; nothing outside
+sees an integer. Measured ~65 B/ply on a short-game synthetic corpus
+(games-row overhead is heavy at 11 plies a game; the production mix sits
+lower). There are still no migrations — a v1 database is refused — but a
+finished run's history cannot be replayed, so `--run <dir> convert`
+regenerates a v1 file as v2 in place, deliberately and once, keeping the
+original as `telemetry.db.v1.bak`. Never against a live writer. The
+remaining levers if disk hurts again: dropping a scalar column, or
+recording plies for a sample of games rather than all.
 
 ```python
 from mantisnet import MantisConfig, MantisNet
@@ -295,7 +365,7 @@ if samples:
 | Records / runner integration for the buffer | Design doc §12/§14. The in-memory per-iteration buffer is the paper's own shape; persistence arrives with B2's per-move blob, not with a private writer here. |
 | Container-side `fit` | The package returns a loud unsupported-operation error. Production fitting is `mantisnet.klent.run`; migrating it is an owner decision, and no partial trainer is scaffolded. |
 | A second checkpoint format | Python training continues to write the authoritative Torch `.pt`. `hexo-bot init` seals that same file with the package manifest, τ/λ metadata, and a probe hash; there is no exported model or translated weight format. |
-| Python-owned test-time search | Shared `hexo-search::GumbelSession` now supplies package evaluation. Python search code is a parity reference, not a second container search path. |
+| A second container search | Shared `hexo-search::GumbelSession` supplies package evaluation. The Python Gumbel line search in `klent/search.py` remains the training loop's own eval search and the container's parity reference — one implementation per side of the boundary, proven equal by fixture. |
 | Further hand-written Triton kernels | Two have landed. Block attention computes distance buckets and the learned per-head bias in-kernel and stops each row at its live key prefix, but its fixed 64×64, four-warp, three-stage launch improved the complete long-position forward only ~1.04×, below the 1.4× target. The decoder aggregation is the one that paid: a single-warp segment reduction over the incidence, 1.39–1.82× on the forward. Dense SDPA and an `index_add_` scatter remain as the CPU/failed-shape fallbacks and for fit's recompute backward. The profile now puts the trunk's §5.1/§5.2 message passing on top at ~19 %, and everything below it is under 10 %. The same segment reduction applies to §5.1 directly (`inc_window` is emitted in window order) but not to §5.2, whose `inc_stone` is not sorted — that half would need a permutation the builder does not currently produce. |
 | FlexAttention for the §4.1 distance bias | Measured out (2026-07-27): a `score_mod` computing buckets from coordinates in-kernel was built and proven exactly equivalent (outputs ~2e-6, `dist_bias` grads ~2e-8), but at this model's sizes it ran **5× slower in fit and 2.7× slower in collection** for ≤0.2 GiB saved — once batches are budget-packed, attention is no longer the memory driver, and flex under dynamic shapes needed 128-padded lengths plus an eager block mask to compile at all. Revisit only if H or D_MAX grow enough to make the bias tensor dominant again. |
 

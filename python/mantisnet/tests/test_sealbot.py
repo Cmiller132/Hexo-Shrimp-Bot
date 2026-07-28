@@ -68,6 +68,9 @@ def test_sealbot_match_smoke():
     assert result["score_as_p0"] + result["score_as_p1"] == result["score"]
     assert result["capped"] + result["avg_plies"] >= 0
     assert result["ci_lo"] <= result["win_rate"] <= result["ci_hi"]
+    assert result["opponent_config"] == {
+        "variant": "current", "time_limit": 0.02, "max_depth": None
+    }
 
     # The per-game detail is the summary, unaggregated: same seats, same
     # score, and each game's moves start with the opening it was paired on.
@@ -101,7 +104,7 @@ def test_a_real_match_lands_in_the_telemetry_database(tmp_path):
     with tel.open_telemetry(tmp_path) as writer:
         writer.begin_run({"iterations": 0}, {"v": 1}, 0)
         record_match(
-            writer, result, per_game, variant="current", source="driver", iteration=7
+            writer, result, per_game, source="driver", iteration=7
         )
 
     conn = tel.connect(tmp_path)

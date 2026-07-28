@@ -1,12 +1,10 @@
-"""Match machinery (design doc §11): argmax π_θ, no search, seat balanced.
+"""Policy-argmax chooser and simple checkpoint cross-play machinery.
 
-π′ is a training-time construct; the deployed artefact is the policy head's
-argmax. Seats alternate because the game is asymmetric even though the
-encoding is not, and a capped game scores a half-win for each side — the
-paper's draw convention, visible in the count rather than folded away.
-Strength evaluation itself lives in ``sealbot.py`` — SealBot is the one
-external yardstick; ``play_match`` here serves checkpoint-vs-checkpoint
-cross-play and tests.
+``argmax_choose`` is the zero-search parity anchor. Evaluation strength
+matches use ``search.gumbel_choose`` and ``opponents.opponent_match``; this
+module's ``play_match`` remains the compact checkpoint-vs-checkpoint loop.
+Seats alternate because the game is asymmetric even though the encoding is
+not, and a capped game scores a half-win for each side.
 """
 
 from __future__ import annotations

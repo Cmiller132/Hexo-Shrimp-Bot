@@ -8,9 +8,9 @@ machine's counters, queryable — see `telemetry.py`), and periodic checkpoints
 carrying model, optimizer, RNG state, and the iteration counter, so a crash
 loses at most one checkpoint interval. While it lives it also keeps
 `status.json` fresh (the per-lane heartbeat) and honors the `STOP` /
-`CHECKPOINT` sentinel files once per iteration. `--eval-every N` plays a seat-balanced
-paired match against SealBot — the independent external yardstick, and the
-only evaluation — and merges its score into that iteration's metrics row;
+`CHECKPOINT` sentinel files once per iteration. `--eval-every N` plays a
+seat-balanced paired match against full-strength SealBot with the model's
+Gumbel line search, and merges its score into that iteration's metrics row;
 the eval RNG is derived from (run seed, iteration), never drawn from the
 training stream, so a run's training trajectory is identical with evaluation
 on or off.
@@ -395,12 +395,16 @@ def main(argv=None) -> None:
         help="SealBot checkout root, the external eval opponent",
     )
     ap.add_argument(
-        "--eval-depth", type=int, default=1,
-        help="SealBot's search-depth cap during eval matches",
+        "--eval-depth", type=int, default=None,
+        help="optional SealBot depth cap for a weaker evaluation rung",
     )
     ap.add_argument(
-        "--eval-time", type=float, default=0.05,
-        help="SealBot's per-turn time limit (rarely binds under the depth cap)",
+        "--eval-time", type=float, default=0.1,
+        help="SealBot's per-turn time limit (default: 0.1, uncapped search)",
+    )
+    ap.add_argument(
+        "--eval-sims", type=int, default=32,
+        help="model Gumbel line-search simulations (0 = policy argmax)",
     )
     ap.add_argument(
         "--starve-limit", type=int, default=10,
@@ -418,6 +422,12 @@ def main(argv=None) -> None:
 
     if args.eval_every > 0 and args.sealbot is None:
         raise SystemExit("--eval-every > 0 needs --sealbot")
+    if args.eval_depth is not None and args.eval_depth < 1:
+        raise SystemExit("--eval-depth must be >= 1")
+    if args.eval_time <= 0:
+        raise SystemExit("--eval-time must be > 0")
+    if args.eval_sims < 0:
+        raise SystemExit("--eval-sims must be >= 0")
     if args.resume and args.init_from is not None:
         raise SystemExit("--resume and --init-from are exclusive")
 
@@ -475,6 +485,7 @@ def main(argv=None) -> None:
         "eval_games": args.eval_games,
         "eval_depth": args.eval_depth,
         "eval_time": args.eval_time,
+        "eval_sims": args.eval_sims,
         "sealbot": str(args.sealbot) if args.sealbot else None,
         "seed": args.seed,
         "init_from": str(args.init_from) if args.init_from else None,
@@ -493,6 +504,7 @@ def main(argv=None) -> None:
         "eval_games": args.eval_games,
         "eval_depth": args.eval_depth,
         "eval_time": args.eval_time,
+        "eval_sims": args.eval_sims,
         "sealbot": str(args.sealbot) if args.sealbot else None,
         "starve_limit": args.starve_limit,
         "init_from": str(args.init_from) if args.init_from else None,
@@ -505,25 +517,37 @@ def main(argv=None) -> None:
 
     evaluate_fn = None
     if args.eval_every > 0:
-        from .sealbot import record_match, sealbot_match
+        from .opponents import SealBotOpponent, opponent_match
+        from .search import gumbel_choose
+        from .sealbot import record_match
+        from .train import network_evaluate
 
         def evaluate_fn(m, done, telemetry):
             # Seeded from (run seed, iteration), never the training stream:
             # the training trajectory is identical with evaluation on or off,
             # and a resumed run replays the same matches it would have played.
-            result, per_game = sealbot_match(
-                m,
-                cfg.device,
+            m.eval()
+            choose = gumbel_choose(
+                network_evaluate(m, cfg),
+                tau=cfg.tau,
+                lam=cfg.lam,
+                sims=args.eval_sims,
+            )
+            opponent = SealBotOpponent(
+                args.sealbot,
+                time_limit=args.eval_time,
+                max_depth=args.eval_depth,
+            )
+            result, per_game = opponent_match(
+                choose,
+                opponent,
                 args.eval_games,
                 cfg.ply_cap,
                 np.random.default_rng([args.seed, done]),
-                args.eval_time,
-                args.sealbot,
-                max_depth=args.eval_depth,
             )
             record_match(
                 telemetry, result, per_game,
-                variant="current", source="driver", iteration=done,
+                source="driver", iteration=done,
             )
             return {
                 "eval_score": result["win_rate"],
