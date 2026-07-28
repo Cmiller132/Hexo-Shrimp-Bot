@@ -187,6 +187,21 @@ deviation from it can be measured.
   writes a strength curve to `sealbot_curve.jsonl`. First measurement
   (2026-07-28): the overnight-3 endpoint loses 0/64 even at depth 1 — the
   run plan §4 has the table and what it says about racing vs defending.
+- **Opponent grounding puts that opponent in the corpus**
+  (`--ground-fraction`, with `--sealbot`/`--ground-depth`): that fraction
+  of each iteration's games seats a depth-capped SealBot on one
+  (alternating) side, unseeded. Its whole turns enter the move list but
+  never the records — the buffer holds only the model's decisions, judged
+  by an outcome a real opponent enforced. Grounded returns are pure
+  Monte-Carlo whatever `lam_ret` says (the λ-return's bootstrap chain
+  breaks at unrecorded opponent plies), and a capped grounded game is a
+  draw (g = 0) rather than dropped: surviving a killer is an outcome, and
+  the only gradient toward defense while wins are out of reach. The f
+  stats stay self-play-only so the anneal keeps its signal; grounded games
+  report `f_grounded` and a per-iteration `grounded_score` (`gnd` on the
+  console) instead. Grounding is off during warm iterations, and
+  `--init-from` forks a fresh run (own seed, iteration 0) from a trained
+  checkpoint — how ablation arms share a parent.
 
 ```python
 from mantisnet import MantisConfig, MantisNet
@@ -235,10 +250,16 @@ per lockstep step with one collate and one forward per side, which is the
 the previous iteration — they depend on nothing the model learns, so their
 ~0.5 s leaves the critical path (`generate_prefixes`, seeded off the main
 stream for resume-reproducibility). **Sampling is one uniform per game**
-against the stored π′ CDF rather than a per-game `rng.choice`. GPU
-utilization at this model size is orchestration-bound (~15–25% duty
-cycle); the honest lever for saturating it is more games per iteration,
-not kernels.
+against the stored π′ CDF rather than a per-game `rng.choice`.
+
+**End-to-end throughput plateaus at ~3.2 k samples/s** (measured 2026-07-28
+at games 256 / 512 / 1024: ~1.1 s / ~2.0 s / ~4.2 s per iteration, same
+samples/s): the loop is CPU-orchestration-bound, so more games per
+iteration raises GPU duty (spikes reach ~99% at 1024, VRAM ~4.4 GiB) but
+not throughput, while halving policy-improvement rounds per hour each
+doubling. 512 is the operating point. Depth-1 SealBot grounding at
+fraction 0.25 costs ~nothing (~1 ms/turn). The next real lever is
+pipelining collection against fitting, not more games.
 
 `KlentConfig.compile` turns on one `torch.compile(dynamic=True)` graph shared
 by collection and fitting. Sizes inside the forward come from tensor shapes,

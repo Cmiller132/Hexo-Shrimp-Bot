@@ -263,10 +263,38 @@ equilibrium races and does not defend, exactly the §3 mechanism-5 story at
 external resolution. The gap to close is tactical defense, and the
 yardstick for closing it now exists: **score against depth-1 SealBot is
 the next headline metric**, with survival plies as the gradient while the
-score sits at zero. This sharpens the order of the next builds — opponent
-grounding first (SealBot games never enter the training corpus, but
-anchor/searcher opponents in collection are the named fix for self-play
-blindness), then the A3 entropy controller.
+score sits at zero.
+
+### Opponent grounding — landed same day (2026-07-28)
+
+`--ground-fraction F --sealbot <root> --ground-depth 1` seats a
+depth-capped SealBot in one (alternating) side of `F` of each iteration's
+games, unseeded. Only the model's plies are recorded; grounded returns are
+pure Monte-Carlo (the λ-return's bootstrap chain breaks at unrecorded
+opponent plies) and a capped grounded game is a **draw, g = 0**, not a K4
+drop — against a real opponent, surviving to the cap is an outcome, and
+the only gradient toward defense while wins are out of reach. The f stats
+stay self-play-only (an external opponent terminates games regardless of
+what the policy knows — mixing them in would flatter exactly what the
+anneal walks on); grounded games report `f_grounded` and a per-iteration
+`grounded_score` instead — a free strength reading against the yardstick
+in every metrics row. Grounding stays off during warm; `--init-from`
+forks arms from a shared parent checkpoint.
+
+Measured at landing: grounding at depth 1 costs ~nothing (~1 ms/turn, one
+shared engine); a 15-iteration shakeout forked from the overnight-3
+endpoint moved `gnd` 0.00 → 0.05 with acting entropy rising 0.136 → 0.204
+— the corpus getting harder in real time. Games-per-iteration probe:
+throughput plateaus at ~3.2 k samples/s from 256 through 1024 (the loop
+is orchestration-bound); 512 chosen — double the grounded games per
+iteration of 256, twice the improvement rounds per hour of 1024.
+
+The first grounding ablation (running as this is written): three arms
+forked from `overnight-3/checkpoint_002062`, 1300 iterations at games
+512, `--ground-fraction` 0 / 0.25 / 0.5 (`runs/abl-gnd0`,
+`runs/abl-gnd25`, `runs/abl-gnd50`), judged by the depth-1 SealBot curve
+over each arm's checkpoints plus the anchor eval for regression. The
+winner's setting carries into the next long run.
 
 ---
 
