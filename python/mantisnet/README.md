@@ -37,6 +37,7 @@ python/mantisnet/
       evaluate.py     # argmax π_θ, seat-balanced matches, the anchor match
       run.py          # the run driver: config.json, metrics.jsonl, checkpoints
       crossplay.py    # the A7 checkpoint round-robin, the forgetting detector
+      sealbot.py      # the external yardstick: matches vs a SealBot checkout
   tests/              # the two specs' obligations, one file per concern
   bench/
     bench_forward.py  # builder and forward throughput at spec defaults
@@ -174,6 +175,18 @@ deviation from it can be measured.
   burned night, and `mantisnet.klent.crossplay` plays the A7 checkpoint
   round-robin. `docs/KLENT_RUN_PLAN.md` is the operational plan, §3 of it
   the measured history, around this driver.
+- **`mantisnet.klent.sealbot` is the external yardstick** — seat-balanced
+  paired matches against [SealBot](https://github.com/Ramora0/SealBot), an
+  independent C++ alpha-beta bot for this exact game, from a machine-local
+  checkout (`--sealbot <root>`; build its `minimax_cpp` there first —
+  MSVC via `setup.py build_ext --inplace` works). Its rules implementation
+  is held to agree with `hexo-engine` on every placement and winner (a live
+  second-implementation oracle; setting `SEALBOT_ROOT` enables the tests),
+  its moves are asserted legal, and `hexo_py` stays authoritative.
+  `--max-depth` caps its search for graded rungs; `--run <dir> --every N`
+  writes a strength curve to `sealbot_curve.jsonl`. First measurement
+  (2026-07-28): the overnight-3 endpoint loses 0/64 even at depth 1 — the
+  run plan §4 has the table and what it says about racing vs defending.
 
 ```python
 from mantisnet import MantisConfig, MantisNet

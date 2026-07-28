@@ -232,6 +232,42 @@ Still future, deliberately:
   diagnostic for cyclic forgetting — checkpoints already exist, so it is
   cheap when wanted.
 
+### The external yardstick — SealBot (measured 2026-07-28)
+
+`mantisnet.klent.sealbot` plays checkpoints against
+[SealBot](https://github.com/Ramora0/SealBot), an independent C++
+alpha-beta bot for this exact game (owner-supplied, machine-local checkout,
+`--sealbot <root>`). It shares nothing with this repo — separate rules
+implementation (asserted to agree with `hexo-engine` on every placement and
+every winner), a hand-tuned 729-pattern eval, real search — which makes it
+the first strength measurement that self-play conditioning cannot flatter.
+Games run in seat-balanced pairs from shared line-builder openings, since
+argmax-vs-searcher is otherwise near-deterministic; `--max-depth` caps its
+search for weaker rungs, `--run <dir>` sweeps a checkpoint curve to
+`sealbot_curve.jsonl`.
+
+What it measured, 64 games per point:
+
+| Player | vs SealBot depth-1 | vs SealBot 0.1 s/turn | survival (plies) |
+| --- | --- | --- | --- |
+| line builder (the anchor) | 0/64 | 1/64 | 16 |
+| overnight-3 it 250 (≈ warm clone) | 0/64 | — | 15 |
+| overnight-3 it 2000–2062 | 0–2/64 | 0/64 | 22–24 |
+
+Reading: the run's eval-vs-anchor climb (0.65 → 0.87) is real — survival
+against SealBot moved from anchor-level to clearly above it, and late
+checkpoints steal the occasional game from both seats. But even a
+*depth-1* SealBot (one turn of search plus mate-threat quiescence over its
+pattern eval) wins every game in near-minimal time: the self-play
+equilibrium races and does not defend, exactly the §3 mechanism-5 story at
+external resolution. The gap to close is tactical defense, and the
+yardstick for closing it now exists: **score against depth-1 SealBot is
+the next headline metric**, with survival plies as the gradient while the
+score sits at zero. This sharpens the order of the next builds — opponent
+grounding first (SealBot games never enter the training corpus, but
+anchor/searcher opponents in collection are the named fix for self-play
+blindness), then the A3 entropy controller.
+
 ---
 
 ## 5. The ladder to production-ready
