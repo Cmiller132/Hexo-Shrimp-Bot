@@ -22,3 +22,38 @@ services:
       # mount); scripts like bench/ find it through the path instead.
       - PYTHONPATH=/workspace/python/mantisnet
     working_dir: /workspace/python/mantisnet
+
+  frontend-build:
+    image: node:22
+    working_dir: /workspace/frontend
+    volumes:
+      - ${REPO_ROOT:-/mnt/d/Hexo-Shrimp-Bot}:/workspace
+      - frontend-node-modules:/workspace/frontend/node_modules
+    command: ["sh", "-lc", "npm ci && npm run build"]
+
+  deck:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: mantisnet-train
+    runtime: nvidia
+    shm_size: 8gb
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ${REPO_ROOT:-/mnt/d/Hexo-Shrimp-Bot}:/workspace
+      - /mnt/d/SealBot:/sealbot
+    environment:
+      - SEALBOT_ROOT=/sealbot
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONPATH=/workspace/python/mantisnet
+      - DECK_RUNS_ROOT=/workspace/python/mantisnet/runs
+      - DECK_FRONTEND_DIST=/workspace/frontend/dist
+      - DECK_DEVICE=${DECK_DEVICE:-cuda}
+      - DECK_RUN_COMMAND=${DECK_RUN_COMMAND:-}
+    working_dir: /workspace/python/mantisnet
+    command: ["/bin/bash", "/workspace/docker/deck-entrypoint.sh"]
+
+volumes:
+  frontend-node-modules:
