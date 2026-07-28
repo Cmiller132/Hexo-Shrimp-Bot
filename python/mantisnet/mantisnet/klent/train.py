@@ -150,8 +150,18 @@ def _pack(samples: list[Sample], order, cfg: KlentConfig) -> list[list[int]]:
     return chunks
 
 
-def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.random.Generator):
+def fit(
+    model,
+    samples: list[Sample],
+    optimizer,
+    cfg: KlentConfig,
+    rng: np.random.Generator,
+    progress=None,
+):
     """One epoch over the buffer at the paper's *effective* batch.
+
+    ``progress(chunk, chunks)`` is called after each consumed chunk — an
+    observer for heartbeats, nothing more.
 
     The memory budgets cap what one forward may hold, so chunks accumulate
     sample-weighted gradients until ~``batch_size`` samples have contributed
@@ -221,6 +231,8 @@ def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.rando
                     ((ce + q_mse) * (len(chunk) / group_n)).backward()
                     policy_sum += ce.detach() * len(chunk)
                     q_sum += q_mse.detach() * len(chunk)
+                if progress is not None:
+                    progress(consumed, len(order))
             optimizer.step()
             total += group_n
     return {
@@ -230,16 +242,19 @@ def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.rando
     }
 
 
-def collect_episodes(model, collector: Collector, cfg: KlentConfig) -> tuple[list, dict]:
+def collect_episodes(
+    model, collector: Collector, cfg: KlentConfig, progress=None
+) -> tuple[list, dict]:
     """One iteration's corpus: episodes plus the §13 collection metrics.
 
     Worker-safe by construction — it draws only from the collector's own
     stream and mutates only the collector's slots, which is what lets the
     run driver collect iteration ``i+1`` on a weight snapshot while
-    iteration ``i`` fits on the live model."""
+    iteration ``i`` fits on the live model. ``progress`` is the collector's
+    per-step observer."""
     model.eval()
     episodes, metrics = collector.collect(
-        network_evaluate(model, cfg), cfg.games_per_iteration
+        network_evaluate(model, cfg), cfg.games_per_iteration, progress
     )
     metrics.update(collection_stats(episodes))
     return episodes, metrics

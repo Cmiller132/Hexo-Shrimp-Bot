@@ -154,9 +154,15 @@ class Collector:
         # coarser than the ~256 positions the forward saturates at.
         self.chunk_cap = min(envs, max(64, envs // 4))
 
-    def collect(self, evaluate: Evaluate, episodes: int) -> tuple[list[Episode], dict]:
+    def collect(
+        self, evaluate: Evaluate, episodes: int, progress=None
+    ) -> tuple[list[Episode], dict]:
         """Step the cohort until ``episodes`` games have ended; return them
-        plus the acting-time means of the §13 diagnostics."""
+        plus the acting-time means of the §13 diagnostics.
+
+        ``progress(finished, quota, slot_plies)`` is called once per lockstep
+        step, after the barrier — an observer for heartbeats, drawing nothing
+        from the collection state it is shown."""
         done: list[Episode] = []
         stats = {"kl": 0.0, "ent": 0.0, "n": 0}
 
@@ -194,6 +200,11 @@ class Collector:
                 # step's chunking reads a stone count.
                 for fut in sampled:
                     fut.result()
+                if progress is not None:
+                    progress(
+                        len(done), episodes,
+                        [p.stone_count for p in self.positions],
+                    )
 
         metrics = {
             "acting_kl": stats["kl"] / max(stats["n"], 1),

@@ -115,6 +115,24 @@ def test_collector_carries_games_across_calls():
             assert pos.is_terminal and pos.winner == ep.winner
 
 
+def test_collector_progress_observer():
+    """The per-step observer sees every lockstep step: monotone finished
+    counts toward the quota and one live ply count per slot — and, being an
+    observer, changes nothing about what collection returns."""
+    episodes, _ = Collector(6, 200, 0.1, 0.03, np.random.default_rng(21)).collect(
+        heuristic_evaluate, 6
+    )
+    calls = []
+    observed, _ = Collector(6, 200, 0.1, 0.03, np.random.default_rng(21)).collect(
+        heuristic_evaluate, 6,
+        progress=lambda done, quota, plies: calls.append((done, quota, list(plies))),
+    )
+    assert calls and calls[-1][0] >= 6
+    assert all(quota == 6 and len(plies) == 6 for _, quota, plies in calls)
+    assert all(a[0] <= b[0] for a, b in zip(calls, calls[1:]))
+    assert [e.moves for e in observed] == [e.moves for e in episodes]
+
+
 def test_heuristic_selfplay_terminates_and_buffers_correctly():
     rng = np.random.default_rng(7)
     episodes, metrics = _collect(

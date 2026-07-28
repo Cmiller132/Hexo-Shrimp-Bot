@@ -6,7 +6,9 @@ version the run depended on), `metrics.jsonl` (one line per iteration; the
 metrics plus every game, every self-play ply, every evaluation match and the
 machine's counters, queryable — see `telemetry.py`), and periodic checkpoints
 carrying model, optimizer, RNG state, and the iteration counter, so a crash
-loses at most one checkpoint interval. `--eval-every N` plays a seat-balanced
+loses at most one checkpoint interval. While it lives it also keeps
+`status.json` fresh (the per-lane heartbeat) and honors the `STOP` /
+`CHECKPOINT` sentinel files once per iteration. `--eval-every N` plays a seat-balanced
 paired match against SealBot — the independent external yardstick, and the
 only evaluation — and merges its score into that iteration's metrics row;
 the eval RNG is derived from (run seed, iteration), never drawn from the
@@ -27,8 +29,11 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import itertools
 import json
+import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -110,6 +115,41 @@ def load_checkpoint(path: Path, model, optimizer, rng=None) -> int:
     return ckpt["iteration"]
 
 
+class _Status:
+    """The run's heartbeat: ``runs/<name>/status.json``, atomically replaced
+    (write then rename) at most once a second.
+
+    The format is the deck's contract (docs/DECK_SPEC.md): ``updated`` (UTC
+    ISO), ``iteration`` (last committed), and one entry per lane — ``collect``
+    ``{iteration, finished, quota, steps, slot_plies}``, ``fit``
+    ``{iteration, chunk, chunks}``, ``eval`` ``{iteration}`` — each ``null``
+    while that lane is idle. Lanes report from two threads (the collection
+    worker and the driver), hence the lock; a write draws nothing from the
+    training RNG and adds nothing to the metrics row, exactly like telemetry.
+    """
+
+    def __init__(self, out_dir: Path):
+        self.path = out_dir / "status.json"
+        self._lock = threading.Lock()
+        self._state = {"updated": None, "iteration": None,
+                       "collect": None, "fit": None, "eval": None}
+        self._written = 0.0
+
+    def update(self, force: bool = False, **lanes) -> None:
+        with self._lock:
+            self._state.update(lanes)
+            now = time.monotonic()
+            if not force and now - self._written < 1.0:
+                return
+            self._written = now
+            self._state["updated"] = datetime.now(timezone.utc).isoformat(
+                timespec="seconds"
+            )
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._state), encoding="utf-8")
+            tmp.replace(self.path)
+
+
 def run_training(
     model,
     optimizer,
@@ -152,9 +192,17 @@ def run_training(
     empty buffer. After this many consecutive iterations yielding under one
     sample per game, the run stops loudly (checkpointing first) instead of
     burning the night. 0 disables.
+
+    Two file seams face outward while the run lives. ``status.json`` is the
+    :class:`_Status` heartbeat. And two sentinel files in the run directory
+    are honored once per iteration: ``STOP`` (checkpoint, consume, exit 0)
+    and ``CHECKPOINT`` (write a checkpoint at the next commit point,
+    consume, continue) — how anything outside the process, the deck
+    included, asks politely instead of killing.
     """
     starved = 0
     out_dir.mkdir(parents=True, exist_ok=True)
+    status = _Status(out_dir)
     # The collection actor: a persistent clone the worker forwards through
     # while fit mutates the live model. Reloaded (cheap, on-device copies)
     # at each submission, when the worker is idle by construction.
@@ -169,9 +217,17 @@ def run_training(
         cell_budget=cfg.collect_cell_budget,
     )
 
-    def submit_collect(pool):
+    def submit_collect(pool, iteration):
         snapshot.load_state_dict(model.state_dict())
-        return pool.submit(collect_episodes, snapshot, collector, cfg)
+        steps = itertools.count(1)
+
+        def progress(finished, quota, slot_plies):
+            status.update(collect={
+                "iteration": iteration, "finished": finished, "quota": quota,
+                "steps": next(steps), "slot_plies": slot_plies,
+            })
+
+        return pool.submit(collect_episodes, snapshot, collector, cfg, progress)
 
     with (
         (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file,
@@ -190,7 +246,10 @@ def run_training(
             versions=_versions(),
             start_iteration=start_iteration,
         )
-        pending = submit_collect(pool)
+        def finish():
+            status.update(force=True, collect=None, fit=None, eval=None)
+
+        pending = submit_collect(pool, start_iteration)
         for i in range(start_iteration, iterations):
             t0 = time.perf_counter()
             episodes, metrics = pending.result()
@@ -202,19 +261,26 @@ def run_training(
             # graphs exist and collection overlaps fit.
             overlap = i > start_iteration
             if overlap and i + 1 < iterations:
-                pending = submit_collect(pool)  # overlaps the fit below
+                pending = submit_collect(pool, i + 1)  # overlaps the fit below
             samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret)]
             metrics["buffer_samples"] = len(samples)
             if samples:
-                metrics.update(fit(model, samples, optimizer, cfg, rng))
+
+                def fit_progress(chunk, chunks, i=i):
+                    status.update(fit={"iteration": i, "chunk": chunk, "chunks": chunks})
+
+                metrics.update(fit(model, samples, optimizer, cfg, rng, fit_progress))
+                status.update(fit=None)
             if not overlap and i + 1 < iterations:
-                pending = submit_collect(pool)
+                pending = submit_collect(pool, i + 1)
             metrics["seconds"] = time.perf_counter() - t0  # eval kept out: this
             done = i + 1  # column is the recompile/leak detector and must stay flat
             if eval_every and evaluate_fn is not None and done % eval_every == 0:
+                status.update(force=True, eval={"iteration": done})
                 t1 = time.perf_counter()
                 metrics.update(evaluate_fn(model, done, telemetry))
                 metrics["eval_seconds"] = time.perf_counter() - t1
+                status.update(force=True, eval=None)
             # NaN (an empty stat, e.g. won_length_mean with nothing won)
             # becomes null: a `NaN` token would make the file invalid JSON
             # for exactly the tools an operator points at it.
@@ -223,10 +289,21 @@ def run_training(
             metrics_file.flush()
             # The same row the file just took, plus the episodes behind it.
             telemetry.write_iteration(row, episodes, hardware.drain())
-            if done % checkpoint_every == 0 or done == iterations:
+            status.update(force=True, iteration=done)
+            # CHECKPOINT is the on-demand sentinel: whoever wants a durable
+            # artifact now (the deck, an operator) touches the file and the
+            # next commit point honors and consumes it.
+            requested = (out_dir / "CHECKPOINT").exists()
+            if done % checkpoint_every == 0 or done == iterations or requested:
                 save_checkpoint(
                     out_dir / f"checkpoint_{done:06d}.pt", model, optimizer, done, rng
                 )
+                if requested:
+                    (out_dir / "CHECKPOINT").unlink()
+                    print(
+                        f"checkpoint_{done:06d}.pt written (CHECKPOINT sentinel)",
+                        flush=True,
+                    )
             line = (
                 f"iteration {i}: {metrics['seconds']:.1f}s | "
                 f"f {metrics['f']:.2f} | "
@@ -251,7 +328,23 @@ def run_training(
                     f"checkpoint_{done:06d}.pt written",
                     flush=True,
                 )
+                finish()
                 return
+            # STOP is the graceful-stop sentinel: finish the iteration, make
+            # the state durable, consume the request, exit clean.
+            if (out_dir / "STOP").exists():
+                save_checkpoint(
+                    out_dir / f"checkpoint_{done:06d}.pt", model, optimizer, done, rng
+                )
+                (out_dir / "STOP").unlink()
+                print(
+                    f"stopping: STOP sentinel honored — "
+                    f"checkpoint_{done:06d}.pt written",
+                    flush=True,
+                )
+                finish()
+                return
+        finish()
 
 
 def main(argv=None) -> None:

@@ -153,6 +153,56 @@ def test_crossplay_plays_every_checkpoint_pair(tmp_path):
     assert rows[0]["capped"] <= 2
 
 
+def _tiny_run(out_dir, iterations, checkpoint_every=100, seed=2):
+    from mantisnet import MantisConfig, MantisNet
+    from mantisnet.klent import run as run_mod
+    from mantisnet.klent.train import KlentConfig
+
+    torch.manual_seed(seed)
+    model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
+    run_mod.run_training(
+        model,
+        torch.optim.Adam(model.parameters()),
+        KlentConfig(games_per_iteration=2, envs=2, ply_cap=24, batch_size=64),
+        iterations=iterations,
+        out_dir=out_dir,
+        rng=np.random.default_rng(seed),
+        checkpoint_every=checkpoint_every,
+    )
+
+
+def test_status_heartbeat(tmp_path):
+    """status.json is the deck's contract: per-lane, nulled at exit."""
+    _tiny_run(tmp_path, iterations=2)
+    status = json.loads((tmp_path / "status.json").read_text())
+    assert set(status) == {"updated", "iteration", "collect", "fit", "eval"}
+    assert status["iteration"] == 2
+    assert status["collect"] is None and status["fit"] is None and status["eval"] is None
+    assert status["updated"] is not None
+
+
+def test_stop_sentinel(tmp_path):
+    """STOP ends the run after the current iteration, durably and consumed."""
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "STOP").touch()
+    _tiny_run(tmp_path, iterations=5)
+    assert len((tmp_path / "metrics.jsonl").read_text().splitlines()) == 1
+    assert (tmp_path / "checkpoint_000001.pt").exists()
+    assert not (tmp_path / "STOP").exists()
+
+
+def test_checkpoint_sentinel(tmp_path):
+    """CHECKPOINT forces one durable write at the next commit point and the
+    run continues to its requested end."""
+    tmp_path.mkdir(exist_ok=True)
+    (tmp_path / "CHECKPOINT").touch()
+    _tiny_run(tmp_path, iterations=2)
+    assert (tmp_path / "checkpoint_000001.pt").exists()  # the sentinel's
+    assert (tmp_path / "checkpoint_000002.pt").exists()  # end-of-run
+    assert not (tmp_path / "CHECKPOINT").exists()
+    assert len((tmp_path / "metrics.jsonl").read_text().splitlines()) == 2
+
+
 def test_starvation_stops_the_run(tmp_path, monkeypatch):
     """The unattended-run guard: consecutive empty-buffer iterations end the
     run with a checkpoint instead of collecting dead games until morning."""
