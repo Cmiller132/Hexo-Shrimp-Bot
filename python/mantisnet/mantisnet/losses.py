@@ -50,9 +50,21 @@ def policy_loss(logits: Tensor, offsets: Tensor, target: Tensor) -> Tensor:
     seg = segment_ids(offsets)
 
     target = target.float()
-    sums = segment_sum(target, seg, p)
+    # The check accumulates in f64: at Hexo widths (10^4+ legal cells) honest
+    # fp32 index_add rounding alone approaches the tolerance, and this guard
+    # exists to catch corrupt targets, not accumulator noise. NaN, Inf, and
+    # truncation still fail it.
+    sums = segment_sum(target.double(), seg, p)
     if not torch.allclose(sums, torch.ones_like(sums), atol=1e-4):
-        raise ValueError("each position's policy target must sum to 1")
+        dev = (sums - 1.0).abs()
+        worst = int(dev.argmax())
+        counts = offsets[1:] - offsets[:-1]
+        raise ValueError(
+            "each position's policy target must sum to 1: "
+            f"{int((dev > 1e-4).sum())}/{p} positions off, worst |sum-1|="
+            f"{float(dev[worst]):.3e} at width {int(counts[worst])}, "
+            f"{int(target.isnan().sum())} NaN / {int(target.isinf().sum())} Inf entries"
+        )
 
     log_probs = segment_log_softmax(logits.float(), offsets)
     return segment_sum(-(target * log_probs), seg, p).mean()
