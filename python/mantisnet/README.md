@@ -140,10 +140,13 @@ deviation from it can be measured.
   refuses a sample whose stored π′ no longer matches its position's legal
   count. States are stored as move prefixes and rebuilt by replay (§12).
 - **Seeding is the line builder**, the checkpoint-free source the design doc
-  names, and the same chooser is the fixed evaluation opponent. Annealing the
-  prefix cut toward zero is an operator decision driven by the reported `f`,
-  not an automated schedule — the metric is first-class, the controller is
-  not yet earned.
+  names, and the same scoring is the warm-start evaluator
+  (`--warm-iterations`) and the fixed evaluation opponent. The cut anneal is
+  earned and mechanical (`--anneal`): the ceiling deepens while measured `f`
+  holds and backs off when it falls, recorded per row as `seed_cut_hi` —
+  a static cut was measured to park the corpus on trivial endgame stubs
+  while strength died. Its known gap: `f` measures termination, not
+  competence; the successor is a competence-gated walk.
 - **Collection goes through one seam**: `evaluate(batch) -> (policy_logits,
   q_values)` on CPU. Training wraps the network; the pipeline tests wrap a
   scripted line-extender, which is how the buffer rules are testable without
@@ -152,17 +155,25 @@ deviation from it can be measured.
   (reverse KL) and `λ = 0.03` (entropy) per the paper's eq. 2 — the design
   doc's original pair was transposed and is corrected — and
   `λ_ret = e^{-1/16}`, the paper's 8-turn horizon at Hexo's two placements
-  per turn. `docs/KLENT_RUN_PLAN.md` §2 records both resolutions.
+  per turn. Operationally the first runs use `--lam-ret 1.0`: with a young
+  Q, a 0.94-weight bootstrap erases the warm start (measured — the
+  run plan's training-night record); the λ-return returns when v̂ has
+  earned trust. `docs/KLENT_RUN_PLAN.md` §2/§3 record all of it.
 - **A run is its directory.** `python -m mantisnet.klent.run --out runs/<name>
   --iterations N` writes `config.json` (knobs + versions), `metrics.jsonl`
   (strict JSON, one row per iteration: the §13 metrics including the
-  v̂-vs-outcome calibration that watches the §9 bias), and resumable
-  checkpoints; `--resume` continues after a crash and refuses a checkpoint
-  from other versions. `--eval-every N` plays `argmax π_θ` against the line
-  builder at pinned noise — seat balanced, caps scored ½ and kept visible —
-  with an eval RNG derived from (run seed, iteration) so the training
-  trajectory is identical with evaluation on or off.
-  `docs/KLENT_RUN_PLAN.md` is the operational plan around this driver.
+  v̂-vs-outcome calibration that watches the §9 bias), `invocations.jsonl`
+  (every process that touched the run, with its resolved knobs — the anneal
+  path changes them on resume), and resumable checkpoints; `--resume`
+  continues after a crash and refuses a checkpoint from other versions.
+  `--eval-every N` plays `argmax π_θ` against the line builder at pinned
+  noise (or a frozen checkpoint via `--eval-anchor`) — seat balanced, caps
+  scored ½ and kept visible — with an eval RNG derived from (run seed,
+  iteration) so the training trajectory is identical with evaluation on or
+  off. `--starve-limit` ends a collapsed run with a checkpoint instead of a
+  burned night, and `mantisnet.klent.crossplay` plays the A7 checkpoint
+  round-robin. `docs/KLENT_RUN_PLAN.md` is the operational plan, §3 of it
+  the measured history, around this driver.
 
 ```python
 from mantisnet import MantisConfig, MantisNet

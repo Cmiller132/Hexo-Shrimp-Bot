@@ -154,6 +154,62 @@ game* (lockstep), so flat phases cost ~2 min/iteration at 64 games while
 sharp phases cost 0.3 s. Size from the shakeout's own `seconds` column, not
 per-sample arithmetic.
 
+### The first training night (2026-07-28) — five runs, five mechanisms
+
+The λ sweep the shakeout called for ran, collapsed, and each collapse was
+chased to a mechanism with a fix landed the same night. In causal order:
+
+1. **Init-noise poisoning.** KLENT exponentiates `Q/(τ+λ)`, so at
+   framework-default init π′ is *sharpened noise* (KL ≈ 4 from the policy);
+   the first fitting epoch trains π_θ onto it and seeded games stop
+   terminating. Both sweep configs died of this at birth. Fix: the Q
+   decoder's output layer initializes to zero (`MODEL_SPEC.md` appendix B,
+   a measured requirement).
+2. **The honest bootstrap starves.** With `Q ≡ 0`, π′ opens near-uniform
+   and finishes ~3% of seeded games — the §5.2 seeding assumed π′ could
+   finish cut games at birth, and that had only ever held by the init-noise
+   accident. Fix: `--warm-iterations N` — collection acts through the line
+   builder's scores (the same evaluator seam the pipeline tests use), games
+   finish, both heads train on dense real outcomes.
+3. **Bootstrap self-erasure.** At λ_ret = 0.939 a return on a longer game is
+   ~94% bootstrap, and a young Q's v̂ ≈ 0 drags Q back to zero — the warm
+   investment erased itself within two iterations of handover. Fix for now:
+   pure Monte-Carlo returns (λ_ret = 1.0) and lr 2.5e-4; the λ-return
+   returns when v̂ has earned trust. Warm must also actually converge:
+   30 warm steps left Q-loss at 0.87 (no skill); 300 drove it to ~0.05,
+   and the handover then held with Q separating winners +0.61 / losers
+   −0.37 — the healthiest iteration of the night.
+4. **Corpus conditioning, §5.1, realized.** With a static (1,8) cut the
+   corpus parks on trivial near-terminal stubs: self-play metrics stay
+   perfect while strength against a real opponent dies — checkpoint 350
+   lost 63/64 to the anchor with *all three* heads while f sat at 1.00.
+   Fix: `--anneal`, the f-driven cut walk §5.2 always required. Eval went
+   0.000 → 0.695 in 24 annealed iterations. Known gap: f measures
+   *termination*, not *competence* — deep-cut races still terminate, so
+   the ceiling can outrun the student; a competence-gated anneal (eval- or
+   length-gated) is the successor.
+5. **Exploration collapse.** At λ = 0.01, once the cut saturated, π′ went
+   near-deterministic (H ≈ 0.03–0.09): self-play locked into 11-ply mutual
+   races that Q predicted almost perfectly (calibration MAE 0.04) and the
+   anchor beat 9:1 — a self-consistent, objectively weak equilibrium, and
+   the strongest argument yet for opponent grounding and A3. Fix: λ
+   restored to 0.03 — safe *now* because Q's ±1 spread dwarfs τ+λ, so the
+   old flattening pathology cannot recur. Eval climbed from 0.02 back into
+   a stable 0.60–0.72 band and held it for 500+ iterations of pure
+   self-play.
+
+Also collected on the way: the sum-to-1 guard fired honestly a second time
+(the fp32 softmax *denominator* leaves |sum−1| ≈ N·1e-8 at 10⁴-cell widths
+— π′ is now stored f64-renormalized at the source), and `--starve-limit`
+ended every dead configuration with a checkpoint instead of a burned night.
+
+**The resolved recipe** (what `runs/overnight-3` converged to):
+`--games 256 --warm-iterations 300 --lam 0.03 --lam-ret 1.0 --lr 2.5e-4
+--seed-fraction 0.9 --anneal --starve-limit 6 --eval-every 25`. End state:
+stable self-play training at ≈ the warm clone's strength (eval ~0.65,
+peaks 0.82) — the loop *works*; exceeding the clone is what the next
+builds are for.
+
 ---
 
 ## 4. Evaluation — in the driver, and what it still isn't
