@@ -64,7 +64,7 @@ class KlentConfig:
 def _policy_q(model, batch):
     """The KLENT pass: trunk + the two heads it trains, never the value head."""
     _s, w, g = model.trunk(batch)
-    return model.policy_head(w, g, batch), model.q_head(w, g, batch)
+    return model.cell_heads(w, g, batch)
 
 
 # One symbolic-shape graph serves every batch; compiled lazily, shared by

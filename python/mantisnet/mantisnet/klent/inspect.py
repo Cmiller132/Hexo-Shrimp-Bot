@@ -68,8 +68,8 @@ def inspect_position(
     batch = collate_prefixes([moves], [t]).to(device)
     with torch.no_grad():
         _s, w, g = model.trunk(batch)
-        logits = model.policy_head(w, g, batch).float().cpu()
-        q_values = model.q_head(w, g, batch).float().cpu()
+        logits, q_values = model.cell_heads(w, g, batch)
+        logits, q_values = logits.float().cpu(), q_values.float().cpu()
     offsets = batch.legal_offsets.cpu()
     log_pi = segment_log_softmax(logits, offsets)
     imp = improved_policy(logits, q_values, offsets, tau, lam)

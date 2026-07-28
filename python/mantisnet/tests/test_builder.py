@@ -10,7 +10,7 @@ import hexo_py
 import numpy as np
 import pytest
 
-from mantisnet import NUM_PATTERNS, from_position
+from mantisnet import NUM_PATTERNS, collate, from_position
 from mantisnet.builder import _CANON, _PATTERN_RANK, _SLOT_CLASS, AXES
 
 from .conftest import oracle_live_windows
@@ -94,6 +94,18 @@ def test_decoder_table_ordering_and_coverage(positions):
                 ]
                 bucket = min(min(dists), 8) - 1 if dists else 7
                 assert bucket_by_cell[j] == bucket
+
+
+def test_decoder_entries_arrive_in_cell_order(positions):
+    # Part of the representation, not an accident of the walk: the decoder
+    # aggregation reduces each cell's run of entries in one pass, which is
+    # only the same sum if a cell's entries are contiguous. `collate` keeps it
+    # across positions because cell offsets increase with position index.
+    graphs = [from_position(pos) for pos in positions]
+    for g in graphs:
+        assert (np.diff(g.dec_cell) >= 0).all()
+    batch = collate(graphs)
+    assert (batch.dec_cell[1:] >= batch.dec_cell[:-1]).all()
 
 
 def test_ply_zero_builds_background_only():

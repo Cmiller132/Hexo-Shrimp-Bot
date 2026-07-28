@@ -27,6 +27,7 @@ python/mantisnet/
     builder.py        # §3-§4, §9: graphs, index tables, collation
     model.py          # §5-§7, §10 + appendix B: trunk, policy/Q/value heads
     attention.py      # fused coordinate-biased attention + SDPA fallback/backward
+    decoder.py        # the cell-head incidence pass: segment kernel + scatter fallback
     losses.py         # §6, §7, §10: targets, cross-entropies, decay grouping
     segments.py       # ragged per-position reductions, shared by losses and klent
     klent/
@@ -59,7 +60,8 @@ uv run python bench/bench_forward.py # throughput on CPU and the local GPU
 | Module | Role |
 | --- | --- |
 | `builder` | `build` (raw §11 inputs to a `PositionGraph`), `from_position` (the `hexo_py` wrapper), `collate` (graphs to one `Batch` of index tensors). Owns `MODEL_REPR_VERSION` and every index convention. |
-| `model` | `MantisConfig` (the §2 named parameters), `MantisNet`, `ModelOutput`. `trunk` and the three head methods are separate so a caller pays only for the heads it reads. |
+| `model` | `MantisConfig` (the §2 named parameters), `MantisNet`, `ModelOutput`. `trunk`, `cell_heads`, and `value_head` are separate so a caller pays only for the heads it reads; `policy_head` is the one-head entry the argmax chooser wants. |
+| `decoder` | `aggregate` (the pass over the decoder incidence both cell heads read) and `head_matrix` (a head's projection and embedding tables folded into the matrix reading an aggregate row). Holds no parameters. |
 | `losses` | `value_target` (two-hot projection), `value_loss`, `policy_loss` (segmented CE over ragged engine-order logits), `param_groups` (§10 decay split). |
 | `segments` | The ragged per-position reductions everything above and below shares. |
 | `klent` | The KLENT baseline: operator, returns, collection, fitting, evaluation, and the run's telemetry capture. See below. |
@@ -88,9 +90,10 @@ uv run python bench/bench_forward.py # throughput on CPU and the local GPU
   then `TOKEN`, with `TOKEN` winning the token-token pair; the one stoneless
   position (ply 0) takes the background clamp bucket 7.
 
-- **Batching is concatenation plus two padded layouts.** Message passing and
-  both MLP heads run on concatenated entities with `index_add_`/`index_select`
-  — no padding, no waste. Attention and the value readout run padded per
+- **Batching is concatenation plus two padded layouts.** Message passing runs
+  on concatenated entities with `index_add_`/`index_select` and both cell
+  heads on one segment reduction over the same concatenation — no padding, no
+  waste. Attention and the value readout run padded per
   position with the token at slot 0, masked block-diagonal by construction.
   Distance buckets are computed in-forward from padded coordinates —
   elementwise arithmetic, not index discovery — because shipping the
@@ -285,7 +288,7 @@ if samples:
 | Records / runner integration for the buffer | Design doc §12/§14. The in-memory per-iteration buffer is the paper's own shape; persistence arrives with B2's per-move blob, not with a private writer here. |
 | Checkpoint I/O | The manifest and probe protocol are `hexo-model`'s, and arrive with the package. |
 | Test-time Gumbel MCTS | Design doc §15: the paper's best number, but it measures the search, not the algorithm. |
-| Further hand-written Triton kernels | Block attention is the one kernel that landed: distance buckets and the learned per-head bias are computed in-kernel, each row stops at its live key prefix, and dense SDPA remains only for CPU/failed-shape fallback and fit's recompute backward. Its fixed 64×64, four-warp, three-stage launch passed parity but improved the complete long-position forward only ~1.04×, below the 1.4× target; add another kernel only after a new profile identifies a larger isolated cost. |
+| Further hand-written Triton kernels | Two have landed. Block attention computes distance buckets and the learned per-head bias in-kernel and stops each row at its live key prefix, but its fixed 64×64, four-warp, three-stage launch improved the complete long-position forward only ~1.04×, below the 1.4× target. The decoder aggregation is the one that paid: a single-warp segment reduction over the incidence, 1.39–1.82× on the forward. Dense SDPA and an `index_add_` scatter remain as the CPU/failed-shape fallbacks and for fit's recompute backward. The profile now puts the trunk's §5.1/§5.2 message passing on top at ~19 %, and everything below it is under 10 %. The same segment reduction applies to §5.1 directly (`inc_window` is emitted in window order) but not to §5.2, whose `inc_stone` is not sorted — that half would need a permutation the builder does not currently produce. |
 | FlexAttention for the §4.1 distance bias | Measured out (2026-07-27): a `score_mod` computing buckets from coordinates in-kernel was built and proven exactly equivalent (outputs ~2e-6, `dist_bias` grads ~2e-8), but at this model's sizes it ran **5× slower in fit and 2.7× slower in collection** for ≤0.2 GiB saved — once batches are budget-packed, attention is no longer the memory driver, and flex under dynamic shapes needed 128-padded lengths plus an eager block mask to compile at all. Revisit only if H or D_MAX grow enough to make the bias tensor dominant again. |
 
 ## Performance
@@ -297,8 +300,8 @@ pool (worst-case-dense positions):
 | --- | --- |
 | Batch build, Rust (`collate_positions`, all cores) | ~9.5 k pos/s (~0.10 ms/pos) |
 | Batch build, Python reference (single thread) | ~0.6 k pos/s |
-| Forward, compiled, bf16 autocast (random-playout shape mix) | ~9.4 k pos/s (27 ms/batch) |
-| Forward, eager, bf16 autocast | ~4.4 k pos/s |
+| Forward, compiled, bf16 autocast (random-playout shape mix) | ~11.7 k pos/s (21.9 ms/batch) |
+| Forward, eager, bf16 autocast | ~6.1 k pos/s |
 | Collection (1024 slots, 4096-game quota, trained policy) | ~144 k samples in 59.88 s from empty compiler caches / 17.55 s warm (2.42 k / 8.16 k samples/s) |
 
 **Fused attention is a measured negative against its 1.4× whole-forward
@@ -323,6 +326,52 @@ network busy time. A real compiled fit epoch was effectively flat: 8,215
 samples in 0.86 s (9,569 samples/s) dense versus 7,784 in 0.82 s (9,487
 samples/s) fused, a normalized -0.9%; the two receipts used separate
 collector corpora rather than a paired sample set.
+
+**The shared decoder aggregation is a measured 1.39–1.82× on the forward**
+(2026-07-28). Both cell heads walk one incidence table and differ only in
+their parameters, and a linear map commutes with a sum, so each head's
+projection moves out from under the gather-scatter: one pass aggregates the
+window rows, the slot-class counts, and the background bucket into a row per
+cell, and a head folds its projection and both embedding tables into the
+single matrix that reads that row. Compiled bf16 `_policy_q` time was:
+
+| Stones | Cohort | Twice-run | Shared | Speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 256 | 44.5 ms | 24.5 ms | 1.82× |
+| 50 | 1024 | 142.0 ms | 100.5 ms | 1.41× |
+| 200 | 256 | 116.6 ms | 83.1 ms | 1.40× |
+| 200 | 1024 | 468.4 ms | 335.3 ms | 1.40× |
+| 400 | 256 | 217.3 ms | 156.7 ms | 1.39× |
+| 400 | 1024 | 871.3 ms | 624.8 ms | 1.39× |
+
+Peak allocation fell with it — 3.04 to 1.96 GiB at 50 stones / cohort 1024,
+2.07 to 1.66 at 200 / 256 — since the two `(N_c, H)` fp32 accumulators are
+gone.
+
+**Sharing the incidence is not where that came from.** Inductor had already
+fused the two heads' scatters into one launch that reads the index tensors
+once and issues two `atomic_add` streams, so folding them by hand is worth
+1.12–1.15× and no more: the cost was never the duplicated indexing, it was
+2×H-wide fp32 atomics into two zeroed accumulators. Removing it takes
+aggregating H-wide *once* and projecting afterwards, and then a Triton
+segment reduction — the builder emits decoder entries in cell order, so a
+cell's run sums in registers and stores once, with no atomics and no zero
+fill. The gather-scatter's share of device time at cohort 256:
+
+| Stones | Before | After |
+| ---: | ---: | ---: |
+| 50 | 9.51 ms of 32.7 (29.1 %) | 0.62 ms of 22.1 (2.8 %) |
+| 400 | 49.2 ms of 214.9 (22.9 %) | 3.04 ms of 154.4 (2.0 %) |
+
+**The loop converts that unevenly.** A real compiled fit epoch went 32,864
+samples in 4.18 s (7,871 samples/s) to 33,043 in 3.54 s (9,346 samples/s), a
+normalized 1.19×. Collection did not move: 15.61 s / 9.3 k samples/s against
+14.75–15.25 s / 9.5–9.8 k, inside run-to-run spread. Its median game is 32
+plies, and a lockstep step at that size is bound by the host–device transfer
+and the Python around it rather than by decoder device time — the same
+orchestration ceiling the pipelined loop already met. The largest single
+kernel is now the trunk's own §5.1/§5.2 message passing, eight launches per
+forward at 18.8 % of device time at both 50 and 400 stones.
 
 Two loop-level facts behind those numbers. **Choosers are batched**
 (`choose(positions, rng) -> moves`): `play_match` advances every live game

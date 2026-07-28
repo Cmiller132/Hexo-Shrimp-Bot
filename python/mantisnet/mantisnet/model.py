@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from . import decoder
 from .attention import fused_attention
 from .builder import NEAREST_BUCKETS, NUM_PATTERNS, Batch
 
@@ -248,38 +249,72 @@ class MantisNet(nn.Module):
             s, w, g = block(s, w, g, batch, seq_lens)
         return self.ln_out(s), self.ln_out(w), self.ln_out(g)
 
-    def _decode_cells(
+    def _decoder_rows(self, w: Tensor, batch: Batch, dtype: torch.dtype) -> Tensor:
+        """The pass over the decoder incidence, shared by both cell heads.
+
+        ``dtype`` comes from a head linear the caller has already run, so the
+        aggregation is built in whatever precision autocast chose for the head
+        GEMMs that consume it, without this forward assuming which that is."""
+        return decoder.aggregate(
+            w.to(dtype),
+            batch.dec_window,
+            batch.dec_class,
+            batch.dec_cell,
+            batch.bg_cell,
+            batch.bg_bucket,
+            batch.cell_pos.shape[0],
+        )
+
+    def _cell_scores(
         self,
-        w: Tensor,
-        g: Tensor,
+        rows: Tensor,
+        g_half: Tensor,
         batch: Batch,
         lin: nn.Linear,
         e_w: nn.Embedding,
         e_bg: nn.Embedding,
         mlp: _PairMlp,
     ) -> Tensor:
-        """§6's decoder: one scalar per legal cell. Window path is a
-        gather-sum over the decoder table; background cells overwrite from
-        their bucket table; the token half of the MLP runs per position."""
-        msg = lin(w).index_select(0, batch.dec_window) + e_w(batch.dec_class)
-        h = g.new_zeros(batch.cell_pos.shape[0], self.cfg.h)
-        h.index_add_(0, batch.dec_cell, msg.to(h.dtype))
-        if batch.bg_cell.numel():
-            h.index_copy_(0, batch.bg_cell, e_bg(batch.bg_bucket).to(h.dtype))
-        g_half = mlp.lin_b(g)
-        out = mlp.out(F.relu(mlp.lin_a(h) + g_half.index_select(0, batch.cell_pos)))
+        """One head's scalar per legal cell, off the shared aggregation. The
+        head's projection and both its embedding tables live in the matrix
+        that reads an aggregate row; the token half of the MLP runs per
+        position."""
+        matrix = decoder.head_matrix(
+            lin.weight, e_w.weight, e_bg.weight, mlp.lin_a.weight
+        )
+        pre = F.linear(rows, matrix, mlp.lin_a.bias)
+        out = mlp.out(F.relu(pre + g_half.index_select(0, batch.cell_pos)))
         return out.squeeze(-1)
 
     def policy_head(self, w: Tensor, g: Tensor, batch: Batch) -> Tensor:
         """§6: one raw policy logit per legal cell, engine legal order."""
-        return self._decode_cells(w, g, batch, self.p, self.e_pw, self.e_bg, self.mlp_p)
+        g_half = self.mlp_p.lin_b(g)
+        rows = self._decoder_rows(w, batch, g_half.dtype)
+        return self._cell_scores(
+            rows, g_half, batch, self.p, self.e_pw, self.e_bg, self.mlp_p
+        )
 
-    def q_head(self, w: Tensor, g: Tensor, batch: Batch) -> Tensor:
-        """Appendix B: one action value per legal cell, same layout, bounded
-        to (−1, 1) by tanh as in the KLENT reference net — π′ exponentiates
-        Q/(τ+λ), so an unbounded Q could sharpen without limit."""
-        return torch.tanh(
-            self._decode_cells(w, g, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q)
+    def cell_heads(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor]:
+        """§6 and appendix B over the same legal cells: policy logits and
+        action values, from one pass over the decoder incidence.
+
+        The pair, not two calls, is what the KLENT operator consumes — π′
+        needs both — and the two heads read an identical incidence, so
+        aggregating it once is the whole point of the shared pass. Q is
+        bounded to (−1, 1) by tanh as in the KLENT reference net: π′
+        exponentiates Q/(τ+λ), so an unbounded Q could sharpen without
+        limit."""
+        g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
+        rows = self._decoder_rows(w, batch, g_p.dtype)
+        return (
+            self._cell_scores(
+                rows, g_p, batch, self.p, self.e_pw, self.e_bg, self.mlp_p
+            ),
+            torch.tanh(
+                self._cell_scores(
+                    rows, g_q, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q
+                )
+            ),
         )
 
     def value_head(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
@@ -312,9 +347,10 @@ class MantisNet(nn.Module):
         trains instead, skipping the value readout it never reads."""
         s_, w, g = self.trunk(batch)
         value, value_dist, value_logits = self.value_head(w, g, batch)
+        policy_logits, q_values = self.cell_heads(w, g, batch)
         return ModelOutput(
-            policy_logits=self.policy_head(w, g, batch),
-            q_values=self.q_head(w, g, batch),
+            policy_logits=policy_logits,
+            q_values=q_values,
             value=value,
             value_dist=value_dist,
             value_logits=value_logits,
