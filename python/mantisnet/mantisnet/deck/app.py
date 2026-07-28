@@ -46,8 +46,9 @@ class LaunchRun(BaseModel):
     lam_ret: float = Field(default=float(np.exp(-1 / 16)), gt=0, le=1)
     eval_every: int = Field(default=0, ge=0)
     eval_games: int = Field(default=64, ge=2, le=64)
-    eval_depth: int = Field(default=1, gt=0)
-    eval_time: float = Field(default=0.05, gt=0)
+    eval_depth: int | None = Field(default=None, gt=0)
+    eval_time: float = Field(default=0.1, gt=0)
+    eval_sims: int = Field(default=32, ge=0)
     checkpoint_every: int = Field(default=25, gt=0)
     init_from: str | None = None
     resume: bool = False

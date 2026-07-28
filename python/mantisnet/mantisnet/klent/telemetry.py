@@ -696,6 +696,7 @@ def convert_v1(run_dir) -> None:
         conn.execute("ATTACH DATABASE ? AS v1", (str(path),))
         with conn:
             conn.execute("INSERT INTO runs SELECT * FROM v1.runs")
+            conn.execute("INSERT INTO iterations SELECT * FROM v1.iterations")
             conn.execute("INSERT INTO opponents SELECT * FROM v1.opponents")
             conn.execute(
                 "INSERT INTO eval_matches (created, source, opponent, iteration,"

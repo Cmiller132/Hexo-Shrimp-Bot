@@ -310,6 +310,21 @@ CREATE TABLE schema_version (version INTEGER NOT NULL);
 CREATE TABLE runs (id INTEGER PRIMARY KEY, created TEXT NOT NULL,
     start_iteration INTEGER NOT NULL, iterations INTEGER NOT NULL,
     config_json TEXT NOT NULL, versions_json TEXT NOT NULL);
+CREATE TABLE iterations (iteration INTEGER PRIMARY KEY,
+    run INTEGER NOT NULL REFERENCES runs(id), f REAL, acting_kl REAL,
+    acting_norm_entropy REAL, won_length_mean REAL, p0_win_rate REAL,
+    first_stone_win_rate REAL, v_hat_winner_mean REAL, v_hat_loser_mean REAL,
+    v_hat_mae REAL, buffer_samples INTEGER, policy_loss REAL, q_loss REAL,
+    fit_steps INTEGER, seconds REAL, eval_score REAL, eval_capped INTEGER,
+    eval_games INTEGER, eval_seconds REAL, samples_per_s REAL,
+    games INTEGER NOT NULL, plies INTEGER NOT NULL, hw_samples INTEGER,
+    cpu_percent_mean REAL, cpu_percent_max REAL, threads_mean REAL,
+    threads_max INTEGER, rss_mean REAL, rss_max INTEGER,
+    sys_ram_used_mean REAL, sys_ram_used_max INTEGER, gpu_util_mean REAL,
+    gpu_util_max REAL, gpu_power_w_mean REAL, gpu_power_w_max REAL,
+    gpu_mem_used_mean REAL, gpu_mem_used_max INTEGER, gpu_temp_mean REAL,
+    gpu_temp_max REAL, torch_alloc_max INTEGER, torch_reserved_max INTEGER,
+    metrics_json TEXT NOT NULL);
 CREATE TABLE opponents (opponent_id INTEGER PRIMARY KEY, name TEXT NOT NULL,
     config_json TEXT NOT NULL, UNIQUE (name, config_json));
 CREATE TABLE eval_matches (match_id INTEGER PRIMARY KEY, created TEXT NOT NULL,
@@ -345,6 +360,10 @@ def test_convert_regenerates_a_v1_database(tmp_path):
         v1.executescript(_V1_SCHEMA)
         v1.execute("INSERT INTO schema_version VALUES (1)")
         v1.execute("INSERT INTO runs VALUES (1, 'then', 0, 5, '{}', '{}')")
+        v1.execute(
+            "INSERT INTO iterations (iteration, run, f, games, plies,"
+            " metrics_json) VALUES (7, 1, 0.5, 3, 40, '{}')"
+        )
         v1.execute("INSERT INTO opponents VALUES (1, 'sealbot', '{}')")
         v1.execute(
             "INSERT INTO eval_matches VALUES (1, 'then', 'driver', 1, 5, NULL,"
@@ -377,6 +396,25 @@ def test_convert_regenerates_a_v1_database(tmp_path):
     row = dict(conn.execute("SELECT * FROM eval_matches").fetchone())
     assert row["win_rate"] == 0.75 and row["forfeits"] is None
     assert dict(conn.execute("SELECT * FROM runs").fetchone())["iterations"] == 5
+    assert conn.execute(
+        "SELECT iteration FROM iterations"
+    ).fetchone()[0] == 7
+
+    # Regeneration means every table, whole: a converted database with a
+    # silently empty table is worse than a refused one.
+    backup = sqlite3.connect(tmp_path / "telemetry.db.v1.bak")
+    tables = [
+        row[0]
+        for row in backup.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+        if row[0] != "schema_version"
+    ]
+    for table in tables:
+        expected = backup.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        carried = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+        assert carried == expected, f"{table}: {carried} of {expected} rows survived"
+    backup.close()
     conn.close()
 
     with pytest.raises(ValueError, match="v1 databases only"):

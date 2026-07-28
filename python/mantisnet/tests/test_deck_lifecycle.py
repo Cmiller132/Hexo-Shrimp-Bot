@@ -65,6 +65,54 @@ def test_a_launched_run_is_listed_before_its_directory_exists(tmp_path):
         assert killed.status_code == 202, killed.text
 
 
+def test_launch_defaults_to_the_uncapped_eval_ladder(tmp_path):
+    """The driver's eval defaults are full-strength SealBot at a time limit
+    with a Gumbel search; a depth cap is an explicit weaker rung, not a
+    silent deck default."""
+    driver = tmp_path / "fake_driver.py"
+    _fake_driver(driver)
+    runs = tmp_path / "runs"
+    with TestClient(
+        create_app(runs, tmp_path / "dist", device="cpu", command_prefix=[sys.executable, str(driver)])
+    ) as client:
+        launched = client.post(
+            "/api/runs",
+            json={
+                "name": "ladder", "iterations": 20, "games": 2, "envs": 2,
+                "device": "cpu", "eval_every": 5, "sealbot": str(tmp_path),
+            },
+        )
+        assert launched.status_code == 201, launched.text
+        command = launched.json()["command"]
+        assert "--eval-depth" not in command
+        assert command[command.index("--eval-time") + 1] == "0.1"
+        assert command[command.index("--eval-sims") + 1] == "32"
+        assert client.post("/api/runs/ladder/stop").status_code == 202
+
+        _wait_for_exit(client, "ladder")
+        capped = client.post(
+            "/api/runs",
+            json={
+                "name": "rung", "iterations": 20, "games": 2, "envs": 2,
+                "device": "cpu", "eval_every": 5, "sealbot": str(tmp_path),
+                "eval_depth": 3,
+            },
+        )
+        assert capped.status_code == 201, capped.text
+        command = capped.json()["command"]
+        assert command[command.index("--eval-depth") + 1] == "3"
+        assert client.post("/api/runs/rung/stop").status_code == 202
+
+
+def _wait_for_exit(client, name):
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if client.get(f"/api/runs/{name}").json()["exit_code"] is not None:
+            return
+        time.sleep(.02)
+    raise AssertionError(f"{name} did not exit")
+
+
 def test_lifecycle_one_active_run_and_sentinels(tmp_path):
     driver = tmp_path / "fake_driver.py"
     _fake_driver(driver)

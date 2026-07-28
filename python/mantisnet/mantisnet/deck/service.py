@@ -206,10 +206,14 @@ class RunRegistry:
                 "--checkpoint-every", str(request.get("checkpoint_every", 25)),
                 "--eval-every", str(request.get("eval_every", 0)),
                 "--eval-games", str(request.get("eval_games", 64)),
-                "--eval-depth", str(request.get("eval_depth", 1)),
-                "--eval-time", str(request.get("eval_time", 0.05)),
+                "--eval-time", str(request.get("eval_time", 0.1)),
+                "--eval-sims", str(request.get("eval_sims", 32)),
                 "--device", str(request.get("device", os.environ.get("DECK_DEVICE", "cuda"))),
             ]
+            if request.get("eval_depth") is not None:
+                # No cap means the driver's uncapped default: full-strength
+                # SealBot at the time limit. A cap is a weaker offline rung.
+                args += ["--eval-depth", str(request["eval_depth"])]
             if request.get("init_from"):
                 args += ["--init-from", str(self.resolve_checkpoint(request["init_from"]))]
             if resume:
