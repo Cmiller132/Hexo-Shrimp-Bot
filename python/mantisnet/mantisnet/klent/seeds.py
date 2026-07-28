@@ -45,15 +45,28 @@ def line_evaluate(batch):
     return scores, scores.clone()
 
 
+def line_builder_choose_batch(positions, rng: np.random.Generator, noise: float = 0.1):
+    """One placement per position: each game's best-scoring legal cell, with
+    ``noise`` chance of a uniformly random legal move. Ties break randomly
+    so two line builders produce different games. One collate and one
+    scoring pass serve the whole batch."""
+    batch = collate_positions(positions)
+    scores = line_scores(batch).numpy()
+    offsets = batch.legal_offsets.tolist()
+    moves = []
+    for k, pos in enumerate(positions):
+        segment = scores[offsets[k] : offsets[k + 1]]
+        if rng.random() < noise:
+            moves.append(pos.nth_legal(int(rng.integers(len(segment)))))
+        else:
+            top = np.flatnonzero(segment == segment.max())
+            moves.append(pos.nth_legal(int(top[rng.integers(len(top))])))
+    return moves
+
+
 def line_builder_choose(pos, rng: np.random.Generator, noise: float = 0.1):
-    """One placement: the best-scoring legal cell, with ``noise`` chance of a
-    uniformly random legal move. Ties break randomly so two line builders
-    produce different games."""
-    if rng.random() < noise:
-        return pos.nth_legal(int(rng.integers(pos.legal_count)))
-    scores = line_scores(collate_positions([pos])).numpy()
-    top = np.flatnonzero(scores == scores.max())
-    return pos.nth_legal(int(top[rng.integers(len(top))]))
+    """The batch chooser, for one position."""
+    return line_builder_choose_batch([pos], rng, noise)[0]
 
 
 def line_builder_game(rng: np.random.Generator, noise: float = 0.1, cap: int = 512):

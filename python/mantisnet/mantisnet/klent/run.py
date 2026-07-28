@@ -30,10 +30,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from concurrent.futures import ThreadPoolExecutor
+
 from ..builder import MODEL_REPR_VERSION
 from ..model import MantisConfig, MantisNet
 from .evaluate import ANCHOR_NOISE, anchor_match, argmax_choose
-from .train import KlentConfig, iterate
+from .train import KlentConfig, generate_prefixes, iterate
 
 
 def _versions() -> dict:
@@ -135,10 +137,31 @@ def run_training(
     starved = 0
     cut_lo, cut_hi = cfg.seed_cut
     out_dir.mkdir(parents=True, exist_ok=True)
-    with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file:
+
+    def submit_prefixes(pool):
+        # Knobs are frozen at submission (the anneal mutates cfg between
+        # iterations) and the worker seed comes off the main stream, so a
+        # resumed run regenerates the same prefixes.
+        return pool.submit(
+            generate_prefixes,
+            int(rng.integers(2**63)),
+            cfg.games_per_iteration,
+            cfg.seed_fraction,
+            cfg.seed_cut,
+            cfg.seed_noise,
+        )
+
+    with (
+        (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file,
+        ThreadPoolExecutor(max_workers=1) as pool,
+    ):
+        pending = submit_prefixes(pool)
         for i in range(start_iteration, iterations):
             t0 = time.perf_counter()
-            metrics = iterate(model, optimizer, cfg, rng, warm=i < warm_iterations)
+            prefixes = pending.result()
+            metrics = iterate(
+                model, optimizer, cfg, rng, warm=i < warm_iterations, prefixes=prefixes
+            )
             metrics["iteration"] = i
             if anneal and i >= warm_iterations:
                 f = metrics["f_seeded"]
@@ -148,6 +171,7 @@ def run_training(
                     cut_hi = max(cut_lo, cut_hi - 4)
                 cfg.seed_cut = (cut_lo, cut_hi)
             metrics["seed_cut_hi"] = cut_hi
+            pending = submit_prefixes(pool)  # overlaps eval, write, next collect
             metrics["seconds"] = time.perf_counter() - t0  # eval kept out: this
             done = i + 1  # column is the recompile/leak detector and must stay flat
             if eval_every and evaluate_fn is not None and done % eval_every == 0:

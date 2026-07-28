@@ -202,7 +202,7 @@ def test_anneal_walks_the_cut_by_measured_f(tmp_path, monkeypatch):
     cfg = KlentConfig(games_per_iteration=8, seed_cut=(1, 8), ply_cap=64)
     fs = iter([1.0, 1.0, 1.0, 0.1, 0.1, float("nan"), 1.0])
 
-    def fake_iterate(model, opt, c, rng, warm=False):
+    def fake_iterate(model, opt, c, rng, warm=False, prefixes=None):
         return {
             "f_seeded": next(fs), "f_unseeded": 1.0, "buffer_samples": 99,
             "acting_kl": 0.0, "acting_norm_entropy": 0.5,

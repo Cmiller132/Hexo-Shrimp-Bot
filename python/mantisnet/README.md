@@ -210,8 +210,22 @@ pool (worst-case-dense positions):
 | Batch build, Python reference (single thread) | ~0.6 k pos/s |
 | Forward, compiled, bf16 autocast | ~9.4 k pos/s (27 ms/batch) |
 | Forward, eager, bf16 autocast | ~4.4 k pos/s |
-| KLENT iteration (32 games, cap 200, steady state) | ~3 s (was ~30 s eager + Python builder) |
-| KLENT iteration (64 games, cap 512, iteration 0) | ~36 s — the capped-tail worst case |
+| Collection, steady state (256 games, trained policy) | ~9.3 k pos/s (~0.35 s) |
+| KLENT iteration, steady state (256 games) | ~1.1–1.5 s at 3–4.5 k samples (~3 k samples/s end to end) |
+| Anchor eval, 128 games | ~0.3 s (was ~6 s sequential) |
+| KLENT iteration (64 games, cap 512, iteration 0, untrained) | ~36 s — the capped-tail worst case |
+
+Three loop-level facts behind those numbers. **Choosers are batched**
+(`choose(positions, rng) -> moves`): `play_match` advances every live game
+per lockstep step with one collate and one forward per side, which is the
+~20× on evaluation. **Seed prefixes generate on a worker thread** during
+the previous iteration — they depend on nothing the model learns, so their
+~0.5 s leaves the critical path (`generate_prefixes`, seeded off the main
+stream for resume-reproducibility). **Sampling is one uniform per game**
+against the stored π′ CDF rather than a per-game `rng.choice`. GPU
+utilization at this model size is orchestration-bound (~15–25% duty
+cycle); the honest lever for saturating it is more games per iteration,
+not kernels.
 
 `KlentConfig.compile` turns on one `torch.compile(dynamic=True)` graph shared
 by collection and fitting. Sizes inside the forward come from tensor shapes,

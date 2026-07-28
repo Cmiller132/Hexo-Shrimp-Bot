@@ -184,8 +184,24 @@ def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.rando
     }
 
 
+def generate_prefixes(seed: int, n: int, seed_fraction: float, seed_cut, seed_noise):
+    """One iteration's seed prefixes, from a self-contained RNG — the run
+    driver generates them on a worker thread while the previous iteration
+    still fits, because prefixes depend on nothing the model learns."""
+    prng = np.random.default_rng(seed)
+    return [
+        seed_prefix(prng, seed_cut, seed_noise) if prng.random() < seed_fraction else []
+        for _ in range(n)
+    ]
+
+
 def iterate(
-    model, optimizer, cfg: KlentConfig, rng: np.random.Generator, warm: bool = False
+    model,
+    optimizer,
+    cfg: KlentConfig,
+    rng: np.random.Generator,
+    warm: bool = False,
+    prefixes: list | None = None,
 ) -> dict:
     """One full KLENT iteration. Returns the §13 first-class metrics; an
     empty buffer (f = 0) skips fitting rather than failing — that outcome is
@@ -195,13 +211,18 @@ def iterate(
     builder's scores instead of the network, because an honestly-initialized
     π′ is near-uniform and finishes almost no seeded games — measured, not
     supposed. Warm returns are pure Monte-Carlo outcomes (λ_ret = 1): the
-    heuristic's v̂ lives on an arbitrary scale and must not bootstrap."""
-    prefixes = [
-        seed_prefix(rng, cfg.seed_cut, cfg.seed_noise)
-        if rng.random() < cfg.seed_fraction
-        else []
-        for _ in range(cfg.games_per_iteration)
-    ]
+    heuristic's v̂ lives on an arbitrary scale and must not bootstrap.
+
+    ``prefixes`` may be supplied (the driver pre-generates them on a worker
+    thread); left ``None``, they are drawn here from ``rng``."""
+    if prefixes is None:
+        prefixes = generate_prefixes(
+            int(rng.integers(2**63)),
+            cfg.games_per_iteration,
+            cfg.seed_fraction,
+            cfg.seed_cut,
+            cfg.seed_noise,
+        )
     model.eval()
     episodes, metrics = play_episodes(
         line_evaluate if warm else network_evaluate(model, cfg),

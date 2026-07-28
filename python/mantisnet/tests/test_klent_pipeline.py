@@ -17,7 +17,6 @@ from mantisnet.klent import (
     KlentConfig,
     episode_samples,
     iterate,
-    line_builder_choose,
     play_episodes,
     play_match,
 )
@@ -222,8 +221,10 @@ def test_network_evaluate_matches_forward():
 
 
 def test_play_match_is_seat_balanced_and_scores_caps_as_half():
+    from mantisnet.klent.seeds import line_builder_choose_batch
+
     rng = np.random.default_rng(13)
-    builder = lambda pos, r: line_builder_choose(pos, r, noise=0.0)  # noqa: E731
+    builder = lambda ps, r: line_builder_choose_batch(ps, r, noise=0.0)  # noqa: E731
     result = play_match(builder, builder, games=4, ply_cap=300, rng=rng)
     assert result["games"] == 4
     assert 0.0 <= result["score_a"] <= 4.0
