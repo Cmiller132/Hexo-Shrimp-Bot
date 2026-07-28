@@ -62,16 +62,21 @@ def play_match(
     return {"score_a": score_a, "games": games, "capped": capped}
 
 
-def anchor_match(model, device: str, games: int, ply_cap: int, rng: np.random.Generator) -> dict:
-    """The run plan's anchor zero: argmax π_θ against the line builder at
-    pinned noise. Returns metrics-row fields; capped games are visible in
-    ``eval_capped`` rather than folded away."""
+def anchor_match(
+    model, device: str, games: int, ply_cap: int, rng: np.random.Generator, opponent=None
+) -> dict:
+    """Argmax π_θ against the anchor. The default opponent is anchor zero —
+    the line builder at pinned noise; a frozen checkpoint's chooser replaces
+    it once one is worth freezing (design doc §11). Returns metrics-row
+    fields; capped games are visible in ``eval_capped``, never folded away."""
     model.eval()
 
-    def anchor(pos, anchor_rng):
-        return line_builder_choose(pos, anchor_rng, ANCHOR_NOISE)
+    if opponent is None:
 
-    result = play_match(argmax_choose(model, device), anchor, games, ply_cap, rng)
+        def opponent(pos, anchor_rng):
+            return line_builder_choose(pos, anchor_rng, ANCHOR_NOISE)
+
+    result = play_match(argmax_choose(model, device), opponent, games, ply_cap, rng)
     return {
         "eval_score": result["score_a"] / result["games"],
         "eval_capped": result["capped"],

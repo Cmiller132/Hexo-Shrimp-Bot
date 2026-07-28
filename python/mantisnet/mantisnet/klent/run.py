@@ -32,7 +32,7 @@ import torch
 
 from ..builder import MODEL_REPR_VERSION
 from ..model import MantisConfig, MantisNet
-from .evaluate import ANCHOR_NOISE, anchor_match
+from .evaluate import ANCHOR_NOISE, anchor_match, argmax_choose
 from .train import KlentConfig, iterate
 
 
@@ -61,6 +61,23 @@ def save_checkpoint(path: Path, model, optimizer, iteration: int, rng) -> None:
         tmp,
     )
     tmp.replace(path)
+
+
+def load_model(path: Path, device: str = "cpu"):
+    """A checkpoint's model half, version-checked — the frozen eval anchor.
+
+    Architecture comes from the default :class:`MantisConfig`, which is what
+    every run trains; a checkpoint from other shapes fails the state-dict
+    load loudly rather than being adapted to."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if ckpt["versions"] != _versions():
+        raise ValueError(
+            f"checkpoint versions {ckpt['versions']} != this build {_versions()}"
+        )
+    model = MantisNet(MantisConfig()).to(device)
+    model.load_state_dict(ckpt["model"])
+    model.eval()
+    return model
 
 
 def load_checkpoint(path: Path, model, optimizer, rng) -> int:
@@ -145,7 +162,10 @@ def main(argv=None) -> None:
     ap.add_argument("--lam-ret", type=float, default=KlentConfig.lam_ret)
     ap.add_argument("--seed-fraction", type=float, default=1.0)
     ap.add_argument("--seed-cut", type=int, nargs=2, default=[1, 8], metavar=("LO", "HI"))
-    ap.add_argument("--batch", type=int, default=1024, help="max samples per fit step")
+    ap.add_argument(
+        "--batch", type=int, default=KlentConfig.batch_size,
+        help="effective fitting batch, accumulated across packed chunks",
+    )
     ap.add_argument(
         "--pair-budget", type=int, default=KlentConfig.pair_budget,
         help="attention pairs per network batch — the VRAM knob",
@@ -161,6 +181,10 @@ def main(argv=None) -> None:
         help="anchor match every N iterations (0 = off)",
     )
     ap.add_argument("--eval-games", type=int, default=64)
+    ap.add_argument(
+        "--eval-anchor", type=Path, default=None,
+        help="a frozen checkpoint as the eval opponent (default: the line builder)",
+    )
     ap.add_argument("--seed", type=int, default=0, help="the run's RNG seed")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-compile", action="store_true")
@@ -216,12 +240,38 @@ def main(argv=None) -> None:
         }
         (out / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
+    # Every invocation records its resolved knobs: a resume may legitimately
+    # change them (the seed curriculum anneals by stop-and-resume), and a
+    # run whose later knobs exist only in shell history does not reproduce.
+    invocation = {
+        "start_iteration": start,
+        "iterations": args.iterations,
+        "checkpoint_every": args.checkpoint_every,
+        "eval_every": args.eval_every,
+        "eval_games": args.eval_games,
+        "eval_anchor": str(args.eval_anchor) if args.eval_anchor else None,
+        "seed": args.seed,
+        "klent": dataclasses.asdict(cfg),
+        "versions": _versions(),
+    }
+    with (out / "invocations.jsonl").open("a", encoding="utf-8") as f:
+        f.write(json.dumps(invocation) + "\n")
+
+    opponent = None
+    if args.eval_anchor is not None:
+        opponent = argmax_choose(load_model(args.eval_anchor, cfg.device), cfg.device)
+
     def evaluate_fn(m, done):
         # Seeded from (run seed, iteration), never the training stream: the
         # training trajectory is identical with evaluation on or off, and a
         # resumed run replays the same matches it would have played.
         return anchor_match(
-            m, cfg.device, args.eval_games, cfg.ply_cap, np.random.default_rng([args.seed, done])
+            m,
+            cfg.device,
+            args.eval_games,
+            cfg.ply_cap,
+            np.random.default_rng([args.seed, done]),
+            opponent=opponent,
         )
 
     run_training(

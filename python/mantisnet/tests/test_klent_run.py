@@ -81,12 +81,20 @@ def test_run_resume_and_artifacts(tmp_path):
         assert key in row
     assert (out / "checkpoint_000002.pt").exists()
 
-    # Resume finds the latest checkpoint and appends rather than restarting.
-    main(args + ["--iterations", "3", "--resume"])
+    # Resume finds the latest checkpoint and appends rather than restarting;
+    # a knob changed on resume (the anneal path) lands on the record.
+    main(args + ["--iterations", "3", "--resume", "--lam", "0.05"])
     lines = (out / "metrics.jsonl").read_text().splitlines()
     assert len(lines) == 3
     assert json.loads(lines[-1])["iteration"] == 2
     assert (out / "checkpoint_000003.pt").exists()
+    invocations = [
+        json.loads(line)
+        for line in (out / "invocations.jsonl").read_text().splitlines()
+    ]
+    assert [inv["start_iteration"] for inv in invocations] == [0, 2]
+    assert invocations[0]["klent"]["lam"] == 0.03
+    assert invocations[1]["klent"]["lam"] == 0.05
 
     # A fresh start into a used directory is refused.
     with pytest.raises(SystemExit, match="not empty"):
@@ -122,6 +130,36 @@ def test_eval_in_driver_leaves_training_untouched(tmp_path):
 
     config = json.loads((tmp_path / "evaled" / "config.json").read_text())
     assert config["eval_every"] == 1 and config["eval_anchor_noise"] == 0.1
+
+
+def test_frozen_anchor_and_crossplay(tmp_path):
+    """A checkpoint serves as the frozen eval opponent, and the A7 matrix
+    plays every checkpoint pair of a run."""
+    from mantisnet.klent.crossplay import cross_play
+
+    out = tmp_path / "run"
+    base = [
+        "--games", "2", "--cap", "16", "--batch", "64",
+        "--device", "cpu", "--seed-cut", "1", "3",
+    ]
+    main(["--out", str(out), "--seed", "4", "--checkpoint-every", "1",
+          "--iterations", "2"] + base)
+    anchor = out / "checkpoint_000001.pt"
+
+    out2 = tmp_path / "run2"
+    main(["--out", str(out2), "--seed", "5", "--checkpoint-every", "1",
+          "--iterations", "1", "--eval-every", "1", "--eval-games", "2",
+          "--eval-anchor", str(anchor)] + base)
+    row = json.loads((out2 / "metrics.jsonl").read_text().splitlines()[-1])
+    assert 0.0 <= row["eval_score"] <= 1.0
+    invocation = json.loads((out2 / "invocations.jsonl").read_text().splitlines()[0])
+    assert invocation["eval_anchor"].endswith("checkpoint_000001.pt")
+
+    matrix = cross_play(out, games=2, ply_cap=12, device="cpu", seed=0)
+    pair = "checkpoint_000001.pt vs checkpoint_000002.pt"
+    assert pair in matrix
+    assert 0.0 <= matrix[pair]["score_a"] <= 1.0
+    assert matrix[pair]["capped"] <= 2
 
 
 def test_checkpoint_refuses_version_drift(tmp_path):

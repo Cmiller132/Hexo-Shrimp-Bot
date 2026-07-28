@@ -64,6 +64,33 @@ def test_fit_packing_respects_budgets_and_loses_nothing():
             assert sum(len(samples[i].improved) for i in chunk) <= cfg.cell_budget
 
 
+def test_accumulated_gradients_match_one_big_batch():
+    """Chunking is memory, not optimization: an epoch forced into many tiny
+    chunks accumulates to the same gradients as one whole-buffer batch."""
+    rng = np.random.default_rng(3)
+    episodes, _ = play_episodes(
+        heuristic_evaluate, [[] for _ in range(4)], 100, 0.1, 0.03, rng
+    )
+    samples = [s for e in episodes for s in episode_samples(e, 0.939)][:24]
+    assert len(samples) >= 12
+
+    grads = []
+    for cell_budget in (10**9, 1):  # one big chunk vs all-singleton chunks
+        torch.manual_seed(0)
+        model = _tiny_model()
+        cfg = KlentConfig(
+            batch_size=len(samples), pair_budget=10**9, cell_budget=cell_budget
+        )
+        opt = torch.optim.SGD(model.parameters(), lr=0.0)  # keep grads readable
+        out = fit(model, samples, opt, cfg, np.random.default_rng(0))
+        assert out["fit_steps"] == 1
+        grads.append({n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None})
+
+    assert grads[0].keys() == grads[1].keys()
+    for name in grads[0]:
+        assert torch.allclose(grads[0][name], grads[1][name], atol=1e-4), name
+
+
 def test_collection_is_chunking_invariant():
     """Budgets change how the cohort is split across evaluate calls, and
     nothing else: with a per-position evaluator the episodes are identical."""

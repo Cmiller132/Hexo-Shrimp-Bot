@@ -37,7 +37,7 @@ class KlentConfig:
     seed_fraction: float = 1.0  # §5.2: anneal toward zero as f allows
     seed_cut: tuple = (1, 8)  # plies cut from a won seed game's end
     seed_noise: float = 0.1
-    batch_size: int = 4096  # paper's fitting batch — a per-step *maximum*
+    batch_size: int = 4096  # paper's *effective* batch: chunks accumulate to it
     lr: float = 1e-3  # paper's Adam rate
     device: str = "cpu"
     autocast: bool = False  # bf16 autocast for the network passes
@@ -132,31 +132,56 @@ def _pack(samples: list[Sample], order, cfg: KlentConfig) -> list[list[int]]:
 
 
 def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.random.Generator):
-    """One epoch over the buffer. Returns the mean loss components."""
+    """One epoch over the buffer at the paper's *effective* batch.
+
+    The memory budgets cap what one forward may hold, so chunks accumulate
+    sample-weighted gradients until ~``batch_size`` samples have contributed
+    and the optimizer steps once — the paper's batch statistics under the
+    packing. A step's gradient equals the mean loss over its whole
+    accumulated batch, so the chunking is an implementation detail of memory
+    and not of optimization. Returns the sample-weighted mean losses."""
     model.train()
     policy_q = _policy_q_fn(cfg)
     chunks = _pack(samples, rng.permutation(len(samples)), cfg)
-    policy_sum, q_sum, steps = 0.0, 0.0, 0
+
+    groups: list[tuple[list[int], int]] = []
+    group: list[int] = []
+    count = 0
     for k in rng.permutation(len(chunks)):
-        chunk = [samples[i] for i in chunks[k]]
-        batch = _rebuild(chunk).to(cfg.device)
-        target = torch.from_numpy(np.concatenate([s.improved for s in chunk])).to(cfg.device)
-        ranks = torch.tensor([s.rank for s in chunk], device=cfg.device)
-        returns = torch.tensor([s.g for s in chunk], dtype=torch.float32, device=cfg.device)
+        group.append(int(k))
+        count += len(chunks[k])
+        if count >= cfg.batch_size:
+            groups.append((group, count))
+            group, count = [], 0
+    if group:
+        groups.append((group, count))
 
-        with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
-            policy_logits, q_values = policy_q(model, batch)
-        ce = policy_loss(policy_logits.float(), batch.legal_offsets, target)
-        taken = q_values.float().index_select(0, batch.legal_offsets[:-1] + ranks)
-        q_mse = (taken - returns).square().mean()
-
+    policy_sum, q_sum, total = 0.0, 0.0, 0
+    for group, group_n in groups:
         optimizer.zero_grad(set_to_none=True)
-        (ce + q_mse).backward()
+        for k in group:
+            chunk = [samples[i] for i in chunks[k]]
+            batch = _rebuild(chunk).to(cfg.device)
+            target = torch.from_numpy(np.concatenate([s.improved for s in chunk])).to(cfg.device)
+            ranks = torch.tensor([s.rank for s in chunk], device=cfg.device)
+            returns = torch.tensor([s.g for s in chunk], dtype=torch.float32, device=cfg.device)
+
+            with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
+                policy_logits, q_values = policy_q(model, batch)
+            ce = policy_loss(policy_logits.float(), batch.legal_offsets, target)
+            taken = q_values.float().index_select(0, batch.legal_offsets[:-1] + ranks)
+            q_mse = (taken - returns).square().mean()
+
+            ((ce + q_mse) * (len(chunk) / group_n)).backward()
+            policy_sum += float(ce.detach()) * len(chunk)
+            q_sum += float(q_mse.detach()) * len(chunk)
         optimizer.step()
-        policy_sum += float(ce.detach())
-        q_sum += float(q_mse.detach())
-        steps += 1
-    return {"policy_loss": policy_sum / steps, "q_loss": q_sum / steps, "fit_steps": steps}
+        total += group_n
+    return {
+        "policy_loss": policy_sum / total,
+        "q_loss": q_sum / total,
+        "fit_steps": len(groups),
+    }
 
 
 def iterate(model, optimizer, cfg: KlentConfig, rng: np.random.Generator) -> dict:

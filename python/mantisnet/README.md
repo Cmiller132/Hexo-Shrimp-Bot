@@ -34,8 +34,9 @@ python/mantisnet/
       seeds.py        # the line-building seeder / fixed opponent
       selfplay.py     # batched collection, acting-time v̂, buffer rules, stats
       train.py        # KlentConfig, the fit epoch, the iteration
-      evaluate.py     # argmax π_θ, seat-balanced matches
+      evaluate.py     # argmax π_θ, seat-balanced matches, the anchor match
       run.py          # the run driver: config.json, metrics.jsonl, checkpoints
+      crossplay.py    # the A7 checkpoint round-robin, the forgetting detector
   tests/              # the two specs' obligations, one file per concern
   bench/
     bench_forward.py  # builder and forward throughput at spec defaults
