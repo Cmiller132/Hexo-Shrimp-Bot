@@ -20,7 +20,7 @@ import torch
 
 from ..builder import collate_prefixes
 from ..losses import policy_loss
-from .selfplay import Sample, collection_stats, play_episodes
+from .selfplay import Collector, Sample, collection_stats
 
 
 @dataclass
@@ -35,7 +35,10 @@ class KlentConfig:
     # (KLENT_PROPOSALS A1). The paper's literal e^{-1/8} would halve it.
     lam_ret: float = 0.939
     ply_cap: int = 512  # §5: capped episodes are dropped whole
-    games_per_iteration: int = 128
+    # The completion quota: an iteration's buffer is at least this many
+    # *finished* games, from however many slots are in flight.
+    games_per_iteration: int = 4096
+    envs: int = 1024  # persistent self-play slots (the reference's env count)
     batch_size: int = 4096  # paper's *effective* batch: chunks accumulate to it
     lr: float = 1e-3  # paper's Adam rate
     device: str = "cpu"
@@ -45,12 +48,17 @@ class KlentConfig:
     # collection cohort — is packed under both measured memory axes, so the
     # peak is set here rather than by whatever the corpus happens to contain.
     # Attention memory is quadratic in the batch's longest position (padding),
-    # decoder memory linear in its total legal cells.
-    pair_budget: int = 8_000_000  # padded (stones + token)^2 pairs per batch
+    # decoder memory linear in its total legal cells. Fit and collection get
+    # separate budgets because fit holds the backward graph per cell while
+    # collection runs no_grad — and in the pipelined loop both peaks are
+    # resident at once, so together they must clear the card.
+    pair_budget: int = 8_000_000  # fit: padded (stones + token)^2 pairs per batch
     # 800k cells ≈ 5.8 GiB worst-case fit peak on the iteration-0 corpus —
     # still comfortable on 12 GiB, and half the chunk count (so half the
     # per-chunk Python and launch overhead) of the original 400k.
-    cell_budget: int = 800_000  # legal cells (decoder rows) per batch
+    cell_budget: int = 800_000  # fit: legal cells (decoder rows) per batch
+    collect_pair_budget: int = 24_000_000  # collection (no_grad) equivalents
+    collect_cell_budget: int = 2_400_000
 
 
 def _policy_q(model, batch):
@@ -222,23 +230,16 @@ def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.rando
     }
 
 
-def collect_episodes(model, cfg: KlentConfig, rng: np.random.Generator) -> tuple[list, dict]:
+def collect_episodes(model, collector: Collector, cfg: KlentConfig) -> tuple[list, dict]:
     """One iteration's corpus: episodes plus the §13 collection metrics.
 
-    Worker-safe by construction — it draws only from the ``rng`` it is
-    given and mutates only the episodes it creates, which is what lets the
+    Worker-safe by construction — it draws only from the collector's own
+    stream and mutates only the collector's slots, which is what lets the
     run driver collect iteration ``i+1`` on a weight snapshot while
     iteration ``i`` fits on the live model."""
     model.eval()
-    episodes, metrics = play_episodes(
-        network_evaluate(model, cfg),
-        cfg.games_per_iteration,
-        cfg.ply_cap,
-        cfg.tau,
-        cfg.lam,
-        rng,
-        pair_budget=cfg.pair_budget,
-        cell_budget=cfg.cell_budget,
+    episodes, metrics = collector.collect(
+        network_evaluate(model, cfg), cfg.games_per_iteration
     )
     metrics.update(collection_stats(episodes))
     return episodes, metrics

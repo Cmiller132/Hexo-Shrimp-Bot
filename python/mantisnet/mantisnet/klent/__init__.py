@@ -9,7 +9,7 @@ paper's own ablation (no V head, design doc fidelity ledger).
 
 from .improve import ImprovedPolicy, improved_policy
 from .returns import lambda_returns, signs_from_moves_remaining
-from .selfplay import Episode, Sample, collection_stats, episode_samples, play_episodes
+from .selfplay import Collector, Episode, Sample, collection_stats, episode_samples
 from .train import KlentConfig, collect_episodes, fit
 from .evaluate import argmax_choose, play_match
 from .run import run_training
@@ -25,7 +25,7 @@ __all__ = [
     "Sample",
     "collection_stats",
     "episode_samples",
-    "play_episodes",
+    "Collector",
     "KlentConfig",
     "collect_episodes",
     "fit",

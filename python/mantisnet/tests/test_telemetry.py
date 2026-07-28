@@ -46,7 +46,7 @@ def _train(out_dir, iterations, start_iteration=0, seed=5):
     run_mod.run_training(
         model,
         optimizer,
-        KlentConfig(games_per_iteration=2, ply_cap=24, batch_size=64),
+        KlentConfig(games_per_iteration=2, envs=2, ply_cap=24, batch_size=64),
         iterations=iterations,
         out_dir=out_dir,
         rng=np.random.default_rng(seed),
@@ -599,7 +599,7 @@ def test_inspect_position_reproduces_a_recorded_ply(tmp_path):
     torch.manual_seed(2)
     model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
     optimizer = torch.optim.Adam(model.parameters())
-    cfg = KlentConfig(games_per_iteration=2, ply_cap=24, batch_size=64)
+    cfg = KlentConfig(games_per_iteration=2, envs=2, ply_cap=24, batch_size=64)
     run_mod.run_training(
         model, optimizer, cfg, iterations=1, out_dir=tmp_path,
         rng=np.random.default_rng(5), checkpoint_every=1,

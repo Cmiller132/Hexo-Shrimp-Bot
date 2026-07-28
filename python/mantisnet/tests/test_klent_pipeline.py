@@ -14,10 +14,10 @@ import torch
 
 from mantisnet import MantisConfig, MantisNet
 from mantisnet.klent import (
+    Collector,
     KlentConfig,
     collect_episodes,
     episode_samples,
-    play_episodes,
     play_match,
 )
 from mantisnet.klent.evaluate import argmax_choose
@@ -34,6 +34,11 @@ def _tiny_model():
             policy_hidden=32, value_hidden=32,
         )
     )
+
+
+def _collect(evaluate, games, ply_cap, tau, lam, rng, **budgets):
+    """One fresh-cohort collect call: as many slots as the quota."""
+    return Collector(games, ply_cap, tau, lam, rng, **budgets).collect(evaluate, games)
 
 
 def test_fit_packing_respects_budgets_and_loses_nothing():
@@ -61,7 +66,7 @@ def test_accumulated_gradients_match_one_big_batch():
     """Chunking is memory, not optimization: an epoch forced into many tiny
     chunks accumulates to the same gradients as one whole-buffer batch."""
     rng = np.random.default_rng(3)
-    episodes, _ = play_episodes(heuristic_evaluate, 4, 100, 0.1, 0.03, rng)
+    episodes, _ = _collect(heuristic_evaluate, 4, 100, 0.1, 0.03, rng)
     samples = [s for e in episodes for s in episode_samples(e, 0.939)][:24]
     assert len(samples) >= 12
 
@@ -88,14 +93,31 @@ def test_collection_is_chunking_invariant():
     outcomes = []
     for budgets in ({}, {"pair_budget": 2_000, "cell_budget": 400}):
         rng = np.random.default_rng(11)
-        episodes, _ = play_episodes(heuristic_evaluate, 5, 60, 0.1, 0.03, rng, **budgets)
+        episodes, _ = _collect(heuristic_evaluate, 5, 60, 0.1, 0.03, rng, **budgets)
         outcomes.append([(e.moves, e.winner) for e in episodes])
     assert outcomes[0] == outcomes[1]
 
 
+def test_collector_carries_games_across_calls():
+    """Auto-reset and carry: a quota smaller than the cohort leaves games in
+    flight, the next call finishes them, and every returned record is a
+    whole game from the empty board."""
+    rng = np.random.default_rng(10)
+    collector = Collector(4, 200, 0.1, 0.03, rng)
+    first, _ = collector.collect(heuristic_evaluate, 1)
+    assert len(first) >= 1
+    assert sum(len(e.moves) for e in collector.episodes) > 0, "no game in flight"
+    second, _ = collector.collect(heuristic_evaluate, 3)
+    assert len(second) >= 3
+    for ep in first + second:
+        pos = hexo_py.Position.replay([tuple(m) for m in ep.moves])
+        if ep.winner is not None:
+            assert pos.is_terminal and pos.winner == ep.winner
+
+
 def test_heuristic_selfplay_terminates_and_buffers_correctly():
     rng = np.random.default_rng(7)
-    episodes, metrics = play_episodes(
+    episodes, metrics = _collect(
         heuristic_evaluate, 8, ply_cap=200, tau=0.03, lam=0.1, rng=rng
     )
     won = [e for e in episodes if e.winner is not None]
@@ -118,7 +140,7 @@ def test_heuristic_selfplay_terminates_and_buffers_correctly():
 
 def test_samples_replay_to_their_positions():
     rng = np.random.default_rng(8)
-    episodes, _ = play_episodes(heuristic_evaluate, 1, ply_cap=200, tau=0.03, lam=0.1, rng=rng)
+    episodes, _ = _collect(heuristic_evaluate, 1, ply_cap=200, tau=0.03, lam=0.1, rng=rng)
     samples = episode_samples(episodes[0], lam_ret=0.9)
     assert samples, "seed 8 should produce a finished game"
     for s in samples[:: max(len(samples) // 6, 1)]:
@@ -131,7 +153,7 @@ def test_samples_replay_to_their_positions():
 
 def test_fit_trains_policy_and_q_and_never_the_value_head():
     rng = np.random.default_rng(10)
-    episodes, _ = play_episodes(heuristic_evaluate, 4, ply_cap=200, tau=0.03, lam=0.1, rng=rng)
+    episodes, _ = _collect(heuristic_evaluate, 4, ply_cap=200, tau=0.03, lam=0.1, rng=rng)
     samples = [s for e in episodes for s in episode_samples(e, 0.883)]
     assert samples
 
@@ -157,10 +179,13 @@ def test_collect_and_fit_end_to_end():
     produced fits cleanly — including the honest zero-data case, since an
     untrained policy rarely finishes a game (the design's §5 premise)."""
     model = _tiny_model()
-    cfg = KlentConfig(games_per_iteration=4, ply_cap=60, batch_size=64)
+    cfg = KlentConfig(games_per_iteration=4, envs=4, ply_cap=60, batch_size=64)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    episodes, metrics = collect_episodes(model, cfg, np.random.default_rng(12))
-    assert len(episodes) == 4
+    collector = Collector(
+        cfg.envs, cfg.ply_cap, cfg.tau, cfg.lam, np.random.default_rng(12)
+    )
+    episodes, metrics = collect_episodes(model, collector, cfg)
+    assert len(episodes) >= 4
     for key in ("f", "acting_kl", "acting_norm_entropy", "v_hat_mae"):
         assert key in metrics
     samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret)]

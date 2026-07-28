@@ -284,7 +284,7 @@ if samples:
 | Records / runner integration for the buffer | Design doc §12/§14. The in-memory per-iteration buffer is the paper's own shape; persistence arrives with B2's per-move blob, not with a private writer here. |
 | Checkpoint I/O | The manifest and probe protocol are `hexo-model`'s, and arrive with the package. |
 | Test-time Gumbel MCTS | Design doc §15: the paper's best number, but it measures the search, not the algorithm. |
-| Hand-written Triton kernels | Measured out, for now: after `torch.compile` (which generates fused Triton kernels itself) the forward is no longer the bottleneck, and the remaining costs are memory-bound scatters Inductor already fuses. Revisit if a profile ever shows one kernel dominating. |
+| Hand-written Triton kernels | The earlier "measured out" verdict was conditioned on the forward not being the bottleneck. That condition ended with the auto-reset collector (2026-07-28): collection is now ~96 % forward-path wall clock, so a hand attention kernel — padding-aware key bounds, the distance bucket computed in-kernel from coordinates, the bias table's pad row as the mask — is the active work item. |
 | FlexAttention for the §4.1 distance bias | Measured out (2026-07-27): a `score_mod` computing buckets from coordinates in-kernel was built and proven exactly equivalent (outputs ~2e-6, `dist_bias` grads ~2e-8), but at this model's sizes it ran **5× slower in fit and 2.7× slower in collection** for ≤0.2 GiB saved — once batches are budget-packed, attention is no longer the memory driver, and flex under dynamic shapes needed 128-padded lengths plus an eager block mask to compile at all. Revisit only if H or D_MAX grow enough to make the bias tensor dominant again. |
 
 ## Performance
@@ -298,9 +298,7 @@ pool (worst-case-dense positions):
 | Batch build, Python reference (single thread) | ~0.6 k pos/s |
 | Forward, compiled, bf16 autocast | ~9.4 k pos/s (27 ms/batch) |
 | Forward, eager, bf16 autocast | ~4.4 k pos/s |
-| Collection, steady state (256 games, trained policy) | ~9.3 k pos/s (~0.35 s) |
-| KLENT iteration, pipelined (1024 games) | ~2.3 s at ~14.8 k samples (~6.3 k samples/s end to end) |
-| KLENT iteration (64 games, cap 512, iteration 0, untrained) | ~36 s — the capped-tail worst case |
+| Collection (1024 slots, 4096-game quota, trained policy) | ~145 k samples in ~42 s cold / ~30 s warm (~4.9 k samples/s steady) |
 
 Two loop-level facts behind those numbers. **Choosers are batched**
 (`choose(positions, rng) -> moves`): `play_match` advances every live game
@@ -319,10 +317,20 @@ sampling loop is one flat CDF + one vectorized `searchsorted` per chunk;
 fit preps each chunk one ahead on a worker and accumulates its loss
 scalars on-device (one host sync per iteration, not per chunk).
 
-Measured at the operating point (games 1024, warm caches):
-**2.34 s/iteration at ~14.8 k samples — ~6.3 k samples/s end to end, 2×
-the sequential loop** — scaling with games again (512 → ~4.8 k/s), GPU
-bursting to 90–98% with ~5.0 GiB reserved.
+**Collection is a persistent auto-reset cohort** (2026-07-28, design doc
+§16 item 15). The old drain-to-empty lockstep ran until its single longest
+game ended — same-corpus iterations measured 2.7 s → 144 s, ~30 % of
+collection spent with under 6 % of the cohort alive. `Collector` keeps
+`envs` slots permanently full (a finished game's slot restarts from the
+empty board that step), stops at a completion quota, and carries in-flight
+games to the next call. Inside each step, chunks pipeline across three
+lanes — collate worker → GPU → sampling worker — so the CPU phases hide
+behind the forward (measured: 6.1 s of CPU busy against 4.4 s of
+wall-clock overhang at the operating point). Net: **~671 samples/s
+production average before → ~4.9 k samples/s steady after (~7×), with
+iteration wall clock bounded by construction.** The loop is now
+network-bound (~96 % of wall in the forward path), which is where the
+next round of work goes.
 
 Two threading facts the pipeline depends on. **Every compiled-callable
 invocation holds one lock** (`train._gpu_lock`): a dynamo (re)compile on

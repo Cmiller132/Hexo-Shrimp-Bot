@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 import torch
 
-from mantisnet.klent import Episode, collection_stats, play_episodes
+from mantisnet.klent import Collector, Episode, collection_stats
 from mantisnet.klent.run import load_checkpoint, main
 
 from .heuristic import heuristic_evaluate
@@ -50,7 +50,7 @@ def test_collection_stats_by_hand():
 
 def test_collection_stats_from_real_collection():
     rng = np.random.default_rng(21)
-    episodes, _ = play_episodes(heuristic_evaluate, 6, ply_cap=200, tau=0.1, lam=0.03, rng=rng)
+    episodes, _ = Collector(6, 200, 0.1, 0.03, rng).collect(heuristic_evaluate, 6)
     stats = collection_stats(episodes)
     assert 0.0 <= stats["f"] <= 1.0
     assert 0.0 <= stats["p0_win_rate"] <= 1.0
@@ -61,8 +61,9 @@ def test_collection_stats_from_real_collection():
 def test_run_resume_and_artifacts(tmp_path):
     out = tmp_path / "run"
     args = [
-        "--out", str(out), "--games", "2", "--cap", "24", "--batch", "64",
-        "--checkpoint-every", "1", "--device", "cpu", "--seed", "3",
+        "--out", str(out), "--games", "2", "--envs", "2", "--cap", "24",
+        "--batch", "64", "--checkpoint-every", "1", "--device", "cpu",
+        "--seed", "3",
     ]
     main(args + ["--iterations", "2"])
 
@@ -112,7 +113,7 @@ def test_eval_in_driver_leaves_training_untouched(tmp_path):
         model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
         return model, torch.optim.Adam(model.parameters())
 
-    cfg = KlentConfig(games_per_iteration=2, ply_cap=24, batch_size=64)
+    cfg = KlentConfig(games_per_iteration=2, envs=2, ply_cap=24, batch_size=64)
     fake_eval = lambda m, done, tel: {"eval_score": 0.5, "eval_capped": 0, "eval_games": 2}  # noqa: E731
     for name, eval_every in (("plain", 0), ("evaled", 1)):
         model, opt = build()

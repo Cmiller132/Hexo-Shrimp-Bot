@@ -39,7 +39,7 @@ from concurrent.futures import ThreadPoolExecutor
 from ..builder import MODEL_REPR_VERSION
 from ..model import MantisConfig, MantisNet
 from .hardware import hardware_sampler
-from .selfplay import episode_samples
+from .selfplay import Collector, episode_samples
 from .telemetry import open_telemetry
 from .train import KlentConfig, collect_episodes, fit
 
@@ -129,9 +129,11 @@ def run_training(
     therefore runs one fit behind the paper's strict alternation — the
     deliberate cost of overlapping the loop's CPU half with its GPU half,
     recorded here because it is an algorithmic property, not an
-    implementation detail. Collection draws from its own per-iteration
-    stream (seeded off the main one at submission), so a resumed run replays
-    the same corpus.
+    implementation detail. Collection draws from the collector's own stream
+    (seeded off the main one at construction), so a from-scratch run is
+    reproducible; a *resumed* run restarts with empty slots, so it replays
+    the same distribution but not the same games — in-flight episodes do
+    not survive the process.
 
     ``evaluate_fn(model, done, telemetry) -> dict`` runs every ``eval_every``
     completed iterations and its fields join that iteration's metrics row; it
@@ -157,13 +159,19 @@ def run_training(
     # while fit mutates the live model. Reloaded (cheap, on-device copies)
     # at each submission, when the worker is idle by construction.
     snapshot = copy.deepcopy(model)
+    collector = Collector(
+        cfg.envs,
+        cfg.ply_cap,
+        cfg.tau,
+        cfg.lam,
+        np.random.default_rng(int(rng.integers(2**63))),
+        pair_budget=cfg.collect_pair_budget,
+        cell_budget=cfg.collect_cell_budget,
+    )
 
     def submit_collect(pool):
-        play_seed = int(rng.integers(2**63))
         snapshot.load_state_dict(model.state_dict())
-        return pool.submit(
-            collect_episodes, snapshot, cfg, np.random.default_rng(play_seed)
-        )
+        return pool.submit(collect_episodes, snapshot, collector, cfg)
 
     with (
         (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file,
@@ -250,7 +258,14 @@ def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", type=Path, required=True, help="run directory")
     ap.add_argument("--iterations", type=int, required=True)
-    ap.add_argument("--games", type=int, default=64)
+    ap.add_argument(
+        "--games", type=int, default=KlentConfig.games_per_iteration,
+        help="finished games per iteration (the completion quota)",
+    )
+    ap.add_argument(
+        "--envs", type=int, default=KlentConfig.envs,
+        help="persistent self-play slots stepped in lockstep",
+    )
     ap.add_argument("--cap", type=int, default=512)
     ap.add_argument("--tau", type=float, default=KlentConfig.tau)
     ap.add_argument("--lam", type=float, default=KlentConfig.lam)
@@ -261,11 +276,19 @@ def main(argv=None) -> None:
     )
     ap.add_argument(
         "--pair-budget", type=int, default=KlentConfig.pair_budget,
-        help="attention pairs per network batch — the VRAM knob",
+        help="attention pairs per fit batch — the VRAM knob",
     )
     ap.add_argument(
         "--cell-budget", type=int, default=KlentConfig.cell_budget,
-        help="legal cells (decoder rows) per network batch — the other VRAM knob",
+        help="legal cells (decoder rows) per fit batch — the other VRAM knob",
+    )
+    ap.add_argument(
+        "--collect-pair-budget", type=int, default=KlentConfig.collect_pair_budget,
+        help="attention pairs per collection batch (no_grad, so larger)",
+    )
+    ap.add_argument(
+        "--collect-cell-budget", type=int, default=KlentConfig.collect_cell_budget,
+        help="legal cells per collection batch (no_grad, so larger)",
     )
     ap.add_argument("--lr", type=float, default=KlentConfig.lr)
     ap.add_argument("--checkpoint-every", type=int, default=25)
@@ -311,9 +334,12 @@ def main(argv=None) -> None:
         lam_ret=args.lam_ret,
         ply_cap=args.cap,
         games_per_iteration=args.games,
+        envs=args.envs,
         batch_size=args.batch,
         pair_budget=args.pair_budget,
         cell_budget=args.cell_budget,
+        collect_pair_budget=args.collect_pair_budget,
+        collect_cell_budget=args.collect_cell_budget,
         lr=args.lr,
         device=args.device,
         autocast=args.device == "cuda",

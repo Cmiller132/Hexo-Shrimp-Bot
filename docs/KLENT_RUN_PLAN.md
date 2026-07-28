@@ -359,6 +359,27 @@ The mantisnet README's Performance section records the two threading
 hazards this depends on (the compile lock and the sequential first
 iteration).
 
+### The auto-reset cohort (2026-07-28, the drain-tail fix)
+
+The pure runs exposed what the pipelined loop had left: iteration wall
+clock tracked the *single longest game*, not the corpus. Same-size
+iterations measured 2.7 s → 144 s (correlation of seconds with mean game
+length: −0.02 — it was never the average), and a step-level trace showed
+~30 % of collection wall clock spent with under 6 % of the cohort alive,
+each near-empty step still paying full collate/launch/sync overhead.
+
+The fix is design doc §16 item 15: `Collector` — persistent slots,
+auto-reset on the spot, a completion quota (owner setting: **4096 finished
+games per iteration**, toward the paper's ~2M-transition buffers), carry
+of in-flight games across calls, and a three-lane pipeline inside each
+step (collate worker → GPU → sampling worker). Measured at 1024 slots /
+4096-game quota on the pure-2 checkpoint: **145 k samples in 41.8 s cold
+(~30 s warm, ~4.9 k samples/s steady) vs the old loop's ~671 samples/s
+production average — ~7×** — with the tail structurally gone and ~96 % of
+wall clock now in the forward path. The forward is the next target; peak
+collection VRAM measured at 0.26 GiB against 12, so the memory headroom
+for that work is wide.
+
 ---
 
 ## 4a. Telemetry — the dashboard's substrate

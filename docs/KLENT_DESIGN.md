@@ -767,6 +767,20 @@ runs on. Still needed:
 14. **The anchor is SealBot, external and never a training opponent.** Pinned
     time/depth settings, seat-balanced paired matches, `argmax π_θ` with no
     search (2026-07-28; supersedes the earlier fixed-checkpoint wording).
+15. **Collection is a persistent auto-reset cohort with a completion quota**
+    (2026-07-28). The reference implementation's own shape — a fixed set of
+    environment slots, a finished game's slot restarting from the empty
+    board immediately — replacing the drain-to-empty lockstep, whose wall
+    clock was set by the single longest game (measured: iterations with
+    identical corpora varying 2.7 s → 144 s; ~30 % of collection spent with
+    under 6 % of the cohort alive). An iteration's buffer is "at least N
+    finished games". The one departure from the reference inside this: games
+    in flight when the quota fills *carry to the next call* and finish under
+    the next weights, where the reference NaN-drops its window tails. At our
+    episode-to-window ratio dropping would waste ~a third of collection;
+    carrying keeps episodes whole and adds only the one-fit-behind staleness
+    class the pipelined driver already accepts. Mixed-vintage episodes are
+    the recorded cost.
 
 ---
 
