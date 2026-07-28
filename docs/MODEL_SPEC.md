@@ -422,6 +422,16 @@ table, and MLP — emitting one raw unbounded scalar per legal cell in engine
 legal order. Trained by squared error against the λ-return of the action
 actually taken (KLENT eq. 4); nothing softmaxes or clamps it.
 
+**Its MLP's output layer initializes to zero**, overriding §10's
+framework-default for that one layer, so `Q ≡ 0` until trained. This is a
+measured requirement, not a preference (2026-07-27): KLENT's improvement
+exponentiates `Q/(τ+λ)`, which at the §10 default turns initialization
+noise into sharp, arbitrary π′ targets; the first fitting epoch trains the
+policy toward them, seeded games stop terminating, and the training loop
+starves before Q has learned anything real. With a zero start, π′ opens as
+`π_θ^{τ/(τ+λ)}` — near the policy — and sharpens only as fitted returns
+give it reason to.
+
 Like appendix A, this head reads the trunk's output and adds no inputs, so
 `MODEL_REPR_VERSION` is untouched. Under KLENT the §7 value head sits outside
 the loss entirely — faithful to the paper's no-V-head ablation — and whether

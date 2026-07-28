@@ -223,6 +223,13 @@ class MantisNet(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
         nn.init.normal_(self.token_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
+        # Appendix B: the Q decoder's output layer starts at zero, so Q ≡ 0
+        # until trained. KLENT's π′ ∝ π_θ^{τ/(τ+λ)}·exp(Q/(τ+λ)) sharpens
+        # *initialization noise* otherwise — measured to poison the seeded
+        # bootstrap: the first fit trains the policy toward arbitrary sharp
+        # targets and seeded games stop terminating.
+        nn.init.zeros_(self.mlp_q.out.weight)
+        nn.init.zeros_(self.mlp_q.out.bias)
 
     def _buckets(self, batch: Batch) -> Tensor:
         """Distance buckets for every padded row pair, once per forward (§4.1)."""
