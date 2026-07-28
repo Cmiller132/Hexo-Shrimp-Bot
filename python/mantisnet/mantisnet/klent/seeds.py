@@ -35,6 +35,16 @@ def line_scores(batch) -> torch.Tensor:
     return torch.where(per_cell >= 5, 8.0, per_cell)
 
 
+def line_evaluate(batch):
+    """The line builder's scoring as an evaluator: cell scores as both
+    policy logits and Q. The KLENT warm start (`--warm-iterations`) acts
+    through this for a run's first iterations — measured necessity: an
+    honestly-initialized π′ is near-uniform and finishes almost no seeded
+    games, so the network's first targets must come from play that ends."""
+    scores = line_scores(batch)
+    return scores, scores.clone()
+
+
 def line_builder_choose(pos, rng: np.random.Generator, noise: float = 0.1):
     """One placement: the best-scoring legal cell, with ``noise`` chance of a
     uniformly random legal move. Ties break randomly so two line builders

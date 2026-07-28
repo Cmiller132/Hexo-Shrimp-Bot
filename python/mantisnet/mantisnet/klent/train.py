@@ -17,7 +17,7 @@ import torch
 
 from ..builder import collate_prefixes
 from ..losses import policy_loss
-from .seeds import seed_prefix
+from .seeds import line_evaluate, seed_prefix
 from .selfplay import Sample, collection_stats, episode_samples, play_episodes
 
 
@@ -184,10 +184,18 @@ def fit(model, samples: list[Sample], optimizer, cfg: KlentConfig, rng: np.rando
     }
 
 
-def iterate(model, optimizer, cfg: KlentConfig, rng: np.random.Generator) -> dict:
+def iterate(
+    model, optimizer, cfg: KlentConfig, rng: np.random.Generator, warm: bool = False
+) -> dict:
     """One full KLENT iteration. Returns the §13 first-class metrics; an
     empty buffer (f = 0) skips fitting rather than failing — that outcome is
-    the signal the seeding knobs exist to move."""
+    the signal the seeding knobs exist to move.
+
+    ``warm`` is the bootstrap phase: collection acts through the line
+    builder's scores instead of the network, because an honestly-initialized
+    π′ is near-uniform and finishes almost no seeded games — measured, not
+    supposed. Warm returns are pure Monte-Carlo outcomes (λ_ret = 1): the
+    heuristic's v̂ lives on an arbitrary scale and must not bootstrap."""
     prefixes = [
         seed_prefix(rng, cfg.seed_cut, cfg.seed_noise)
         if rng.random() < cfg.seed_fraction
@@ -196,7 +204,7 @@ def iterate(model, optimizer, cfg: KlentConfig, rng: np.random.Generator) -> dic
     ]
     model.eval()
     episodes, metrics = play_episodes(
-        network_evaluate(model, cfg),
+        line_evaluate if warm else network_evaluate(model, cfg),
         prefixes,
         cfg.ply_cap,
         cfg.tau,
@@ -206,8 +214,11 @@ def iterate(model, optimizer, cfg: KlentConfig, rng: np.random.Generator) -> dic
         cell_budget=cfg.cell_budget,
     )
     metrics.update(collection_stats(episodes))
+    metrics["warm"] = int(warm)
 
-    samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret)]
+    samples = [
+        s for e in episodes for s in episode_samples(e, 1.0 if warm else cfg.lam_ret)
+    ]
     metrics["buffer_samples"] = len(samples)
     if samples:
         metrics.update(fit(model, samples, optimizer, cfg, rng))

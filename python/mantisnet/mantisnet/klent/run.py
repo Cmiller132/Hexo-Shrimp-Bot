@@ -110,6 +110,7 @@ def run_training(
     eval_every: int = 0,
     evaluate_fn=None,
     starve_limit: int = 10,
+    warm_iterations: int = 0,
 ) -> None:
     """Loop `iterate`, appending metrics and checkpointing as it goes.
 
@@ -127,7 +128,7 @@ def run_training(
     with (out_dir / "metrics.jsonl").open("a", encoding="utf-8") as metrics_file:
         for i in range(start_iteration, iterations):
             t0 = time.perf_counter()
-            metrics = iterate(model, optimizer, cfg, rng)
+            metrics = iterate(model, optimizer, cfg, rng, warm=i < warm_iterations)
             metrics["iteration"] = i
             metrics["seconds"] = time.perf_counter() - t0  # eval kept out: this
             done = i + 1  # column is the recompile/leak detector and must stay flat
@@ -210,6 +211,10 @@ def main(argv=None) -> None:
         "--starve-limit", type=int, default=10,
         help="stop after N consecutive starved iterations (0 = never)",
     )
+    ap.add_argument(
+        "--warm-iterations", type=int, default=0,
+        help="bootstrap iterations acting through the line builder's scores",
+    )
     ap.add_argument("--seed", type=int, default=0, help="the run's RNG seed")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-compile", action="store_true")
@@ -276,6 +281,7 @@ def main(argv=None) -> None:
         "eval_games": args.eval_games,
         "eval_anchor": str(args.eval_anchor) if args.eval_anchor else None,
         "starve_limit": args.starve_limit,
+        "warm_iterations": args.warm_iterations,
         "seed": args.seed,
         "klent": dataclasses.asdict(cfg),
         "versions": _versions(),
@@ -312,6 +318,7 @@ def main(argv=None) -> None:
         eval_every=args.eval_every,
         evaluate_fn=evaluate_fn,
         starve_limit=args.starve_limit,
+        warm_iterations=args.warm_iterations,
     )
 
 

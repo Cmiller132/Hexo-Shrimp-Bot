@@ -22,15 +22,13 @@ from mantisnet.klent import (
     play_match,
 )
 from mantisnet.klent.evaluate import argmax_choose
-from mantisnet.klent.seeds import line_scores, seed_prefix
-from mantisnet.klent.train import _pack, fit, network_evaluate
+from mantisnet.klent.seeds import line_evaluate, line_scores, seed_prefix
+from mantisnet.klent.train import _pack, fit, iterate, network_evaluate
 
-
-def heuristic_evaluate(batch):
-    """The line builder's scoring through the evaluator seam, so games
-    terminate and the buffer rules are observable without a trained model."""
-    score = line_scores(batch)
-    return score.clone(), score.clone()
+# The line builder's scoring through the evaluator seam, so games terminate
+# and the buffer rules are observable without a trained model — the same
+# evaluator the warm start acts through.
+heuristic_evaluate = line_evaluate
 
 
 def _tiny_model():
@@ -41,6 +39,22 @@ def _tiny_model():
             policy_hidden=32, value_hidden=32,
         )
     )
+
+
+def test_warm_iteration_trains_through_the_line_evaluator():
+    """The warm start: collection acts through the line builder, games
+    finish, and both heads fit on Monte-Carlo outcomes."""
+    model = _tiny_model()
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    cfg = KlentConfig(games_per_iteration=8, ply_cap=200, batch_size=256)
+    metrics = iterate(model, opt, cfg, np.random.default_rng(9), warm=True)
+    assert metrics["warm"] == 1
+    assert metrics["buffer_samples"] > 0, "line play must terminate games"
+    assert metrics["fit_steps"] >= 1
+    assert any(
+        p.grad is not None and float(p.grad.abs().sum()) > 0
+        for p in model.mlp_q.parameters()
+    ), "the zero-initialized Q head must receive warm gradients"
 
 
 def test_fit_packing_respects_budgets_and_loses_nothing():

@@ -173,7 +173,7 @@ def test_starvation_stops_the_run(tmp_path, monkeypatch):
         "f_seeded": 0.0, "f_unseeded": float("nan"), "buffer_samples": 0,
         "acting_kl": 0.0, "acting_norm_entropy": 0.99,
     }
-    monkeypatch.setattr(run_mod, "iterate", lambda *a: dict(starved))
+    monkeypatch.setattr(run_mod, "iterate", lambda *a, **k: dict(starved))
 
     torch.manual_seed(0)
     model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
