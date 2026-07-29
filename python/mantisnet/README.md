@@ -5,7 +5,8 @@
 `python/mantisnet` requires Python 3.12 or later and contains the MantisNet
 Torch model, independent graph-builder oracle, losses, Hexo KLENT training loop,
 telemetry store, benchmarks, and control-deck backend. The training path uses a policy head and one
-`tanh`-bounded scalar action value per legal cell. Algorithm obligations are in
+`tanh`-bounded scalar action value per legal cell, the latter decoded from the
+critic's own private tail over the trunk output. Algorithm obligations are in
 `docs/KLENT_FOR_HEXO.md`; measured experiment outcomes are in
 `docs/ABLATIONS.md`.
 
@@ -28,15 +29,16 @@ Core modules:
 | Module | Contract |
 | --- | --- |
 | `builder` | Graph construction, Rust batch conversion, and collation |
-| `model` | Stone/window trunk, policy decoder, action-value decoder, value head |
+| `model` | Stone/window trunk, policy decoder, critic tail, action-value decoder, value head |
 | `attention` | Fused attention operation plus reference path |
-| `decoder` | Shared legal-cell incidence aggregation |
+| `decoder` | Per-head legal-cell incidence aggregation |
 | `segments` | Ragged segment reductions |
 | `losses` | Policy and distributional value losses |
 | `klent.improve` | Closed-form improved policy |
 | `klent.selfplay` | Persistent-slot collection and samples |
 | `klent.train` | Network evaluation, packing, collection, and fit |
 | `klent.run` | Checkpointed iteration driver and CLI |
+| `klent.graft` | Measured conversion of a pre-critic-tail checkpoint |
 | `klent.telemetry` | SQLite writes, queries, and CLI |
 | `klent.search` | Gumbel line search used by Python evaluation |
 | `deck.app` | FastAPI routes and SPA serving |
@@ -86,6 +88,13 @@ uv run python -m mantisnet.klent.run \
   --resume
 ```
 
+Convert a checkpoint trained before the critic tail, measuring the conversion:
+
+```sh
+uv run python -m mantisnet.klent.graft OLD.pt NEW.pt \
+  --tau 0.1 --lam 0.01 --manifest graft.json
+```
+
 Inspect telemetry and run benchmarks:
 
 ```sh
@@ -120,10 +129,14 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 
 - Model weights are fp32; CUDA network calls use bf16 autocast when configured.
 - Legal-cell outputs are ragged and follow engine canonical legal order.
-- Policy and action-value decoders share incidence aggregation but own separate
-  projections, embeddings, and output MLPs.
+- The action-value head reads a critic-private tail over the trunk's window
+  rows and global token; the policy and state-value heads read the trunk's own
+  rows.
+- Each cell head therefore runs its own incidence aggregation, and owns its
+  projection, embeddings, and output MLP.
 - Action values are scalar and bounded to `(-1, 1)` by `tanh`.
-- The policy and action-value output layers initialize to zero.
+- The policy, action-value, and critic-tail output layers initialize to zero,
+  so a fresh model's cell heads are zero and its critic tail is the identity.
 - KLENT improvement consumes raw policy logits and scalar action values.
 - The KLENT fit objective trains policy cross-entropy and the taken action's
   squared return error.
@@ -135,6 +148,12 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
   budgets.
 - Checkpoints contain model state, optimizer state, completed iteration, and
   NumPy RNG state.
+- `klent.graft` is the only path from a pre-critic-tail checkpoint: it adds the
+  tail's keys, remaps Adam state by parameter name, and refuses to write unless
+  every parent tensor still equals the source file's bit for bit and a seeded
+  probe set shows the grafted action values are the parent's.
+- The graft manifest records the count and SHA-256 of the parent tensors it
+  carried unchanged alongside the probe's measurements.
 - A fresh run refuses a nonempty output directory.
 - `--resume` requires a checkpoint and is exclusive with `--init-from`.
 - `config.json` records current run fields; `invocations.jsonl` records every invocation and resume.

@@ -32,8 +32,9 @@ inputs, and no nodes for empty cells.
   background path when there are none). Trunk cost therefore scales with
   stones and live windows, not with the legal halo.
 - The **action-value** head is an independently parameterized decoder with the
-  same routing as policy. It emits one tanh-bounded scalar per legal cell
-  (appendix B).
+  same routing as policy, reading a private adaptation of the trunk output
+  rather than the trunk output itself. It emits one tanh-bounded scalar per
+  legal cell (appendix B).
 - The **value** head reads the board through multi-query attention over the
   window embeddings and outputs a binned distribution over `[−1, 1]`,
   decoded to a scalar in-forward.
@@ -50,7 +51,7 @@ group D6, so the whole model is D6-invariant by construction (§8).
 | `H` | embedding width, everywhere | 128 |
 | `B` | number of trunk blocks | 4 |
 | `A` | attention heads | 4 |
-| `F` | FFN expansion factor in the attention sub-block | 2 |
+| `F` | FFN expansion factor in the attention sub-block and the critic tail | 2 |
 | `D_MAX` | hex-distance clamp for the attention bias table | 12 |
 | `Q` | learned value-readout queries | 4 |
 | `K` | value bins | 65 |
@@ -61,8 +62,9 @@ group D6, so the whole model is D6-invariant by construction (§8).
 Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
 slot classes = 3 (§4.3), `moves_remaining ∈ {1, 2}`.
 
-The default configuration has 1,249,699 parameters: 1,063,648 in the four
-trunk blocks and 186,051 across input/final parameters and the three heads.
+The default configuration has 1,315,875 parameters: 1,063,648 in the four
+trunk blocks, 66,176 in the critic tail (appendix B), and 186,051 across
+input/final parameters and the three heads.
 
 ---
 
@@ -403,21 +405,38 @@ explicit allowlist, not silent prefix matching).
 The action-value head has the §6 decoder shape and emits one scalar per legal
 cell in engine legal-move order. It owns a window projection, slot-class
 table, background-bucket table, and MLP distinct from the policy decoder's
-parameters. The policy and action-value heads may share the parameter-free
-pass over the decoder incidence table.
+parameters, and it reads its own rows rather than the trunk's.
 
-For each legal cell `a`, the head uses the same window/background routing as
-§6:
+**The critic tail.** After the trunk's final `LayerNorm` (§5), the head adapts
+the window rows and the token with one pre-norm residual FFN of its own:
 
 ```
-h_a     = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[class(a, w)] )
-q_raw   = MLP_Q( [ h_a ; g ] )                    # 2H → P_H → 1, ReLU
+rows          = [ W ; g ]
+rows_q        = rows + MLP_QT( LN_QT(rows) )      # MLP_QT: H → F·H → H, ReLU
+[ W_q ; g_q ] = rows_q                            # split back, in that order
+```
+
+`MLP_QT` is row-independent, as §5.3's FFN is, so the concatenation needs no
+padding and the split back is exact. The tail is **critic-private**: §6's
+policy head and §7's value head read the unadapted `W` and `g`.
+
+For each legal cell `a`, the head then uses the same window/background routing
+as §6, over its own rows:
+
+```
+h_a     = Σ_{w ∋ a, live} ( Q_W · W_q,w + E_qw[class(a, w)] )
+q_raw   = MLP_Q( [ h_a ; g_q ] )                  # 2H → P_H → 1, ReLU
 Q(s, a) = tanh(q_raw)
 ```
 
 For a background cell, `h_a = E_qbg[nearest-stone bucket(a)]`. The head applies
 `tanh`, so each action value lies in `(−1, 1)`. The KLENT operator and loss cast
 these values to fp32 before arithmetic.
+
+A nonlinearity ahead of the incidence sum does not commute with it, so this
+head cannot share the policy head's parameter-free pass over the decoder
+incidence table: each head aggregates its own rows, and the decoder
+aggregation and the rows it produces therefore cost twice as much per batch.
 
 The KLENT operator and training contract are specified in
 [`KLENT_FOR_HEXO.md`](KLENT_FOR_HEXO.md). The improvement step consumes the
@@ -432,9 +451,10 @@ Training selects the taken action and minimizes its squared error
 `(Q(s,a_taken) − G)²` against the sample's λ-return `G`. Policy
 cross-entropy is unchanged.
 
-**Both the policy decoder's and action-value decoder's MLP output layers
-initialize to zero**, overriding §10's framework default for those two
-layers. Initial policy logits and action values are therefore exactly zero.
+**The policy decoder's MLP output layer, the action-value decoder's MLP output
+layer, and `MLP_QT`'s output layer initialize to zero**, overriding §10's
+framework default for those three layers. Initial policy logits and action
+values are therefore exactly zero, and a fresh critic tail is the identity.
 
 This head reads the trunk output and adds no inputs, so it does not change
 `MODEL_REPR_VERSION`. The §7 state-value head is neither called nor trained

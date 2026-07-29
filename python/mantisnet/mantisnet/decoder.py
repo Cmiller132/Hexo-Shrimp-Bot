@@ -1,19 +1,22 @@
-"""The incidence pass both cell heads read.
+"""The incidence pass a cell head reads.
 
 MODEL_SPEC §6's policy decoder and appendix B's action-value decoder walk the
 same table: a legal cell's live windows, the slot class the cell holds in each,
-and — for a cell lying in no live window — its nearest-stone bucket. Only their
-parameters differ. Their per-cell decoder input is
+and — for a cell lying in no live window — its nearest-stone bucket. Their
+parameters differ, and so do their window rows: the policy reads the trunk's
+rows and the critic reads its private tail's. Their per-cell decoder input is
 
     covered cell:      h[c] = M · Σ_e w[dec_window[e]] + Σ_e e_class[dec_class[e]]
     background cell:   h[c] = e_bg[bg_bucket[c]]
 
 over the cell's incidence entries ``e``. A linear map commutes with a sum, so
-``M`` can be applied *after* the aggregation rather than under it. Everything
-remaining under the sum is head-independent, and one pass over the incidence
-then serves both heads instead of two.
+``M`` can be applied *after* the aggregation rather than under it, which leaves
+nothing but the rows and the parameter-free coefficients under the sum. The
+tail's nonlinearity does not commute with the sum, so each head makes its own
+pass over the incidence.
 
-``aggregate`` returns the coefficients of ``h``, one row per cell:
+``aggregate`` returns the coefficients of ``h`` for the rows it is given, one
+row per cell:
 
     [0, H)            Σ_e w[dec_window[e]]
     [H, H+3)          how many entries carried each slot class
@@ -280,7 +283,7 @@ def aggregate(
     bg_bucket: Tensor,
     n_cells: int,
 ) -> Tensor:
-    """The (N_c, H + COEF_WIDTH) coefficient rows both cell heads read."""
+    """The (N_c, H + COEF_WIDTH) coefficient rows one cell head reads."""
     return _aggregate_op(
         w, dec_window, dec_class, dec_cell, bg_cell, bg_bucket, n_cells
     )

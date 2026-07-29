@@ -177,7 +177,7 @@ class _Block(nn.Module):
 
 
 class MantisNet(nn.Module):
-    """Embeddings, B trunk blocks, policy, action-value, and state-value heads."""
+    """Embeddings, B trunk blocks, the critic tail, and the three heads."""
 
     def __init__(self, cfg: MantisConfig | None = None) -> None:
         super().__init__()
@@ -200,6 +200,14 @@ class MantisNet(nn.Module):
         self.e_pw = nn.Embedding(3, h)
         self.e_bg = nn.Embedding(NEAREST_BUCKETS, h)
         self.mlp_p = _PairMlp(h, cfg.policy_hidden, 1)
+
+        # Appendix B critic tail: one row-independent pre-norm FFN over the
+        # trunk's output rows, read by the action-value head alone, so policy
+        # and critic do not decode identical features.
+        self.q_tail_ln = nn.LayerNorm(h)
+        self.q_tail = nn.Sequential(
+            nn.Linear(h, cfg.ffn_factor * h), nn.ReLU(), nn.Linear(cfg.ffn_factor * h, h)
+        )
 
         # Appendix B action-value decoder: the same shape as §6 with its own
         # parameters everywhere, one raw Q per legal cell. KLENT's head.
@@ -227,10 +235,11 @@ class MantisNet(nn.Module):
         nn.init.normal_(self.token_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
         # Both decoder outputs start at zero, so initial policy logits and Q
-        # values are constant across legal cells.
-        for head in (self.mlp_p, self.mlp_q):
-            nn.init.zeros_(head.out.weight)
-            nn.init.zeros_(head.out.bias)
+        # values are exactly zero. The critic tail's output linear starts at
+        # zero too, so a fresh critic reads the trunk's rows unchanged.
+        for out in (self.mlp_p.out, self.mlp_q.out, self.q_tail[2]):
+            nn.init.zeros_(out.weight)
+            nn.init.zeros_(out.bias)
 
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""
@@ -244,7 +253,7 @@ class MantisNet(nn.Module):
         return self.ln_out(s), self.ln_out(w), self.ln_out(g)
 
     def _decoder_rows(self, w: Tensor, batch: Batch, dtype: torch.dtype) -> Tensor:
-        """The pass over the decoder incidence, shared by both cell heads.
+        """One head's pass over the decoder incidence, over its window rows.
 
         ``dtype`` comes from a head linear the caller has already run, so the
         aggregation is built in whatever precision autocast chose for the head
@@ -269,10 +278,9 @@ class MantisNet(nn.Module):
         e_bg: nn.Embedding,
         mlp: _PairMlp,
     ) -> Tensor:
-        """One head's scalar per legal cell, off the shared aggregation. The
-        head's projection and both its embedding tables live in the matrix
-        that reads an aggregate row; the token half of the MLP runs per
-        position."""
+        """One head's scalar per legal cell, off its aggregation. The head's
+        projection and both its embedding tables live in the matrix that reads
+        an aggregate row; the token half of the MLP runs per position."""
         matrix = decoder.head_matrix(
             lin.weight, e_w.weight, e_bg.weight, mlp.lin_a.weight
         )
@@ -288,21 +296,38 @@ class MantisNet(nn.Module):
             rows, g_half, batch, self.p, self.e_pw, self.e_bg, self.mlp_p
         )
 
+    def critic_rows(self, w: Tensor, g: Tensor) -> tuple[Tensor, Tensor]:
+        """The action-value head's private view of the trunk output (appendix B).
+
+        One pre-norm residual FFN over the windows and the global token. It is
+        row-independent, as §5.3's FFN is, so the rows concatenate without
+        padding and split back exactly. The tail is critic-private: §6's policy
+        head and §7's value head read the unadapted ``w`` and ``g``.
+        """
+        rows = torch.cat([w, g], dim=0)
+        rows = rows + self.q_tail(self.q_tail_ln(rows))
+        return rows[: w.shape[0]], rows[w.shape[0] :]
+
     def cell_heads(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor]:
         """Return §6 policy logits and appendix-B scalar action values.
 
-        Both heads use the same parameter-free incidence aggregation and own
-        separate decoder parameters. Action values are bounded by tanh.
+        The policy reads the trunk's rows and the critic its own tail's rows,
+        so each head aggregates the decoder incidence over its own windows: the
+        tail's nonlinearity does not commute with the incidence sum, and the
+        aggregation is what the two heads would otherwise have shared. Action
+        values are bounded by tanh.
         """
-        g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
-        rows = self._decoder_rows(w, batch, g_p.dtype)
+        w_q, g_q = self.critic_rows(w, g)
+        g_p_half, g_q_half = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g_q)
         return (
             self._cell_scores(
-                rows, g_p, batch, self.p, self.e_pw, self.e_bg, self.mlp_p
+                self._decoder_rows(w, batch, g_p_half.dtype),
+                g_p_half, batch, self.p, self.e_pw, self.e_bg, self.mlp_p,
             ),
             torch.tanh(
                 self._cell_scores(
-                    rows, g_q, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q
+                    self._decoder_rows(w_q, batch, g_q_half.dtype),
+                    g_q_half, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q,
                 )
             ),
         )

@@ -181,13 +181,18 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
     # so the step count is bounded by, not equal to, ceil(n / batch_size).
     assert 1 <= metrics["fit_steps"] <= (len(samples) + 63) // 64
 
+    # The state-value head is the only part the fit leaves alone; the critic's
+    # private tail trains with the rest of the action-value path.
     value_only = {"value_queries", "ln_value", "mlp_v"}
-    for name, p in model.named_parameters():
-        head = name.split(".")[0]
-        if head in value_only:
-            assert p.grad is None, f"value head parameter {name} was trained"
-        else:
-            assert p.grad is not None, f"{name} received no gradient"
+    trained = {name for name, p in model.named_parameters() if p.grad is not None}
+    untrained = {name for name, p in model.named_parameters() if p.grad is None}
+    assert untrained == {
+        name for name in trained | untrained if name.split(".")[0] in value_only
+    }
+    assert {
+        "q_tail_ln.weight", "q_tail_ln.bias",
+        "q_tail.0.weight", "q_tail.0.bias", "q_tail.2.weight", "q_tail.2.bias",
+    } <= trained
 
 
 def test_collect_and_fit_end_to_end():

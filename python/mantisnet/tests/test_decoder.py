@@ -1,4 +1,4 @@
-"""Shared decoder layout, folded head matrix, and kernel contracts.
+"""Decoder layout, folded head matrix, and kernel contracts.
 
 The oracle transcribes the §6 decoder formula directly: project window rows,
 add slot-class embeddings, sum each cell's entries, and overwrite background
@@ -110,17 +110,20 @@ def test_slack_columns_never_contribute(positions, model):
 
 @torch.no_grad()
 def test_cell_heads_match_the_spec_decode(positions, model):
+    """Each head over its own rows: the policy over the trunk's, the critic
+    over the appendix-B tail's."""
     batch = _batch(positions)
     _s, w, g = model.trunk(batch)
     policy, q = model.cell_heads(w, g, batch)
+    w_q, g_q = model.critic_rows(w, g)
 
-    for scores, tail, proj, e_class, e_bg, mlp in (
-        (policy, lambda x: x, model.p, model.e_pw, model.e_bg, model.mlp_p),
-        (q, torch.tanh, model.q, model.e_qw, model.e_qbg, model.mlp_q),
+    for scores, tail, rows, token, proj, e_class, e_bg, mlp in (
+        (policy, lambda x: x, w, g, model.p, model.e_pw, model.e_bg, model.mlp_p),
+        (q, torch.tanh, w_q, g_q, model.q, model.e_qw, model.e_qbg, model.mlp_q),
     ):
-        h = _spec_decoder_input(w, batch, proj.weight, e_class.weight, e_bg.weight)
+        h = _spec_decoder_input(rows, batch, proj.weight, e_class.weight, e_bg.weight)
         spec = mlp.out(
-            F.relu(mlp.lin_a(h) + mlp.lin_b(g).index_select(0, batch.cell_pos))
+            F.relu(mlp.lin_a(h) + mlp.lin_b(token).index_select(0, batch.cell_pos))
         ).squeeze(-1)
         torch.testing.assert_close(scores, tail(spec), rtol=1e-4, atol=1e-4)
 

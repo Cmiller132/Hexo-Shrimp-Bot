@@ -118,6 +118,8 @@ The operator refuses `tau < 0`, `lam < 0`, and `tau + lam <= 0`. Shape, device, 
 
 The consumed model contract is the trunk and legal-cell decoder in [MODEL_SPEC.md](MODEL_SPEC.md): `cell_heads` returns one raw policy logit and one scalar $Q\in(-1,1)$, produced by `tanh`, for every legal cell in engine order. KLENT calls no state-value readout and applies no loss to it.
 
+The two heads do not read one output representation. The policy decodes the trunk's rows; the critic decodes the appendix-B critic tail's, a pre-norm residual FFN over the window rows and the token that only the action-value head reads. The tail's nonlinearity does not commute with the decoder's incidence sum, so each head makes its own pass over the incidence table: the decoder aggregation and the rows it produces cost twice as much per batch, in both the fit and collection budgets of §5.1. The tail's parameters are trained by the loss below, like the rest of the action-value path.
+
 For a fitting batch of positions,
 
 $$L =
@@ -237,6 +239,14 @@ Telemetry stores per-ply $\hat v$, KL, normalized entropy, top probability, and 
 - Checkpoints require exact equality of `MODEL_REPR_VERSION`, `RULES_VERSION`, `ACTION_ORDER_VERSION`, and Torch version. Model loading constructs default `MantisConfig`; incompatible shapes fail strict state-dict loading.
 - `telemetry.db` independently refuses a schema-version mismatch.
 
+A checkpoint trained before the critic tail existed is converted by `python -m mantisnet.klent.graft OLD.pt NEW.pt --tau T --lam L --manifest OUT.json`, which is the only path between the two formats; the loaders above stay strict. The conversion:
+
+- adds the tail's keys from a fresh model seeded by one recorded constant, rewrites no parent tensor, and refuses a parent that differs from the build in any other key, that already holds the tail, that is not in the build's parameter order, or whose versions are not the build's;
+- remaps Adam state by parameter name, not by position: a shared parameter keeps its moments and its step, and each added parameter arrives with zero moments and a zero step, which is the state Adam would build for it on its first step;
+- preserves `iteration`, `rng_state`, and `versions`, and requires `--tau` and `--lam` because it measures $\pi'$ at that operating point;
+- compares every parent tensor it is about to write, and every one the grafted network then reads, against the source file read a second time, bit for bit, records their count and SHA-256 in the manifest, and refuses a mismatch. This is the half of the property that covers the trunk, the embeddings, and the state-value head: the probe below reads the grafted trunk on both sides of its comparison and never reaches the state-value head;
+- measures the grafted network against the parent's own readout on a fixed seeded probe set of nonterminal positions and writes those measurements to `--manifest`. The tail arrives with the zero output layer of [MODEL_SPEC.md](MODEL_SPEC.md) appendix B, so the conversion preserves the parent's action values exactly; a probe that finds otherwise is a failure that writes no checkpoint and no manifest.
+
 ## 8. Per-iteration metrics
 
 Acting means cover every position evaluated during the collection call, including capped episodes and unfinished slots. Outcome-conditioned statistics cover only naturally terminated episodes returned by the call.
@@ -322,6 +332,10 @@ Acting means cover every position evaluated during the collection call, includin
 
 **Paper:** Experiments use a fixed-action ResNetV2 with policy and action-value heads and no state-value head for KLENT. **Here:** KLENT consumes MantisNet's ragged legal-cell policy/scalar-Q decoders; its model container has a state-value head that KLENT neither calls nor trains. **Grounds:** Hexo's board and legal-action count are variable. **Measured outcomes:** See [ABLATIONS.md § Shared decoder aggregation](ABLATIONS.md#shared-decoder-aggregation-and-triton-segment-reduction) and [§ Critic ranking-stability probe](ABLATIONS.md#critic-ranking-stability-probe).
 
+### 9.15 Critic output representation
+
+**Paper:** Separate policy and action-value heads read one shared backbone's output representation; appendix H's alternatives are a single head over that representation and two fully separate backbones at twice the computation. **Here:** The heads stay separate and the action-value head reads a critic-private tail over the trunk's output — one pre-norm residual FFN over the window rows and the token, specified in [MODEL_SPEC.md](MODEL_SPEC.md) appendix B — while the policy reads the trunk's rows. **Grounds:** One private block over a shared trunk lies between the paper's two appendix-H alternatives, and it costs a second decoder incidence pass rather than a second backbone. **Measured outcomes:** See [ABLATIONS.md § Training runs](ABLATIONS.md#training-runs).
+
 ## 10. Reference configuration
 
 The current repository reference recipe is:
@@ -332,7 +346,7 @@ The current repository reference recipe is:
 | $\lambda$ | `0.01` |
 | $\tau$ | `0.1` |
 | $\lambda_{\mathrm{ret}}$ | `0.939` |
-| Critic | scalar tanh Q |
+| Critic | scalar tanh Q on a private critic tail |
 
 These are configuration facts recorded in [ABLATIONS.md](ABLATIONS.md), which also records their selection.
 
