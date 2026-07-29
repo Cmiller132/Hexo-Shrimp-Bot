@@ -47,20 +47,18 @@ def sealbot_match(
     sims: int = 0,
     tau: float = KlentConfig.tau,
     lam: float = KlentConfig.lam,
-    q_scale: float = KlentConfig.q_scale,
 ) -> tuple[dict, list[dict]]:
     """Compose a model chooser and ``SealBotOpponent`` into one match."""
     model.eval()
     cfg = KlentConfig(
         tau=tau,
         lam=lam,
-        q_scale=q_scale,
         device=device,
         autocast=device == "cuda",
         compile=False,
     )
     choose = gumbel_choose(
-        network_evaluate(model, cfg), tau=tau, lam=lam, q_scale=q_scale, sims=sims
+        network_evaluate(model, cfg), tau=tau, lam=lam, sims=sims
     )
     opponent = SealBotOpponent(
         sealbot_root,
@@ -125,15 +123,12 @@ def _fmt(result: dict) -> str:
     )
 
 
-def _coefficients(run_dir: Path) -> tuple[float, float, float]:
+def _coefficients(run_dir: Path) -> tuple[float, float]:
     path = run_dir / "config.json"
     if not path.exists():
-        return KlentConfig.tau, KlentConfig.lam, KlentConfig.q_scale
+        return KlentConfig.tau, KlentConfig.lam
     config = json.loads(path.read_text(encoding="utf-8"))
-    klent = config["klent"]
-    # A config written before the q_scale knob existed ran at the eq. 3
-    # gain of 1.0 — reading history, not defaulting an input.
-    return klent["tau"], klent["lam"], klent.get("q_scale", 1.0)
+    return config["klent"]["tau"], config["klent"]["lam"]
 
 
 def main(argv=None):
@@ -186,7 +181,7 @@ def main(argv=None):
     from .telemetry import open_telemetry
 
     run_dir = args.checkpoint.parent if args.checkpoint is not None else args.run
-    tau, lam, q_scale = _coefficients(run_dir)
+    tau, lam = _coefficients(run_dir)
 
     def play(path):
         model = load_model(path, args.device)
@@ -203,7 +198,6 @@ def main(argv=None):
             sims=args.sims,
             tau=tau,
             lam=lam,
-            q_scale=q_scale,
         )
 
     if args.checkpoint is not None:

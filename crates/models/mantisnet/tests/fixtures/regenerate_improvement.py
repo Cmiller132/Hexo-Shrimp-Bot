@@ -69,9 +69,6 @@ def main() -> None:
             offsets,
             tau=case["tau"],
             lam=case["lambda"],
-            # Gain 1 is eq. 3 verbatim — the operator the Rust improve_policy
-            # implements and the one these frozen fixtures were written at.
-            q_scale=1.0,
         )
         generated.append(
             {

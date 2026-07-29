@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from mantisnet import (
@@ -93,19 +92,15 @@ def test_every_parameter_receives_gradient(positions):
     net.train()
     # Includes ply 0, so the background bucket table participates too.
     batch = collate([from_position(p) for p in positions])
-    _s, w, g = net.trunk(batch)
-    _value, _value_dist, value_logits = net.value_head(w, g, batch)
-    policy_logits, critic_logits = net._cell_head_logits(w, g, batch)
+    out = net(batch)
 
     counts = batch.legal_offsets[1:] - batch.legal_offsets[:-1]
     targets = torch.cat([torch.full((int(c),), 1.0 / int(c)) for c in counts])
     z = torch.linspace(-0.9, 0.9, batch.n_pos)
-    taken = critic_logits.index_select(0, batch.legal_offsets[:-1])
     loss = (
-        policy_loss(policy_logits, batch.legal_offsets, targets)
-        + value_loss(value_logits, z)
-        + F.binary_cross_entropy_with_logits(taken[:, 0], (1.0 + z.sign()) / 2.0)
-        + F.binary_cross_entropy_with_logits(taken[:, 1], z.abs())
+        policy_loss(out.policy_logits, batch.legal_offsets, targets)
+        + value_loss(out.value_logits, z)
+        + (out.q_values.index_select(0, batch.legal_offsets[:-1]) - z).square().mean()
     )
     loss.backward()
     missing = [n for n, p in net.named_parameters() if p.grad is None]

@@ -13,7 +13,7 @@ from mantisnet import MantisConfig, MantisNet
 from mantisnet.deck.app import create_app
 from mantisnet.klent import telemetry
 from mantisnet.klent.inspect import inspect_position
-from mantisnet.klent.run import save_checkpoint
+from mantisnet.klent.run import _versions, save_checkpoint
 
 from .test_telemetry import _fixture_db
 
@@ -118,7 +118,7 @@ def test_inspect_endpoint_equals_direct_inspection(deck_run):
     checkpoint = run / "checkpoint_000001.pt"
     save_checkpoint(checkpoint, model, optimizer, 1, np.random.default_rng(4))
     moves = [(0, 0), (1, 0), (0, 1)]
-    expected = inspect_position(model, moves, 3, 0.1, 0.03, 1.0)
+    expected = inspect_position(model, moves, 3, 0.1, 0.03)
 
     with TestClient(create_app(runs, device="cpu")) as client:
         response = client.post(
@@ -152,6 +152,45 @@ def test_inspect_endpoint_equals_direct_inspection(deck_run):
         assert capture.status_code == 200, capture.text
         assert len(capture.json()["layers"]) == 1
         assert len(capture.json()["layers"][0]["heads"]) == 2
+
+
+def test_inspect_refuses_a_factored_checkpoint_with_structured_error(deck_run):
+    runs, run = deck_run
+    model = MantisNet(MantisConfig())
+    state = model.state_dict()
+    state["mlp_q.out.weight"] = state["mlp_q.out.weight"].expand(2, -1).clone()
+    state["mlp_q.out.bias"] = state["mlp_q.out.bias"].expand(2).clone()
+    checkpoint = run / "checkpoint_000002.pt"
+    torch.save(
+        {
+            "model": state,
+            "versions": _versions(),
+        },
+        checkpoint,
+    )
+
+    with TestClient(create_app(runs, device="cpu")) as client:
+        response = client.post(
+            "/api/inspect",
+            json={"checkpoint": str(checkpoint), "moves": []},
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "inspect_failed"
+    assert "factored critic checkpoint" in response.json()["error"]["message"]
+
+    with TestClient(create_app(runs, device="cpu")) as client:
+        response = client.post(
+            "/api/play",
+            json={
+                "seats": [
+                    {"kind": "checkpoint", "checkpoint": str(checkpoint)},
+                    {"kind": "human"},
+                ]
+            },
+        )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "play_failed"
+    assert "factored critic checkpoint" in response.json()["error"]["message"]
 
 
 def test_deck_database_refuses_a_version_mismatch(tmp_path):

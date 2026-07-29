@@ -68,7 +68,7 @@ def _improve(pi, q):
     logits = torch.tensor(np.log(np.concatenate([pi[s] for s in order])), dtype=torch.float32)
     qs = torch.tensor(np.concatenate([q[s] for s in order]), dtype=torch.float32)
     offsets = torch.arange(0, 2 * len(order) + 1, 2)
-    imp = improved_policy(logits, qs, offsets, TAU, LAM, 1.0)
+    imp = improved_policy(logits, qs, offsets, TAU, LAM)
     probs = imp.probs.numpy()
     v_hat = imp.v_hat.numpy()
     new_pi = {s: probs[2 * i : 2 * i + 2].astype(np.float64) for i, s in enumerate(order)}

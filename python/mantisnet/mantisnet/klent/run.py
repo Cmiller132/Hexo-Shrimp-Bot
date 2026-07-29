@@ -212,7 +212,6 @@ def run_training(
         cfg.ply_cap,
         cfg.tau,
         cfg.lam,
-        cfg.q_scale,
         np.random.default_rng(int(rng.integers(2**63))),
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
@@ -363,10 +362,6 @@ def main(argv=None) -> None:
     ap.add_argument("--cap", type=int, default=512)
     ap.add_argument("--tau", type=float, default=KlentConfig.tau)
     ap.add_argument("--lam", type=float, default=KlentConfig.lam)
-    ap.add_argument(
-        "--q-scale", type=float, default=KlentConfig.q_scale,
-        help="critic gain inside the operator's softmax (1.0 = eq. 3 verbatim)",
-    )
     ap.add_argument("--lam-ret", type=float, default=KlentConfig.lam_ret)
     ap.add_argument(
         "--gamma", type=float, default=KlentConfig.gamma,
@@ -443,7 +438,6 @@ def main(argv=None) -> None:
     cfg = KlentConfig(
         tau=args.tau,
         lam=args.lam,
-        q_scale=args.q_scale,
         lam_ret=args.lam_ret,
         gamma=args.gamma,
         ply_cap=args.cap,
@@ -542,7 +536,6 @@ def main(argv=None) -> None:
                 network_evaluate(m, cfg),
                 tau=cfg.tau,
                 lam=cfg.lam,
-                q_scale=cfg.q_scale,
                 sims=args.eval_sims,
             )
             opponent = SealBotOpponent(

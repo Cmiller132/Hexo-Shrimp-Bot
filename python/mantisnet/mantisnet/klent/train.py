@@ -2,10 +2,11 @@
 
 Faithful to the paper's outer loop (design doc §1): a self-play phase fills
 the buffer, one fitting epoch consumes it (the reference implementation's
-``fitting_epochs=1``), and nothing survives to the next iteration. Policy
-cross-entropy is joined by taken-action binary losses for the return's sign
-and magnitude. The value head appears nowhere: KLENT has no state-value
-head, and v̂ = E_{π′}[Q] does its job.
+``fitting_epochs=1``), and nothing survives to the next iteration. The loss
+is eq. 4 — cross-entropy of π_θ against π′ plus squared error of the taken
+action's Q against the λ-return — under plain Adam at the paper's learning
+rate. The value head appears nowhere: KLENT has no state-value head, and
+v̂ = E_{π′}[Q] does its job.
 """
 
 from __future__ import annotations
@@ -16,11 +17,9 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from ..builder import collate_prefixes
 from ..losses import policy_loss
-from ..model import _compose_q
 from .selfplay import Collector, Sample, collection_stats
 
 
@@ -32,13 +31,6 @@ class KlentConfig:
     # reverse KL is the heavier regulariser. Prior exponent tau/(tau+lam) = 0.77.
     tau: float = 0.1  # reverse-KL weight (the paper's beta)
     lam: float = 0.03  # entropy weight (the paper's alpha)
-    # Critic gain inside the operator's softmax only (improve.py); 1.0 is
-    # eq. 3 verbatim. The factored critic's calibrated magnitudes in
-    # contested positions under-drive the exponent against the flattening
-    # prior — measured entropy runaway and eval collapse at 1.0 — so the
-    # gain the scalar head's overconfidence used to provide implicitly is a
-    # knob here. v̂ and the returns never see it.
-    q_scale: float = 1.0
     # e^{-1/16}: the paper's 8-turn horizon at Hexo's two placements per turn
     # (KLENT_PROPOSALS A1). The paper's literal e^{-1/8} would halve it.
     lam_ret: float = 0.939
@@ -74,9 +66,9 @@ class KlentConfig:
 
 
 def _policy_q(model, batch):
-    """The KLENT pass: policy and raw critic logits, never the value head."""
+    """The KLENT pass: trunk + the two heads it trains, never the value head."""
     _s, w, g = model.trunk(batch)
-    return model._cell_head_logits(w, g, batch)
+    return model.cell_heads(w, g, batch)
 
 
 # One symbolic-shape graph serves every batch; compiled lazily, shared by
@@ -110,8 +102,7 @@ def network_evaluate(model, cfg: KlentConfig):
         with _gpu_lock:
             b = batch.to(cfg.device)
             with torch.no_grad(), torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
-                policy, critic_logits = policy_q(model, b)
-            q = _compose_q(critic_logits)
+                policy, q = policy_q(model, b)
             return policy.float().cpu(), q.float().cpu()
 
     return evaluate
@@ -214,8 +205,7 @@ def fit(
 
     order = [k for group, _ in groups for k in group]
     policy_sum = torch.zeros((), device=cfg.device)
-    p_sum = torch.zeros((), device=cfg.device)
-    m_sum = torch.zeros((), device=cfg.device)
+    q_sum = torch.zeros((), device=cfg.device)
     total = 0
     with ThreadPoolExecutor(max_workers=1) as pool:
         prepped = {k: pool.submit(prep, k) for k in order[:1]}
@@ -235,29 +225,23 @@ def fit(
                     returns = returns.to(cfg.device)
 
                     with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
-                        policy_logits, critic_logits = policy_q(model, batch)
+                        policy_logits, q_values = policy_q(model, batch)
                     ce = policy_loss(policy_logits.float(), batch.legal_offsets, target)
-                    taken = critic_logits.float().index_select(
+                    taken = q_values.float().index_select(
                         0, batch.legal_offsets[:-1] + ranks
                     )
-                    taken_p, taken_m = taken.unbind(dim=-1)
-                    y_p = (1.0 + returns.sign()) / 2.0
-                    y_m = returns.abs()
-                    p_loss = F.binary_cross_entropy_with_logits(taken_p, y_p)
-                    m_loss = F.binary_cross_entropy_with_logits(taken_m, y_m)
+                    q_mse = (taken - returns).square().mean()
 
-                    ((ce + p_loss + m_loss) * (len(chunk) / group_n)).backward()
+                    ((ce + q_mse) * (len(chunk) / group_n)).backward()
                     policy_sum += ce.detach() * len(chunk)
-                    p_sum += p_loss.detach() * len(chunk)
-                    m_sum += m_loss.detach() * len(chunk)
+                    q_sum += q_mse.detach() * len(chunk)
                 if progress is not None:
                     progress(consumed, len(order))
             optimizer.step()
             total += group_n
     return {
         "policy_loss": float(policy_sum) / total,
-        "p_loss": float(p_sum) / total,
-        "m_loss": float(m_sum) / total,
+        "q_loss": float(q_sum) / total,
         "fit_steps": len(groups),
     }
 

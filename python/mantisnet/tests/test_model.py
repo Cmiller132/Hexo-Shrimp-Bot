@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import copy
-
 import pytest
 import torch
 
@@ -49,28 +47,6 @@ def test_output_contracts(model, positions):
     assert torch.isfinite(out.policy_logits).all()
 
 
-@torch.no_grad()
-def test_zero_init_composes_to_zero_q(model, positions):
-    batch = collate([from_position(positions[0])])
-    out = model(batch)
-    _s, w, g = model.trunk(batch)
-    _policy, critic_logits = model._cell_head_logits(w, g, batch)
-    assert critic_logits.shape == (out.q_values.shape[0], 2)
-    assert torch.count_nonzero(critic_logits) == 0
-    assert torch.count_nonzero(out.q_values) == 0
-
-
-@pytest.mark.parametrize("p_logit", [-0.75, 0.75])
-@torch.no_grad()
-def test_q_values_are_bounded_and_follow_p_logit_sign(model, positions, p_logit):
-    net = copy.deepcopy(model)
-    net.mlp_q.out.weight.zero_()
-    net.mlp_q.out.bias.copy_(torch.tensor([p_logit, -0.25]))
-    out = net(collate([from_position(positions[3])]))
-    assert torch.all((out.q_values > -1.0) & (out.q_values < 1.0))
-    assert torch.all(torch.sign(out.q_values) == torch.sign(torch.tensor(p_logit)))
-
-
 def test_dropout_config_runs_and_eval_is_deterministic(positions):
     torch.manual_seed(1)
     net = MantisNet(MantisConfig(dropout=0.1))
@@ -94,7 +70,6 @@ def test_cuda_bf16_smoke(model, positions):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = net(batch)
         assert torch.isfinite(out.policy_logits).all()
-        assert out.q_values.dtype == torch.float32
         assert torch.isfinite(out.value).all()
         assert out.value_dist.dtype == torch.float32
         assert torch.allclose(
