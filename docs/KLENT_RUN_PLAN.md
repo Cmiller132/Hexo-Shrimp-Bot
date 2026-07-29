@@ -251,6 +251,59 @@ run used. The λ-return returns when the critic earns it; the critic build
 that would earn it (dueling `Q = V + A`, or A2's Bernoulli critic — §9's
 named mitigations) is the next staged deviation if pure-2 holds its climb.
 
+### Conversion diffusion (2026-07-28/29) — a sixth mechanism, and the γ fix
+
+pure-2 held its climb to eval **0.844** at iteration 199, then dissolved:
+entropy ratcheted 0.33 → 0.56, won lengths 49 → 83 plies, iterations to
+500 s+, eval declining — replicated identically from `checkpoint_000200`
+on Windows and in the container, so a training dynamic, not environment.
+The ply telemetry located it exactly: by iterations 235–239 the `t ≥ 100`
+plies had `|v̂| = 0.91` with winner/loser separation ±0.86 — a
+near-perfect critic — and π′ top-1 mass **0.106** over ~2,700 legal
+cells. Both at once mean Q is *flat at ±0.9 across actions*: in a decided
+position every move wins, eq. 3 degenerates to `π′ ∝ π_θ^0.77`, and the
+winner learns to wander instead of converting. Longer games put more
+decided plies in the corpus and the loop compounds. The trigger is the
+critic *maturing* (q_loss 0.84 → 0.53 over exactly that window): while Q
+was noisy the flatness was invisible. Root cause is objective-level: at
+`γ = −1` per ply a 5-ply and a 300-ply win are the same return, and λ·H
+actively rewards wandering — the reference objective is degenerate on a
+game whose winner controls termination. Note A3 as specced (fixed ρ,
+adapt T) cannot touch this: `π_θ^ρ` flattening at flat Q is
+T-independent.
+
+The fix is `--gamma`, a per-ply return-discount *magnitude* in the
+λ-return (the mover-change sign stays in `signs`; 1.0 is the reference
+objective). Three arms forked from `pure-2/checkpoint_000200`, judged
+against the two crashed control replicates:
+
+- **conv-disc** (γ = 0.99, λ = 0.03, 100 its): the runaway is arrested —
+  won lengths 50–60, flat buffers, critic learns (q_loss 0.46 → 0.30),
+  eval 0.609/0.625/**0.734**/0.578 — but decided plies still flatten to a
+  *bounded* H ≈ 0.70 plateau: at k ~ 40 plies from the terminal the
+  win-sooner spread `γᵏ(1 − γ^Δ)` ≈ 0.12 only ties `τ+λ = 0.13`.
+- **conv-rho1** (τ = 0.13, λ = 0, stopped at 51): decided plies *sharpen*
+  (top-1 0.64 → 0.73) — λ's exponent is definitively the diffusion
+  mechanism — but the run stagnates whole: q_loss pinned at 0.88,
+  KL → 0.006, eval flat, sharp deterministic wandering (won lengths
+  58 → 87). γ, not ρ, is what feeds the critic: undiscounted ±1 targets
+  on long balanced games teach it nothing.
+- **conv-disc-lam01** (γ = 0.99, λ = 0.01 → ρ = 0.909, 50 its): decided
+  sharpness *stable* (H 0.28 → 0.29, top-1 0.61 → 0.61), contested plies
+  sharpen without rho1's over-concentration (0.54 → 0.66), q_loss falls,
+  H settles at 0.20 with healthy KL ≈ 0.007, and evals **0.750 / 0.703**
+  — the strongest of the night.
+
+**Resolved recipe: `--gamma 0.99 --lam 0.01 --lam-ret 1.0`, τ = 0.1**;
+`runs/conv-disc-lam01` resumed to `--iterations 2000` as the live run.
+Watch items: won lengths creep mildly (55 → 71) — not runaway, but the
+starve trajectory if it compounds; and λ = 0.01's documented collapse
+mode, hedged here by γ's near-terminal Q spread (abort signature: H
+under ~0.1 with short mutual races). Judging caveat: `v_hat_mae` and the
+winner/loser v̂ means are defined against ±1, so they read differently
+under γ — compare critics on the ply-bucket telemetry (decided =
+`|v̂| ≥ 0.5`), not on those columns.
+
 ---
 
 ## 4. Evaluation — SealBot, in the driver
