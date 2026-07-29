@@ -39,6 +39,13 @@ in whichever direction is less work.
 **`target/` collides between Windows and WSL.** Set
 `CARGO_TARGET_DIR=target-wsl` on the WSL side; both are gitignored.
 
+**The training CLI defaults to the paper's coefficients, not the reference
+recipe.** A flagless `python -m mantisnet.klent.run` trains at γ = 1.0,
+λ = 0.03 — a configuration `docs/ABLATIONS.md` records as degenerate on Hexo.
+The reference recipe must be passed explicitly on every launch:
+`--gamma 0.99 --lam 0.01 --lam-ret 0.939`. Deliberate (owner ruling
+2026-07-29): defaults stay paper-faithful, deviations are always spelled out.
+
 ## How to write code here
 
 Simple means not building for requirements that don't exist yet; it does not

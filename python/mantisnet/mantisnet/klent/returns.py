@@ -1,26 +1,20 @@
-"""The sign function and the λ-return (``KLENT_FOR_HEXO.md`` §1.2–§1.3).
+"""The mover-change sign and λ-return from ``KLENT_FOR_HEXO.md`` §1.2–§1.3.
 
-The sign follows mover *change*, not ply parity — K1, the "most likely
-catastrophic bug" in ``KLENT_FOR_HEXO.md`` §1.4. It is read off the phase of
-the acted-on position:
+The sign follows mover change rather than ply parity. It is read from the
+acted-on position's phase:
 ``+1`` exactly at a ``FirstStone`` ply, where the same mover places again.
 ``moves_remaining`` carries the phase here: 2 is ``FirstStone``; 1 is
 ``Opening`` or ``SecondStone``, both of which hand the turn over.
 
-The recursion runs backward over a completed, won episode only — capped
-episodes are dropped whole before this module ever sees them
-(``KLENT_FOR_HEXO.md`` §4.2) — so
-there is exactly one case:
+The recursion consumes completed, won episodes; capped episodes are excluded
+by the caller:
 
     G_T = +1
     G_t = s_t · γ · [ (1 − λ)·v̂_{t+1} + λ·G_{t+1} ]        t < T
 
-γ is the per-ply discount *magnitude* — the mover-change sign is carried
-entirely by ``s_t``. At γ = 1 this is the reference objective, under which a
-win in 5 plies and a win in 300 plies are the same return, so every move of
-a decided position carries the same Q and eq. 3 flattens π′ there
-(conversion diffusion). γ < 1 ranks faster wins above slower ones, which is
-what keeps a gradient alive in won positions.
+γ is the per-ply discount magnitude; ``s_t`` carries the mover-change sign.
+At γ = 1, outcome timing does not change return magnitude. Values below one
+give earlier outcomes larger magnitude.
 """
 
 from __future__ import annotations
@@ -52,8 +46,14 @@ def lambda_returns(signs: np.ndarray, v_hats, lam_ret: float, gamma: float) -> n
     v = np.asarray(v_hats, dtype=np.float64)
     if v.shape != np.shape(signs) or v.ndim != 1 or len(v) == 0:
         raise ValueError("signs and v_hats must be equal-length, nonempty 1-d arrays")
+    if not (np.isfinite(v).all() and np.abs(v).max() <= 1.0):
+        raise ValueError("v_hats must be finite and within [-1, 1]")
     g = np.empty_like(v)
     g[-1] = 1.0
     for t in range(len(v) - 2, -1, -1):
         g[t] = signs[t] * gamma * ((1.0 - lam_ret) * v[t + 1] + lam_ret * g[t + 1])
+    # Bounded inputs and gamma <= 1 bound G by construction; leaving the
+    # interval means the recursion or its inputs changed incompatibly.
+    if np.abs(g).max() > 1.0:
+        raise ValueError("lambda-return left [-1, 1]; recursion inputs are corrupt")
     return g

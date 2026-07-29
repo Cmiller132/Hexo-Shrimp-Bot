@@ -119,3 +119,7 @@ def test_validation():
         lambda_returns(np.array([1.0]), [0.0], 1.0, 1.5)
     with pytest.raises(ValueError, match="equal-length"):
         lambda_returns(np.array([1.0, -1.0]), [0.0], 0.9, 1.0)
+    with pytest.raises(ValueError, match="v_hats"):
+        lambda_returns(np.array([1.0, -1.0]), [0.0, 1.5], 0.9, 1.0)
+    with pytest.raises(ValueError, match="v_hats"):
+        lambda_returns(np.array([1.0, -1.0]), [0.0, np.nan], 0.9, 1.0)

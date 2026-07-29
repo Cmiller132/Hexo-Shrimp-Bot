@@ -48,8 +48,11 @@ The last stored state precedes the winning placement, so its acting mover is the
 `lambda_returns(signs, v_hats, lam_ret, gamma)` returns float64 and refuses:
 
 - `lam_ret` outside $[0,1]$;
-- `gamma` outside $(0,1]$; or
-- inputs that are empty, non-1-D, or unequal in shape.
+- `gamma` outside $(0,1]$;
+- inputs that are empty, non-1-D, or unequal in shape; or
+- `v_hats` entries that are non-finite or outside $[-1,1]$.
+
+The returned array is itself refused if any entry leaves $[-1,1]$, which bounded inputs make unreachable.
 
 It does not separately validate sign values, finiteness, or the range of `v_hats`.
 
