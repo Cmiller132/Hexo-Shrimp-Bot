@@ -177,7 +177,9 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     metrics = fit(model, samples, optimizer, cfg, rng)
     assert np.isfinite(metrics["policy_loss"]) and np.isfinite(metrics["q_loss"])
-    assert metrics["fit_steps"] == (len(samples) + 63) // 64
+    # Groups close at >= batch_size samples and may overshoot by one chunk,
+    # so the step count is bounded by, not equal to, ceil(n / batch_size).
+    assert 1 <= metrics["fit_steps"] <= (len(samples) + 63) // 64
 
     value_only = {"value_queries", "ln_value", "mlp_v"}
     for name, p in model.named_parameters():
