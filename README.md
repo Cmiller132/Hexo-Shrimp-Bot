@@ -20,7 +20,9 @@ A Hexo engine and bot-training framework, built ground up.
 > MantisNet deliberately declines container-side `fit`: its production trainer
 > remains the faithful KLENT loop under `python/mantisnet`, pending an owner
 > decision to migrate that loop. The `mantisnet-train` image and compose
-> environment live under `docker/`.
+> environment live under `docker/`, and the control deck — the LAN dashboard
+> that launches and watches runs, `docs/DECK_SPEC.md` — runs in that same
+> image, serving the `frontend/` SPA.
 
 ## Layout
 
@@ -39,12 +41,14 @@ Hexo-Shrimp-Bot/
   xtask/                  the verification gates, defined once; `cargo xtask`
   python/
     hexo-py/              PyO3 engine/shared-encoder bindings; detached leaf crate
-    mantisnet/            the MantisNet model: builder, network, losses, tests, bench
+    mantisnet/            the MantisNet model and KLENT trainer, plus the control deck
+  frontend/               the deck's React SPA, built once and served by the deck
   docker/                 the mantisnet-train image and WSL compose environment
   docs/
     ENGINE_SPEC.md        normative implementation target for hexo-engine
     MODEL_SPEC.md         normative target for the MantisNet network
     KLENT_DESIGN.md       how KLENT works on Hexo; the training path's governing doc
+    DECK_SPEC.md          normative target for the control deck: API, lifecycle, SPA
     KLENT_PROPOSALS.md    an external KLENT suggestion set, reviewed; two items since applied
     KLENT_RUN_PLAN.md     the operational plan: settled questions, shakeout, path to production
     ENGINE_RL_AUDIT.md    review findings on readiness for parallel self-play

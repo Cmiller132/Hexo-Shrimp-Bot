@@ -1,39 +1,100 @@
-import { useEffect, useMemo, useState } from "react";
-import { api, useApi } from "../api";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { api, reasonText, useApi } from "../api";
 import Board from "../components/Board";
-import { Empty, ErrorBox, format, Metric, Panel } from "../components/Ui";
-import type { Checkpoint, Inspect, Move, Run } from "../types";
+import Transport from "../components/Replay";
+import { Empty, ErrorBox, format, Metric, Notice, Panel } from "../components/Ui";
+import { lineKey, moveKey } from "../lib/hex";
+import { withPolicyRank } from "../lib/inspect";
+import type { Candidate, Inspect, Move, Run } from "../types";
 
-type Session = { session_id: string; moves: Move[]; seats: Array<Record<string, unknown>>; current_player: number | null; moves_remaining: number; terminal: boolean; winner: number | null; legal_count: number; legal_moves: Move[]; capped: boolean };
+/** `/api/play/{id}` — the engine's own view of a session. `legal_moves` is the
+ *  authoritative legality mask, so the board is playable with no model loaded. */
+interface Session {
+  session_id: string;
+  moves: Move[];
+  current_player: number | null;
+  moves_remaining: number;
+  terminal: boolean;
+  winner: number | null;
+  legal_count: number;
+  legal_moves: Move[];
+  capped: boolean;
+}
+
+interface MatchJob { job_id: number | string; status: string }
 
 export default function Play({ runs }: { runs: Run[] }) {
-  const checkpoints = useMemo(() => runs.flatMap((run) => run.checkpoints.map((checkpoint) => ({ ...checkpoint, run: run.name }))), [runs]);
+  const checkpoints = useMemo(
+    () => runs.flatMap((run) => run.checkpoints.map((checkpoint) => ({ ...checkpoint, run: run.name }))),
+    [runs],
+  );
   const [checkpoint, setCheckpoint] = useState(checkpoints.at(-1)?.path ?? "");
   const [opponent, setOpponent] = useState<"random" | "checkpoint" | "sealbot">("random");
   const [humanSeat, setHumanSeat] = useState(0);
   const [mode, setMode] = useState("argmax");
-  const [overlay, setOverlay] = useState<"policy" | "q" | "improved" | "rank">("policy");
   const [session, setSession] = useState<Session>();
-  const [inspect, setInspect] = useState<Inspect>();
   const [error, setError] = useState<string>();
-  const jobs = useApi<Array<Record<string, unknown>>>("/api/matches", []);
+  // The review cursor. `session.moves.length` is the live position; anything
+  // earlier replays the game so far, where no move can be placed.
+  const [cursor, setCursor] = useState(0);
+  const [selected, setSelected] = useState<Move | null>(null);
+  const jobs = useApi<MatchJob[]>("/api/matches", []);
+
   useEffect(() => { if (!checkpoint && checkpoints.length) setCheckpoint(checkpoints.at(-1)!.path); }, [checkpoint, checkpoints]);
-  useEffect(() => {
-    if (!session || !checkpoint || session.terminal) { setInspect(undefined); return; }
-    void api<Inspect>(`/api/play/${session.session_id}/inspect?checkpoint=${encodeURIComponent(checkpoint)}`).then(setInspect).catch((reason) => setError(reason.message));
-  }, [session, checkpoint]);
+
+  const live = session ? session.moves.length : 0;
+  const atLive = cursor === live;
+  useEffect(() => { setCursor(live); setSelected(null); }, [live, session?.session_id]);
+
+  /* The checkpoint's read of the live position. `useApi` aborts the in-flight
+     request and discards a stale response whenever `session` changes — the path is
+     the same across a move, so the session itself is the dependency. The payload is
+     then matched against the line it describes: an inspect answering for a position
+     the board has already left would put a legal cell on top of a stone, which the
+     Board rejects outright. */
+  const inspect = useApi<Inspect>(
+    session && checkpoint && !session.terminal
+      ? `/api/play/${session.session_id}/inspect?checkpoint=${encodeURIComponent(checkpoint)}`
+      : null,
+    [session],
+  );
+
+  // A held response describes the checkpoint and position it was asked for. A
+  // request in flight — or one that failed — means one of those has moved on, so
+  // the board falls back to the engine's mask rather than to the last answer.
+  const read = useMemo(
+    () => !inspect.loading && !inspect.error && inspect.data && session && checkpoint
+      && lineKey(inspect.data.moves) === lineKey(session.moves)
+      ? inspect.data
+      : undefined,
+    [inspect.data, inspect.loading, inspect.error, session, checkpoint],
+  );
+  // Either a scored candidate set or a bare legality mask — never a mask dressed up
+  // with zeros, which would read as a model that scores every move at nothing.
+  const candidates = useMemo((): Candidate[] | undefined => {
+    if (!read || !session || !atLive || session.terminal) return undefined;
+    return withPolicyRank(read.legal);
+  }, [read, session, atLive]);
+  const legalMask = !session || read || !atLive || session.terminal ? undefined : session.legal_moves;
+  const topMove = useMemo(() => candidates?.find((row) => row.policyRank === 0)?.move, [candidates]);
 
   async function create() {
-    const bot = opponent === "checkpoint" ? { kind: "checkpoint", checkpoint, mode } : opponent === "sealbot" ? { kind: "sealbot", depth: 1 } : { kind: "random" };
+    const bot = opponent === "checkpoint" ? { kind: "checkpoint", checkpoint, mode }
+      : opponent === "sealbot" ? { kind: "sealbot", depth: 1 }
+      : { kind: "random" };
     const seats = humanSeat === 0 ? [{ kind: "human" }, bot] : [bot, { kind: "human" }];
     try { setSession(await api("/api/play", { method: "POST", body: JSON.stringify({ seats }) })); setError(undefined); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    catch (reason) { setError(reasonText(reason)); }
   }
-  async function move(value: Move) {
+
+  const move = useCallback(async (value: Move) => {
     if (!session) return;
-    try { setSession(await api(`/api/play/${session.session_id}/moves`, { method: "POST", body: JSON.stringify({ move: value }) })); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-  }
+    try {
+      setSession(await api(`/api/play/${session.session_id}/moves`, { method: "POST", body: JSON.stringify({ move: value }) }));
+      setError(undefined);
+    } catch (reason) { setError(reasonText(reason)); }
+  }, [session]);
+
   async function arena(kind: "sealbot" | "checkpoint") {
     if (!checkpoint) return;
     const second = checkpoints.find((item) => item.path !== checkpoint);
@@ -43,28 +104,112 @@ export default function Play({ runs }: { runs: Run[] }) {
         checkpoint_b: kind === "checkpoint" ? second?.path : undefined, games: 8,
       }) });
       void jobs.refresh();
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    } catch (reason) { setError(reasonText(reason)); }
   }
+
   return <div className="screen-grid play-page">
     <aside className="side-column">
       <Panel title="Seats">
         <label>Human seat<select value={humanSeat} onChange={(e) => setHumanSeat(Number(e.target.value))}><option value="0">P0 · blue</option><option value="1">P1 · red</option></select></label>
         <label>Opponent<select value={opponent} onChange={(e) => setOpponent(e.target.value as typeof opponent)}><option value="random">Random</option><option value="checkpoint">MantisNet checkpoint</option><option value="sealbot">SealBot depth 1</option></select></label>
-        <label>Checkpoint<select value={checkpoint} onChange={(e) => setCheckpoint(e.target.value)}><option value="">No checkpoints</option>{checkpoints.map((item) => <option key={item.path} value={item.path}>{item.run} / {item.name}</option>)}</select></label>
+        <label>Checkpoint<select value={checkpoint} onChange={(e) => setCheckpoint(e.target.value)}>
+          <option value="">No checkpoint · engine only</option>
+          {runs.filter((run) => run.checkpoints.length).map((run) => <optgroup key={run.name} label={run.name}>
+            {run.checkpoints.map((item) => <option key={item.path} value={item.path}>{item.name}{item.iteration != null ? ` · iter ${item.iteration}` : ""}</option>)}
+          </optgroup>)}
+        </select></label>
         {opponent === "checkpoint" && <label>Move mode<select value={mode} onChange={(e) => setMode(e.target.value)}><option value="argmax">argmax πθ</option><option value="sample">sample πθ</option><option value="improved">π′</option></select></label>}
         <button onClick={() => void create()}>New game</button>
         <ErrorBox message={error} />
       </Panel>
-      <Panel title="Arena & quick suites"><div className="stack-buttons"><button onClick={() => void arena("sealbot")}>8-game SealBot set</button><button disabled={checkpoints.length < 2} onClick={() => void arena("checkpoint")}>Checkpoint cross-play</button></div><div className="data-list">{jobs.data?.slice(0, 5).map((job) => <div key={String(job.job_id)}><span>job {String(job.job_id)}</span><b>{String(job.status)}</b></div>)}</div></Panel>
+      <Panel title="Arena & quick suites">
+        <div className="stack-buttons">
+          <button onClick={() => void arena("sealbot")}>8-game SealBot set</button>
+          <button disabled={checkpoints.length < 2} onClick={() => void arena("checkpoint")}>Checkpoint cross-play</button>
+        </div>
+        <div className="data-list">{jobs.data?.length
+          ? jobs.data.slice(0, 5).map((job) => <div key={String(job.job_id)}><span>job {job.job_id}</span><b>{job.status}</b></div>)
+          : <Empty>No arena jobs.</Empty>}</div>
+      </Panel>
     </aside>
+
     <main className="main-column">
-      <Panel title={session ? `Session ${session.session_id}` : "Authoritative game board"} action={<select value={overlay} onChange={(e) => setOverlay(e.target.value as typeof overlay)}><option>policy</option><option>q</option><option>improved</option><option>rank</option></select>}>
-        {session ? <><Board moves={session.moves} legal={session.legal_moves} inspect={inspect} overlay={overlay} onMove={(value) => void move(value)} /><div className="metric-row"><Metric label="ply" value={session.moves.length} /><Metric label="to move" value={session.terminal ? "finished" : `P${session.current_player}`} /><Metric label="placements left" value={session.moves_remaining} /><Metric label="legal" value={session.legal_count} /><Metric label="result" value={session.capped ? "capped" : session.terminal ? `P${session.winner} wins` : "live"} /></div></> : <Empty>Choose seats and start a game.</Empty>}
+      <Panel title={session ? `Session ${session.session_id}` : "Authoritative game board"}>
+        {!session ? <Empty>Choose seats and start a game.</Empty> : <>
+          {!atLive && <Notice kind="info" action={<button type="button" onClick={() => setCursor(live)}>Back to the live position</button>}>
+            Reviewing ply {cursor} of {live} — the engine only accepts a placement from the live position.
+          </Notice>}
+          <Board
+            moves={session.moves}
+            cursor={cursor}
+            legal={candidates}
+            mask={legalMask}
+            selected={selected}
+            onSelect={(value) => void move(value)}
+            onStone={(ply) => setCursor(ply + 1)}
+            interactive={atLive && !session.terminal}
+            toolbar
+            status={inspect.loading && atLive ? "pending" : "idle"}
+            height={500}
+            caption={session.terminal
+              ? `Finished after ${session.moves.length} plies`
+              : `Live position, P${session.current_player} to place`}
+          />
+          <Transport length={live} value={cursor} onChange={setCursor} />
+          <div className="metric-row wrap">
+            <Metric label="ply" value={`${cursor} / ${live}`} />
+            <Metric label="to move" value={session.terminal ? "finished" : `P${session.current_player}`} />
+            <Metric label="placements left" value={session.moves_remaining} />
+            <Metric label="legal" value={session.legal_count} />
+            <Metric label="result" value={session.capped ? "capped" : session.terminal ? `P${session.winner} wins` : "live"} />
+          </div>
+          <div className="kbd-hint">click a legal cell to place · click a stone to review that ply · ← → step · shift ±10 · space play</div>
+        </>}
       </Panel>
     </main>
+
     <aside className="side-column">
-      <Panel title="KLENT position read"><div className="metric-row wrap"><Metric label="v̂" value={format(inspect?.v_hat)} /><Metric label="KL" value={format(inspect?.kl)} /><Metric label="H/log|A|" value={format(inspect?.norm_entropy)} /><Metric label="legal" value={inspect?.legal_count ?? "—"} /></div></Panel>
-      <Panel title="Candidates"><div className="candidate-table">{inspect?.legal.slice().sort((a, b) => b[overlay] - a[overlay]).slice(0, 20).map((row) => <div key={`${row.move}`}><b>({row.move.join(", ")})</b><span>π {format(row.policy)}</span><span>Q {format(row.q)}</span><span>π′ {format(row.improved)}</span><em>#{row.rank + 1}</em></div>) ?? <Empty />}</div></Panel>
+      <Panel title="Checkpoint read of this position">
+        <ErrorBox message={inspect.error} />
+        {!session ? <Empty>Start a game to read a position.</Empty>
+          : !checkpoint ? <Empty>No checkpoint selected — the engine is refereeing, but nothing is reading the position.</Empty>
+          : session.terminal ? <Empty>The game is over — there is nothing to choose.</Empty>
+          : !atLive ? <Empty>Reviewing ply {cursor}; the read follows the live position.</Empty>
+          : !read ? <Empty>reading…</Empty>
+          : <>
+            <div className="metric-row wrap">
+              <Metric label="v̂" value={format(read.v_hat)} />
+              <Metric label="KL" value={format(read.kl)} />
+              <Metric label="H/log|A|" value={format(read.norm_entropy)} />
+              <Metric label="legal" value={read.legal_count} />
+            </div>
+            <div className="play-note">
+              model's top move {topMove ? `(${topMove.join(", ")})` : "—"} · τ {read.tau} · λ {read.lam} · {read.moves_remaining} stone{read.moves_remaining === 1 ? "" : "s"} left in this turn
+            </div>
+          </>}
+      </Panel>
+      <Panel title="Candidates" action={<span>{read ? candidates?.length ?? 0 : "—"}</span>}>
+        {read && candidates?.length
+          ? <div className="candidate-table" style={{ ["--cand-cols" as string]: "1fr 50px 50px 50px 26px" }} data-pending={inspect.loading ? "" : undefined}>
+            <div className="candidate-head"><b>move</b><span>π</span><span>Q</span><span>π′</span><em>#</em></div>
+            {candidates.slice().sort((a, b) => a.policyRank - b.policyRank).slice(0, 24).map((row) => {
+              const isSelected = selected != null && moveKey(selected) === moveKey(row.move);
+              return <button
+                key={moveKey(row.move)}
+                type="button"
+                aria-pressed={isSelected}
+                onClick={() => setSelected(isSelected ? null : row.move)}
+              >
+                <b>({row.move.join(", ")})</b>
+                <span>{format(row.policy)}</span>
+                <span>{format(row.q)}</span>
+                <span>{format(row.improved)}</span>
+                <em>#{row.policyRank + 1}</em>
+              </button>;
+            })}
+          </div>
+          : <Empty>{session && !checkpoint ? "Select a checkpoint to rank the legal moves." : "No candidate set for this position."}</Empty>}
+      </Panel>
     </aside>
   </div>;
 }

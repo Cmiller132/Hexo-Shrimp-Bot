@@ -9,6 +9,8 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
+    "lan-relay": "node scripts/lan-relay.cjs",
+    "prune-css": "node scripts/prune-css.cjs --write",
     "test": "npm run build && node --test tests/rendered-html.test.mjs",
     "lint": "tsc --noEmit"
   },

@@ -50,9 +50,10 @@ Note that `maturin develop` installs into `/opt/venv`, which lives in the
 container layer — a `--rm` container rebuilds it next time. For a
 long-lived workflow, `docker compose up -d train` once and `exec` into it.
 
-SealBot's `minimax_cpp` on the mount is a Windows build; evals inside the
-container need a Linux build of it first. Until that lands, run SealBot
-evals from the Windows side.
+SealBot evals need a Linux `minimax_cpp` on the `/sealbot` mount, which is
+writable for exactly that: `python setup.py build_ext --inplace` in
+`/sealbot/current` drops the `.so` beside the Windows `.pyd`, and the `deck`
+entrypoint does it automatically when the `.so` is missing.
 
 ## Control deck
 
@@ -80,7 +81,8 @@ maturin develop --release -m ../hexo-py/Cargo.toml
 ```
 
 and, when the Linux SealBot artifact is absent, runs `python setup.py
-build_ext --inplace` in `/sealbot/current`. It then starts Uvicorn on
+build_ext --inplace` in `$SEALBOT_ROOT/$SEALBOT_VARIANT` (`/sealbot/current`
+by default). It then starts Uvicorn on
 `0.0.0.0:8000`. Training runs launched by the API are ordinary child processes
 inside this service; there is no Docker socket and no Docker-in-Docker.
 
