@@ -188,8 +188,10 @@ CREATE UNIQUE INDEX games_selfplay_key ON games(iteration, game_index)
     WHERE kind = 'selfplay';
 CREATE UNIQUE INDEX games_eval_key ON games(match, game_index)
     WHERE kind = 'eval';
+-- Serves the iteration range of a browse that names no kind, and the
+-- iteration sweeps `begin_run` deletes by. The game browser's own indexes
+-- are `_GAME_INDEXES`, applied by `_index_games` rather than declared here.
 CREATE INDEX games_iteration ON games(iteration);
-CREATE INDEX games_search ON games(kind, winner, length);
 
 -- Acting-time scalars, self-play only: an evaluation game plays argmax
 -- π_θ and has no π′ to reduce.
@@ -312,6 +314,67 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# What `search_games` needs to answer a page without reading the table:
+# one index per entry of GAME_ORDERS, named after it. Each leads with
+# `kind`, since every browse filters on it, and then repeats that order's
+# sort key column for column, in the direction the order reads each one —
+# so the whole ORDER BY comes off the index and only the page's rows are
+# ever touched. Without them SQLite has no ordered path into `games` and
+# sorts every matching row to hand back fifty: measured on a 575,342-game
+# run, ~480 ms warm on a local disk and ~44 s through the deck's mount, per
+# request.
+#
+# One index per order rather than a shared pair, because sharing depends on
+# the planner turning an index around and sorting only the trailing term of
+# the sort key inside each tie group. It will, sometimes: SQLite 3.45 does
+# it for both reversed orders, 3.53 for one of them and a full sort for the
+# other. Matching each order exactly costs ~14 MB apiece on a run that size
+# and is a decision the planner cannot get wrong.
+#
+# `winner`, `capped`, and the length bounds stay out of them: the ordered
+# scan tests those per row as it walks, which is free at fifty rows,
+# whereas indexing them would mean an index per combination of filters. An
+# iteration range conjoined with a *length* order is the one shape still
+# answered by a sort — no index can lead with both columns — and there the
+# sort is bounded by the range the filter selected.
+#
+# `games_search(kind, winner, length)` is dropped by the same list: it can
+# satisfy a filter but never an order, so with these present the planner has
+# no reason to pick it, and an index the planner never picks is weight on
+# every insert.
+_GAME_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS games_browse_recent"
+    " ON games(kind, iteration DESC, game_index)",
+    "CREATE INDEX IF NOT EXISTS games_browse_oldest"
+    " ON games(kind, iteration, game_index)",
+    "CREATE INDEX IF NOT EXISTS games_browse_longest"
+    " ON games(kind, length DESC, iteration DESC, game_index)",
+    "CREATE INDEX IF NOT EXISTS games_browse_shortest"
+    " ON games(kind, length, iteration DESC, game_index)",
+    "DROP INDEX IF EXISTS games_search",
+)
+
+
+def _index_games(conn: sqlite3.Connection) -> None:
+    """Bring a database's `games` indexes up to `_GAME_INDEXES`.
+
+    Called from `Telemetry.__init__` alone, which is the only path that
+    holds a writable connection — the deck opens telemetry read-only, and a
+    reader cannot create an index. Idempotent, because a database written
+    before these indexes existed has to gain them the next time a writer
+    opens it, and one written after must not be touched twice.
+
+    This is deliberately not a schema version. An index is derived from
+    rows already in the file and stores no format of its own, so a database
+    with these and one without hold the same bytes and answer the same
+    queries — SCHEMA_VERSION stays where it is, and every run database ever
+    written stays readable by this build.
+    """
+    with conn:
+        for statement in _GAME_INDEXES:
+            conn.execute(statement)
+
+
 def _connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
@@ -372,6 +435,10 @@ class Telemetry:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._conn = _connect(self.path)
+        # The only moment a run's telemetry is open for writing, and so the
+        # only moment a database written by an earlier build can be given
+        # the game browser's indexes.
+        _index_games(self._conn)
         self._run: int | None = None
         self._next_game_id = self._max_game_id() + 1
 
@@ -768,7 +835,9 @@ def iteration_series(conn, columns, *, iterations=None) -> list[dict]:
 
 
 # The orders the game browser offers, by name. Every one ends in the game's
-# natural key so paging is stable when the sort column ties.
+# natural key so paging is stable when the sort column ties. Adding one
+# means checking `_GAME_INDEXES` still covers it: an order with no index
+# behind it sorts every matching game to return a page of fifty.
 GAME_ORDERS = {
     "recent": "iteration DESC, game_index",
     "oldest": "iteration, game_index",

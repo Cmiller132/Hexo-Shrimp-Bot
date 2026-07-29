@@ -303,9 +303,21 @@ class RunRegistry:
 
 
 def _config_from_checkpoint(raw: dict) -> MantisConfig:
-    if "model_config" in raw:
-        return MantisConfig(**raw["model_config"])
+    """The architecture a checkpoint actually holds, read off its own tensors.
+
+    The deck is the analysis surface: it puts checkpoints from different runs
+    on the same axes, so it reads what each file contains rather than assuming
+    the shape this build trains. The width of the action-value head is the one
+    field a stored ``model_config`` can be silently wrong about — checkpoints
+    written before the critic was factored predate the field and would take
+    the dataclass default — so the state dict decides it either way.
+    """
     state = raw["model"]
+    critic_factors = state["mlp_q.out.weight"].shape[0]
+    if "model_config" in raw:
+        return MantisConfig(
+            **{**raw["model_config"], "critic_factors": critic_factors}
+        )
     blocks = 1 + max(
         [int(k.split(".")[1]) for k in state if k.startswith("blocks.")], default=-1
     )
@@ -321,6 +333,7 @@ def _config_from_checkpoint(raw: dict) -> MantisConfig:
         value_bins=state["mlp_v.2.weight"].shape[0],
         policy_hidden=state["mlp_p.lin_a.weight"].shape[0],
         value_hidden=state["mlp_v.0.weight"].shape[0],
+        critic_factors=critic_factors,
     )
 
 
@@ -354,13 +367,20 @@ class InferenceCache:
                     torch.cuda.empty_cache()
             return path, model
 
-    def parameters(self, path: Path, tau, lam) -> tuple[float, float]:
+    def parameters(self, path: Path, tau, lam) -> tuple[float, float, float]:
         if tau is not None and lam is not None:
-            return float(tau), float(lam)
+            return float(tau), float(lam), 1.0
         try:
             run = path.parent
             config = json_file(run / "config.json")
-            return float(config["klent"]["tau"]), float(config["klent"]["lam"])
+            klent = config["klent"]
+            # A config written before the q_scale knob existed ran at the
+            # eq. 3 gain of 1.0 — reading history, not defaulting an input.
+            return (
+                float(klent["tau"]),
+                float(klent["lam"]),
+                float(klent.get("q_scale", 1.0)),
+            )
         except (FileNotFoundError, KeyError, TypeError):
             raise ValueError(
                 "a checkpoint outside a run directory requires tau and lam"
@@ -368,9 +388,10 @@ class InferenceCache:
 
     def inspect(self, checkpoint: str, moves, t=None, tau=None, lam=None) -> dict:
         path, model = self.get(checkpoint)
-        tau, lam = self.parameters(path, tau, lam)
+        tau, lam, q_scale = self.parameters(path, tau, lam)
         return inspect_position(
-            model, moves, len(moves) if t is None else t, tau, lam, self.device
+            model, moves, len(moves) if t is None else t, tau, lam, q_scale,
+            self.device,
         )
 
 

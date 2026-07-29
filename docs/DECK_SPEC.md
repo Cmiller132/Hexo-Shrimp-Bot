@@ -127,9 +127,11 @@ seams that matter:
 - **Inference sessions.** A small LRU (≤ 2) of loaded checkpoints on the
   service's device, eager (never `torch.compile` — latency beats
   throughput here, and the training process owns the compile caches).
-  `inspect_position` is the one seam for position analysis; τ and λ come
-  from the checkpoint's run `config.json`, never from defaults — a
-  checkpoint outside a run directory requires them in the request.
+  `inspect_position` is the one seam for position analysis; τ, λ, and the
+  critic gain `q_scale` come from the checkpoint's run `config.json`, never
+  from defaults — a checkpoint outside a run directory requires τ and λ in
+  the request. A run predating the gain is read as `q_scale = 1.0`, which
+  is history, not a default: that is the operator it actually ran under.
   Explicitly bounded: analysis batches are single positions; arena/match
   cohorts ≤ 64. The GPU is shared with a possibly-active training run —
   stay small, and surface "training active" in match-launch responses so

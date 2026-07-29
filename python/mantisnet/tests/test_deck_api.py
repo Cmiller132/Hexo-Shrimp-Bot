@@ -118,7 +118,7 @@ def test_inspect_endpoint_equals_direct_inspection(deck_run):
     checkpoint = run / "checkpoint_000001.pt"
     save_checkpoint(checkpoint, model, optimizer, 1, np.random.default_rng(4))
     moves = [(0, 0), (1, 0), (0, 1)]
-    expected = inspect_position(model, moves, 3, 0.1, 0.03)
+    expected = inspect_position(model, moves, 3, 0.1, 0.03, 1.0)
 
     with TestClient(create_app(runs, device="cpu")) as client:
         response = client.post(

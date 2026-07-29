@@ -544,6 +544,92 @@ def test_search_and_series_filter_as_asked(tmp_path):
     writer.close()
 
 
+def test_every_browse_order_comes_off_an_index(tmp_path):
+    """A page of the game browser must never sort `games`.
+
+    Every `GAME_ORDERS` entry has an index matching its sort key column
+    for column, so the plan carries no temp B-tree at all. The failure this
+    pins is the one the deck was shipped with: sorting every matching game
+    — hundreds of thousands of them — to hand back fifty, per request.
+    """
+
+    class Spy:
+        """Records the SQL `search_games` runs, unexpanded: the plan for a
+        query with `kind = ?` is not the plan for one with the value
+        inlined, and it is the parameterized one the deck issues."""
+
+        def __init__(self, conn):
+            self.conn, self.calls = conn, []
+
+        def execute(self, sql, params=()):
+            self.calls.append((sql, list(params)))
+            return self.conn.execute(sql, params)
+
+    writer = _fixture_db(tmp_path)
+    conn = tel.connect(tmp_path)
+
+    def plan_of(**kwargs) -> str:
+        spy = Spy(conn)
+        tel.search_games(spy, **kwargs)
+        (sql, params), = spy.calls
+        return " / ".join(
+            row[3] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)
+        )
+
+    for order in tel.GAME_ORDERS:
+        plan = plan_of(kind="selfplay", order=order)
+        assert f"games_browse_{order}" in plan, (order, plan)
+        assert "TEMP B-TREE" not in plan, (order, plan)
+
+    # The other half of the query the deck fires: an iteration floor
+    # conjoins with the default order as a range seek along the same index,
+    # not as a second pass over what it returned.
+    plan = plan_of(kind="selfplay", iterations=(1, None))
+    assert "games_browse_recent" in plan and "iteration>" in plan, plan
+    assert "TEMP B-TREE FOR ORDER BY" not in plan, plan
+    conn.close()
+    writer.close()
+
+
+def test_a_database_without_the_browse_indexes_gains_them_from_a_writer(tmp_path):
+    """An index is not a schema version.
+
+    The deck opens telemetry read-only and cannot create one, so a run
+    database written before these indexes existed has to pick them up the
+    next time a *writer* opens it — with `SCHEMA_VERSION` untouched, since
+    bumping it would refuse every database already on disk.
+    """
+    _fixture_db(tmp_path).close()
+    browse = {f"games_browse_{order}" for order in tel.GAME_ORDERS}
+
+    raw = sqlite3.connect(tel.db_path(tmp_path))
+    with raw:  # the shape a database from before this build has
+        for name in browse:
+            raw.execute(f"DROP INDEX {name}")
+        raw.execute("CREATE INDEX games_search ON games(kind, winner, length)")
+    version = raw.execute("SELECT version FROM schema_version").fetchone()[0]
+    raw.close()
+
+    with tel.open_telemetry(tmp_path):
+        pass
+
+    conn = tel.connect(tmp_path)
+    indexes = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index'"
+            " AND tbl_name = 'games'"
+        )
+    }
+    # One per order, named after it: an order with no index behind it is a
+    # page that sorts the whole run.
+    assert browse <= indexes
+    assert "games_search" not in indexes  # superseded, so it comes out too
+    assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == version
+    assert [g["game_id"] for g in tel.search_games(conn)] == [0, 1, 2]
+    conn.close()
+
+
 def test_summary_and_cli_read_a_real_run(tmp_path, capsys):
     _train(tmp_path, iterations=1)
     conn = tel.connect(tmp_path)
@@ -653,14 +739,14 @@ def test_inspect_position_matches_a_direct_forward():
     model = _tiny_model().eval()
     moves = [(0, 0), (1, 1), (2, 0), (-1, 0), (0, 2)]
     tau, lam = 0.1, 0.03
-    out = inspect_position(model, moves, t=3, tau=tau, lam=lam)
+    out = inspect_position(model, moves, t=3, tau=tau, lam=lam, q_scale=1.0)
 
     position = hexo_py.Position.replay(moves[:3])
     batch = collate_positions([position])
     with torch.no_grad():
         result = model(batch)
     imp = improved_policy(
-        result.policy_logits, result.q_values, batch.legal_offsets, tau, lam
+        result.policy_logits, result.q_values, batch.legal_offsets, tau, lam, 1.0
     )
     policy = torch.softmax(result.policy_logits, 0)
 
@@ -692,8 +778,8 @@ def test_inspect_position_loads_a_checkpoint_by_path(tmp_path, model):
         path, model, torch.optim.Adam(model.parameters()), 1, np.random.default_rng(0)
     )
     moves = [(0, 0), (1, 1), (2, 0)]
-    by_path = inspect_position(path, moves, 2, 0.1, 0.03)
-    by_object = inspect_position(model, moves, 2, 0.1, 0.03)
+    by_path = inspect_position(path, moves, 2, 0.1, 0.03, 1.0)
+    by_object = inspect_position(model, moves, 2, 0.1, 0.03, 1.0)
     assert by_path == by_object
 
 
@@ -704,13 +790,13 @@ def test_inspect_position_walks_a_line_one_move_at_a_time():
     model = _tiny_model().eval()
     moves = [(0, 0), (1, 1), (2, 0), (-1, 0), (0, 2)]
     for t in range(len(moves) + 1):
-        out = inspect_position(model, moves, t, 0.1, 0.03)
+        out = inspect_position(model, moves, t, 0.1, 0.03, 1.0)
         assert out["stone_count"] == t
         assert out["played"] == (moves[t] if t < len(moves) else None)
         assert out["legal_count"] == len(out["legal"]) > 0
 
     with pytest.raises(ValueError, match="outside"):
-        inspect_position(model, moves, len(moves) + 1, 0.1, 0.03)
+        inspect_position(model, moves, len(moves) + 1, 0.1, 0.03, 1.0)
 
 
 def test_inspect_position_reproduces_a_recorded_ply(tmp_path):
@@ -739,7 +825,7 @@ def test_inspect_position_reproduces_a_recorded_ply(tmp_path):
     # the tolerance is the quantization half-step plus float noise.
     q = 0.5 / tel._Q + 1e-6
     for ply in game["plies"][:3]:
-        out = inspect_position(actor, game["moves"], ply["t"], cfg.tau, cfg.lam)
+        out = inspect_position(actor, game["moves"], ply["t"], cfg.tau, cfg.lam, cfg.q_scale)
         probs = [e["improved"] for e in out["legal"]]
         assert out["legal_count"] == ply["legal_count"]
         assert out["v_hat"] == pytest.approx(ply["v_hat"], abs=q)
