@@ -118,8 +118,6 @@ The operator refuses `tau < 0`, `lam < 0`, and `tau + lam <= 0`. Shape, device, 
 
 The consumed model contract is the trunk and legal-cell decoder in [MODEL_SPEC.md](MODEL_SPEC.md): `cell_heads` returns one raw policy logit and one scalar $Q\in(-1,1)$, produced by `tanh`, for every legal cell in engine order. KLENT calls no state-value readout and applies no loss to it.
 
-**Finding:** `MODEL_SPEC.md` Appendix B currently specifies a factorized critic, a critic gain, and binary cross-entropies; current `model.py`, `improve.py`, and `train.py` implement scalar tanh Q, no gain, and MSE.
-
 For a fitting batch of positions,
 
 $$L =
