@@ -42,14 +42,20 @@ def improved_policy(
     p = offsets.shape[0] - 1
     seg = segment_ids(offsets)
 
-    log_pi = segment_log_softmax(policy_logits.float(), offsets)
-    q = q_values.float()
+    # At least fp32, so bf16 acting logits do not round π′ and its diagnostics;
+    # float64 when both inputs are, so a caller comparing two improved policies
+    # keeps a difference the operator would otherwise round away.
+    dtype = torch.promote_types(
+        torch.promote_types(policy_logits.dtype, q_values.dtype), torch.float32
+    )
+    log_pi = segment_log_softmax(policy_logits.to(dtype), offsets)
+    q = q_values.to(dtype)
     log_improved = segment_log_softmax((q + tau * log_pi) / (tau + lam), offsets)
     probs = log_improved.exp()
 
     v_hat = segment_sum(probs * q, seg, p)
     kl = segment_sum(probs * (log_improved - log_pi), seg, p)
     entropy = segment_sum(-probs * log_improved, seg, p)
-    counts = (offsets[1:] - offsets[:-1]).float()
+    counts = (offsets[1:] - offsets[:-1]).to(dtype)
     norm_entropy = torch.where(counts > 1, entropy / counts.clamp(min=2).log(), entropy.new_zeros(p))
     return ImprovedPolicy(probs=probs, v_hat=v_hat, kl=kl, norm_entropy=norm_entropy)

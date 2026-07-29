@@ -101,7 +101,7 @@ improved_policy(
 ) -> ImprovedPolicy
 ```
 
-`policy_logits` and `q_values` are flat, aligned, and ordered by engine legal rank. `offsets` starts at zero, ends at $N$, and defines $P$ positive-width positions. The tensors share a device. Logit and Q arithmetic is fp32, and the whole operator is `no_grad`.
+`policy_logits` and `q_values` are flat, aligned, and ordered by engine legal rank. `offsets` starts at zero, ends at $N$, and defines $P$ positive-width positions. The tensors share a device. Arithmetic runs in the promotion of the two input dtypes with fp32 as a floor, and every return field carries that dtype: acting's fp32 and bf16 both give fp32, and a float64 caller keeps float64. The whole operator is `no_grad`.
 
 | Return field | Shape | Definition |
 |---|---:|---|
@@ -116,24 +116,31 @@ The operator refuses `tau < 0`, `lam < 0`, and `tau + lam <= 0`. Shape, device, 
 
 ## 3. Critic and losses
 
-The consumed model contract is the trunk and legal-cell decoder in [MODEL_SPEC.md](MODEL_SPEC.md): `cell_heads` returns one raw policy logit and one scalar $Q\in(-1,1)$, produced by `tanh`, for every legal cell in engine order. KLENT calls no state-value readout and applies no loss to it.
+The consumed model contract is the trunk and legal-cell decoder in [MODEL_SPEC.md](MODEL_SPEC.md) appendix B. For every legal cell in engine order, `cell_head_logits` returns one raw policy logit and the critic's two return-mass logits $(z^{+},z^{-})$; `cell_heads` composes the second into the action value
 
-For a fitting batch of positions,
+$$u^{+}=\sigma(z^{+}),\qquad u^{-}=\sigma(z^{-}),\qquad Q=u^{+}-u^{-}\in(-1,1),$$
+
+which is what every acting path consumes. Fitting reads the raw logits and composes only the taken action from the same pass. KLENT calls no state-value readout and applies no loss to it.
+
+For a fitting batch of positions, with $G^{+}_i=\max(G_i,0)$ and $G^{-}_i=\max(-G_i,0)$,
 
 $$L =
 \frac1P\sum_{i=1}^{P}
 \left[
   -\sum_{a\in A(S_i)}\pi'_i(a)\log\pi_\theta(a\mid S_i)
   +(Q_\theta(S_i,A_i)-G_i)^2
+  +\frac{\eta}{2}\Big(
+     \mathrm{BCE}\big(z^{+}_\theta(S_i,A_i),\,G^{+}_i\big)
+    +\mathrm{BCE}\big(z^{-}_\theta(S_i,A_i),\,G^{-}_i\big)\Big)
 \right].$$
 
-The policy cross-entropy covers the full legal set. The critic loss selects only the stored action rank. The two terms have unit weight.
+The policy cross-entropy covers the full legal set. All three critic terms select only the stored action rank. $\mathrm{BCE}$ is the with-logits binary cross-entropy against a **soft** target in $[0,1]$: at its optimum $u^{+}=\mathbb E[G^{+}\mid S,A]$ and $u^{-}=\mathbb E[G^{-}\mid S,A]$, hence $Q=\mathbb E[G\mid S,A]$. The policy cross-entropy and the squared error have unit weight; only the mass pair carries a coefficient, $\eta$ = `KlentConfig.mass_weight` (§10). Composition and every loss term are fp32.
 
 | Check | Owner | Exact behavior |
 |---|---|---|
 | Policy target normalization | `policy_loss` | Accumulates each segment in float64 and refuses sums not `torch.allclose` to one with `atol=1e-4` and the default relative tolerance; NaN, infinity, and truncated targets fail. It does not separately refuse negative entries. |
 | Outcome range | `value_target` | Refuses values outside $[-1,1]$. KLENT does not call this binned state-value helper. |
-| Scalar return range | KLENT fitter | No explicit range or finiteness check; valid collection through tanh Q and the return recursion keeps $G$ bounded. |
+| Scalar return range | KLENT fitter | No explicit range or finiteness check; valid collection through bounded $Q$ and the return recursion keeps $G$ in $[-1,1]$, which is also what makes $G^{\pm}$ admissible cross-entropy targets. |
 | Stored-policy width | `_rebuild` | Refuses a stored $\pi'$ whose length differs from the replayed position's legal count. |
 
 ## 4. Collection and buffer
@@ -146,7 +153,7 @@ Collection accepts:
 evaluate(batch) -> (policy_logits, q_values)
 ```
 
-Both outputs are flat fp32 CPU tensors in batch legal-cell order. `network_evaluate` implements the seam with `trunk` plus `cell_heads` under `no_grad`; it does not evaluate the state-value head.
+Both outputs are flat fp32 CPU tensors in batch legal-cell order. `network_evaluate` implements the seam with `trunk` plus the cell heads under `no_grad`, composing $Q$ outside the autocast region; it does not evaluate the state-value head.
 
 For each acting position, collection computes $\pi'$, $\hat v$, KL, and normalized entropy before sampling. It renormalizes each probability segment in float64 for sampling and fp32 storage, draws one uniform per slot, advances the selected legal rank, and retains the operator's original fp32 diagnostics.
 
@@ -237,6 +244,16 @@ Telemetry stores per-ply $\hat v$, KL, normalized entropy, top probability, and 
 - Checkpoints require exact equality of `MODEL_REPR_VERSION`, `RULES_VERSION`, `ACTION_ORDER_VERSION`, and Torch version. Model loading constructs default `MantisConfig`; incompatible shapes fail strict state-dict loading.
 - `telemetry.db` independently refuses a schema-version mismatch.
 
+A checkpoint whose critic readout is the single `tanh`-scored row of the scalar critic is not loadable by this build; `python -m mantisnet.klent.graft OLD.pt NEW.pt --tau T --lam L --manifest OUT.json` converts it once, and every other loader stays strict. The conversion is defined by
+
+$$W^{+}=2W_s,\quad b^{+}=2b_s,\quad W^{-}=-2W_s,\quad b^{-}=-2b_s,$$
+
+which is exactly function preserving because $\sigma(2z)-\sigma(-2z)=\tanh(z)$. It refuses a parent that differs from this build's architecture at any key other than the two readout tensors, a malformed checkpoint, versions other than this build's, a missing Adam entry, an unexpected readout shape, and equal source and destination paths. `--tau` and `--lam` are required: the manifest's $\pi'$ measurements are meaningless without the operating point they were taken at.
+
+Adam state is remapped by parameter name onto a single group contiguous over `named_parameters()`. Shared parameters keep their moments verbatim; a readout row scaled by $s$ takes $m\leftarrow s\,m$ with $v$ and the step unchanged, so the first post-graft step is $s$ times the parent's — the same step in function space that the readout itself preserves. This arm adds no parameter tensor, so no moment is zero-filled; a parent missing a parameter this build has is refused, not initialized.
+
+The graft is a detector, not a formality. It runs a fixed seeded probe set of 64 nonterminal positions through two models — the grafted one, and the parent checkpoint strict-loaded into the one-wide-readout architecture it was trained with — so the comparison covers every tensor the conversion carries over and not only the two it rewrites, and it writes neither checkpoint nor manifest unless $\max|Q_{\text{new}}-Q_{\text{parent}}|\le10^{-5}$ and $\bigl|\overline{D_{\mathrm{KL}}(\pi'_{\text{new}}\Vert\pi'_{\text{parent}})}\bigr|\le10^{-6}$. Each model's $\pi'$ is taken from its own policy logits and action values, in float64, so the KL tolerance bounds a difference between the two rather than the operator's own rounding. The manifest records the arm, source, source iteration, versions, transform, operating point, probe seed and counts, both preservation numbers, and the median per-position spread of $Q$ over the policy's top 16 legal cells before and after.
+
 ## 8. Per-iteration metrics
 
 Acting means cover every position evaluated during the collection call, including capped episodes and unfinished slots. Outcome-conditioned statistics cover only naturally terminated episodes returned by the call.
@@ -256,13 +273,14 @@ Acting means cover every position evaluated during the collection call, includin
 | `buffer_samples` | Training samples after whole-dropping capped episodes. |
 | `policy_loss` | Sample-weighted mean full-legal-set cross-entropy over the epoch. |
 | `q_loss` | Sample-weighted mean taken-action $(Q-G)^2$ over the epoch. |
+| `mass_loss` | Sample-weighted mean taken-action $\mathrm{BCE}(z^{+},G^{+})+\mathrm{BCE}(z^{-},G^{-})$ over the epoch, **unweighted** by $\eta$, so it reads as a calibration diagnostic independent of the coefficient. |
 | `fit_steps` | Number of optimizer groups stepped. |
 | `seconds` | Driver interval covering the collection wait and fit; evaluation is excluded. |
 | `eval_score` | Evaluation score per game: win or opponent forfeit 1, cap $1/2$, loss 0. |
 | `eval_capped`, `eval_games` | Capped-game count and total games in that evaluation. |
 | `eval_seconds` | Wall time around evaluation and its telemetry recording. |
 
-`policy_loss`, `q_loss`, and `fit_steps` are absent when the buffer is empty. Evaluation fields are absent when no evaluation runs. Empty conditional statistics are serialized as `null`. Telemetry additionally derives samples/second, game and ply counts, and per-iteration hardware means and maxima.
+`policy_loss`, `q_loss`, `mass_loss`, and `fit_steps` are absent when the buffer is empty. Evaluation fields are absent when no evaluation runs. Empty conditional statistics are serialized as `null`. `mass_loss` has no queryable telemetry column and survives in `metrics.jsonl` and the telemetry `metrics_json` payload. Telemetry additionally derives samples/second, game and ply counts, and per-iteration hardware means and maxima.
 
 ## 9. Deviations from the paper
 
@@ -288,7 +306,7 @@ Acting means cover every position evaluated during the collection call, includin
 
 ### 9.6 Output initialization
 
-**Paper:** Policy and action-value networks start from random initialization. **Here:** The policy and scalar-Q output layers initialize exactly to zero. **Grounds:** The remaining model parameters retain their configured initialization. **Measured outcomes:** See [ABLATIONS.md § `abl-zeroq-lam01`](ABLATIONS.md#abl-zeroq-lam01).
+**Paper:** Policy and action-value networks start from random initialization. **Here:** The policy and action-value output layers initialize exactly to zero, so the initial policy logits and action values are exactly zero. **Grounds:** The remaining model parameters retain their configured initialization. **Measured outcomes:** See [ABLATIONS.md § `abl-zeroq-lam01`](ABLATIONS.md#abl-zeroq-lam01).
 
 ### 9.7 Capped episodes
 
@@ -320,7 +338,11 @@ Acting means cover every position evaluated during the collection call, includin
 
 ### 9.14 Model substrate
 
-**Paper:** Experiments use a fixed-action ResNetV2 with policy and action-value heads and no state-value head for KLENT. **Here:** KLENT consumes MantisNet's ragged legal-cell policy/scalar-Q decoders; its model container has a state-value head that KLENT neither calls nor trains. **Grounds:** Hexo's board and legal-action count are variable. **Measured outcomes:** See [ABLATIONS.md § Shared decoder aggregation](ABLATIONS.md#shared-decoder-aggregation-and-triton-segment-reduction) and [§ Critic ranking-stability probe](ABLATIONS.md#critic-ranking-stability-probe).
+**Paper:** Experiments use a fixed-action ResNetV2 with policy and action-value heads and no state-value head for KLENT. **Here:** KLENT consumes MantisNet's ragged legal-cell policy and action-value decoders; its model container has a state-value head that KLENT neither calls nor trains. **Grounds:** Hexo's board and legal-action count are variable. **Measured outcomes:** See [ABLATIONS.md § Shared decoder aggregation](ABLATIONS.md#shared-decoder-aggregation-and-triton-segment-reduction) and [§ Critic ranking-stability probe](ABLATIONS.md#critic-ranking-stability-probe).
+
+### 9.15 Critic parameterization
+
+**Paper:** The action-value head emits one scalar per action, fitted by squared error against the $\lambda$-return. **Here:** The head emits two logits per action whose sigmoids are the positive and the negative return mass; their difference is $Q$ and carries the same squared error, and each mass additionally carries a cross-entropy against its own part of the return with weight $\eta/2$. **Grounds:** Each mass is calibrated by its own cross-entropy while $Q$ stays their difference, so the head stores $\mathbb E[G^{+}]$ and $\mathbb E[G^{-}]$ instead of $\mathbb E[G]$ alone. **Measured outcomes:** See [ABLATIONS.md § Training runs](ABLATIONS.md#training-runs).
 
 ## 10. Reference configuration
 
@@ -332,11 +354,12 @@ The current repository reference recipe is:
 | $\lambda$ | `0.01` |
 | $\tau$ | `0.1` |
 | $\lambda_{\mathrm{ret}}$ | `0.939` |
-| Critic | scalar tanh Q |
+| $\eta$ (`mass_weight`) | `0.25` |
+| Critic | two return-mass logits, $Q=u^{+}-u^{-}$ |
 
 These are configuration facts recorded in [ABLATIONS.md](ABLATIONS.md), which also records their selection.
 
-**Finding:** `KlentConfig` and the CLI currently default to $\gamma=1.0,\lambda=0.03$; the reference recipe therefore requires explicit flags, and `test_klent_run.py` pins the `0.03` CLI default.
+**Finding:** `KlentConfig` and the CLI currently default to $\gamma=1.0,\lambda=0.03$; the reference recipe therefore requires explicit flags, and `test_klent_run.py` pins the `0.03` CLI default. `mass_weight` defaults to the $\eta$ above, so `--mass-weight` is needed only to depart from it.
 
 ## 11. Open questions
 

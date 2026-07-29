@@ -5,9 +5,9 @@
 `python/mantisnet` requires Python 3.12 or later and contains the MantisNet
 Torch model, independent graph-builder oracle, losses, Hexo KLENT training loop,
 telemetry store, benchmarks, and control-deck backend. The training path uses a policy head and one
-`tanh`-bounded scalar action value per legal cell. Algorithm obligations are in
-`docs/KLENT_FOR_HEXO.md`; measured experiment outcomes are in
-`docs/ABLATIONS.md`.
+action value per legal cell, composed from the critic's two return-mass logits.
+Algorithm obligations are in `docs/KLENT_FOR_HEXO.md`; measured experiment
+outcomes are in `docs/ABLATIONS.md`.
 
 ## Public surface
 
@@ -28,7 +28,7 @@ Core modules:
 | Module | Contract |
 | --- | --- |
 | `builder` | Graph construction, Rust batch conversion, and collation |
-| `model` | Stone/window trunk, policy decoder, action-value decoder, value head |
+| `model` | Stone/window trunk, policy decoder, action-value decoder and its composition, value head |
 | `attention` | Fused attention operation plus reference path |
 | `decoder` | Shared legal-cell incidence aggregation |
 | `segments` | Ragged segment reductions |
@@ -36,6 +36,7 @@ Core modules:
 | `klent.improve` | Closed-form improved policy |
 | `klent.selfplay` | Persistent-slot collection and samples |
 | `klent.train` | Network evaluation, packing, collection, and fit |
+| `klent.graft` | Scalar-critic checkpoint conversion, measured and refusing |
 | `klent.run` | Checkpointed iteration driver and CLI |
 | `klent.telemetry` | SQLite writes, queries, and CLI |
 | `klent.search` | Gumbel line search used by Python evaluation |
@@ -43,9 +44,9 @@ Core modules:
 | `deck.service` | Run registry, inference cache, and play sessions |
 | `deck.state` | Deck-owned reviews, probes, presets, and match jobs |
 
-`MantisNet.forward(batch)` returns raw policy logits, scalar action values,
+`MantisNet.forward(batch)` returns raw policy logits, composed action values,
 distributional state value outputs, and the decoded state value. KLENT
-collection and fitting call `trunk` plus `cell_heads` and do not consume the
+collection and fitting call `trunk` plus the cell heads and do not consume the
 state-value head.
 
 The `mantisnet.klent` package exports collection, returns, improvement, fit,
@@ -86,6 +87,14 @@ uv run python -m mantisnet.klent.run \
   --resume
 ```
 
+Convert a scalar-critic checkpoint to this build's critic:
+
+```sh
+uv run python -m mantisnet.klent.graft \
+  runs/source/checkpoint_000151.pt runs/forked/checkpoint_000151.pt \
+  --tau 0.1 --lam 0.01 --manifest runs/forked/graft.json
+```
+
 Inspect telemetry and run benchmarks:
 
 ```sh
@@ -122,11 +131,18 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 - Legal-cell outputs are ragged and follow engine canonical legal order.
 - Policy and action-value decoders share incidence aggregation but own separate
   projections, embeddings, and output MLPs.
-- Action values are scalar and bounded to `(-1, 1)` by `tanh`.
-- The policy and action-value output layers initialize to zero.
-- KLENT improvement consumes raw policy logits and scalar action values.
-- The KLENT fit objective trains policy cross-entropy and the taken action's
-  squared return error.
+- The critic emits two return-mass logits per legal cell; an action value is
+  `sigmoid(z_pos) - sigmoid(z_neg)` in `(-1, 1)`, composed in fp32.
+- The policy and action-value output layers initialize to zero, so initial
+  policy logits and action values are exactly zero.
+- KLENT improvement consumes raw policy logits and composed action values.
+- The KLENT fit objective trains policy cross-entropy, the taken action's
+  squared return error, and the taken action's two return-mass cross-entropies
+  weighted by `mass_weight`.
+- `mass_loss` reports the unweighted mass bracket and has no telemetry column.
+- A scalar-critic checkpoint loads only after `python -m mantisnet.klent.graft`
+  converts it; that conversion refuses to write unless it measures as function
+  preserving.
 - KLENT fitting does not train or read the distributional state-value head.
 - Stored training states are move prefixes and are rebuilt through `hexo_py`.
 - Capped self-play episodes are excluded from the fitting buffer.

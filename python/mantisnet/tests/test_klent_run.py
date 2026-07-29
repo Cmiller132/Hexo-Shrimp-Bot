@@ -69,6 +69,7 @@ def test_run_resume_and_artifacts(tmp_path):
 
     config = json.loads((out / "config.json").read_text())
     assert config["klent"]["tau"] == 0.1 and config["klent"]["lam"] == 0.03
+    assert config["klent"]["mass_weight"] == 0.25
     assert config["eval_time"] == 0.1
     assert config["eval_depth"] is None
     assert config["eval_sims"] == 32

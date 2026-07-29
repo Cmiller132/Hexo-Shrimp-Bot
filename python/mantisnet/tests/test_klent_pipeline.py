@@ -20,6 +20,7 @@ from mantisnet.klent import (
 )
 from mantisnet.klent.evaluate import argmax_choose
 from mantisnet.klent.train import _pack, fit, network_evaluate
+from mantisnet.model import CRITIC_LOGITS
 
 from .heuristic import heuristic_choose, heuristic_evaluate
 
@@ -176,7 +177,9 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
     cfg = KlentConfig(batch_size=64)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     metrics = fit(model, samples, optimizer, cfg, rng)
-    assert np.isfinite(metrics["policy_loss"]) and np.isfinite(metrics["q_loss"])
+    for key in ("policy_loss", "q_loss", "mass_loss"):
+        assert np.isfinite(metrics[key]), key
+    assert metrics["mass_loss"] > 0  # two cross-entropies against soft targets
     # Groups close at >= batch_size samples and may overshoot by one chunk,
     # so the step count is bounded by, not equal to, ceil(n / batch_size).
     assert 1 <= metrics["fit_steps"] <= (len(samples) + 63) // 64
@@ -188,6 +191,11 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
             assert p.grad is None, f"value head parameter {name} was trained"
         else:
             assert p.grad is not None, f"{name} received no gradient"
+    # Both critic readout rows train: the squared error moves the composed Q
+    # and each cross-entropy moves its own mass.
+    rows = model.mlp_q.out.weight.grad.abs().sum(dim=1)
+    assert rows.shape == (CRITIC_LOGITS,)
+    assert (rows > 0).all(), "a return mass received no gradient"
 
 
 def test_collect_and_fit_end_to_end():
@@ -209,14 +217,21 @@ def test_collect_and_fit_end_to_end():
 
 
 def test_network_evaluate_matches_forward():
+    """The acting seam composes what the full forward reports. The critic
+    readout is perturbed off zero first, or both sides would be zero and the
+    composition would go untested."""
     model = _tiny_model().eval()
     from mantisnet import collate, from_position
 
+    with torch.no_grad():
+        model.mlp_q.out.weight.normal_(std=0.5)
+        model.mlp_q.out.bias.normal_(std=0.5)
     pos = hexo_py.Position.replay([(0, 0), (1, 1), (2, 0)])
     batch = collate([from_position(pos)])
     logits, q = network_evaluate(model, KlentConfig())(batch)
     with torch.no_grad():
         out = model(batch)
+    assert q.abs().max() > 0
     assert torch.allclose(logits, out.policy_logits, atol=1e-6)
     assert torch.allclose(q, out.q_values, atol=1e-6)
 
