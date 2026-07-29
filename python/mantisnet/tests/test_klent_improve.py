@@ -51,7 +51,7 @@ def test_tau_zero_ignores_the_prior():
 
 def test_constant_q_flattens_to_the_tempered_prior():
     # Constant Q: π′ = softmax(τ·log π_θ / (τ+λ)) — the prior to the power
-    # τ/(τ+λ), the flattening §8 is about.
+    # τ/(τ+λ), the flattening KLENT_FOR_HEXO.md §2 is about.
     logits, _q, offsets = _random_ragged(3, [11])
     tau, lam = 0.03, 0.1
     imp = improved_policy(logits, torch.zeros(11), offsets, tau, lam)

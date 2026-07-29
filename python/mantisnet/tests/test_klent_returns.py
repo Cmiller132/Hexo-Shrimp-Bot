@@ -1,4 +1,5 @@
-"""§4.3/§4.4: the sign function and the λ-return, pinned per design doc §4.7.
+"""``KLENT_FOR_HEXO.md`` §1.2/§1.3: the sign function and the λ-return,
+pinned per ``KLENT_FOR_HEXO.md`` §1.4.
 
 The engine cross-check is the one test that catches a parity implementation
 (K1): the sign derived from the phase is compared against the mover actually
@@ -50,7 +51,7 @@ def _walk(moves):
 
 
 def test_signs_follow_the_design_table():
-    # Design doc §4.3's walk: Opening, then P1's two, then P0's two.
+    # KLENT_FOR_HEXO.md §1.2's walk: Opening, then P1's two, then P0's two.
     assert signs_from_moves_remaining([1, 2, 1, 2, 1]).tolist() == [-1, 1, -1, 1, -1]
     with pytest.raises(ValueError):
         signs_from_moves_remaining([1, 3])

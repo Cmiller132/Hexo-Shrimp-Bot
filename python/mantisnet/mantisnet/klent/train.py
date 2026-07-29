@@ -1,6 +1,6 @@
 """The KLENT iteration: collect an on-policy buffer, fit once, discard it.
 
-Faithful to the paper's outer loop (design doc §1): a self-play phase fills
+Faithful to the paper's outer loop (``KLENT_FOR_HEXO.md`` §5): a self-play phase fills
 the buffer, one fitting epoch consumes it (the reference implementation's
 ``fitting_epochs=1``), and nothing survives to the next iteration. The loss
 is eq. 4 — cross-entropy of π_θ against π′ plus squared error of the taken
@@ -25,7 +25,8 @@ from .selfplay import Collector, Sample, collection_stats
 
 @dataclass
 class KlentConfig:
-    """The paper's values wherever Hexo permits them (design doc §2)."""
+    """The paper's values wherever Hexo permits them
+    (``KLENT_FOR_HEXO.md`` §10)."""
 
     # Verified against the paper's eq. 2 and the reference implementation:
     # reverse KL is the heavier regulariser. Prior exponent tau/(tau+lam) = 0.77.
@@ -38,7 +39,7 @@ class KlentConfig:
     # 1.0 is the reference objective; below 1 it ranks faster wins above
     # slower ones — the conversion pressure an infinite no-draw board lacks.
     gamma: float = 1.0
-    ply_cap: int = 512  # §5: capped episodes are dropped whole
+    ply_cap: int = 512  # KLENT_FOR_HEXO.md §4.2: capped episodes are dropped whole
     # The completion quota: an iteration's buffer is at least this many
     # *finished* games, from however many slots are in flight.
     games_per_iteration: int = 4096
@@ -109,7 +110,8 @@ def network_evaluate(model, cfg: KlentConfig):
 
 
 def _rebuild(samples: list[Sample]):
-    """Buffer states back into one batch by parallel replay (design doc §12:
+    """Buffer states back into one batch by parallel replay
+    (``KLENT_FOR_HEXO.md`` §4.3:
     a position is a move prefix). Refuses a sample whose stored π′ no longer
     matches its position's legal count — that misalignment trains against
     scrambled targets and has no downstream symptom."""
@@ -249,7 +251,8 @@ def fit(
 def collect_episodes(
     model, collector: Collector, cfg: KlentConfig, progress=None
 ) -> tuple[list, dict]:
-    """One iteration's corpus: episodes plus the §13 collection metrics.
+    """One iteration's corpus: episodes plus the
+    ``KLENT_FOR_HEXO.md`` §8 collection metrics.
 
     Worker-safe by construction — it draws only from the collector's own
     stream and mutates only the collector's slots, which is what lets the

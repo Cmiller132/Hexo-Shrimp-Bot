@@ -1,6 +1,7 @@
 """The run's telemetry database: every iteration, game, and ply, queryable.
 
-`metrics.jsonl` is the §13 record and stays the run's ground truth. This is
+`metrics.jsonl` is the ``KLENT_FOR_HEXO.md`` §8 record and stays the run's
+ground truth. This is
 the substrate beside it — one `runs/<name>/telemetry.db` per run — holding
 what the metrics row averaged away: which games were played and how they
 went, what the policy believed at each ply, how a checkpoint scored against
@@ -57,7 +58,7 @@ _Q = 10_000
 # The five quantized columns, in schema order.
 _PLY_SCALARS = ("v_hat", "kl", "norm_entropy", "pi_top1", "pi_chosen")
 
-# The §13 metrics that become their own iteration columns. Everything in the
+# The KLENT_FOR_HEXO.md §8 metrics that become their own iteration columns. Everything in the
 # metrics row is also kept verbatim in ``metrics_json``; these are the ones a
 # threshold query ("where did calibration collapse?") must not have to parse.
 _ITERATION_METRICS = (
@@ -915,7 +916,7 @@ def fetch_game(conn, game_id: int) -> dict:
 
 def calibration(conn, *, by="v_hat", bucket=0.1, iterations=None) -> list[dict]:
     """v̂ against the outcome it was predicting, bucketed — the instrument
-    for the design's §9 overestimation bias.
+    for the overestimation bias in ``KLENT_FOR_HEXO.md`` §8.
 
     Self-play games that finished only: a capped game has no realized
     outcome to compare against. ``by`` chooses the axis — ``'v_hat'`` for a

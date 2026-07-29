@@ -1,11 +1,12 @@
-"""The closed-form improvement step (design doc §1, paper eq. 3), ragged.
+"""The closed-form improvement step (``KLENT_FOR_HEXO.md`` §2, paper eq. 3), ragged.
 
     π′(a|s) ∝ exp[ (Q(s,a) + τ·log π_θ(a|s)) / (τ + λ) ]
     v̂(s)    = E_{A~π′(·|s)}[ Q(s, A) ]
 
 τ weighs the reverse KL to the current policy, λ the entropy of π′. Both
-diagnostics of design doc §8 — per-position KL(π′‖π_θ) and entropy normalised
-by log|A_legal| — come out of the same pass, because they are the §13 metrics
+diagnostics of ``KLENT_FOR_HEXO.md`` §2.1 — per-position KL(π′‖π_θ) and entropy normalised
+by log|A_legal| — come out of the same pass, because they are the
+``KLENT_FOR_HEXO.md`` §8 metrics
 that decide whether the run is working at all.
 """
 

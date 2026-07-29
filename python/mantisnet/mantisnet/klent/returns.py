@@ -1,13 +1,15 @@
-"""The sign function and the λ-return (design doc §4.3, §4.4).
+"""The sign function and the λ-return (``KLENT_FOR_HEXO.md`` §1.2–§1.3).
 
-The sign follows mover *change*, not ply parity — K1, the design doc's "most
-likely catastrophic bug". It is read off the phase of the acted-on position:
+The sign follows mover *change*, not ply parity — K1, the "most likely
+catastrophic bug" in ``KLENT_FOR_HEXO.md`` §1.4. It is read off the phase of
+the acted-on position:
 ``+1`` exactly at a ``FirstStone`` ply, where the same mover places again.
 ``moves_remaining`` carries the phase here: 2 is ``FirstStone``; 1 is
 ``Opening`` or ``SecondStone``, both of which hand the turn over.
 
 The recursion runs backward over a completed, won episode only — capped
-episodes are dropped whole before this module ever sees them (§5.1) — so
+episodes are dropped whole before this module ever sees them
+(``KLENT_FOR_HEXO.md`` §4.2) — so
 there is exactly one case:
 
     G_T = +1
@@ -38,9 +40,10 @@ def lambda_returns(signs: np.ndarray, v_hats, lam_ret: float, gamma: float) -> n
     """Per-ply returns ``G_0..G_T`` of a won episode, each in its mover's frame.
 
     ``signs`` and ``v_hats`` cover plies ``0..T`` — the acting-time values of
-    design doc K6; ``v_hats[t]`` is `v̂_t` and only entries ``1..T`` are read.
+    ``KLENT_FOR_HEXO.md`` §1.4 K6; ``v_hats[t]`` is `v̂_t` and only entries ``1..T`` are read.
     ``signs[T]`` is likewise never read: the recursion terminates at the win,
-    and a terminal position's frozen phase must answer nothing (§4.3).
+    and a terminal position's frozen phase must answer nothing
+    (``KLENT_FOR_HEXO.md`` §1.1).
     """
     if not 0.0 <= lam_ret <= 1.0:
         raise ValueError(f"lam_ret must lie in [0, 1], got {lam_ret}")

@@ -1,4 +1,5 @@
-"""The two-placements-per-turn Count Up Game (design doc §4.7).
+"""The two-placements-per-turn Count Up Game
+(``KLENT_FOR_HEXO.md`` §1.4).
 
 A synthetic with Hexo's mover pattern — one opening placement, then two per
 turn — small enough to solve exactly. The KLENT iteration, run through the

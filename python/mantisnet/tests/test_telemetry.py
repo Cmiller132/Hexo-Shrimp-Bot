@@ -4,8 +4,9 @@ The obligations here are the ones nothing else can see. Training must be
 bit-identical with the writer removed — telemetry that perturbed the corpus
 would corrupt the experiment it exists to describe. A resume must supersede
 its replayed tail rather than duplicate it. The calibration query must agree
-with arithmetic done by hand, since it is the instrument for the design's
-§9 bias. And `inspect_position` must reproduce collection's own numbers,
+with arithmetic done by hand, since it is the instrument for the bias in
+`KLENT_FOR_HEXO.md` §8. And `inspect_position` must reproduce collection's
+own numbers,
 because it stands in for the π′ the database deliberately does not store.
 """
 

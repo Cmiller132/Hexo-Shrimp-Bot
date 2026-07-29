@@ -12,7 +12,7 @@ GPU at cohort sizes of two. A `collect` call returns once enough games have
 next call's weights, which is the same one-fit-behind staleness the
 pipelined driver already accepts for the whole corpus.
 
-What is recorded per ply is exactly what design doc §4.5 keeps: the
+What is recorded per ply is exactly what ``KLENT_FOR_HEXO.md`` §4.3 keeps: the
 action's legal rank, π′ itself, and the acting-time `v̂` (K6) that the
 λ-return will consume. What is excluded is exactly what it excludes:
 terminal positions never exist as samples, and every ply of a capped
@@ -158,7 +158,7 @@ class Collector:
         self, evaluate: Evaluate, episodes: int, progress=None
     ) -> tuple[list[Episode], dict]:
         """Step the cohort until ``episodes`` games have ended; return them
-        plus the acting-time means of the §13 diagnostics.
+        plus the acting-time means of the ``KLENT_FOR_HEXO.md`` §8 diagnostics.
 
         ``progress(finished, quota, slot_plies)`` is called once per lockstep
         step, after the barrier — an observer for heartbeats, drawing nothing
@@ -272,9 +272,10 @@ class Collector:
 
 
 def collection_stats(episodes: list[Episode]) -> dict:
-    """The §13 collection-side metrics: the terminating fraction that decides
+    """The ``KLENT_FOR_HEXO.md`` §8 collection-side metrics: the terminating fraction that decides
     whether training data exists, seat and win-half coverage, and the
-    v̂-vs-outcome calibration that makes the §9 overestimation bias visible."""
+    v̂-vs-outcome calibration that makes the overestimation bias visible
+    (``KLENT_FOR_HEXO.md`` §8)."""
     won = [e for e in episodes if e.winner is not None]
 
     def mean(values):
@@ -301,7 +302,8 @@ def collection_stats(episodes: list[Episode]) -> dict:
 
 
 def episode_samples(episode: Episode, lam_ret: float, gamma: float) -> list[Sample]:
-    """The buffer entries of one episode: empty for a capped one (§5.1)."""
+    """The buffer entries of one episode: empty for a capped one
+    (``KLENT_FOR_HEXO.md`` §4.2)."""
     if episode.winner is None:
         return []
     signs = signs_from_moves_remaining(episode.moves_remaining)

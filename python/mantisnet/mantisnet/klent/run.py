@@ -2,7 +2,8 @@
 
 What a run leaves behind is the run directory — `config.json` (every knob and
 version the run depended on), `metrics.jsonl` (one line per iteration; the
-§13 metrics are the experiment, so they persist), `telemetry.db` (the same
+`KLENT_FOR_HEXO.md` §8 metrics are the experiment, so they persist),
+`telemetry.db` (the same
 metrics plus every game, every self-play ply, every evaluation match and the
 machine's counters, queryable — see `telemetry.py`), and periodic checkpoints
 carrying model, optimizer, RNG state, and the iteration counter, so a crash

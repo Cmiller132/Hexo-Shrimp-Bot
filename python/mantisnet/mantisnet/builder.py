@@ -340,7 +340,8 @@ def collate_positions(positions) -> Batch:
 def collate_prefixes(games, ts) -> Batch:
     """Move prefixes to one collated batch: replay + build, in parallel.
 
-    The fitting path — a stored position is a move prefix (KLENT design §12).
+    The fitting path — a stored position is a move prefix
+    (``docs/KLENT_FOR_HEXO.md`` §4.3).
     """
     import hexo_py
 

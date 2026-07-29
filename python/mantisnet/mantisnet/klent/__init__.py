@@ -1,10 +1,10 @@
-"""KLENT for Hexo: the closed-form policy improvement of ``docs/KLENT_DESIGN.md``.
+"""KLENT for Hexo: the closed-form policy improvement of ``docs/KLENT_FOR_HEXO.md``.
 
 Faithful first: the paper's algorithm unchanged wherever Hexo permits it, and
-every deviation traceable to §3 of the design doc. This package is the
+every deviation traceable to ``KLENT_FOR_HEXO.md`` §9. This package is the
 training path; the model it trains is MantisNet's trunk with the policy and
 action-value heads, and the state-value head is outside its loss by the
-paper's own ablation (no V head, design doc fidelity ledger).
+paper's own ablation (no V head, ``KLENT_FOR_HEXO.md`` §3).
 """
 
 from .improve import ImprovedPolicy, improved_policy

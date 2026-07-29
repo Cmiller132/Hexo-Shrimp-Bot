@@ -195,7 +195,8 @@ def test_collect_and_fit_end_to_end():
     """The whole iteration through an untrained network: collection runs the
     real evaluator, the metrics row is complete, and whatever the games
     produced fits cleanly — including the honest zero-data case, since an
-    untrained policy rarely finishes a game (the design's §5 premise)."""
+    untrained policy rarely finishes a game
+    (the ``KLENT_FOR_HEXO.md`` §4.2 premise)."""
     model = _tiny_model()
     cfg = KlentConfig(games_per_iteration=4, envs=4, ply_cap=60, batch_size=64)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
