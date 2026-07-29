@@ -4,8 +4,7 @@ export class ApiError extends Error {
   constructor(message: string, public status: number) { super(message); }
 }
 
-/** True for the rejection `fetch` produces when its `AbortSignal` fires. Aborted
- *  work is discarded, never surfaced — it is a cancellation, not a failure. */
+/** Identifies `AbortSignal` rejections so callers can discard cancellations. */
 export function isAbortError(reason: unknown): boolean {
   return reason instanceof DOMException ? reason.name === "AbortError"
     : reason instanceof Error && reason.name === "AbortError";
@@ -15,7 +14,7 @@ export function reasonText(reason: unknown): string {
   return reason instanceof Error ? reason.message : String(reason);
 }
 
-/** The one JSON client. `init.signal` is honoured, so every caller can cancel. */
+/** Shared JSON client; `init.signal` is honored and non-success responses throw `ApiError`. */
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
@@ -34,8 +33,7 @@ export function post<T>(path: string, body: unknown, init?: RequestInit): Promis
 }
 
 export interface UseApiOptions {
-  /** Do not fetch on mount or on a path change; only `refresh()` fetches. Required
-   *  for the aggregates that cost 60–110 s on a live run. */
+  /** Do not fetch on mount or path change; only `refresh()` fetches. */
   manual?: boolean;
 }
 
@@ -43,17 +41,14 @@ export interface UseApiResult<T> {
   data: T | undefined;
   error: string | undefined;
   loading: boolean;
-  /** Whether a fetch for the current path has been asked for at all. Lets a manual
-   *  panel distinguish "not requested" from "requested and empty". */
+  /** Whether the current path has been requested, including an empty response. */
   requested: boolean;
   refresh: () => Promise<void>;
 }
 
 /**
- * One request per path, with two guards: the in-flight request is aborted when the
- * path changes or the component unmounts, and every response is checked against a
- * monotone generation snapshot so an already-resolved stale response can never land
- * on top of a fresher one.
+ * Fetches the current path and accepts only its latest response.
+ * Path changes and unmounts abort in-flight work; generation checks reject stale results.
  */
 export function useApi<T>(path: string | null, deps: unknown[] = [], options: UseApiOptions = {}): UseApiResult<T> {
   const manual = options.manual ?? false;
@@ -88,8 +83,7 @@ export function useApi<T>(path: string | null, deps: unknown[] = [], options: Us
 
   useEffect(() => {
     if (manual) {
-      // A new path means the held result describes something else. Drop it rather
-      // than showing last run's numbers under this run's heading.
+      // Manual hooks clear held state when the path changes because it describes the prior path.
       generation.current++;
       inFlight.current?.abort();
       setData(undefined);

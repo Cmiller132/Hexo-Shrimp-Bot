@@ -10,12 +10,7 @@ use std::num::{NonZeroU32, NonZeroUsize};
 
 /// The shape of one tree search.
 ///
-/// Every field is required and there is deliberately **no** `Default`. A search
-/// shape is a model choice — the budget is the compute a seat is allowed, the
-/// in-flight cap is how much of the batch this seat may occupy, and `c_puct`
-/// trades exploration against the value head — and a default would let a package
-/// ship without ever choosing one, then quietly train against numbers nobody
-/// picked.
+/// Every field is required; this type has no `Default`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MctsConfig {
     /// Visits below the root, and the whole compute budget of one decision.
@@ -28,10 +23,7 @@ pub struct MctsConfig {
     pub visits: NonZeroU32,
     /// How many leaves this session may have out for evaluation at once.
     ///
-    /// The cap is what makes waiting into data rather than a stalled thread: the
-    /// session hands out this many questions and returns, and the driver fills
-    /// the rest of the batch from other games. Larger caps fill a batch from
-    /// fewer games and lean harder on virtual loss to keep the descents apart.
+    /// The session returns after reaching this cap until results are resumed.
     pub max_in_flight: NonZeroUsize,
     /// The PUCT exploration constant. Must be finite and non-negative; zero is
     /// meaningful (pure exploitation of the value estimate), so it is not a
@@ -39,9 +31,7 @@ pub struct MctsConfig {
     pub c_puct: f32,
 }
 
-/// Index into [`Tree::nodes`]. `u32` because a decision's tree is bounded by its
-/// visit budget, and halving the arena's footprint matters at a thousand
-/// concurrent games.
+/// Index into [`Tree::nodes`]; a decision's tree is bounded by its visit budget.
 type NodeIx = u32;
 
 /// An edge whose child node has not been created yet.
@@ -60,39 +50,31 @@ struct Edge {
     child: NodeIx,
     /// Real visits plus outstanding virtual losses.
     visits: u32,
-    /// Sum of backed-up values in the **parent's** perspective. `f64` because it
-    /// accumulates thousands of terms of magnitude one and the mean of it is
-    /// compared against a `c_puct * prior` term that can be four orders of
-    /// magnitude smaller.
+    /// Sum of backed-up values in the **parent's** perspective.
     total_value: f64,
 }
 
 /// One position in the tree.
 #[derive(Clone, Copy, Debug)]
 struct Node {
-    /// The player to move at this node's position, recorded when the node was
-    /// created. Backpropagation compares movers against this rather than
-    /// counting plies: a turn is two placements, so consecutive tree plies can
-    /// have the same mover and depth parity is simply the wrong function.
+    /// The player to move at this node's position.
+    ///
+    /// Backpropagation compares movers because consecutive plies can have the
+    /// same mover.
     mover: Player,
     /// Start of this node's edges in [`Tree::edges`]; the children of one node
     /// are contiguous.
     first_edge: u32,
-    /// How many edges. Zero until the node is emitted as a leaf, which is where
-    /// the edges are materialised.
+    /// How many edges; zero until the node is first emitted as a leaf.
     edge_count: u32,
     /// Whether this node's evaluation has arrived. Until it has, the node is a
     /// leaf: its edges carry no priors and nothing selects through it.
     evaluated: bool,
-    /// Sum of this node's edge visits — the `N_parent` of the PUCT formula.
-    /// Maintained rather than summed on read, and cross-checked against the
-    /// edges by the debug accounting assert.
+    /// Sum of this node's edge visits, the `N_parent` term in PUCT.
     visits: u32,
 }
 
-/// One step of a selection path: which node was at, and which of its edges was
-/// taken. The node travels with the edge because backpropagation needs the
-/// parent's mover, and an edge does not know its parent.
+/// One selection-path step: parent node and selected edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Step {
     node: NodeIx,
@@ -189,14 +171,10 @@ impl Tree {
         }
     }
 
-    /// Back `value` up `path`, where the value is stated from `perspective`'s
-    /// side — the leaf's mover for an evaluation, the winner for a terminal.
+    /// Back up `value`, stated from `perspective`'s side, along `path`.
     ///
-    /// Each edge's statistics are kept from its **parent's** side, so the sign
-    /// is decided by comparing that parent's mover against `perspective`. There
-    /// is no depth parity here on purpose: a turn is two placements, so the same
-    /// player can move at two consecutive plies, and alternating the sign by
-    /// depth would make a search prefer to avoid its own winning second stone.
+    /// Each edge stores values in its parent's perspective, so sign is selected
+    /// by comparing the parent mover with `perspective`.
     fn credit(&mut self, path: &[Step], perspective: Player, value: f64) {
         for step in path {
             let signed = if self.nodes[step.node as usize].mover == perspective {
@@ -217,9 +195,7 @@ impl Tree {
 struct InFlight {
     leaf: LeafId,
     node: NodeIx,
-    /// The path the descent took, kept so the same edges can be un-virtual-lossed
-    /// and credited when the answer arrives. Recycled through
-    /// [`Walker::path_pool`].
+    /// The descent path used to remove virtual loss and credit the result.
     path: Vec<Step>,
 }
 
@@ -239,8 +215,7 @@ struct Walker {
     path: Vec<Step>,
     /// Visits taken from the budget so far.
     dispatched: u32,
-    /// Never reset: a [`LeafId`] minted for one decision must not be a plausible
-    /// answer for the next.
+    /// Monotonic leaf serial that is not reset between decisions.
     next_serial: u64,
 }
 
@@ -259,17 +234,11 @@ impl Walker {
 
     /// The edge of `node` with the highest PUCT score.
     ///
-    /// `Q + c_puct * P * sqrt(N_parent) / (1 + N_child)`, with `Q = 0` for an
-    /// unvisited child. Zero is the neutral outcome from the parent's side, so
-    /// an unvisited child is neither preferred nor avoided until something is
-    /// known about it — first-play-urgency is a tuning knob, and this crate does
-    /// not own the model's tuning knobs.
+    /// Uses `Q + c_puct * P * sqrt(N_parent) / (1 + N_child)`, with `Q = 0`
+    /// for an unvisited child.
     ///
-    /// At `N_parent == 0` every term of the formula is zero and the canonically
-    /// first child is taken. That costs exactly one visit per node, on its first
-    /// descent, and the standard formula is kept rather than patched because the
-    /// patch (`sqrt(max(N, 1))`) is a different search that would then be this
-    /// crate's opinion rather than the model's.
+    /// At `N_parent == 0`, all scores are zero and canonical order breaks the
+    /// tie.
     fn select_edge(&self, node: NodeIx, c_puct: f64) -> u32 {
         let n = self.tree.nodes[node as usize];
         debug_assert!(n.edge_count > 0, "selecting from a node with no children");
@@ -316,9 +285,7 @@ impl Walker {
                 .apply(action)
                 .expect("a tree edge was legal at its parent, and the descent rebuilt that parent");
             if let Some(outcome) = applied.outcome {
-                // A win inside the search. There is nothing to ask a network
-                // about — the engine already answered — so this consumes a visit
-                // and emits nothing.
+                // Terminal outcomes consume a visit without an evaluation.
                 self.tree.credit(&self.path, outcome.winner, 1.0);
                 self.dispatched += 1;
                 break;
@@ -332,9 +299,7 @@ impl Walker {
                 child
             };
         }
-        // Explicit rather than left to `Search::drop`: the same `Search` is
-        // reused by the next descent of this `pump`, so the unwind has to happen
-        // here and not at the end of the call.
+        // Unwind here because this `Search` is reused by the next descent.
         search.unwind();
         debug_assert!(search.at_floor(), "a descent returns to the root position");
     }
@@ -355,13 +320,11 @@ impl Walker {
         self.next_serial += 1;
         emit(leaf, position);
 
-        // The children are materialised here, while the position still exists.
-        // `resume` arrives long after the descent unwound, and a node index does
-        // not recover a legal set. The priors stay zero until the answer lands,
-        // which nothing can read: `evaluated` is false, so the node is a leaf.
+        // Materialize children while the transient position is available.
+        // Priors remain unreadable until `evaluated` becomes true.
         //
-        // A node can be emitted more than once, when a descent re-selects a leaf
-        // that is still in flight. The edges are built by the first emit only.
+        // A node still in flight may be emitted more than once; only the first
+        // emission builds its edges.
         if self.tree.nodes[node as usize].edge_count == 0 {
             self.tree.create_edges(node, position);
         }
@@ -384,20 +347,10 @@ impl Walker {
         self.path_pool.push(path);
     }
 
-    /// Settled root-child visits plus the ones still in flight equal the visits
-    /// dispatched, and the root's maintained visit total is the sum of its edges'.
+    /// Assert root visit accounting, including outstanding virtual losses.
     ///
-    /// A descent lands its visit on a root child the moment it is dispatched:
-    /// a real one when it ended at a terminal, a virtual one when it ended at a
-    /// leaf that is still out. So the sum over the root's edges already carries
-    /// both terms of that invariant, and it must equal `dispatched` exactly —
-    /// before, between, and after every resume.
-    ///
-    /// This is the assert that catches a virtual loss removed twice, or not at
-    /// all, or applied to a path that was then edited. None of those is visible
-    /// to a round-trip test: a virtual loss and its removal are the same
-    /// operation with opposite signs, so applying either one an extra time on
-    /// both sides cancels.
+    /// Root-edge visits and the maintained root total must both equal
+    /// `dispatched` before, during, and after resumes.
     fn debug_assert_accounting(&self) {
         if !cfg!(debug_assertions) {
             return;
@@ -427,9 +380,8 @@ impl Walker {
 /// A seat that searches with PUCT, batching its leaf evaluations instead of
 /// blocking on them.
 ///
-/// Fresh tree per decision: [`DecisionSession::begin`] clears the arenas and
-/// keeps their capacity. See the crate README for why subtree reuse and a
-/// transposition table are deliberately not here.
+/// [`DecisionSession::begin`] clears the tree while retaining arena capacity.
+/// Sessions do not reuse subtrees or maintain a transposition table.
 pub struct MctsSession {
     config: MctsConfig,
     selector: Box<dyn SelectFromSearch>,
@@ -514,12 +466,8 @@ impl MctsSession {
         let outcome = SearchOutcome::new(root, summary);
         let action = selector.select(&outcome, rng);
         let diagnostics = selector.diagnostics(&outcome);
-        // The seat authors the whole decision. The hash is its attestation of the
-        // position it actually searched — its own clone of the canonical one, so
-        // an in-process driver cannot desync — and the diagnostics are the
-        // package's, passed through untouched. Legality is not checked here, for
-        // the reason `hexo-player`'s README gives: the game adjudicates a bad
-        // placement, and a check would be a second implementation of the rules.
+        // The decision attests the searched root and preserves package
+        // diagnostics. The game owns placement adjudication.
         *decision = Some(Decision {
             action,
             zobrist: root.zobrist(),
@@ -608,8 +556,7 @@ impl DecisionSession for MctsSession {
                 )
             });
 
-        // Checked before anything is taken apart, so a refused evaluation leaves
-        // the session exactly as it was and the panic is the only consequence.
+        // Validate before mutating in-flight state.
         let node = walker.tree.nodes[walker.in_flight[slot].node as usize];
         evaluation.check(node.edge_count as usize, leaf);
 

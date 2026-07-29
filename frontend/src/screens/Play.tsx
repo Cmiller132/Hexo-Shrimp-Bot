@@ -34,8 +34,7 @@ export default function Play({ runs }: { runs: Run[] }) {
   const [mode, setMode] = useState("argmax");
   const [session, setSession] = useState<Session>();
   const [error, setError] = useState<string>();
-  // The review cursor. `session.moves.length` is the live position; anything
-  // earlier replays the game so far, where no move can be placed.
+  // The live cursor equals `session.moves.length`; earlier cursors are read-only.
   const [cursor, setCursor] = useState(0);
   const [selected, setSelected] = useState<Move | null>(null);
   const jobs = useApi<MatchJob[]>("/api/matches", []);
@@ -46,12 +45,8 @@ export default function Play({ runs }: { runs: Run[] }) {
   const atLive = cursor === live;
   useEffect(() => { setCursor(live); setSelected(null); }, [live, session?.session_id]);
 
-  /* The checkpoint's read of the live position. `useApi` aborts the in-flight
-     request and discards a stale response whenever `session` changes — the path is
-     the same across a move, so the session itself is the dependency. The payload is
-     then matched against the line it describes: an inspect answering for a position
-     the board has already left would put a legal cell on top of a stone, which the
-     Board rejects outright. */
+  /* The checkpoint read is keyed by the complete session and accepted only when
+     its move prefix still matches the live position. */
   const inspect = useApi<Inspect>(
     session && checkpoint && !session.terminal
       ? `/api/play/${session.session_id}/inspect?checkpoint=${encodeURIComponent(checkpoint)}`
@@ -59,9 +54,7 @@ export default function Play({ runs }: { runs: Run[] }) {
     [session],
   );
 
-  // A held response describes the checkpoint and position it was asked for. A
-  // request in flight — or one that failed — means one of those has moved on, so
-  // the board falls back to the engine's mask rather than to the last answer.
+  // Loading, failed, or mismatched reads fall back to the engine legality mask.
   const read = useMemo(
     () => !inspect.loading && !inspect.error && inspect.data && session && checkpoint
       && lineKey(inspect.data.moves) === lineKey(session.moves)
@@ -69,8 +62,7 @@ export default function Play({ runs }: { runs: Run[] }) {
       : undefined,
     [inspect.data, inspect.loading, inspect.error, session, checkpoint],
   );
-  // Either a scored candidate set or a bare legality mask — never a mask dressed up
-  // with zeros, which would read as a model that scores every move at nothing.
+  // The board receives either scored candidates or an unscored legality mask.
   const candidates = useMemo((): Candidate[] | undefined => {
     if (!read || !session || !atLive || session.terminal) return undefined;
     return withPolicyRank(read.legal);

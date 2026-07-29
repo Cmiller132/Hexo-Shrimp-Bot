@@ -1,12 +1,8 @@
-//! The byte layout, stated once: every tag constant, and the encoder and decoder
-//! for each shape a shard carries.
+//! Shard byte-layout tags, encoders, and decoders.
 //!
-//! The tag numbers are the format. They are written here as named constants so
-//! that the encoder and the decoder cannot drift apart, and so that changing one
-//! is visibly a format change rather than an edit to a literal. Every `match`
-//! over a source enum is exhaustive with no catch-all arm: a variant added to
-//! `hexo-engine` or `hexo-runner` must break this build, because the alternative
-//! is a writer that silently encodes the wrong thing.
+//! Tag values are format constants shared by encoding and decoding. Matches over
+//! source enums remain exhaustive so new engine or runner variants require an
+//! explicit wire-format decision.
 
 use crate::codec::{Cursor, put_i16, put_str, put_u8, put_u32, put_u64};
 use crate::error::RecordError;
@@ -109,8 +105,7 @@ const HEADER_FIXED_SUFFIX: u64 = 4 + 4;
 
 /// The most bytes a header can occupy, with all three strings at their `u16` cap.
 ///
-/// A reader peeks this much of the file before decoding, which keeps one decoder
-/// for the header rather than a streaming second implementation of the layout.
+/// Readers may buffer this many bytes to decode the complete header.
 pub(crate) const HEADER_MAX_BYTES: u64 =
     HEADER_FIXED_PREFIX + 3 * (2 + u16::MAX as u64) + HEADER_FIXED_SUFFIX;
 
@@ -220,9 +215,7 @@ pub(crate) fn decode_game(cursor: &mut Cursor<'_>) -> Result<GameRecord, RecordE
     let result = decode_result(cursor)?;
 
     let count = cursor.u32()? as usize;
-    // Every ply occupies at least `MIN_PLY_BYTES`, so a count the entry cannot
-    // hold is truncation — caught here rather than as an allocation of whatever
-    // a corrupt `u32` happened to say.
+    // Validate the minimum encoded size before allocating for the ply count.
     let needed = count.saturating_mul(MIN_PLY_BYTES);
     if needed > cursor.remaining() {
         return Err(RecordError::Truncated {

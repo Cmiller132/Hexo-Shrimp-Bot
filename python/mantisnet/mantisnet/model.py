@@ -1,4 +1,4 @@
-"""MantisNet: the trunk and both heads of ``docs/MODEL_SPEC.md`` §5–§7.
+"""MantisNet trunk and policy, action-value, and state-value heads.
 
 The forward consumes a :class:`~mantisnet.builder.Batch` and performs no
 data-dependent index discovery: every gather, scatter, and pad slot was
@@ -81,11 +81,8 @@ def _mlp(d_in: int, d_hidden: int, d_out: int) -> nn.Sequential:
 class _PairMlp(nn.Module):
     """``MLP([a; b])`` with the concatenation folded away.
 
-    A linear over a concatenation is the sum of two linears, so the 2H-wide
-    input tensor of the spec's ``MLP_W``/``MLP_S``/``MLP_P`` never has to be
-    materialised — on a batch of a few hundred thousand entity rows that cat
-    is pure memory traffic. Parameters are identical (one bias on the first
-    layer), and so is the arithmetic.
+    A linear over a concatenation is the sum of two linears. This form preserves
+    the parameters and arithmetic without materializing the 2H-wide input.
     """
 
     def __init__(self, h: int, d_hidden: int, d_out: int) -> None:
@@ -180,7 +177,7 @@ class _Block(nn.Module):
 
 
 class MantisNet(nn.Module):
-    """The whole model: embeddings, B trunk blocks, policy and value heads."""
+    """Embeddings, B trunk blocks, policy, action-value, and state-value heads."""
 
     def __init__(self, cfg: MantisConfig | None = None) -> None:
         super().__init__()
@@ -229,11 +226,8 @@ class MantisNet(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
         nn.init.normal_(self.token_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
-        # Appendix B: both decoder output layers start at zero — the KLENT
-        # reference net's `zero_init` — so π_θ opens uniform and Q ≡ 0 until
-        # trained. π′ ∝ π_θ^{τ/(τ+λ)}·exp(Q/(τ+λ)) sharpens *initialization
-        # noise* otherwise, measured to train the first fit toward arbitrary
-        # sharp targets.
+        # Both decoder outputs start at zero, so initial policy logits and Q
+        # values are constant across legal cells.
         for head in (self.mlp_p, self.mlp_q):
             nn.init.zeros_(head.out.weight)
             nn.init.zeros_(head.out.bias)
@@ -295,15 +289,11 @@ class MantisNet(nn.Module):
         )
 
     def cell_heads(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor]:
-        """§6 and appendix B over the same legal cells: policy logits and
-        action values, from one pass over the decoder incidence.
+        """Return §6 policy logits and appendix-B scalar action values.
 
-        The pair, not two calls, is what the KLENT operator consumes — π′
-        needs both — and the two heads read an identical incidence, so
-        aggregating it once is the whole point of the shared pass. Q is
-        bounded to (−1, 1) by tanh as in the KLENT reference net: π′
-        exponentiates Q/(τ+λ), so an unbounded Q could sharpen without
-        limit."""
+        Both heads use the same parameter-free incidence aggregation and own
+        separate decoder parameters. Action values are bounded by tanh.
+        """
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
         rows = self._decoder_rows(w, batch, g_p.dtype)
         return (

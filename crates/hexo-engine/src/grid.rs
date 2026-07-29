@@ -1,4 +1,4 @@
-//! The dense recentred arena. **Private: zero items escape the crate.**
+//! Crate-private dense recentered arena.
 
 use crate::MAX_GRID_CELLS;
 use crate::coord::{COORD_LIMIT, HexCoord, LEGAL_RADIUS};
@@ -639,10 +639,8 @@ mod tests {
         })
     }
 
-    /// Every frontier cell in canonical order, read by walking the whole arena
-    /// coordinate by coordinate — deliberately not the word scan that `frontier_rank`
-    /// and `nth_frontier` use, so the two are a real cross-check rather than the same
-    /// code twice.
+    /// Every frontier cell in canonical order, computed by a coordinate walk
+    /// independent of the word scan used by `frontier_rank` and `nth_frontier`.
     fn frontier_by_brute_force(g: &Grid) -> Vec<HexCoord> {
         let mut out = Vec::new();
         for row in 0..g.rows() {
@@ -680,9 +678,8 @@ mod tests {
         assert_eq!(frontier, g.frontier_cells(), "frontier counter");
     }
 
-    /// The one detector the coverage design leans on: the run-OR (placement), the
-    /// separable dilation (removal), and the offset table are three independent
-    /// statements of the same set, compared after every mutation and after a growth.
+    /// Compare run-OR placement, separable-dilation removal, and offset-table
+    /// coverage after each mutation and growth.
     #[test]
     fn coverage_matches_the_stone_recount_through_places_unplaces_and_growth() {
         let mut g = Grid::new();
@@ -972,9 +969,7 @@ mod tests {
         assert_eq!(g.row_words(), before_words, "arena mutated on refusal");
     }
 
-    /// Regression: the growth policy grew *both* dimensions on every event, so the
-    /// arena quadrupled per growth, its aspect ratio froze at 32:128, and a straight
-    /// walk along `q` blew the ceiling after six allocations.
+    /// A walk confined to `r = 0` must not increase the arena's `r` extent.
     #[test]
     fn a_q_only_walk_never_widens_r() {
         let mut g = Grid::new();
@@ -1022,9 +1017,7 @@ mod tests {
         assert_eq!(walk(false), 1999, "the r walk hit the arena ceiling");
     }
 
-    /// The refusal predicate reads the stones, not the allocation history: an arena
-    /// that grew large and then lost those stones must decide exactly as a fresh one
-    /// holding the same stones does.
+    /// Extent refusal depends on occupied bounds, not retained arena capacity.
     #[test]
     fn the_ceiling_is_a_function_of_the_stones_not_of_past_growth() {
         let mut inflated = Grid::new();

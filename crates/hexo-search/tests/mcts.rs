@@ -1,5 +1,4 @@
-//! What the tree search must get right: the terminal it can see, the mover
-//! comparison that signs it, the virtual-loss books, and the decision it authors.
+//! MCTS terminal handling, mover-relative values, virtual loss, and decisions.
 
 mod common;
 
@@ -26,11 +25,8 @@ fn the_search_finds_a_win_in_one() {
     assert_eq!(game.position().current_player(), Player::P1);
     assert!(game.position().is_legal(Action::new(WIN_IN_ONE_CELL)));
 
-    // With no opinion in the priors, PUCT ties every unvisited child and takes
-    // them in canonical order, so the budget has to reach the winning cell's rank
-    // before the terminal is seen at all — never mind preferred. That is a fact
-    // about uniform priors rather than about this search, and the alternative is
-    // a test that passes only because the winning cell happens to sort early.
+    // Uniform priors visit unvisited children in canonical order, so the budget
+    // must reach the winning action's rank.
     let legal = u32::try_from(game.position().legal_count()).expect("a legal count fits u32");
     let mut session = MctsSession::new(config(legal + 64, 8), Box::new(MaxVisits), 1);
 
@@ -71,23 +67,19 @@ fn the_search_finds_a_win_in_one() {
     );
 }
 
-/// The discriminating test for backpropagation by mover comparison.
+/// A fixture that distinguishes mover-based signing from depth-parity signing.
 ///
 /// `P1` is on the first stone of its turn and holds `(1, 0)..(4, 0)`. Neither
 /// `(5, 0)` nor `(6, 0)` wins on its own; the *second* stone of the same turn
-/// closes the line either way. So the terminal sits two plies below the root with
-/// the **same mover at both** — under a backpropagation that negates by depth
-/// parity the `+1` would reach the root edge as `-1`, and the search would spend
-/// its budget working around its own win.
+/// closes the line either way. The terminal is two plies below the root with the
+/// same mover at both plies.
 #[test]
 fn a_win_on_the_turns_second_stone_is_preferred_and_not_avoided() {
     let game = game_after(&WIN_IN_TWO, GameSpec::default());
     let root = game.position();
     assert_eq!(root.current_player(), Player::P1);
 
-    // Both plies of the line are the same mover's, which is what makes the
-    // fixture discriminating. Check that against the engine rather than by
-    // reading it off the move list.
+    // Confirm both fixture plies have the same mover through engine state.
     let mut probe = root.clone();
     let applied = probe
         .advance(Action::new(WIN_IN_TWO_FIRST))
@@ -248,8 +240,7 @@ fn an_answer_for_a_decision_the_session_has_left_panics() {
     session.pump(&mut |id, _position| stale = Some(id));
     let stale = stale.expect("the root of the first decision");
 
-    // A new decision. The leaf ids of the old one are not merely settled, they
-    // belong to a tree that no longer exists.
+    // Starting a new decision invalidates leaves from the prior tree.
     session.begin(&game);
     session.pump(&mut |_id, _position| {});
     session.resume(stale, uniform_evaluation(game.position().legal_count()));

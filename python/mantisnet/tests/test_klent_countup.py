@@ -1,13 +1,11 @@
 """The two-placements-per-turn Count Up Game
 (``KLENT_FOR_HEXO.md`` §1.4).
 
-A synthetic with Hexo's mover pattern — one opening placement, then two per
-turn — small enough to solve exactly. The KLENT iteration, run through the
-*real* `improved_policy`, must converge to the quantal-response fixed point
-`π* ∝ exp(Q*/λ)` computed by independent backward induction; and episodes
-scored by the *real* sign/λ-return machinery must average back to `Q*`. A
-parity-derived sign (K1), a bootstrap from a terminal (K3), or a `v̂` taken
-under `π_θ` instead of `π′` (K5) each move the fixed point and fail here.
+A finite game with Hexo's mover pattern — one opening placement, then two per
+turn — permits exact solution. ``improved_policy`` must converge to the
+quantal-response fixed point `π* ∝ exp(Q*/λ)` computed by independent backward
+induction, and the sign/λ-return path must average to `Q*`. Parity-derived
+signs, terminal bootstraps, and `v̂` under `π_θ` produce different fixed points.
 
 The game: a counter starts at 0; each placement adds 1 or 2; the mover who
 reaches `TARGET` wins. States are `(count, moves_remaining)` — mr = 2 is a
@@ -64,7 +62,7 @@ def solved_qre():
 
 
 def _improve(pi, q):
-    """One π′/v̂ pass over every state, through the real operator."""
+    """One π′/v̂ pass over every state through ``improved_policy``."""
     order = states()
     logits = torch.tensor(np.log(np.concatenate([pi[s] for s in order])), dtype=torch.float32)
     qs = torch.tensor(np.concatenate([q[s] for s in order]), dtype=torch.float32)
@@ -102,8 +100,7 @@ def test_expected_iteration_converges_to_the_qre():
 
 
 def test_sampled_returns_average_to_q_star():
-    # Play the solved policy; score episodes with the real sign and λ-return
-    # machinery at λ_ret = 1 (the Monte Carlo endpoint). E[G | s, a] is Q*.
+    # Score solved-policy episodes with the sign and λ-return implementation.
     q_star, _ = solved_qre()
     pi_star = {}
     for s in states():

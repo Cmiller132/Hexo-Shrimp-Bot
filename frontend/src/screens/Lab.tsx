@@ -13,10 +13,7 @@ import type {
 
 /* ------------------------------------------------------------------ the line */
 
-/** Where the line on screen came from, and the line it came in as. Provenance
- *  decides which extra traces are available — only a self-play game carries the
- *  acting net's own per-ply read — and `moves` is what the line is measured
- *  against: where it departs from them is where the source stops describing it. */
+/** Line provenance and its original moves; source traces apply only through the shared prefix. */
 type Source =
   | { kind: "blank" }
   | { kind: "paste"; moves: Move[] }
@@ -39,9 +36,7 @@ function commonPrefix(a: Move[], b: Move[]): number {
 interface RecentGame { run: string; gameId: number; length: number }
 const RECENT_KEY = "deck-lab-recent";
 
-/** The recently-opened list, or the reason it could not be read. A stored value of
- *  another shape is a problem to report and clear, not an empty list to present as
- *  if nothing had ever been opened. Pure: the clearing is the caller's effect. */
+/** Parses the recent-game list and reports malformed storage without mutating it. */
 function readRecent(): { games: RecentGame[]; problem?: string } {
   const raw = localStorage.getItem(RECENT_KEY);
   if (raw == null) return { games: [] };
@@ -58,10 +53,8 @@ function readRecent(): { games: RecentGame[]; problem?: string } {
 }
 
 /**
- * Parses a pasted move list. Three shapes are accepted — a JSON array of integer
- * pairs, parenthesised `(q,r)` pairs, and whitespace-separated `q,r` pairs — and
- * anything else is rejected by the index of the token that broke, because a paste
- * that silently drops half a line is worse than no paste at all.
+ * Parses JSON integer pairs, parenthesized `(q,r)` pairs, or whitespace-separated
+ * `q,r` pairs; invalid input identifies the failing token.
  */
 function parseLine(text: string): Move[] {
   const trimmed = text.trim();
@@ -105,8 +98,7 @@ const shortCheckpoint = (path: string) => path.split("/").slice(-2).join("/");
 type Rgb = [number, number, number];
 let rampCache: Rgb[] | null = null;
 
-/** The sequential ramp, read back out of the stylesheet rather than restated here,
- *  so the canvas heatmap and the CSS `HeatLegend` beside it can never drift apart. */
+/** Reads the sequential ramp from CSS so the canvas and `HeatLegend` share one definition. */
 function sequentialRamp(): Rgb[] {
   if (rampCache) return rampCache;
   const probe = document.createElement("div");
@@ -189,8 +181,7 @@ function AttentionMap({ data, block, head, stones }: {
 
 /* ---------------------------------------------------------------- the screen */
 
-/** Candidate rows the table prints before it cuts. A real mid-game position has
- *  450–550 legal moves; the whole set belongs on the board, not in a list. */
+/** Candidate-table limit; the board retains the complete legal set. */
 const CANDIDATE_ROWS = 48;
 
 interface Capture<T> { state: "idle" | "loading" | "ready" | "error"; data?: T; error?: string; atPly: number; atCheckpoint: string; atLine: string }
@@ -245,10 +236,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
   }, []);
 
   /* ---- structural edits --------------------------------------------------- */
-  // Every structural change goes through here: the inspect hook keys on the line's
-  // contents, so a new line drops every reading and aborts a running walk by itself.
-  // Dropping the readings is also what re-arms the auto-walk, which otherwise fires
-  // once per game and checkpoint.
+  // Structural edits replace the line, clear selection, and rearm the one-shot auto-walk.
   const autoWalked = useRef("");
   const applyLine = useCallback((moves: Move[], nextCursor: number, nextSource: Source) => {
     setLine(moves);
@@ -270,9 +258,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
   }, [checkpoint, checkpoints, runs, run]);
 
   /* ---- hand-off from History ---------------------------------------------- */
-  // One hand-off, one seed. The screen stays mounted for the life of the page, so
-  // this fires on the token and never again — coming back from another screen
-  // shows the line the user left here.
+  // Each handoff token seeds the mounted Lab exactly once.
   const handoffToken = handoff?.token;
   useEffect(() => {
     if (!handoff) return;
@@ -288,10 +274,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
 
   /* ---- candidates at the cursor ------------------------------------------- */
   const stoneKeys = useMemo(() => new Set(line.slice(0, cursor).map(moveKey)), [line, cursor]);
-  // A reading is only usable while it still describes the line and ply on screen.
-  // React renders before the hook's invalidation effect runs, so for one frame after
-  // an edit the held reading belongs to the previous position; passing it to the
-  // Board would put a legal cell on top of a stone, which the Board rejects.
+  // Usable readings must match the cursor and contain no legal cell occupied in the prefix.
   const freshLegal = useCallback((state: LineCursor): Candidate[] | null => {
     if (state.state !== "ready" || !state.legal || !state.read || state.read.terminal || state.read.t !== cursor) return null;
     for (const candidate of state.legal) if (stoneKeys.has(moveKey(candidate.move))) return null;
@@ -306,8 +289,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
     return map;
   }, [otherLegal]);
 
-  // The Δ overlay is Δπ — policy is what the two checkpoints are actually being
-  // compared on. The candidate table prints ΔQ beside it from the same pairing.
+  // The board Δ overlay is policy difference; the table derives Q difference from the same pair.
   const candidates = useMemo(() => {
     if (!baseLegal) return undefined;
     if (!otherByMove.size) return baseLegal;
@@ -319,8 +301,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
 
   const reading = primary.cursor.read && !primary.cursor.read.terminal ? primary.cursor.read : null;
   const terminal = primary.cursor.read?.terminal ? primary.cursor.read : null;
-  // The hook reports an illegal line from either read — the cursor's own ply or
-  // the walk — as a ply number, so this screen never re-parses a server message.
+  // Cursor and walk legality failures expose a structured ply number.
   const illegal = useMemo(() => {
     if (primary.cursor.illegalAtPly != null) return { ply: primary.cursor.illegalAtPly, message: primary.cursor.error! };
     if (primary.walk.illegalAtPly != null) return { ply: primary.walk.illegalAtPly, message: primary.walk.error! };
@@ -333,9 +314,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
     : null;
 
   /* ---- editing ------------------------------------------------------------ */
-  // How the line on screen stands against the line its source arrived with. Derived
-  // rather than recorded, so it survives any sequence of clicks, undos and second
-  // branches — and "restore" always puts back exactly the line the label names.
+  // Branch state is derived from the current and source lines so restore uses the exact source.
   const sourceMoves = source.kind === "blank" ? null : source.moves;
   const sourceLabel = source.kind === "game" ? `game ${source.gameId}`
     : source.kind === "probe" ? `probe “${source.name}”`
@@ -391,10 +370,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
     });
   }, []);
 
-  // Two clicks in the listing race, and the payloads differ by two orders of
-  // magnitude, so the second-asked game can easily answer first: the same abort
-  // plus generation snapshot `useApi` uses keeps the last request asked the one
-  // that lands.
+  // Abort plus a generation check ensures only the latest game request lands.
   const loadAbort = useRef<AbortController | undefined>(undefined);
   const loadGeneration = useRef(0);
   const loadGame = useCallback(async (runName: string, id: number) => {
@@ -482,11 +458,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
   const walkRunning = primary.walk.state === "running";
   const startWalk = useRef(primary.runWalk);
   startWalk.current = primary.runWalk;
-  // Loading a game is a request to read the whole game, and the cost is bounded and
-  // known: 0.5 s for a 17-ply game, 5.6 s for 127 plies at two in flight. Only the
-  // game's own line walks itself. Once it has been edited the walk is explicit,
-  // because an edit drops every reading — so a walk per click would re-read the
-  // whole line from scratch each time, and only the last one would ever be shown.
+  // Auto-walk an unedited loaded game once; edited lines require an explicit walk.
   useEffect(() => {
     if (source.kind !== "game" || branch || !checkpoint || line.length > 300) return;
     const identity = `${checkpoint}|${lineKey(line)}`;
@@ -523,9 +495,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
     other.plies.forEach((entry) => map.set(entry.t, entry));
     return map;
   }, [other.plies]);
-  // The stored read at ply t is the opinion the acting net formed to choose move t,
-  // so it describes this line only while this line still plays the game's moves
-  // through t. Past where the two part it belongs to a move that is no longer here.
+  // Acting-net reads apply only before the current line diverges from the source game.
   const actingByPly = useMemo(() => {
     const map = new Map<number, StoredPly>();
     if (source.kind !== "game") return map;
@@ -609,10 +579,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
 
   /* ---- ply list scrolling ------------------------------------------------- */
   const lineList = useRef<HTMLDivElement>(null);
-  // Keeps the cursor's row in view within the ply list, by moving that list's own
-  // scrollTop and nothing else. `scrollIntoView` scrolls every scrollable
-  // ancestor including the document, so on a narrow layout — where the rail sits
-  // below the board — each ply change threw the page down to the list.
+  // Adjust only the ply list; scrollIntoView would also move ancestor scrollers.
   useEffect(() => {
     const list = lineList.current;
     const row = list?.querySelector("[data-current]");
@@ -631,9 +598,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
   const agrees = played != null && reading != null && moveKey(played) === moveKey(reading.topMove);
   const walkCoverage = primary.readings.size;
 
-  // The table is cut to a readable length, and the cut is printed. The played move
-  // is pinned in even when it ranks past the cut — a move the model buried is
-  // exactly what this screen exists to show.
+  // Limit the table but retain the played move even when it falls below the cut.
   const ranked = candidates ? candidates.slice().sort((a, b) => a.policyRank - b.policyRank) : [];
   const listedCandidates = ranked.slice(0, CANDIDATE_ROWS);
   const playedRow = played && ranked.find((row) => moveKey(row.move) === moveKey(played));
@@ -747,7 +712,7 @@ export default function Lab({ runs, run, handoff }: { runs: Run[]; run?: Run; ha
             const tau = Number(tauText), lam = Number(lamText);
             if (!Number.isFinite(tau) || !Number.isFinite(lam)) { setRecipeError(`τ and λ must be numbers: got "${tauText}" and "${lamText}"`); return; }
             setRecipeError(undefined);
-            // Both always travel: the server silently ignores a lone tau or lam.
+            // Recipe overrides send both parameters because the server ignores isolated values.
             setRecipe({ tau, lam });
           }}>Apply</button>
           <button type="button" disabled={!recipe} onClick={() => { setRecipe(null); setTauText("0.1"); setLamText("0.01"); setRecipeError(undefined); }}>Reset</button>

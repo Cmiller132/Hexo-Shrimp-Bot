@@ -15,8 +15,7 @@
 //! let first = pos.legal_actions().next().unwrap();
 //! assert_eq!(first.coord(), HexCoord::new(-8, 0));
 //!
-//! // That order has both directions, and they are the mapping a policy head is
-//! // indexed by — which is why the engine owns them rather than each model.
+//! // Rank and selection expose both directions of canonical action ordering.
 //! assert_eq!(pos.legal_rank(first), Some(0));
 //! assert_eq!(pos.nth_legal(0), Some(first));
 //! ```
@@ -76,8 +75,7 @@ pub use window::{WINDOWS_PER_PLACEMENT, Win, Window, WindowMask, WindowRef};
 /// Version of the rules and of the Zobrist mixing function.
 pub const RULES_VERSION: u32 = 1;
 
-/// Hard ceiling on dense arena cells. With three bit planes this caps a position
-/// at ~6 MiB, and a one-seat spreading walk cannot reach it inside a real game.
+/// Hard ceiling on cells in one dense arena allocation.
 pub const MAX_GRID_CELLS: u64 = 1 << 24;
 
 #[cfg(test)]

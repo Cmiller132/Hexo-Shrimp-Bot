@@ -1,9 +1,7 @@
-//! The Python-free forward boundary injected by the binary leaf.
+//! Runtime-independent MantisNet forward boundary.
 //!
-//! MantisNet owns the typed batch and output semantics. The executable owns how
-//! those values cross into a live Torch module. Keeping the trait here and its
-//! PyO3 implementation in `hexo-bot` resolves the container's leaf rule without
-//! making either side invent the other's model contract.
+//! This crate owns typed batch and output semantics; the executable supplies the
+//! adapter to its model runtime.
 
 use crate::encoder::RawBatch;
 use std::path::Path;
@@ -25,10 +23,8 @@ pub struct RawOutputs {
 
 /// One live MantisNet module, called once per collated evaluator batch.
 ///
-/// This trait deliberately contains no Python, Torch, tensor, or device type.
-/// A binary adapter converts the public [`RawBatch`] arrays to its runtime and
-/// returns ordinary Rust vectors. The package then owns every semantic decision
-/// made from those vectors.
+/// Implementations convert [`RawBatch`] arrays to their runtime and return Rust
+/// vectors; no runtime-specific type crosses this trait.
 pub trait Forward: Send {
     /// Run both cell heads for `batch`.
     ///
@@ -40,9 +36,8 @@ pub trait Forward: Send {
 
 /// Construct a live forward boundary from one package weight file.
 ///
-/// Loading is separate from forwarding because checkpoint proof must build a
-/// candidate module, answer the frozen probe through it, and only then publish
-/// it as the package's loaded state.
+/// Loaders produce a candidate module that can be probe-verified before
+/// publication.
 pub trait ForwardLoader: Send + Sync {
     /// Load `weights`, including all package/runtime version checks.
     fn load(&self, weights: &Path) -> Result<Box<dyn Forward>, BoxError>;

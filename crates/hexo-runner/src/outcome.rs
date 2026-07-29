@@ -1,4 +1,4 @@
-//! How a match ends, and the adjudication policy that decides it.
+//! Match result and adjudication reason types.
 
 use crate::decision::Failure;
 use hexo_engine::{ActionId, MoveError, Player};
@@ -25,9 +25,8 @@ pub enum MatchResult {
 impl MatchResult {
     /// Whether the match reached a verdict, as opposed to a no-contest.
     ///
-    /// A forfeit passes this and is a real match result, but says nothing about the
-    /// play on the board, so a consumer selecting training data matches on
-    /// [`WinReason`] rather than on this alone.
+    /// Forfeits are contested results; consumers needing board-play outcomes
+    /// must also inspect [`WinReason`].
     #[inline]
     #[must_use]
     pub const fn is_contested(self) -> bool {

@@ -1,21 +1,12 @@
-//! Why a model package refused.
+//! Model-package failure types.
 
 use std::path::PathBuf;
 
 /// Everything a [`crate::ModelPackage`] can refuse to do.
 ///
-/// The shape follows the same rule `hexo-records` follows: a variant carries
-/// what it takes to locate the problem without opening a file, and every
-/// version failure names *both* numbers, because "version mismatch" alone does
-/// not say which side is old.
-///
-/// Two variants exist so that a package never has to flatten something that had
-/// structure. [`PackageError::Failed`] keeps a package's own error as a boxed
-/// source — a `RecordError` from a shard read, a Python exception from a
-/// trainer — so a caller can still downcast to it, and
-/// [`PackageError::NoTrainingData`] is a first-class variant because "the fit
-/// consumed nothing" is the exact silent failure `docs/CONTAINER_SPEC.md` §5
-/// builds the mock package to catch, and it deserves better than a message.
+/// Version errors carry expected and found values. [`PackageError::Failed`]
+/// preserves a package-owned source error for inspection or downcasting, while
+/// [`PackageError::NoTrainingData`] reports empty fitting inputs explicitly.
 #[derive(Debug)]
 pub enum PackageError {
     /// The filesystem refused an operation.
@@ -27,9 +18,7 @@ pub enum PackageError {
     },
     /// A `manifest.json` is not JSON, or is not a [`crate::Manifest`].
     ///
-    /// Missing and unknown fields both land here: the manifest is written and
-    /// read by this crate alone, so a field this build does not know is a file
-    /// from another build rather than a forward-compatible extension.
+    /// Missing and unknown fields are parse errors.
     ManifestParse {
         /// The manifest that could not be read.
         path: PathBuf,
@@ -38,10 +27,8 @@ pub enum PackageError {
     },
     /// An artefact names a different package than the one running.
     ///
-    /// Raised by [`crate::Manifest::validate`] on a checkpoint, and by a
-    /// package's `fit` on a record shard whose header names someone else:
-    /// either way the artefact was produced by code that is not this code, and
-    /// its bytes mean whatever that code decided they mean.
+    /// Raised for checkpoint manifests and training shards whose package name
+    /// differs from the active package.
     PackageName {
         /// The running package's registry name.
         expected: String,
@@ -55,9 +42,7 @@ pub enum PackageError {
         /// What the checkpoint states.
         found: u32,
     },
-    /// The weights were trained against different encoder bytes than this build
-    /// writes, so every feature they learned is indexed against a layout that no
-    /// longer exists.
+    /// The weights require a different encoder representation version.
     EncoderVersion {
         /// What this build's encoder is.
         expected: u32,
@@ -71,8 +56,7 @@ pub enum PackageError {
         /// What the checkpoint states.
         found: u32,
     },
-    /// The weights were produced under a different canonical action ordering,
-    /// so the policy head's index *i* does not mean the same placement it did.
+    /// The weights require a different canonical action ordering.
     ActionOrderVersion {
         /// `hexo_engine::ACTION_ORDER_VERSION` as linked.
         expected: u32,
@@ -89,23 +73,14 @@ pub enum PackageError {
     },
     /// Package-owned checkpoint metadata disagrees with this package instance.
     ///
-    /// The JSON is opaque to this crate; carrying both values lets the package
-    /// report the mismatch without flattening its configuration to a string or
-    /// teaching the container what any field means.
+    /// The JSON values are opaque to this crate.
     PackageMetadata {
         /// What the running package requires.
         expected: serde_json::Value,
         /// What the checkpoint states.
         found: serde_json::Value,
     },
-    /// The loaded weights do not answer the probe the way the manifest says
-    /// they should.
-    ///
-    /// This is the detector `docs/CONTAINER_SPEC.md` §10.2 exists for, and it is
-    /// the one failure in this enum that nothing else in the system would ever
-    /// report: the wrong checkpoint, a swap that folded away to a no-op, or a
-    /// runtime that drifted between build and run all load cleanly and then
-    /// train against weights nobody chose.
+    /// The loaded weights' computed probe hash differs from the manifest.
     ProbeMismatch {
         /// What the manifest promised.
         expected: u64,
@@ -120,9 +95,7 @@ pub enum PackageError {
     },
     /// The package has no session variant by that name.
     ///
-    /// The variant vocabulary is the package's, so this is the only thing a
-    /// package that defines none can say — which is why
-    /// [`crate::ModelPackage::variant_session`] may default to producing it.
+    /// [`crate::ModelPackage::variant_session`] returns this by default.
     UnknownVariant {
         /// The package that was asked.
         package: &'static str,
@@ -131,10 +104,7 @@ pub enum PackageError {
     },
     /// The package's configuration string is not one it can use.
     ///
-    /// The syntax is package-defined, so the description is the package's own:
-    /// nothing above the package knows what keys it has, and a shared enum that
-    /// tried to enumerate them would be the container having an opinion about a
-    /// model.
+    /// The package supplies the configuration-specific description.
     InvalidConfig {
         /// The package that refused.
         package: &'static str,
@@ -143,11 +113,8 @@ pub enum PackageError {
     },
     /// A weight file is present but does not hold weights this build can read.
     ///
-    /// The description is the package's, because the format is: the container
-    /// stores a file and a manifest, not a description of layers
-    /// (`docs/CONTAINER_SPEC.md` §10). A package whose loader raises structured
-    /// failures of its own reports them through [`PackageError::Failed`]
-    /// instead, which keeps the source error intact.
+    /// The package supplies the format-specific description. Structured loader
+    /// errors may instead use [`PackageError::Failed`].
     MalformedWeights {
         /// The weight file.
         path: PathBuf,
@@ -156,11 +123,7 @@ pub enum PackageError {
     },
     /// A `fit` was handed nothing to fit on.
     ///
-    /// A first-class variant rather than a message because it is the failure the
-    /// whole checkpoint design exists to catch: a fit that consumed no games and
-    /// produced weights anyway is indistinguishable, downstream, from a fit that
-    /// worked. Every count that was zero is carried, so the caller can tell an
-    /// empty shard list from a shard list of empty shards.
+    /// Carries both shard and game counts.
     NoTrainingData {
         /// The package whose fit refused.
         package: &'static str,
@@ -169,11 +132,7 @@ pub enum PackageError {
         /// How many games it found in them.
         games: usize,
     },
-    /// The package deliberately does not implement this operation.
-    ///
-    /// This is distinct from a failed attempt: no partial work was started and
-    /// the reason names the owner decision required before the operation can
-    /// exist honestly.
+    /// The package does not implement this operation.
     Unsupported {
         /// The package that declined.
         package: &'static str,
@@ -184,12 +143,8 @@ pub enum PackageError {
     },
     /// A package-internal operation failed, carrying the package's own error.
     ///
-    /// This is the escape hatch for the errors a package's dependencies raise —
-    /// `hexo-records` is not a dependency of this crate, and neither is
-    /// PyTorch — and it is deliberately not a string: the source is boxed so it
-    /// survives whole and can be downcast back to the concrete type by anything
-    /// that links it. `doing` says which operation, in the package's words, so
-    /// the message reads as a sentence without the source having to repeat it.
+    /// The boxed source preserves its concrete type for callers that can
+    /// downcast it.
     Failed {
         /// The package that failed.
         package: &'static str,
@@ -203,10 +158,7 @@ pub enum PackageError {
 impl PackageError {
     /// Wrap a package-internal error as [`PackageError::Failed`].
     ///
-    /// The convenience exists because the boxing is the whole point and a
-    /// package should not have to write it out at every call site — the
-    /// alternative a package reaches for otherwise is `to_string`, which throws
-    /// away the error it took trouble to produce.
+    /// The source is boxed without converting it to a string.
     pub fn failed<E>(package: &'static str, doing: &'static str, source: E) -> Self
     where
         E: std::error::Error + Send + Sync + 'static,

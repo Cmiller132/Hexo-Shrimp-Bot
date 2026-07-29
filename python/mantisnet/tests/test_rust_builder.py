@@ -1,10 +1,8 @@
 """The Rust batch builder against the Python builder, field for field.
 
-Two implementations of one representation are only tolerable with an exact
-parity detector between them (the spirit of MODEL_SPEC §12.7). The Python
-builder is the normative reference; `hexo_py.build_batch` is the production
-path; every tensor of every batch must be equal — not close, equal, since
-every field is integral.
+The Python builder is the reference implementation. Every integral tensor
+returned by ``hexo_py.build_batch`` must equal its Python-builder counterpart
+(MODEL_SPEC §12.7).
 """
 
 from __future__ import annotations

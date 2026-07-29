@@ -1,5 +1,4 @@
-//! Hexo match orchestration: the authoritative game, and the policy that decides how a
-//! match ends.
+//! Hexo match state, submissions, and adjudication.
 //!
 //! ```
 //! use hexo_runner::{Decision, Game, GameSpec, Reply, Step};
@@ -9,9 +8,7 @@
 //!     match game.step() {
 //!         Step::Finished(result) => break result,
 //!         Step::NeedDecision { generation, zobrist, .. } => {
-//!             // A real driver asks a seat here, over whatever transport it
-//!             // likes, and may block for as long as it wants. The game does
-//!             // not care, because it is not involved.
+//!             // The driver obtains a seat decision outside the game state machine.
 //!             let action = game.position().nth_legal(0).expect("a legal move");
 //!             let reply = Reply::Place(Decision::new(action, zobrist));
 //!             game.submit(generation, reply).expect("fresh generation");

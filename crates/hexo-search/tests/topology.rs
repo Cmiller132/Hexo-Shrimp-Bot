@@ -1,14 +1,9 @@
-//! The reference sweep: the whole execution topology on one thread.
+//! Single-threaded multi-game batching topology.
 //!
 //! Thirty-two games, sixty-four seats, one batch. Every game holds two sessions;
 //! every session hands out the leaves it wants evaluated and returns; the sweep
 //! collects those leaves from *all* the games into one [`EncodedBatch`], crosses
-//! to the evaluator once, and hands the answers back. No session ever waits, and
-//! no game ever holds a thread.
-//!
-//! This is the executable statement of what the crate is for. A threaded driver
-//! (`hexo-bot`) replaces the `for` loop with actor shards and a queue and changes
-//! nothing else about the shape.
+//! to the evaluator once, and hands the answers back.
 
 mod common;
 
@@ -46,9 +41,7 @@ fn policy(seed: u64) -> Box<dyn DecisionSession> {
     Box::new(PolicySession::new(Box::new(SampleByPrior), seed))
 }
 
-/// Three lane shapes, so the sweep is genuinely mixed: two searching seats, one
-/// of each, and two policy-only seats. All three are the same trait and the same
-/// loop, which is the claim being tested.
+/// Three lane shapes covering search-only, mixed, and policy-only seats.
 fn lane(index: usize, spec: GameSpec) -> Lane {
     let seed = |seat: usize| (index * 2 + seat) as u64 + 1;
     let seats: [Box<dyn DecisionSession>; 2] = match index % 3 {
@@ -108,9 +101,7 @@ fn every_game_of_a_mixed_sweep_finishes_through_one_shared_batch() {
             });
 
             if status == SessionStatus::Decided {
-                // The seat authored the whole decision: the placement, the hash of
-                // the position it searched, and its own diagnostics. The driver
-                // submits it verbatim and never fills a field in on its behalf.
+                // Submit the session-authored decision verbatim.
                 let decision = lane.seats[seat]
                     .take_decision()
                     .expect("a decided session has a decision");
@@ -131,9 +122,7 @@ fn every_game_of_a_mixed_sweep_finishes_through_one_shared_batch() {
             break;
         }
 
-        // One crossing for every game in the sweep. This call is the whole point
-        // of the seam: on a real deployment it is the single GPU or Python
-        // boundary crossing, and everything above exists to make it wide.
+        // Evaluate the complete sweep batch in one call.
         answers.clear();
         evaluator.evaluate(&batch, &mut answers);
         assert_eq!(answers.len(), batch.len(), "one answer per batch item");

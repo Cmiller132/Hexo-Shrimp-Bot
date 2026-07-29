@@ -18,8 +18,7 @@ from .conftest import oracle_live_windows
 
 def test_thirty_four_canonical_patterns():
     # 62 nonempty, nonfull 6-bit masks fold to (62 + 6 palindromes) / 2 = 34
-    # orbits under reversal. The spec's §3.2 prose said 32; the count is 34,
-    # and the arithmetic above is checkable by hand.
+    # orbits under reversal.
     assert NUM_PATTERNS == 34
     assert (_PATTERN_RANK[_CANON[1:63]] >= 0).all()
     assert _PATTERN_RANK[0] == -1 and _PATTERN_RANK[63] == -1
@@ -97,10 +96,7 @@ def test_decoder_table_ordering_and_coverage(positions):
 
 
 def test_decoder_entries_arrive_in_cell_order(positions):
-    # Part of the representation, not an accident of the walk: the decoder
-    # aggregation reduces each cell's run of entries in one pass, which is
-    # only the same sum if a cell's entries are contiguous. `collate` keeps it
-    # across positions because cell offsets increase with position index.
+    # Decoder entries for each cell remain contiguous before and after collation.
     graphs = [from_position(pos) for pos in positions]
     for g in graphs:
         assert (np.diff(g.dec_cell) >= 0).all()

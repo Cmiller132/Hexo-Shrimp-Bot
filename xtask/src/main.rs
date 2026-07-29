@@ -1,18 +1,17 @@
-//! The workspace verification gates, defined once.
+//! Workspace verification gates.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 /// Which toolchain a gate runs under.
 enum Toolchain {
-    /// Whatever `cargo` already resolves to — current stable, in practice.
+    /// The toolchain selected by the invoking `cargo`.
     Current,
-    /// The `rust-version` floor declared in the workspace manifest, read from that
-    /// manifest so the gate cannot outlive the promise it checks.
+    /// The `rust-version` declared in the workspace manifest.
     Msrv,
 }
 
-/// One gate: what it runs, and why it catches something no other gate does.
+/// One verification gate.
 struct Gate {
     /// The subcommand name, as typed.
     name: &'static str,
@@ -21,14 +20,12 @@ struct Gate {
     toolchain: Toolchain,
     /// Environment set for this gate only.
     env: &'static [(&'static str, &'static str)],
-    /// Arguments after `cargo`. Every gate that resolves dependencies passes
-    /// `--locked`, so a lockfile a manifest has outgrown fails the gate instead of
-    /// being quietly rewritten under it. `cargo fmt` does not take the flag. The
-    /// `xtask` alias in `.cargo/config.toml` passes it too — the launcher's own
-    /// `cargo run` resolves the workspace before any gate, and unlocked it would
-    /// repair the lockfile out from under the checks.
+    /// Arguments after `cargo`.
+    ///
+    /// Dependency-resolving gates pass `--locked`; `cargo fmt` does not accept
+    /// that flag. The `xtask` alias also passes `--locked` to its `cargo run`.
     args: &'static [&'static str],
-    /// One line for the gate table, then why the gate is not redundant.
+    /// User-facing gate description and failure guidance.
     why: &'static str,
 }
 
@@ -197,8 +194,7 @@ fn main() -> ExitCode {
 }
 
 impl Gate {
-    /// Runs the gate from the workspace root, echoing the exact command first so a
-    /// failure can be reproduced by hand.
+    /// Run the gate from the workspace root after printing its command.
     fn run(&self) -> bool {
         let root = workspace_root();
         let toolchain = match self.toolchain {
@@ -241,8 +237,7 @@ impl Gate {
     }
 }
 
-/// The workspace root, resolved from this crate's own manifest directory so `cargo
-/// xtask` works from any subdirectory.
+/// The parent of this crate's manifest directory.
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

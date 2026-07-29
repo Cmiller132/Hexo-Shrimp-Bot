@@ -1,20 +1,18 @@
-"""The run driver: iterations to disk.
+"""Drive KLENT iterations and persist their run artifacts.
 
-What a run leaves behind is the run directory — `config.json` (every knob and
-version the run depended on), `metrics.jsonl` (one line per iteration; the
-`KLENT_FOR_HEXO.md` §8 metrics are the experiment, so they persist),
-`telemetry.db` (the same
-metrics plus every game, every self-play ply, every evaluation match and the
-machine's counters, queryable — see `telemetry.py`), and periodic checkpoints
-carrying model, optimizer, RNG state, and the iteration counter, so a crash
-loses at most one checkpoint interval. While it lives it also keeps
-`status.json` fresh (the per-lane heartbeat) and honors the `STOP` /
-`CHECKPOINT` sentinel files once per iteration. `--eval-every N` plays a
-seat-balanced paired match against full-strength SealBot with the model's
-Gumbel line search, and merges its score into that iteration's metrics row;
-the eval RNG is derived from (run seed, iteration), never drawn from the
-training stream, so a run's training trajectory is identical with evaluation
-on or off.
+The run directory contains the current invocation's ``config.json``, an
+append-only ``invocations.jsonl``, append-only iteration events in
+``metrics.jsonl``, queryable ``telemetry.db``, periodic checkpoints, and the
+``status.json`` heartbeat. A resume restores the latest checkpoint; replayed
+iteration numbers can therefore occur in ``metrics.jsonl``, while telemetry
+replaces its replayed tail. Checkpoints contain model, optimizer, training RNG,
+version identifiers, and the count of completed iterations.
+
+``STOP`` requests a checkpoint and clean exit at the next iteration boundary.
+``CHECKPOINT`` requests a checkpoint at that boundary without stopping.
+``--eval-every N`` records a seat-balanced SealBot match every ``N`` completed
+iterations. Evaluation uses Gumbel line search when ``--eval-sims`` is positive
+and raw-policy argmax when it is zero; its RNG is separate from training.
 
 Run from python/mantisnet:
 
@@ -80,9 +78,8 @@ def save_checkpoint(path: Path, model, optimizer, iteration: int, rng) -> None:
 def load_model(path: Path, device: str = "cpu"):
     """A checkpoint's model half, version-checked.
 
-    Architecture comes from the default :class:`MantisConfig`, which is what
-    every run trains; a checkpoint from other shapes fails the state-dict
-    load loudly rather than being adapted to."""
+    The loader constructs the default :class:`MantisConfig`; checkpoints with
+    another shape fail state-dict validation."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if ckpt["versions"] != _versions():
         raise ValueError(
@@ -97,12 +94,8 @@ def load_model(path: Path, device: str = "cpu"):
 def load_checkpoint(path: Path, model, optimizer, rng=None) -> int:
     """Restore into the given model/optimizer/rng; returns iterations done.
 
-    ``rng=None`` restores the learner halves only — how ``--init-from``
-    forks a fresh run (own seed, iteration 0) from a trained state.
-
-    Version mismatches are refused: a checkpoint from other rules or another
-    representation would train on silently, which is the failure worth a
-    hard stop.
+    ``rng=None`` restores only the model and optimizer for ``--init-from``.
+    Version identifiers must equal those of the running build.
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if ckpt["versions"] != _versions():
@@ -124,9 +117,8 @@ class _Status:
     ISO), ``iteration`` (last committed), and one entry per lane — ``collect``
     ``{iteration, finished, quota, steps, slot_plies}``, ``fit``
     ``{iteration, chunk, chunks}``, ``eval`` ``{iteration}`` — each ``null``
-    while that lane is idle. Lanes report from two threads (the collection
-    worker and the driver), hence the lock; a write draws nothing from the
-    training RNG and adds nothing to the metrics row, exactly like telemetry.
+    while that lane is idle. The lock serializes reports from the collection
+    worker and driver. Heartbeat writes do not consume training RNG state.
     """
 
     def __init__(self, out_dir: Path):
@@ -164,49 +156,29 @@ def run_training(
     evaluate_fn=None,
     starve_limit: int = 10,
 ) -> None:
-    """The pipelined loop: while iteration ``i`` fits on the main thread,
-    iteration ``i+1``'s episodes collect on a worker, acting through a
-    snapshot of the weights as they stood *before* fit ``i``. The corpus
-    therefore runs one fit behind the paper's strict alternation — the
-    deliberate cost of overlapping the loop's CPU half with its GPU half,
-    recorded here because it is an algorithmic property, not an
-    implementation detail. Collection draws from the collector's own stream
-    (seeded off the main one at construction), so a from-scratch run is
-    reproducible; a *resumed* run restarts with empty slots, so it replays
-    the same distribution but not the same games — in-flight episodes do
-    not survive the process.
+    """Run the pipelined collect, fit, evaluate, and commit loop.
+
+    While iteration ``i`` fits on the main thread, iteration ``i+1`` collects
+    through a snapshot taken before fit ``i``. Collection owns a separate RNG
+    stream. Resume restores the training RNG but starts with empty collection
+    slots; in-flight episodes are not checkpointed.
 
     ``evaluate_fn(model, done, telemetry) -> dict`` runs every ``eval_every``
-    completed iterations and its fields join that iteration's metrics row; it
-    is handed the telemetry writer because a match's per-game detail is
-    recorded by whoever played it, through the same call the offline sweep
-    uses.
+    completed iterations. Its fields join that iteration's metric event, and
+    it records match detail through the supplied telemetry writer.
 
-    Telemetry is written on this thread, between the fit and the wait for the
-    next collection — it draws nothing from the training RNG and adds nothing
-    to the metrics row, so a run's trajectory is identical with it removed
-    (which is what `tests/test_telemetry.py` holds it to). It is not optional:
-    a run that cannot record what it did is not a run worth having.
+    ``starve_limit`` stops after that many consecutive iterations with fewer
+    buffer samples than the game quota and writes a checkpoint first. Zero
+    disables this guard.
 
-    ``starve_limit`` is the unattended-run guard: a policy that stops
-    finishing games buys ~`ply_cap` plies of collection per iteration for an
-    empty buffer. After this many consecutive iterations yielding under one
-    sample per game, the run stops loudly (checkpointing first) instead of
-    burning the night. 0 disables.
-
-    Two file seams face outward while the run lives. ``status.json`` is the
-    :class:`_Status` heartbeat. And two sentinel files in the run directory
-    are honored once per iteration: ``STOP`` (checkpoint, consume, exit 0)
-    and ``CHECKPOINT`` (write a checkpoint at the next commit point,
-    consume, continue) — how anything outside the process, the deck
-    included, asks politely instead of killing.
+    ``status.json`` and the ``STOP`` and ``CHECKPOINT`` sentinel files form the
+    live process interface. Sentinels are checked and consumed once per
+    committed iteration.
     """
     starved = 0
     out_dir.mkdir(parents=True, exist_ok=True)
     status = _Status(out_dir)
-    # The collection actor: a persistent clone the worker forwards through
-    # while fit mutates the live model. Reloaded (cheap, on-device copies)
-    # at each submission, when the worker is idle by construction.
+    # The worker evaluates through this clone while fitting mutates the live model.
     snapshot = copy.deepcopy(model)
     collector = Collector(
         cfg.envs,
@@ -255,14 +227,11 @@ def run_training(
             t0 = time.perf_counter()
             episodes, metrics = pending.result()
             metrics["iteration"] = i
-            # The first processed iteration stays sequential: its fit is the
-            # train-graph torch.compile, and a concurrent collection hitting
-            # the same compiled callable mid-compile was measured to livelock
-            # the two threads on the GIL. From the second iteration on, both
-            # graphs exist and collection overlaps fit.
+            # The first processed iteration completes compilation before
+            # collection and fitting share the callable.
             overlap = i > start_iteration
             if overlap and i + 1 < iterations:
-                pending = submit_collect(pool, i + 1)  # overlaps the fit below
+                pending = submit_collect(pool, i + 1)  # Collection overlaps the fit below.
             samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret, cfg.gamma)]
             metrics["buffer_samples"] = len(samples)
             if samples:
@@ -274,26 +243,23 @@ def run_training(
                 status.update(fit=None)
             if not overlap and i + 1 < iterations:
                 pending = submit_collect(pool, i + 1)
-            metrics["seconds"] = time.perf_counter() - t0  # eval kept out: this
-            done = i + 1  # column is the recompile/leak detector and must stay flat
+            # Evaluation time has its own metric and is excluded from iteration time.
+            metrics["seconds"] = time.perf_counter() - t0
+            done = i + 1
             if eval_every and evaluate_fn is not None and done % eval_every == 0:
                 status.update(force=True, eval={"iteration": done})
                 t1 = time.perf_counter()
                 metrics.update(evaluate_fn(model, done, telemetry))
                 metrics["eval_seconds"] = time.perf_counter() - t1
                 status.update(force=True, eval=None)
-            # NaN (an empty stat, e.g. won_length_mean with nothing won)
-            # becomes null: a `NaN` token would make the file invalid JSON
-            # for exactly the tools an operator points at it.
+            # Empty statistics become JSON null; NaN is not valid JSON.
             row = {k: None if v != v else v for k, v in metrics.items()}
             metrics_file.write(json.dumps(row, allow_nan=False) + "\n")
             metrics_file.flush()
-            # The same row the file just took, plus the episodes behind it.
+            # Telemetry receives the same metric event and its source episodes.
             telemetry.write_iteration(row, episodes, hardware.drain())
             status.update(force=True, iteration=done)
-            # CHECKPOINT is the on-demand sentinel: whoever wants a durable
-            # artifact now (the deck, an operator) touches the file and the
-            # next commit point honors and consumes it.
+            # CHECKPOINT requests a durable artifact at this commit point.
             requested = (out_dir / "CHECKPOINT").exists()
             if done % checkpoint_every == 0 or done == iterations or requested:
                 save_checkpoint(
@@ -331,8 +297,7 @@ def run_training(
                 )
                 finish()
                 return
-            # STOP is the graceful-stop sentinel: finish the iteration, make
-            # the state durable, consume the request, exit clean.
+            # STOP requests a durable checkpoint and a clean exit.
             if (out_dir / "STOP").exists():
                 save_checkpoint(
                     out_dir / f"checkpoint_{done:06d}.pt", model, optimizer, done, rng
@@ -476,8 +441,7 @@ def main(argv=None) -> None:
         if args.init_from is not None:
             forked = load_checkpoint(args.init_from, model, optimizer)
             print(f"initialized from {args.init_from} ({forked} iterations trained)")
-    # A restored optimizer state carries the *source run's* learning rate in
-    # its param groups; the invocation's --lr is the truth, not that relic.
+    # The invocation's --lr overrides the value stored in optimizer state.
     for group in optimizer.param_groups:
         group["lr"] = cfg.lr
 
@@ -499,9 +463,7 @@ def main(argv=None) -> None:
     }
     (out / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    # Every invocation records its resolved knobs: a resume may legitimately
-    # change them, and a run whose later knobs exist only in shell history
-    # does not reproduce.
+    # The append-only invocation record preserves resolved knobs across resumes.
     invocation = {
         "start_iteration": start,
         "iterations": args.iterations,
@@ -529,9 +491,7 @@ def main(argv=None) -> None:
         from .train import network_evaluate
 
         def evaluate_fn(m, done, telemetry):
-            # Seeded from (run seed, iteration), never the training stream:
-            # the training trajectory is identical with evaluation on or off,
-            # and a resumed run replays the same matches it would have played.
+            # Evaluation derives its RNG from (run seed, completed iteration).
             m.eval()
             choose = gumbel_choose(
                 network_evaluate(m, cfg),

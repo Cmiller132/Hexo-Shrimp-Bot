@@ -1,25 +1,8 @@
-//! The probe: a frozen set of positions, forwarded whole, hashed over the exact
-//! bytes the evaluator returned.
+//! Frozen evaluator-probe positions and their output hash.
 //!
-//! `docs/CONTAINER_SPEC.md` §10.2 states what this is for, and every failure in
-//! its list is silent: the wrong checkpoint loaded, a swap that constant-folding
-//! turned into a no-op, a mismatched encoder version, a scrambled action
-//! ordering, or a runtime that drifted between build and run. None of them
-//! crash. All of them train or play against the wrong weights indefinitely.
-//!
-//! Three properties make the number mean something, and each is load-bearing:
-//!
-//! - **The whole probe set is one batch, forwarded once.** Batch shape decides
-//!   which kernel runs on a GPU, so a probe split across two batches could
-//!   produce two different hashes from one set of weights and the detector would
-//!   be reporting its own arithmetic.
-//! - **The hash is over the evaluator's exact output bytes**, not over the
-//!   weights and not over a re-derived summary. Hashing the weights would miss
-//!   every failure that leaves the file intact and answers with something else.
-//! - **The positions are fixed and derived from nothing.** They are hardcoded
-//!   move lists replayed through the engine, with no RNG and no dependence on
-//!   the caller, so the same binary with the same weights produces the same hash
-//!   every time and everything that varies is a real difference.
+//! The complete probe set is encoded as one batch and evaluated in one call.
+//! The hash covers the exact little-endian output bytes in position order. The
+//! positions are fixed move-list prefixes with no caller input or RNG.
 
 use hexo_engine::{Action, HexCoord, Position};
 use hexo_search::{EncodedBatch, Encoder, Evaluator};
@@ -32,12 +15,8 @@ const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// A packed game whose prefixes supply seven of the probe positions.
 ///
-/// One list rather than seven because the positions wanted are the *same* game
-/// at different plies — the opening, the first stone, a stone into a turn, and
-/// three mid-game boards — and prefixes state that directly. The line lengths
-/// are deliberately capped at five: `P0` holds `(0, 0)..(0, 4)` along `R` and
-/// `P1` holds `(1, 1)..(5, 1)` along `Q`, so both sides sit one placement from a
-/// win and an evaluator with any opinion at all has somewhere to put it.
+/// Prefixes cover the opening, turn boundaries, mid-turn states, and mid-game
+/// states. The final position leaves both players one placement from a win.
 static PACKED: [(i16, i16); 21] = [
     (0, 0),
     (1, 0),
@@ -65,9 +44,8 @@ static PACKED: [(i16, i16); 21] = [
 /// `P1` on the *first* stone of a turn it can win with two placements: it holds
 /// `(1, 0)..(4, 0)` and closes the window with `(5, 0)` and `(6, 0)`.
 ///
-/// The interesting case for this game specifically. A turn is two placements, so
-/// the two plies that win have the **same** mover, which is the shape a value
-/// signed by depth parity gets exactly backwards.
+/// Both winning plies have the same mover, so this position distinguishes
+/// mover-based value signing from depth-parity signing.
 static WIN_IN_TWO: [(i16, i16); 9] = [
     (0, 0),
     (1, 0),
@@ -99,10 +77,8 @@ static WIN_IN_ONE: [(i16, i16); 10] = [
 /// Stones pushed out to the legality radius in every direction, so the frontier
 /// is the union of thirteen disks rather than one.
 ///
-/// This is the position whose `legal_count` is nothing like the others', which
-/// is what makes it catch an encoder that writes a fixed-width row: the board has
-/// no edge, and a crop that fits every other probe position does not fit this
-/// one.
+/// Its legal count differs from the other probe positions and exercises ragged
+/// encodings.
 static SCATTERED: [(i16, i16); 13] = [
     (0, 0),
     (6, 0),
@@ -127,8 +103,7 @@ fn probe_games() -> [&'static [(i16, i16)]; 10] {
         &PACKED[..0],
         // 1 ply: `P1` on the first stone of the first full turn.
         &PACKED[..1],
-        // 2 plies: `P1` a stone into its turn — the mid-turn state that a search
-        // signing values by depth parity gets wrong.
+        // 2 plies: `P1` one stone into its turn.
         &PACKED[..2],
         // 5 plies: two turns in.
         &PACKED[..5],
@@ -149,23 +124,15 @@ fn probe_games() -> [&'static [(i16, i16)]; 10] {
 
 /// The probe positions, in the order [`probe_hash`] forwards them.
 ///
-/// Ten of them, spanning plies 0, 1, 2, 5, 9, 10, 11, 12, 13, and 21: the
-/// opening, the first stone of a turn, two mid-turn states, two positions one
-/// turn from a decided game, a wide-frontier board, and three ordinary
-/// mid-games. Varied on purpose — a probe set that was all openings would agree
-/// with itself under an encoder bug that only shows up once there are stones to
-/// encode.
+/// Ten positions span plies 0, 1, 2, 5, 9, 10, 11, 12, 13, and 21, including
+/// turn boundaries, mid-turn states, near-terminal states, and a wide frontier.
 ///
-/// **The set is frozen.** Changing it changes every probe hash, which invalidates
-/// every checkpoint manifest on disk — that is a regeneration, in the way this
-/// workspace changes formats, and not an edit to make in passing.
+/// The set is format-frozen. Changing it changes every probe hash and requires
+/// checkpoint regeneration.
 ///
 /// # Panics
 ///
-/// Never, for the lists in this module: each one is replayed through the engine
-/// and a list that is not a legal game, or that ends in a terminal position with
-/// no legal action to have a prior for, is a bug in this file that the panic
-/// names.
+/// If a fixed move list is illegal or ends in a terminal position.
 #[must_use]
 pub fn probe_positions() -> Vec<Position> {
     probe_games()
@@ -192,17 +159,12 @@ pub fn probe_positions() -> Vec<Position> {
 /// Every probe position is encoded into **one** [`EncodedBatch`] and answered by
 /// **one** [`Evaluator::evaluate`] call, and the hash folds the exact
 /// little-endian bytes of every prior and every value, in order, through FNV-1a.
-/// Nothing is rounded, bucketed, or summarised on the way: the point is to
-/// notice a difference, and a summary is a place for one to hide.
+/// No rounding, bucketing, or summarization is applied.
 ///
 /// # Panics
 ///
-/// If the evaluator returns a different number of answers than the batch held,
-/// or if any answer's prior count is not its position's `legal_count`. Both are
-/// package bugs of the same kind `hexo_search::Evaluation`'s own checks panic
-/// on, and both have to be loud here rather than skipped: a probe that hashed a
-/// misaligned answer would still produce a stable number, so the detector would
-/// go on agreeing with itself while describing nothing.
+/// If the evaluator returns the wrong number of answers or any answer's prior
+/// count differs from its position's `legal_count`.
 pub fn probe_hash(encoder: &dyn Encoder, evaluator: &mut dyn Evaluator) -> u64 {
     let positions = probe_positions();
     let mut batch = EncodedBatch::with_capacity(positions.len(), 0);
@@ -241,10 +203,8 @@ pub fn probe_hash(encoder: &dyn Encoder, evaluator: &mut dyn Evaluator) -> u64 {
 
 /// One FNV-1a step per byte: xor, then multiply.
 ///
-/// Written out here rather than taken as a dependency because it is five lines
-/// and because the constants are part of the checkpoint format — a hash function
-/// that changed under a version bump of somebody else's crate would invalidate
-/// every manifest on disk without anything in this workspace having moved.
+/// The local implementation fixes the hash algorithm and constants as part of
+/// the checkpoint format.
 fn fold(hash: u64, bytes: &[u8]) -> u64 {
     let mut hash = hash;
     for &byte in bytes {
@@ -260,10 +220,7 @@ mod tests {
 
     #[test]
     fn the_fold_matches_the_published_fnv1a_vectors() {
-        // The reference vectors for FNV-1a 64. They pin the offset basis, the
-        // prime, and the xor-then-multiply order all at once: swapping the two
-        // operations produces FNV-1, which is a different function that would
-        // otherwise pass every determinism test in this crate.
+        // These vectors pin the offset basis, prime, and xor-then-multiply order.
         assert_eq!(fold(FNV_OFFSET_BASIS, b""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fold(FNV_OFFSET_BASIS, b"a"), 0xaf63_dc4c_8601_ec8c);
         assert_eq!(fold(FNV_OFFSET_BASIS, b"foobar"), 0x8594_4171_f739_67e8);
@@ -277,12 +234,8 @@ mod tests {
 
     #[test]
     fn the_probe_set_is_frozen() {
-        // A golden vector over the *positions*, independent of any encoder or
-        // evaluator: it folds each position's zobrist and legal count, both of
-        // which the engine states and this file does not. Editing a move list
-        // moves this number, and moving it invalidates every checkpoint manifest
-        // that exists — which is the point of having to change the constant by
-        // hand.
+        // This vector freezes each position's zobrist and legal count,
+        // independently of any encoder or evaluator.
         let mut hash = FNV_OFFSET_BASIS;
         for position in probe_positions() {
             hash = fold(hash, &position.zobrist().to_le_bytes());

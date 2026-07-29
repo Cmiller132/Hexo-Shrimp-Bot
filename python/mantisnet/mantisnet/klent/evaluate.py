@@ -1,8 +1,9 @@
-"""Policy-argmax chooser and simple checkpoint cross-play machinery.
+"""Policy-argmax chooser and checkpoint cross-play.
 
-``argmax_choose`` is the zero-search parity anchor. Evaluation strength
-matches use ``search.gumbel_choose`` and ``opponents.opponent_match``; this
-module's ``play_match`` remains the compact checkpoint-vs-checkpoint loop.
+``argmax_choose`` implements the zero-search policy choice. Evaluation
+matches with search use ``search.gumbel_choose`` and
+``opponents.opponent_match``; ``play_match`` implements the
+checkpoint-vs-checkpoint loop.
 Seats alternate because the game is asymmetric even though the encoding is
 not, and a capped game scores a half-win for each side.
 """

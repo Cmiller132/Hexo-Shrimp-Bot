@@ -25,11 +25,6 @@ enum State {
 /// `begin` copies the position, the first `pump` emits the root, `resume`
 /// delivers its evaluation and authors the decision, and the next `pump` reports
 /// [`SessionStatus::Decided`].
-///
-/// It exists so that policy-only training runs through the *same* driver as a
-/// tree search: same trait, same batches, same records. A policy-only seat
-/// written as a straight-line `Player` instead would be a second loop that
-/// batches differently, and the two would drift.
 pub struct PolicySession {
     selector: Box<dyn SelectFromPolicy>,
     rng: SplitMix64,

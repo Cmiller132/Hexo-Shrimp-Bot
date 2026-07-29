@@ -3,12 +3,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { usePaneActive } from "./Pane";
 
 /**
- * Whether a global key binding must stand down for this event.
- *
- * The rules are: never fight a handled event, never take a modifier combination
- * (Ctrl/⌘-K stays the App's command palette), never fire under a modal, and never
- * steal a keystroke aimed at a text field. Space is additionally deferred to a
- * focused button so it still activates it.
+ * Excludes handled events, modifier combinations, modal input, editable fields,
+ * and Space on a focused button from global bindings.
  */
 function shouldIgnoreKey(event: KeyboardEvent): boolean {
   if (event.defaultPrevented) return true;
@@ -24,10 +20,8 @@ function shouldIgnoreKey(event: KeyboardEvent): boolean {
 
 export type KeyHandlers = Record<string, (event: KeyboardEvent) => void>;
 
-/** Binds document-level keys behind `shouldIgnoreKey`, and only for the screen on
- *  show — a hidden pane keeps its state, not the keyboard. Names are the raw
- *  `KeyboardEvent.key`, optionally prefixed `Shift+` — for example `"ArrowLeft"`,
- *  `"Shift+ArrowRight"`, `" "`, `"Home"`, `"w"`. Every match preventDefaults. */
+/** Binds guarded document-level keys only for the visible pane.
+ *  Names use `KeyboardEvent.key` with optional `Shift+`; matches call `preventDefault()`. */
 export function useDeckKeys(handlers: KeyHandlers): void {
   const active = usePaneActive();
   const ref = useRef(handlers);
@@ -59,10 +53,8 @@ export interface TransportProps {
 }
 
 /**
- * The one replay transport: track, first/prev/play/next/last, a speed, and the
- * keyboard map. Play, History and the Lab all mount it — there is no second
- * scrubber, and a hidden screen's transport neither binds the keyboard nor keeps
- * playing, so only the visible one drives a cursor.
+ * Provides cursor track, step, endpoint, playback-speed, and keyboard controls.
+ * A hidden pane stops playback and does not bind the keyboard.
  */
 export default function Transport({ length, value, onChange }: TransportProps) {
   const active = usePaneActive();
@@ -70,8 +62,7 @@ export default function Transport({ length, value, onChange }: TransportProps) {
   const [speed, setSpeed] = useState(1);
   const valueRef = useRef(value);
   valueRef.current = value;
-  // Held in a ref so an inline `onChange` cannot restart the playback timer on
-  // every render — which would stop the transport from ever advancing.
+  // A ref keeps inline `onChange` callbacks from restarting the playback timer.
   const changeRef = useRef(onChange);
   changeRef.current = onChange;
 
@@ -79,7 +70,7 @@ export default function Transport({ length, value, onChange }: TransportProps) {
     changeRef.current(Math.max(0, Math.min(length, next)));
   }, [length]);
 
-  // A new line invalidates playback, and the cursor may now be past the end.
+  // A length change stops playback and clamps the cursor to the new endpoint.
   useEffect(() => {
     setPlaying(false);
     if (valueRef.current > length) changeRef.current(length);

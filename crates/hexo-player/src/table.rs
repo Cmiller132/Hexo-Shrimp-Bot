@@ -1,4 +1,4 @@
-//! One game and the two seats playing it, and the sweep that drives many at once.
+//! Two-seat game tables and interleaved table sweeps.
 
 use crate::player::Player;
 use hexo_engine::Player as Seat;
@@ -6,8 +6,7 @@ use hexo_runner::{Failure, Game, GameSpec, MatchResult, Reply, Step, SubmitError
 
 /// One game and the two seats playing it.
 ///
-/// Both seats are owned values even in self-play: two seats drawing from one
-/// sampler would correlate their choices.
+/// The table owns one player value per seat.
 #[derive(Clone, Debug)]
 pub struct Table<P> {
     game: Game,
@@ -65,10 +64,8 @@ impl<P: Player> Table<P> {
         match self.game.submit(generation, Reply::Place(decision)) {
             Ok(transition) => transition.result,
             Err(SubmitError::Desync { expected, got }) => {
-                // The seat chose from a position that is not the game's. This
-                // driver has nothing to resync — a transport adapter that can
-                // does so inside `choose`, before the decision reaches here —
-                // so it gives up on the turn and lets policy adjudicate.
+                // This driver reports desync as a seat failure; transport-level
+                // resynchronization must occur before submission.
                 self.game
                     .submit(generation, Reply::Failed(Failure::Desync { expected, got }))
                     .expect("a refused submission leaves the generation unchanged")

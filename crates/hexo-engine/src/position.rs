@@ -565,7 +565,7 @@ impl Position {
 
 #[cfg(debug_assertions)]
 impl Position {
-    /// C5: the turn closed form. The most valuable assert in the crate.
+    /// C5: the turn closed form.
     fn debug_assert_turn_closed_form(&self) {
         let form = turn_closed_form(self.stone_count(), self.terminal.is_some());
         let (kind, player) = form.expect("C5: unreachable stones/terminal combination");

@@ -13,8 +13,7 @@ over the cell's incidence entries ``e``. A linear map commutes with a sum, so
 remaining under the sum is head-independent, and one pass over the incidence
 then serves both heads instead of two.
 
-`aggregate` is that pass. It returns the coefficients of ``h``, one row per
-cell:
+``aggregate`` returns the coefficients of ``h``, one row per cell:
 
     [0, H)            Σ_e w[dec_window[e]]
     [H, H+3)          how many entries carried each slot class
@@ -22,22 +21,18 @@ cell:
     [H+11, H+16)      zero — the row is rounded to a multiple of 16 so the head
                       GEMM keeps a tensor-core-friendly K
 
-`head_matrix` folds a head's projection, both its embedding tables, and its
-first MLP layer into the single matrix that reads a whole row, so the per-cell
-work is exactly the GEMM the head already ran and the projection GEMM over
-windows disappears. Neither function holds parameters: they read the ones
-`model` owns, and the checkpoint layout is untouched.
+``head_matrix`` folds a head's projection, embedding tables, and first MLP
+layer into the matrix that reads an aggregate row. Neither function owns
+parameters; both consume parameters owned by ``model`` without changing the
+checkpoint layout.
 
 The background block adds where the spec overwrites. A background cell is by
 construction in no live window, so its window and class coefficients are zero
 and the two agree.
 
-The CUDA path is a Triton segment reduction over ``dec_cell``'s runs, which
-the builder emits in cell order: each cell's entries are summed in registers
-and its row is stored once, so the aggregation needs neither a zeroed
-accumulator nor atomics. The torch path sums by ``index_add_`` and is
-order-independent, which is what makes the parity tests between the two a
-detector for a builder that stops emitting entries in cell order.
+The CUDA path is a Triton segment reduction over the cell-ordered
+``dec_cell`` runs. The torch path uses order-independent ``index_add_`` and
+serves as the parity reference.
 """
 
 from __future__ import annotations
@@ -71,13 +66,8 @@ if CLASS_SLOTS + BG_SLOTS > COEF_WIDTH:
         f"{COEF_WIDTH}-wide block"
     )
 
-# One program per cell, one row of width H per program. A single warp beat
-# {2, 4, 8} on the target RTX 4070 Ti — kernel milliseconds at cohort 256 were
-# 0.68 / 0.72 / 0.84 / 1.40 at 50 stones and 3.36 / 3.40 / 4.25 / 7.21 at 400.
-# Each of the 32 threads then covers four of the 128 columns, which is one
-# vectorised load per thread against a row the warp reads whole. The geometry
-# is fixed rather than autotuned so symbolic shape changes stay out of
-# Triton's tuning cache.
+# One program and one warp process each cell. Fixed geometry keeps symbolic
+# shape changes out of Triton's tuning cache.
 _NUM_WARPS = 1
 
 _FAILED_SHAPES: dict[tuple[object, ...], str] = {}
@@ -137,9 +127,8 @@ def _aggregate_reference(
 ) -> Tensor:
     """The scatter formulation used by CPU, failed launches, and recompute.
 
-    Accumulation is fp32 whatever ``w``'s dtype, matching the kernel's
-    registers: a cell can carry up to eighteen entries, and rounding each
-    partial sum to bf16 would cost more than the aggregation is worth.
+    Accumulation is fp32 whatever ``w``'s dtype, matching the kernel registers
+    and avoiding bf16 rounding at each partial sum.
     """
     h = w.shape[1]
     acc = torch.zeros(n_cells, h + COEF_WIDTH, dtype=torch.float32, device=w.device)

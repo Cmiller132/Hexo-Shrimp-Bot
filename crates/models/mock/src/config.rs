@@ -1,11 +1,7 @@
-//! The package's configuration syntax, parsed in one place.
+//! Mock-package configuration grammar.
 //!
-//! Two entry points, one grammar. [`parse_config`] reads the whole
-//! configuration string the container was given; [`parse_search`] reads a search
-//! shape on its own, which is what a session variant name is. They share a
-//! parser rather than agreeing about one, so `"mcts:visits=128,inflight=4,\
-//! cpuct=1.0"` cannot be a valid `search=` value and an invalid variant name at
-//! the same time.
+//! [`parse_config`] parses the container configuration, and [`parse_search`]
+//! parses the same search-shape syntax used by variant names.
 
 use crate::NAME;
 use hexo_model::PackageError;
@@ -21,13 +17,7 @@ pub(crate) enum Search {
     Mcts(MctsConfig),
 }
 
-/// Why a search shape could not be read.
-///
-/// The distinction is not cosmetic: it is what lets a *variant name* that names
-/// no shape at all come back as [`PackageError::UnknownVariant`] — the honest
-/// answer to "do you have a variant called `greedy`" — while a name that does
-/// name a shape but mis-states its parameters comes back saying which parameter,
-/// which is the answer to the mistake actually made.
+/// Classification of a search-shape parse failure.
 pub(crate) enum ParseFailure {
     /// The leading word is not a search shape this package has.
     UnknownShape,
@@ -68,14 +58,10 @@ impl ParseFailure {
 
 /// Read the package's whole configuration string.
 ///
-/// The grammar is `search=<shape>` and nothing else. There is exactly one key,
-/// it is required, and there is no default: a search shape is a model choice,
-/// and a package that silently picked one would be choosing how every game in
-/// the run is played on behalf of whoever forgot to say.
+/// The grammar is exactly `search=<shape>`. The key is required and has no
+/// default.
 ///
-/// Whitespace is not trimmed anywhere. The string comes from a flag, one
-/// grammar is easier to state than one grammar plus a lenience policy, and
-/// `"search = policy"` is refused by name rather than guessed at.
+/// Whitespace is not trimmed.
 pub(crate) fn parse_config(config: &str) -> Result<Search, PackageError> {
     let Some((key, value)) = config.split_once('=') else {
         return Err(PackageError::InvalidConfig {
@@ -120,13 +106,7 @@ pub(crate) fn parse_search(shape: &str) -> Result<Search, ParseFailure> {
     }
 }
 
-/// The three `mcts` parameters, all required and each stated at most once.
-///
-/// Required rather than defaulted for the reason `MctsConfig` has no `Default`:
-/// the budget is the compute a seat is allowed, the cap is how much of a batch it
-/// may occupy, and `c_puct` trades exploration against the value head. A package
-/// that let any of the three go unstated would be training against a number
-/// nobody picked.
+/// Parse the three required, unique `mcts` parameters.
 fn parse_mcts(params: &str) -> Result<Search, ParseFailure> {
     let mut visits: Option<NonZeroU32> = None;
     let mut inflight: Option<NonZeroUsize> = None;
@@ -166,7 +146,7 @@ fn parse_mcts(params: &str) -> Result<Search, ParseFailure> {
     }))
 }
 
-/// A parameter stated twice is a mistake, not a last-one-wins.
+/// Reject a repeated parameter.
 fn reject_repeat(already: bool, key: &str) -> Result<(), ParseFailure> {
     if already {
         return Err(ParseFailure::BadParameters(format!(
@@ -176,14 +156,14 @@ fn reject_repeat(already: bool, key: &str) -> Result<(), ParseFailure> {
     Ok(())
 }
 
-/// A parameter that was never stated.
+/// Report a missing parameter.
 fn missing(key: &str) -> ParseFailure {
     ParseFailure::BadParameters(format!(
         "`mcts` parameter {key:?} is missing, and this package has no default for it"
     ))
 }
 
-/// A count that has to be at least one.
+/// Parse a positive `u32`.
 fn nonzero_u32(key: &str, value: &str) -> Result<NonZeroU32, ParseFailure> {
     let parsed: u32 = value.parse().map_err(|_| {
         ParseFailure::BadParameters(format!(
@@ -197,7 +177,7 @@ fn nonzero_u32(key: &str, value: &str) -> Result<NonZeroU32, ParseFailure> {
     })
 }
 
-/// A count that has to be at least one, sized for the host.
+/// Parse a positive host-sized integer.
 fn nonzero_usize(key: &str, value: &str) -> Result<NonZeroUsize, ParseFailure> {
     let parsed: usize = value.parse().map_err(|_| {
         ParseFailure::BadParameters(format!(

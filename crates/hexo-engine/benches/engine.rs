@@ -227,9 +227,8 @@ fn new_game(c: &mut Criterion) {
     g.finish();
 }
 
-/// Written out rather than assembled by `criterion_group!` + `criterion_main!`: those
-/// expand to exactly these five lines, plus a `pub fn` with no doc comment that the
-/// workspace `missing_docs` lint then rejects.
+/// Explicit Criterion entry point compatible with the workspace's
+/// `missing_docs` lint.
 fn main() {
     let mut criterion = Criterion::default()
         .warm_up_time(Duration::from_millis(500))

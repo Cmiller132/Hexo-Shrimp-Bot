@@ -84,11 +84,8 @@ impl RunLayout {
 
     /// The one shard an epoch's self-play writes.
     ///
-    /// One shard rather than one per worker: `hexo-records` has exactly one
-    /// writer thread by design, so there is nothing for a second file to
-    /// parallelise. The name is numbered anyway, because the epoch that needs a
-    /// second one is the epoch that outgrows a `u32` of games, and renumbering a
-    /// format's file names afterwards is worse than starting from zero.
+    /// The single writer produces one shard. Its numbered name reserves the
+    /// multi-shard naming form.
     pub(crate) fn shard(&self, epoch: u32) -> PathBuf {
         self.records(epoch).join("shard-0000.hxr")
     }
@@ -129,22 +126,11 @@ where
     rename(&partial, &layout.checkpoint(epoch))
 }
 
-/// Clear away what a crash left behind, and say which epoch to continue from.
+/// Clean incomplete artifacts and return the highest loadable checkpoint epoch.
 ///
-/// Two kinds of leftovers, and they are treated differently on purpose. A
-/// half-written checkpoint is removed: it is a directory this code created under
-/// a temporary name and never renamed, so nothing was ever promised about it. A
-/// checkpoint directory that is in place but *does not load* is not removed and
-/// not skipped — it is an error, because a checkpoint arrives by rename and one
-/// that is present is one that was whole when it landed, so weights that no
-/// longer prove are a fact an operator has to see rather than an artefact a
-/// resume may quietly discard.
-///
-/// Every `records/<epoch>` at or above the epoch being continued from is
-/// removed. Those games were played under weights the run is about to play
-/// under again, and §8 keeps records only until the fit that consumes them —
-/// the phase that produced them is about to be re-run, and `ShardWriter::create`
-/// refuses a destination that already exists.
+/// Partial and manifest-free checkpoint directories are removed. A placed
+/// checkpoint that fails package loading is reported and retained. Record
+/// directories at or above the returned epoch are removed before replay.
 ///
 /// # Errors
 ///
@@ -172,8 +158,7 @@ pub(crate) fn resume_point(
             continue;
         };
         if !path.join(MANIFEST_FILE).exists() {
-            // A checkpoint directory with no manifest was never renamed into
-            // place by this code, so nothing ever depended on it.
+            // A manifest-free checkpoint directory is incomplete.
             remove_dir_all(&path)?;
             continue;
         }
@@ -208,17 +193,10 @@ pub(crate) fn resume_point(
 
 /// Write the run manifest.
 ///
-/// The whole of what an operator chose, plus the four versions the artefacts in
-/// this directory were produced under. **There is no seed field, deliberately:**
-/// `docs/CONTAINER_SPEC.md` §12 and `OPEN_DECISIONS.md` B4 leave seed ownership
-/// open, the driver seeds from entropy, and nothing mints or records a per-game
-/// seed — so a field for one would read as a reproducibility guarantee that
-/// nobody ever checked.
+/// Records artifact-affecting run configuration and the four format versions.
+/// It has no seed field because §12 uses unrecorded entropy-derived streams.
 ///
-/// `--batch-wait-ms` is not recorded either, and for the opposite reason: it is
-/// a flush window that changes how long a partial batch waits and nothing about
-/// what the run produces, so holding a resume to the value it was started with
-/// would forbid retuning a knob that has no bearing on the artefacts.
+/// `--batch-wait-ms` is omitted because it changes only partial-batch latency.
 ///
 /// # Errors
 ///
@@ -253,11 +231,8 @@ fn manifest_json(config: &TrainConfig) -> Value {
 
 /// Hold a resumed run to the flags it was started with.
 ///
-/// Every field has to match, except that `epochs` may grow — extending a run is
-/// what a resume is often for, and shortening one would leave checkpoints the
-/// manifest no longer accounts for. A successful extension is written back, so
-/// the manifest always states the run's current target and a later resume cannot
-/// silently shrink it.
+/// Every field must match except `epochs`, which may increase but not decrease.
+/// A successful increase is written back to the manifest.
 ///
 /// # Errors
 ///

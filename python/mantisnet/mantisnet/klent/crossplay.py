@@ -1,12 +1,8 @@
-"""Checkpoint cross-play (`KLENT_PROPOSALS.md` A7): the forgetting detector.
+"""Evaluate every checkpoint pair in a run; see ``KLENT_FOR_HEXO.md`` §6.3.
 
-Round-robin argmax-vs-argmax between every checkpoint pair of one run
-directory, seat balanced, caps scored ½. Monotone improvement — later
-checkpoints beating earlier ones — is health; a cycle (A beats B beats C
-beats A) is the cyclic-forgetting signature that eval against a fixed
-anchor cannot see. Results land in ``crossplay.json`` beside the
-checkpoints, keyed ``"a vs b"`` with A's score fraction, and in the run's
-``telemetry.db`` as one row per pairing.
+Crossplay is raw-policy argmax against argmax, seat balanced when ``games`` is
+even, with capped games scored ½. Each invocation replaces ``crossplay.json``
+and the telemetry crossplay table with one result per unordered pair.
 
     uv run python -m mantisnet.klent.crossplay --run runs/<name> --games 64
 """
@@ -29,12 +25,10 @@ from .telemetry import open_telemetry
 def cross_play(
     run_dir: Path, games: int, ply_cap: int, device: str, seed: int
 ) -> list[dict]:
-    """Every pair once; each pairing's RNG derives from (seed, pair), so a
-    matrix reproduces and extends when new checkpoints appear.
+    """Evaluate each unordered checkpoint pair once.
 
-    One row per pairing, with the two checkpoints named separately —
-    ``crossplay.json``'s ``"a vs b"`` key is a presentation of this, not the
-    other way round, so nothing downstream has to parse a label apart.
+    Pair RNG derives from ``(seed, index_a, index_b)``. Rows name checkpoints
+    separately; ``crossplay.json`` formats those names as ``"a vs b"`` keys.
     """
     paths = sorted(run_dir.glob("checkpoint_*.pt"))
     if len(paths) < 2:

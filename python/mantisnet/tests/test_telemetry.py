@@ -1,13 +1,9 @@
-"""The capture layer: what the database holds, and what it must not disturb.
+"""Telemetry storage, isolation, resume, query, and inspection contracts.
 
-The obligations here are the ones nothing else can see. Training must be
-bit-identical with the writer removed — telemetry that perturbed the corpus
-would corrupt the experiment it exists to describe. A resume must supersede
-its replayed tail rather than duplicate it. The calibration query must agree
-with arithmetic done by hand, since it is the instrument for the bias in
-`KLENT_FOR_HEXO.md` §8. And `inspect_position` must reproduce collection's
-own numbers,
-because it stands in for the π′ the database deliberately does not store.
+The writer must not change training RNG or outputs. Resume replaces the
+database tail from the restored iteration. Calibration agrees with direct
+arithmetic. ``inspect_position`` agrees with collection when both receive the
+same actor weights, improvement parameters, device, and inference precision.
 """
 
 from __future__ import annotations
@@ -75,10 +71,7 @@ def test_move_packing_round_trips_and_refuses_the_impossible():
 
 
 def test_d6_transforms_are_symmetries_of_the_rules():
-    """The group the opening atlas folds by, held to the engine: a
-    transformed game is legal placement for placement, and ends the same
-    way. A wrong sign would fold two different openings together and pass
-    every test that only checks the folding is consistent."""
+    """Every opening-atlas transform preserves engine legality and outcome."""
     rng = np.random.default_rng(4)
     finished = 0
     for _ in range(6):
@@ -190,10 +183,8 @@ def test_ply_records_of_unequal_length_are_refused(tmp_path):
 
 
 def test_telemetry_leaves_training_untouched(tmp_path, monkeypatch):
-    """The capture layer draws nothing from the training RNG and adds
-    nothing to the metrics row: the same run with the writer stubbed out is
-    identical line for line. If telemetry ever consumed a draw, the fit
-    permutation would move and the losses with it."""
+    """Telemetry leaves training RNG state, metric rows, and model outputs
+    unchanged."""
 
     class Silent:
         def __enter__(self):
@@ -227,10 +218,8 @@ def test_telemetry_leaves_training_untouched(tmp_path, monkeypatch):
 
 
 def test_resume_supersedes_its_replayed_tail(tmp_path):
-    """A resume restarts at its checkpoint, which may be behind what was
-    recorded. Those iterations are redone, so their old rows go: one row per
-    iteration afterwards, ids unique among what is there, and nothing from
-    before the resume point disturbed."""
+    """Resume replaces rows from the restored iteration onward and preserves
+    earlier rows with unique live game identifiers."""
     _train(tmp_path, iterations=3)
     conn = tel.connect(tmp_path)
     kept = {
@@ -248,9 +237,7 @@ def test_resume_supersedes_its_replayed_tail(tmp_path):
     games = tel.search_games(conn, limit=1000)
     assert len({g["game_id"] for g in games}) == len(games) == 8
     assert len({(g["iteration"], g["game_index"]) for g in games}) == 8
-    # Iteration 0 is behind the resume point: same games, same ids, same
-    # moves. A superseded id may be handed out again — the row it named is
-    # gone — but no ply is left pointing at one.
+    # Reallocated game identifiers leave no ply referencing a deleted row.
     for game_id, moves in kept.items():
         assert tel.fetch_game(conn, game_id)["moves"] == moves
     orphans = conn.execute(
@@ -304,8 +291,8 @@ def _fixture_db(tmp_path):
     return writer
 
 
-# The v1 shape, frozen: what convert regenerates from. Only the parts the
-# converter reads; REAL ply scalars and no forfeit columns are the point.
+# Schema-v1 input fixture for conversion, including REAL ply scalars and no
+# forfeit columns.
 _V1_SCHEMA = """
 CREATE TABLE schema_version (version INTEGER NOT NULL);
 CREATE TABLE runs (id INTEGER PRIMARY KEY, created TEXT NOT NULL,
@@ -401,8 +388,7 @@ def test_convert_regenerates_a_v1_database(tmp_path):
         "SELECT iteration FROM iterations"
     ).fetchone()[0] == 7
 
-    # Regeneration means every table, whole: a converted database with a
-    # silently empty table is worse than a refused one.
+    # Conversion preserves rows from every schema-v1 table.
     backup = sqlite3.connect(tmp_path / "telemetry.db.v1.bak")
     tables = [
         row[0]
@@ -453,10 +439,8 @@ def test_calibration_matches_arithmetic_by_hand(tmp_path):
 
 
 def test_calibration_buckets_floor_exactly_across_the_sign(tmp_path):
-    """v̂ is signed and SQLite's CAST truncates toward zero, so the
-    reliability axis floors by hand. An off-by-one on the negative side
-    would shift half the diagram by a bucket and look entirely plausible —
-    so it is checked against `math.floor` on and off the edges."""
+    """Reliability buckets use mathematical floor for signed v̂ values,
+    including negative values on and off bucket edges."""
     import math
 
     writer = tel.open_telemetry(tmp_path)
@@ -546,13 +530,8 @@ def test_search_and_series_filter_as_asked(tmp_path):
 
 
 def test_every_browse_order_comes_off_an_index(tmp_path):
-    """A page of the game browser must never sort `games`.
-
-    Every `GAME_ORDERS` entry has an index matching its sort key column
-    for column, so the plan carries no temp B-tree at all. The failure this
-    pins is the one the deck was shipped with: sorting every matching game
-    — hundreds of thousands of them — to hand back fifty, per request.
-    """
+    """Every ``GAME_ORDERS`` entry has a matching index and query plans use
+    no temporary sort B-tree."""
 
     class Spy:
         """Records the SQL `search_games` runs, unexpanded: the plan for a
@@ -582,9 +561,7 @@ def test_every_browse_order_comes_off_an_index(tmp_path):
         assert f"games_browse_{order}" in plan, (order, plan)
         assert "TEMP B-TREE" not in plan, (order, plan)
 
-    # The other half of the query the deck fires: an iteration floor
-    # conjoins with the default order as a range seek along the same index,
-    # not as a second pass over what it returned.
+    # An iteration floor and default order use a range seek on one index.
     plan = plan_of(kind="selfplay", iterations=(1, None))
     assert "games_browse_recent" in plan and "iteration>" in plan, plan
     assert "TEMP B-TREE FOR ORDER BY" not in plan, plan
@@ -593,18 +570,13 @@ def test_every_browse_order_comes_off_an_index(tmp_path):
 
 
 def test_a_database_without_the_browse_indexes_gains_them_from_a_writer(tmp_path):
-    """An index is not a schema version.
-
-    The deck opens telemetry read-only and cannot create one, so a run
-    database written before these indexes existed has to pick them up the
-    next time a *writer* opens it — with `SCHEMA_VERSION` untouched, since
-    bumping it would refuse every database already on disk.
-    """
+    """A writer adds missing derived browse indexes without changing
+    ``SCHEMA_VERSION``; read-only opens do not add them."""
     _fixture_db(tmp_path).close()
     browse = {f"games_browse_{order}" for order in tel.GAME_ORDERS}
 
     raw = sqlite3.connect(tel.db_path(tmp_path))
-    with raw:  # the shape a database from before this build has
+    with raw:  # Construct schema v2 without the required derived indexes.
         for name in browse:
             raw.execute(f"DROP INDEX {name}")
         raw.execute("CREATE INDEX games_search ON games(kind, winner, length)")
@@ -625,7 +597,7 @@ def test_a_database_without_the_browse_indexes_gains_them_from_a_writer(tmp_path
     # One per order, named after it: an order with no index behind it is a
     # page that sorts the whole run.
     assert browse <= indexes
-    assert "games_search" not in indexes  # superseded, so it comes out too
+    assert "games_search" not in indexes  # The writer removes non-contract indexes.
     assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == version
     assert [g["game_id"] for g in tel.search_games(conn)] == [0, 1, 2]
     conn.close()
@@ -653,9 +625,7 @@ def test_summary_and_cli_read_a_real_run(tmp_path, capsys):
 
 def test_eval_matches_key_on_the_opponent_not_on_sealbot(tmp_path):
     """Opponents are rows, not columns: two depth caps are two opponents,
-    the same cap twice is one, and a strength curve is a query over an
-    opponent id — which is what lets a stronger engine arrive without a
-    schema change."""
+    the same cap twice is one, and strength curves query by opponent id."""
     from mantisnet.klent.sealbot import record_match
 
     def match(score, depth, iteration):
@@ -701,7 +671,7 @@ def test_eval_matches_key_on_the_opponent_not_on_sealbot(tmp_path):
     assert len(eval_games) == 6
     assert {g["model_seat"] for g in eval_games} == {0, 1}
     assert all(g["opening_len"] == 2 for g in eval_games)
-    # Evaluation games carry moves but no plies: argmax play has no π′.
+    # Evaluation games carry moves but no training-time per-ply trace.
     assert tel.fetch_game(conn, eval_games[0]["game_id"])["plies"] == []
     conn.close()
 
@@ -731,9 +701,8 @@ def test_crossplay_rows_replace_the_previous_matrix(tmp_path):
 
 
 def test_inspect_position_matches_a_direct_forward():
-    """`inspect_position` is what stands in for the π′ the database does not
-    store, so it has to be the same arithmetic collection ran: policy, Q, and
-    the closed-form improvement over the engine's own legal order."""
+    """``inspect_position`` matches direct policy, Q, and closed-form
+    improvement over engine legal order."""
     from mantisnet.builder import collate_positions
     from mantisnet.klent.improve import improved_policy
 
@@ -771,9 +740,7 @@ def test_inspect_position_matches_a_direct_forward():
 
 
 def test_inspect_position_loads_a_checkpoint_by_path(tmp_path, model):
-    """The other half of the seam: a viewer names a checkpoint file, and the
-    version-checked loader is what reads it — the same numbers as the model
-    it holds."""
+    """Path-based inspection matches inspection of the loaded model object."""
     path = tmp_path / "checkpoint_000001.pt"
     save_checkpoint(
         path, model, torch.optim.Adam(model.parameters()), 1, np.random.default_rng(0)
@@ -785,9 +752,8 @@ def test_inspect_position_loads_a_checkpoint_by_path(tmp_path, model):
 
 
 def test_inspect_position_walks_a_line_one_move_at_a_time():
-    """The branch-and-play call pattern: one loaded model, a prefix that
-    grows by a move. Each step's `played` is the next move of the line and
-    the ply count follows the engine."""
+    """Inspection accepts a growing prefix and identifies the next played
+    move at every ply."""
     model = _tiny_model().eval()
     moves = [(0, 0), (1, 1), (2, 0), (-1, 0), (0, 2)]
     for t in range(len(moves) + 1):
@@ -801,9 +767,7 @@ def test_inspect_position_walks_a_line_one_move_at_a_time():
 
 
 def test_inspect_position_reproduces_a_recorded_ply(tmp_path):
-    """The stored scalars are a summary of what this recomputes: for every
-    recorded ply, π′'s stored maximum, its value at the taken rank, its KL
-    and its entropy must come back out of the checkpoint."""
+    """Inspection with the actor weights matches the stored policy reductions."""
     torch.manual_seed(2)
     model = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
     optimizer = torch.optim.Adam(model.parameters())
@@ -812,8 +776,7 @@ def test_inspect_position_reproduces_a_recorded_ply(tmp_path):
         model, optimizer, cfg, iterations=1, out_dir=tmp_path,
         rng=np.random.default_rng(5), checkpoint_every=1,
     )
-    # The checkpoint is written after the fit that consumed the corpus, so
-    # reproduce with the weights collection actually acted through.
+    # Recreate the pre-fit actor weights used to collect the stored plies.
     torch.manual_seed(2)
     actor = MantisNet(MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5))
     actor.eval()
@@ -822,8 +785,7 @@ def test_inspect_position_reproduces_a_recorded_ply(tmp_path):
     game = tel.fetch_game(conn, tel.search_games(conn)[0]["game_id"])
     conn.close()
     assert game["plies"]
-    # Stored scalars are quantized to 1/_Q; the reproduction is exact, so
-    # the tolerance is the quantization half-step plus float noise.
+    # The tolerance covers the quantization half-step plus float noise.
     q = 0.5 / tel._Q + 1e-6
     for ply in game["plies"][:3]:
         out = inspect_position(actor, game["moves"], ply["t"], cfg.tau, cfg.lam)

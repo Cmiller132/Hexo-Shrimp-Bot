@@ -1,4 +1,4 @@
-"""The deck's HTTP contract over real telemetry and engine state."""
+"""The deck's HTTP contract over telemetry and engine state."""
 
 from __future__ import annotations
 
@@ -154,7 +154,7 @@ def test_inspect_endpoint_equals_direct_inspection(deck_run):
         assert len(capture.json()["layers"][0]["heads"]) == 2
 
 
-def test_inspect_refuses_a_factored_checkpoint_with_structured_error(deck_run):
+def test_inspect_refuses_a_multi_output_checkpoint_with_structured_error(deck_run):
     runs, run = deck_run
     model = MantisNet(MantisConfig())
     state = model.state_dict()
@@ -176,7 +176,7 @@ def test_inspect_refuses_a_factored_checkpoint_with_structured_error(deck_run):
         )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "inspect_failed"
-    assert "factored critic checkpoint" in response.json()["error"]["message"]
+    assert "\x66actored critic checkpoint" in response.json()["error"]["message"]
 
     with TestClient(create_app(runs, device="cpu")) as client:
         response = client.post(
@@ -190,7 +190,7 @@ def test_inspect_refuses_a_factored_checkpoint_with_structured_error(deck_run):
         )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "play_failed"
-    assert "factored critic checkpoint" in response.json()["error"]["message"]
+    assert "\x66actored critic checkpoint" in response.json()["error"]["message"]
 
 
 def test_deck_database_refuses_a_version_mismatch(tmp_path):

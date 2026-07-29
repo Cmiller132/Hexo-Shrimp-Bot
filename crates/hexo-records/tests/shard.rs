@@ -1,5 +1,4 @@
-//! The shard format: what round-trips, what the reader refuses, and what only a
-//! replay can catch.
+//! Shard round trips, reader refusals, and replay verification.
 
 use hexo_engine::{Action, ActionId, HexCoord, MoveError, Player};
 use hexo_records::{
@@ -154,10 +153,8 @@ fn read_shard(path: &Path) -> (ShardHeader, Result<Vec<GameRecord>, RecordError>
     (head, reader.collect())
 }
 
-/// The file offset of the header's game-count field, stated from the layout the
-/// crate's README documents: magic, four versions, mode, three length-prefixed
-/// strings, epoch. A test that patches bytes has to know where they are, and a
-/// drift between this and the encoder is a format change nobody meant to make.
+/// The game-count offset derived independently from the documented header
+/// layout.
 fn game_count_offset(head: &ShardHeader) -> usize {
     4 + 4 * 4
         + 1
@@ -200,9 +197,8 @@ fn a_shard_round_trips_every_game_it_was_given() {
     }
 }
 
-/// Fabricated plies, so these records are not replayable and `verify` is
-/// deliberately not called on them: the point here is that every arm of the
-/// result model survives the round trip with its payload intact.
+/// Fabricated, non-replayable plies used to cover every result payload during
+/// wire-format round trips.
 #[test]
 fn every_result_arm_round_trips_with_its_payload() {
     let (_dir, path) = scratch();
@@ -339,9 +335,8 @@ fn diagnostics_are_absent_empty_and_present_as_three_distinct_states() {
 
 // --------------------------------------------------------------- detection --
 
-/// A drifted action id is still a valid `u32`, so nothing about parsing can see
-/// it. Either the entry stops decoding or the replay catches it; a shard that
-/// reads back clean and verifies clean would mean the detector is gone.
+/// A syntactically valid action-id mutation must fail decoding or replay
+/// verification.
 #[test]
 fn a_flipped_byte_in_a_move_list_is_caught_by_parsing_or_by_verify() {
     let (_dir, path) = scratch();
@@ -640,8 +635,8 @@ fn a_wall_budget_past_the_formats_nanoseconds_is_a_write_error() {
         other => panic!("expected a loud overflow, got {other:?}"),
     }
 
-    // The refusal is the whole of it: nothing was written, and the shard still
-    // finalizes as an empty one rather than carrying a truncated budget.
+    // The failed append writes no partial entry; finalization yields an empty
+    // shard.
     writer.finalize().expect("finalized");
     let (head, records) = read_shard(&path);
     assert_eq!(head.game_count, 0);

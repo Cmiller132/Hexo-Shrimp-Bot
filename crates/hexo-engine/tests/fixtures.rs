@@ -1,4 +1,4 @@
-//! Hand-built win fixtures the property generator will not find on its own.
+//! Hand-built win fixtures.
 
 mod common;
 

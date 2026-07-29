@@ -27,22 +27,16 @@ const OPPONENT: usize = 1;
 
 /// Run a whole training run.
 ///
-/// Self-play and fitting are one mode, not two (`docs/CONTAINER_SPEC.md` §8):
-/// the fixed costs of standing a model up are paid once per process rather than
-/// once per epoch, the two phases never run at the same time so the one device
-/// is never contended, and the phases are deliberately not separately invocable
-/// — there is one implementation of the loop, not a loop plus a set of pieces
-/// that could drift from it.
+/// Self-play and fitting form one operation (`docs/CONTAINER_SPEC.md` §8).
+/// They execute sequentially through one long-lived package instance.
 ///
 /// # Stopping
 ///
 /// [`TrainConfig::stop`] is checked between epochs and inside every sweep. A
-/// stop that arrives during self-play abandons the partial epoch, records and
-/// all: those games were on-policy and are worthless without the fit that was
-/// going to consume them. A stop that arrives once the fit has begun lets the
+/// stop during self-play abandons the partial epoch and its records. A stop
+/// after fitting begins lets the
 /// fit, the checkpoint, the load that proves it, and the metrics line all
-/// complete, because `docker stop` must never lose an epoch. Either way the
-/// return is [`Outcome::Stopped`], which the binary turns into exit code 2.
+/// complete. Either path returns [`Outcome::Stopped`], which maps to exit code 2.
 ///
 /// # Errors
 ///
@@ -97,9 +91,7 @@ pub fn train(config: &TrainConfig, registry: &PackageRegistry) -> Result<Outcome
         let played = self_play(config, package.as_ref(), &layout, epoch)?;
         timing.self_play = started.elapsed();
         if played.outcome == Outcome::Stopped {
-            // Nothing consumed these games, and nothing ever will: the weights
-            // they were played under are the weights the run would have moved
-            // past. The unfinalized shard is already gone with its writer.
+            // Partial self-play records are not training input and are removed.
             run::remove_dir_all(&records)?;
             return Ok(Outcome::Stopped);
         }
@@ -111,11 +103,7 @@ pub fn train(config: &TrainConfig, registry: &PackageRegistry) -> Result<Outcome
             package.fit(&shards, dir, epoch + 1)
         })?;
 
-        // (3) The records go only once the fit that consumed them has succeeded.
-        // Not before, so a failed fit leaves its input to be inspected or re-run,
-        // and not later, because on-policy records are worthless under the new
-        // weights and keeping them would make disk growth a function of run
-        // length.
+        // (3) Retain records through fit failure; remove them after successful fit.
         run::remove_dir_all(&records)?;
 
         // Loading is proving, and it is what puts the fit's own output behind
@@ -218,9 +206,7 @@ fn self_play(
 ///
 /// The checkpoint just written is played against the epoch-0 anchor and against
 /// the checkpoint it was fit from — two pairings, or one when those are the same
-/// checkpoint. Nothing is recorded: `docs/CONTAINER_SPEC.md` §11 keeps records
-/// as training data, an evaluation game trains nothing, and a shard nobody
-/// consumes would be the largest artefact in the run written for no reader.
+/// checkpoint. Evaluation produces aggregate metrics but no training shard.
 fn evaluate(
     config: &TrainConfig,
     registry: &PackageRegistry,
@@ -260,11 +246,7 @@ fn evaluate(
 
 /// Play the current checkpoint against one older one.
 ///
-/// The opponent is a second instance of the same package, loaded from the older
-/// checkpoint: one package instance per side, because a package holds the
-/// weights that answer and the two sides are two sets of weights. Sharing one
-/// live module between them is the slot pool of §10.1, which arrives with the
-/// first package whose modules are expensive enough to be worth pooling.
+/// Each side owns a package instance loaded with its checkpoint.
 fn pairing(
     config: &TrainConfig,
     registry: &PackageRegistry,

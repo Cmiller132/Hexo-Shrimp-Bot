@@ -1,37 +1,23 @@
-//! The model-package API: what every model crate provides to the container, and
-//! the checkpoint manifest and probe that hold it honest.
+//! Model-package interfaces, checkpoint manifests, and evaluator probes.
 //!
-//! A model is a crate. Packages live under `crates/models/<name>/`, each one
-//! implements [`ModelPackage`], and the container's entire knowledge of a model
-//! is that trait plus a name registry in `hexo-bot`
-//! (`docs/CONTAINER_SPEC.md` §5). Nothing here knows what a feature, a layer, or
-//! a loss is, and nothing here is allowed to acquire an opinion about one:
-//! the moment the container can describe an architecture, adding a package stops
-//! being a new crate and one registry entry.
+//! Each crate under `crates/models/<name>/` implements [`ModelPackage`]. The
+//! container uses that trait and its name registry without interpreting model
+//! architecture.
 //!
-//! Three things live in this crate rather than in a package, because they are
-//! what the container needs *from* a package rather than what a package decides:
-//!
-//! - [`ModelPackage`], the surface — including the rule that the two session
-//!   modes are separate required methods, which is `hexo-player`'s argument
-//!   about defaults applied one level up.
-//! - [`Manifest`], the checkpoint's account of itself: which package, which
-//!   versions, which epoch, and what these weights are supposed to answer. It
-//!   deliberately does not describe the architecture.
-//! - [`probe_hash`], the detector for every way a checkpoint can be wrong
-//!   without anything crashing.
+//! - [`ModelPackage`] defines package lifecycle and session construction.
+//! - [`Manifest`] records package identity, compatibility versions, epoch,
+//!   package metadata, and probe hash.
+//! - [`probe_hash`] hashes exact evaluator outputs over the fixed probe set.
 //!
 //! ```
 //! use hexo_model::{Manifest, probe_positions};
 //!
-//! // A manifest is written by whoever produced the weights, and validated by
-//! // whoever is about to run them.
+//! // Producers write manifests; consumers validate them before use.
 //! let manifest = Manifest::new("mock", 1, 1, 0, 0x0123_4567_89ab_cdef);
 //! manifest.validate("mock", 1, 1)?;
 //! assert!(manifest.validate("gnn", 1, 1).is_err());
 //!
-//! // The probe set is fixed, legal, and live: every position has actions to
-//! // carry priors for.
+//! // Every fixed probe position is live and has legal actions.
 //! for position in probe_positions() {
 //!     assert!(!position.is_terminal());
 //!     assert!(position.legal_count() > 0);

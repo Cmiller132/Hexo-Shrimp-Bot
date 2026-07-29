@@ -50,7 +50,7 @@ fn an_unknown_configuration_key_is_named() {
 
 #[test]
 fn whitespace_is_not_quietly_trimmed() {
-    // One grammar, stated once, rather than a grammar plus a lenience policy.
+    // Whitespace is part of the exact grammar.
     let message = refusal("search = policy");
     assert!(message.contains("unknown configuration key"), "{message}");
 }
@@ -185,8 +185,7 @@ fn a_name_that_is_no_shape_at_all_is_an_unknown_variant() {
 
 #[test]
 fn a_variant_naming_a_real_shape_badly_says_which_parameter_is_wrong() {
-    // Not `UnknownVariant`: the shape is one this package has, so the useful
-    // answer names the mistake rather than the name.
+    // A known shape with invalid parameters is `InvalidConfig`.
     let dir = tempfile::tempdir().expect("a scratch directory");
     let package = loaded(dir.path(), "search=policy").expect("initialised and loaded");
     let Err(error) = package.variant_session("mcts:visits=128,inflight=4") else {

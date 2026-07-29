@@ -1,8 +1,7 @@
-"""Shared fixtures: real engine positions and the D6 transform group.
+"""Shared engine-position and D6-transform fixtures.
 
-Every position here comes from the engine by replay — never from a
-board-shaped constructor — so what the builder is tested against is what the
-rules actually produce.
+Every position is constructed by engine replay rather than a board-shaped
+constructor.
 """
 
 from __future__ import annotations
@@ -23,7 +22,7 @@ PLIES = [0, 1, 2, 3, 5, 9, 12, 21, 34, 60]
 
 def random_moves(plies: int, seed: int) -> list[tuple[int, int]]:
     """A uniformly random legal playout of exactly `plies` placements that
-    does not end the game, retrying seeds where random play won by accident."""
+    does not end the game, retrying playouts that terminate early."""
     for attempt in range(100):
         rng = random.Random(seed * 1_000_003 + attempt * 1_009 + plies)
         pos = hexo_py.Position()
@@ -57,11 +56,8 @@ def model() -> MantisNet:
 def d6_transforms():
     """The 12 board symmetries as maps on (q, r). Index 0 is the identity.
 
-    The same group the telemetry read layer canonicalizes openings with —
-    one definition, used by the model's §12.3 invariance tests and by the
-    opening atlas. The model never sees these transforms, so sharing them
-    deletes no detector; the group itself is held to the rules by
-    `test_telemetry.py`, which replays transformed games through the engine.
+    The model's §12.3 invariance tests and telemetry opening atlas use this
+    group. ``test_telemetry.py`` validates each transform by engine replay.
     """
     return telemetry.D6_TRANSFORMS
 
@@ -70,8 +66,8 @@ def oracle_live_windows(pos: hexo_py.Position) -> dict[tuple[int, int, int], tup
     """Live windows by the engine's own walk: identity (axis, start_q, start_r)
     to (colour relative to the mover, occupancy mask).
 
-    This is the independent oracle of MODEL_SPEC §12.1 — the builder never
-    calls `windows_through`.
+    The builder does not call ``windows_through``, so this is the independent
+    oracle required by MODEL_SPEC §12.1.
     """
     mover = pos.current_player
     live: dict[tuple[int, int, int], tuple[int, int]] = {}

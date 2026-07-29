@@ -1,12 +1,9 @@
-"""The KLENT iteration: collect an on-policy buffer, fit once, discard it.
+"""Collect and fit one KLENT iteration.
 
-Faithful to the paper's outer loop (``KLENT_FOR_HEXO.md`` §5): a self-play phase fills
-the buffer, one fitting epoch consumes it (the reference implementation's
-``fitting_epochs=1``), and nothing survives to the next iteration. The loss
-is eq. 4 — cross-entropy of π_θ against π′ plus squared error of the taken
-action's Q against the λ-return — under plain Adam at the paper's learning
-rate. The value head appears nowhere: KLENT has no state-value head, and
-v̂ = E_{π′}[Q] does its job.
+Each iteration consumes one on-policy buffer for one fitting epoch and then
+discards it. The objective is policy cross-entropy against π′ plus squared
+error of the taken action's scalar Q against its λ-return. The state-value head
+is not part of this path. See ``docs/KLENT_FOR_HEXO.md`` §5.
 """
 
 from __future__ import annotations
@@ -25,19 +22,14 @@ from .selfplay import Collector, Sample, collection_stats
 
 @dataclass
 class KlentConfig:
-    """The paper's values wherever Hexo permits them
-    (``KLENT_FOR_HEXO.md`` §10)."""
+    """KLENT training and batching parameters; see ``KLENT_FOR_HEXO.md`` §10."""
 
-    # Verified against the paper's eq. 2 and the reference implementation:
-    # reverse KL is the heavier regulariser. Prior exponent tau/(tau+lam) = 0.77.
     tau: float = 0.1  # reverse-KL weight (the paper's beta)
     lam: float = 0.03  # entropy weight (the paper's alpha)
-    # e^{-1/16}: the paper's 8-turn horizon at Hexo's two placements per turn
-    # (KLENT_PROPOSALS A1). The paper's literal e^{-1/8} would halve it.
+    # e^-1/16 corresponds to an eight-turn horizon at two placements per turn.
     lam_ret: float = 0.939
     # Per-ply return-discount magnitude (the mover-change sign is separate).
-    # 1.0 is the reference objective; below 1 it ranks faster wins above
-    # slower ones — the conversion pressure an infinite no-draw board lacks.
+    # Values below one give earlier outcomes larger magnitude.
     gamma: float = 1.0
     ply_cap: int = 512  # KLENT_FOR_HEXO.md §4.2: capped episodes are dropped whole
     # The completion quota: an iteration's buffer is at least this many
@@ -49,18 +41,12 @@ class KlentConfig:
     device: str = "cpu"
     autocast: bool = False  # bf16 autocast for the network passes
     compile: bool = False  # torch.compile the policy/Q pass (one-time cost)
-    # VRAM is budgeted, not hoped for: every network batch — fit chunk or
-    # collection cohort — is packed under both measured memory axes, so the
-    # peak is set here rather than by whatever the corpus happens to contain.
+    # Every network batch is packed under attention-pair and legal-cell budgets.
     # Attention memory is quadratic in the batch's longest position (padding),
     # decoder memory linear in its total legal cells. Fit and collection get
     # separate budgets because fit holds the backward graph per cell while
-    # collection runs no_grad — and in the pipelined loop both peaks are
-    # resident at once, so together they must clear the card.
+    # collection runs no_grad. Both allocations may be resident concurrently.
     pair_budget: int = 8_000_000  # fit: padded (stones + token)^2 pairs per batch
-    # 800k cells ≈ 5.8 GiB worst-case fit peak on the iteration-0 corpus —
-    # still comfortable on 12 GiB, and half the chunk count (so half the
-    # per-chunk Python and launch overhead) of the original 400k.
     cell_budget: int = 800_000  # fit: legal cells (decoder rows) per batch
     collect_pair_budget: int = 24_000_000  # collection (no_grad) equivalents
     collect_cell_budget: int = 2_400_000
@@ -76,12 +62,7 @@ def _policy_q(model, batch):
 # collection and fitting (the same graph gets the compiled backward).
 _policy_q_compiled = None
 
-# Every compiled-callable invocation holds this lock. The GPU work was
-# serialized on one stream anyway; what the lock buys is that when dynamo
-# (re)compiles on one thread — sporadic new shape buckets keep this possible
-# at any iteration — the other thread sleeps at the lock instead of
-# thrashing the GIL against the trace, which was measured to stretch a
-# seconds-long compile into a minutes-long crawl.
+# The lock serializes calls and compilation through the shared callable.
 _gpu_lock = threading.Lock()
 
 
@@ -110,11 +91,11 @@ def network_evaluate(model, cfg: KlentConfig):
 
 
 def _rebuild(samples: list[Sample]):
-    """Buffer states back into one batch by parallel replay
-    (``KLENT_FOR_HEXO.md`` §4.3:
-    a position is a move prefix). Refuses a sample whose stored π′ no longer
-    matches its position's legal count — that misalignment trains against
-    scrambled targets and has no downstream symptom."""
+    """Rebuild buffered move prefixes in parallel into one batch.
+
+    Each stored π′ length must equal its replayed position's legal count
+    (``KLENT_FOR_HEXO.md`` §4.3).
+    """
     batch = collate_prefixes([s.moves for s in samples], [s.t for s in samples])
     counts = (batch.legal_offsets[1:] - batch.legal_offsets[:-1]).tolist()
     for s, count in zip(samples, counts):
@@ -129,10 +110,9 @@ def _rebuild(samples: list[Sample]):
 def _pack(samples: list[Sample], order, cfg: KlentConfig) -> list[list[int]]:
     """Pack sample indices into fit chunks under ``batch_size`` and both
     memory budgets. Sorted by position size (descending, ties in ``order``'s
-    random order), so a chunk's padded attention cost is exact — everyone
-    pads to its first element — and one long sample can no longer pad a
-    whole mixed chunk up to its own square. A sample too big for the budgets
-    alone still gets its own chunk: the buffer is never silently dropped."""
+    random order), so each chunk pads to its first element. A sample that
+    exceeds a budget alone occupies its own chunk.
+    """
     idx = sorted(order, key=lambda i: samples[i].t, reverse=True)
     chunks: list[list[int]] = []
     chunk: list[int] = []
@@ -164,23 +144,15 @@ def fit(
     rng: np.random.Generator,
     progress=None,
 ):
-    """One epoch over the buffer at the paper's *effective* batch.
+    """Fit one epoch over the buffer.
 
-    ``progress(chunk, chunks)`` is called after each consumed chunk — an
-    observer for heartbeats, nothing more.
+    ``progress(chunk, chunks)`` is called after each consumed chunk.
 
     The memory budgets cap what one forward may hold, so chunks accumulate
-    sample-weighted gradients until ~``batch_size`` samples have contributed
-    and the optimizer steps once — the paper's batch statistics under the
-    packing. A step's gradient equals the mean loss over its whole
-    accumulated batch, so the chunking is an implementation detail of memory
-    and not of optimization. Returns the sample-weighted mean losses.
-
-    Two throughput facts. Chunk *preparation* (the Rust replay rebuild and
-    the target tensors) runs one chunk ahead on a worker thread, so the GPU
-    never waits on it. And the loss scalars accumulate on-device — the only
-    host sync is the single read at the end; per-chunk ``float()`` reads
-    were measured to stall the stream once per chunk."""
+    sample-weighted gradients until at least ``batch_size`` samples have
+    contributed and the optimizer steps once. Each accumulated gradient is
+    the mean over its group. Chunk preparation runs one chunk ahead, and loss
+    totals remain on-device until the returned sample-weighted means are read."""
     model.train()
     policy_q = _policy_q_fn(cfg)
     chunks = _pack(samples, rng.permutation(len(samples)), cfg)
@@ -254,11 +226,9 @@ def collect_episodes(
     """One iteration's corpus: episodes plus the
     ``KLENT_FOR_HEXO.md`` §8 collection metrics.
 
-    Worker-safe by construction — it draws only from the collector's own
-    stream and mutates only the collector's slots, which is what lets the
-    run driver collect iteration ``i+1`` on a weight snapshot while
-    iteration ``i`` fits on the live model. ``progress`` is the collector's
-    per-step observer."""
+    It consumes only the collector's RNG and mutates only collector slots, so
+    it may run on a worker against a weight snapshot. ``progress`` is called
+    once per collector step."""
     model.eval()
     episodes, metrics = collector.collect(
         network_evaluate(model, cfg), cfg.games_per_iteration, progress

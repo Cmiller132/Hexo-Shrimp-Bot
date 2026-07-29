@@ -13,22 +13,17 @@ use std::path::{Path, PathBuf};
 
 /// The mock model package.
 ///
-/// Deterministic, weightless, and complete: it exercises the encoder, the
-/// evaluator, both session kinds, both selection policies, the diagnostics
-/// channel, checkpoint write and load, the probe hash, and `fit`, with no
-/// network, no GPU, and no Python. `docs/CONTAINER_SPEC.md` §5 argues why that
-/// makes it a permanent part of the workspace rather than a placeholder.
+/// It implements the complete [`ModelPackage`] surface with deterministic
+/// salt-based outputs and no external model runtime.
 ///
-/// Constructed from a configuration string and nothing else — see
-/// [`MockPackage::from_config`] for the syntax — and then loaded from a
-/// checkpoint before it can answer anything.
+/// Construct with [`MockPackage::from_config`], then load a checkpoint before
+/// requesting an evaluator or session.
 pub struct MockPackage {
     /// The configured search shape, used by both required session modes.
     search: Search,
-    /// The loaded salt, or `None` until a checkpoint has been proved.
+    /// The loaded salt, or `None` until checkpoint verification succeeds.
     salt: Option<u64>,
-    /// Serial for the next session's seed, so two sessions from one package
-    /// never share a stream.
+    /// Serial used to derive distinct initial session streams.
     next_serial: Cell<u64>,
 }
 
@@ -36,10 +31,8 @@ impl MockPackage {
     /// Read a configuration string.
     ///
     /// The grammar is `search=<shape>`, where a shape is `policy` or
-    /// `mcts:visits=N,inflight=N,cpuct=F`. Every part of it is required: the
-    /// `search` key has no default because a search shape is a model choice, and
-    /// the three `mcts` parameters have none for the reason
-    /// `hexo_search::MctsConfig` has no `Default`.
+    /// `mcts:visits=N,inflight=N,cpuct=F`. The `search` key and all three `mcts`
+    /// parameters are required.
     ///
     /// ```
     /// use hexo_model_mock::MockPackage;
@@ -47,8 +40,7 @@ impl MockPackage {
     /// MockPackage::from_config("search=policy")?;
     /// MockPackage::from_config("search=mcts:visits=64,inflight=8,cpuct=1.5")?;
     ///
-    /// // Nothing is guessed at: no key, an unknown key, and a half-stated
-    /// // search shape are all refused by name.
+    /// // Missing, unknown, and incomplete configurations are rejected.
     /// assert!(MockPackage::from_config("").is_err());
     /// assert!(MockPackage::from_config("seach=policy").is_err());
     /// assert!(MockPackage::from_config("search=mcts:visits=64").is_err());
@@ -100,14 +92,9 @@ impl MockPackage {
         })
     }
 
-    /// Write a whole checkpoint — weights, then the manifest carrying the probe
-    /// hash of exactly those weights.
+    /// Write weights followed by their manifest and probe hash.
     ///
-    /// The manifest is written last, so a directory holding one is a directory
-    /// whose weights are already there. Placing the directory itself is the
-    /// container's: `docs/CONTAINER_SPEC.md` §9 writes a checkpoint under a
-    /// temporary name and renames it in, which is a decision about the whole
-    /// directory rather than about either file in it.
+    /// The caller owns atomic placement of the complete checkpoint directory.
     fn write_checkpoint(
         &self,
         dir: &Path,
@@ -148,14 +135,10 @@ impl ModelPackage for MockPackage {
         manifest.validate(NAME, PACKAGE_VERSION, ENCODER_VERSION)?;
         let salt = weights::read(dir)?;
 
-        // Loading is proving. The hash is recomputed over what the weights just
-        // read actually answer, not over the file, so a flipped byte anywhere in
-        // it is caught here rather than by a training run that never converges.
+        // Verify the evaluator's output hash, not only the weight-file bytes.
         let computed = probe_hash(&MockEncoder, &mut MockEvaluator::new(salt));
         if computed != manifest.probe_hash {
-            // Deliberately before the assignment: a package that refused a load
-            // keeps whatever it had, because half a load leaves the process
-            // running against weights it can no longer name.
+            // Preserve the prior loaded state when verification fails.
             return Err(PackageError::ProbeMismatch {
                 expected: manifest.probe_hash,
                 computed,
@@ -182,16 +165,9 @@ impl ModelPackage for MockPackage {
         self.evaluating(self.search)
     }
 
-    /// A variant name is a search shape in the same grammar the `search=` value
-    /// uses, so `"policy"` and `"mcts:visits=128,inflight=4,cpuct=1.0"` are both
-    /// valid names and a match harness can pit them against each other over the
-    /// same weights.
+    /// A variant name uses the same search-shape grammar as the `search=` value.
     ///
-    /// Variants select the way an **evaluating** seat does, not a self-play one.
-    /// They exist to compare search shapes and to play benchmark matches, and
-    /// both of those want the sharper sampler and no diagnostics; a variant that
-    /// selected like a self-play seat would be a third mode wearing the name of a
-    /// comparison.
+    /// Variants use evaluation selection and emit no diagnostics.
     fn variant_session(&self, name: &str) -> Result<Box<dyn DecisionSession>, PackageError> {
         let search = config::parse_search(name).map_err(|f| f.into_variant_error(name))?;
         self.evaluating(search)
@@ -220,10 +196,8 @@ impl ModelPackage for MockPackage {
             for record in reader {
                 let record =
                     record.map_err(|e| PackageError::failed(NAME, "reading a record shard", e))?;
-                // `verify` replays the move list through the engine, which is the
-                // detector parsing cannot be. A fit that trained on a shard whose
-                // action ids had drifted would produce weights nothing could
-                // explain, and every field in it parses.
+                // Replay verification checks engine semantics beyond wire
+                // decoding.
                 verify(&record)
                     .map_err(|e| PackageError::failed(NAME, "verifying a recorded game", e))?;
                 games += 1;

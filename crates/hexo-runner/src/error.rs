@@ -1,4 +1,4 @@
-//! Why a submission was not usable.
+//! Submission refusal types.
 
 /// A submission the game refused to act on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

@@ -1,4 +1,4 @@
-//! The on-disk game record: shards of finished games, written once and read strictly.
+//! Versioned on-disk shards of finished games.
 //!
 //! One shard file holds every game produced by one (run, epoch, phase): a header
 //! that pins the versions the games were played under, then one entry per game
@@ -6,19 +6,15 @@
 //! [`MatchResult`](hexo_runner::MatchResult) with the whole adjudication payload,
 //! and its [`PlyRecord`](hexo_runner::PlyRecord)s.
 //!
-//! A record is training data and match evidence, so the reader refuses anything
-//! it cannot account for: a version it was not built against, a game count the
-//! file does not hold, a byte past the last game, a field the file ends inside.
-//! [`verify`] goes further and replays the move list through the engine, which
-//! is the only check that sees a shard whose bytes drifted somewhere every field
-//! still parses from.
+//! Readers require matching versions, exact entry counts, complete fields, and
+//! no trailing bytes. [`verify`] additionally replays engine semantics.
 //!
 //! ```
 //! use hexo_records::{GameRecord, ShardHeader, ShardMode, ShardReader, ShardWriter, verify};
 //! use hexo_runner::{Decision, Game, GameSpec, Reply, Step};
 //! use std::num::NonZeroU32;
 //!
-//! // Play one short game out to its ply cap.
+//! // Play one short game to its ply cap.
 //! let mut game = Game::new(GameSpec {
 //!     ply_cap: NonZeroU32::new(5).expect("nonzero"),
 //!     ..GameSpec::default()
@@ -69,15 +65,11 @@ pub use writer::ShardWriter;
 /// Version of the shard format itself: the byte layout, the tag numbering, and
 /// which fields are present.
 ///
-/// It moves when the layout moves. Formats here are not backward compatible — a
-/// bump means the shards from the previous one are regenerated, not read by a
-/// second decoder — so nothing in this crate branches on it beyond refusing a
-/// file it does not equal.
+/// Increment this for any layout, tag, or field-set change. The reader accepts
+/// only an exact version match.
 pub const RECORDS_VERSION: u32 = 1;
 
 /// The first four bytes of every shard file.
 ///
-/// It answers "is this a shard at all", and nothing else: the version lives in
-/// its own field immediately after it, so exactly one thing in the file states
-/// the format version and a reader never has to adjudicate between two of them.
+/// The format version follows in its own field.
 pub const MAGIC: [u8; 4] = *b"HXRC";

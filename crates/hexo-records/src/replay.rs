@@ -1,4 +1,4 @@
-//! The independent detector: replaying a record through the engine.
+//! Engine replay verification for decoded records.
 
 use crate::error::RecordError;
 use crate::record::GameRecord;
@@ -7,27 +7,15 @@ use hexo_runner::{DrawReason, MatchResult, NoContest, WinReason};
 
 /// Replay a record through the engine and check that it says what it claims.
 ///
-/// Parsing proves a shard is well-formed. It cannot prove the shard is *the game
-/// that was played*: an action id, a hash, or a seat byte that drifted still
-/// decodes into a perfectly valid field, and a training pipeline would learn
-/// from it without noticing. This replays the move list from the empty position
-/// and checks it against everything the record independently claims:
+/// This replays the move list from the empty position and checks:
 ///
 /// - each ply's recorded mover is the seat the replay has on turn;
 /// - each placement is legal in the position it is played into;
-/// - each ply's `zobrist_after` is the hash the replay reaches — the whole
-///   chain, not just the last one, so a drifted move is located at the ply it
-///   drifted rather than at the end of a corrupted game;
-/// - a [`WinReason::SixInARow`] result lands on a terminal position won by the
-///   seat the record names, and every other ending — a resignation, a forfeit, a
-///   ply cap, a no-contest — lands on a position that is *not* terminal, because
-///   the runner would have adjudicated a completed six-in-a-row as one.
+/// - each ply's `zobrist_after` equals the replayed hash;
+/// - a [`WinReason::SixInARow`] result matches the terminal winner;
+/// - every other result ends on a nonterminal position.
 ///
-/// It deliberately does not re-adjudicate. Whether a ply cap fell where the
-/// spec's cap says it should is match policy, and `hexo-runner` owns that; a
-/// second implementation of it here would be a second answer to a question that
-/// already has one. What is checked instead is engine fact, which the record and
-/// the engine state independently.
+/// This function does not re-run runner policy such as ply-cap adjudication.
 ///
 /// # Errors
 ///
@@ -60,9 +48,8 @@ pub fn verify(record: &GameRecord) -> Result<(), RecordError> {
         }
     }
 
-    // Exhaustive, with no catch-all: every way a game can end is either a claim
-    // that the board is won or a claim that it is not, and a variant added to
-    // either enum has to be classified here rather than defaulting to unchecked.
+    // Exhaustive matching requires every result variant to declare whether it
+    // claims an engine-terminal board.
     let claimed_winner = match record.result {
         MatchResult::Decisive {
             winner,

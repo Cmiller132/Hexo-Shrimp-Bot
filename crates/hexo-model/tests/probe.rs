@@ -1,8 +1,6 @@
-//! The probe set, and what the hash over it does and does not notice.
+//! Probe-set and probe-hash contracts.
 //!
-//! The encoder and evaluator here are the crate's *test* stand-ins for what a
-//! package owns. They are deliberately trivial: what is under test is the probe,
-//! not a model.
+//! The test encoder and evaluator isolate probe behavior from model behavior.
 
 use hexo_engine::Position;
 use hexo_model::{probe_hash, probe_positions};
@@ -19,8 +17,7 @@ impl Encoder for Bytes {
     }
 }
 
-/// A stand-in for weights: `knob` is the whole of what this evaluator knows, so
-/// two knobs are two checkpoints.
+/// An evaluator whose complete weight state is `knob`.
 struct Knob {
     knob: u64,
 }
@@ -82,9 +79,7 @@ fn the_probe_set_covers_ten_distinct_plies_from_the_opening_to_a_deep_midgame() 
 
 #[test]
 fn the_probe_set_covers_both_movers_and_both_stones_of_a_turn() {
-    // A turn is two placements, so a probe set that only held turn boundaries
-    // would never show an encoder the mid-turn state that a value signed by
-    // depth parity gets wrong.
+    // The set includes a mid-turn state with the same mover as the prior ply.
     let phases: Vec<_> = probe_positions().iter().map(Position::phase).collect();
     assert!(
         phases.contains(&hexo_engine::TurnPhase::Opening),
@@ -109,10 +104,7 @@ fn the_probe_set_covers_both_movers_and_both_stones_of_a_turn() {
 
 #[test]
 fn the_probe_set_spans_frontier_widths_from_one_action_to_hundreds() {
-    // A ragged set on purpose. The opening offers exactly one placement and the
-    // scattered position offers three times what the first full turn does, which
-    // is what catches an encoder writing a fixed-width per-action row: a crop
-    // that fits every other probe position does not fit that one.
+    // Legal counts vary across the set to exercise ragged encodings.
     let counts: Vec<usize> = probe_positions()
         .iter()
         .map(Position::legal_count)
@@ -138,8 +130,7 @@ fn different_weights_answer_the_probe_with_a_different_hash() {
 
 #[test]
 fn the_hash_moves_when_a_single_value_moves_in_its_last_bit() {
-    // Over the exact bytes, not over a summary: a summary is where a difference
-    // this small would go to hide.
+    // The hash covers exact output bytes.
     struct Nudged {
         inner: Knob,
         nudge: bool,

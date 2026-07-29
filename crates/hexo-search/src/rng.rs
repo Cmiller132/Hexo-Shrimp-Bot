@@ -1,19 +1,8 @@
-//! The crate's own splitmix64.
+//! SplitMix64 state and sampling helpers.
 
-/// A seeded splitmix64 stream: 64 bits of state, one add-xor-multiply chain per
-/// draw, no dependency and no allocation.
+/// A seeded SplitMix64 stream with 64 bits of state.
 ///
-/// It is here because move selection is the model's and a sampling selector
-/// needs entropy at *runtime*. `hexo-engine` has the same algorithm in
-/// `testkit/rng.rs`, but that file is `#[path]`-included by that crate's tests
-/// and benches and is not part of any library, so no runtime crate can reach it.
-/// The algorithm is deliberately the same one rather than a second choice: a
-/// stream is a stream, and two different generators in one workspace would be
-/// the thing that needs explaining.
-///
-/// Deliberately **not** `Copy`. A copied generator hands out the same stream
-/// twice, which is exactly the failure `hexo-player`'s "two seats drawing from
-/// one sampler" note is about; cloning one has to be written out.
+/// This type is `Clone` but not `Copy`; duplicating a stream must be explicit.
 #[derive(Clone, Debug)]
 pub struct SplitMix64 {
     state: u64,
@@ -52,15 +41,12 @@ impl SplitMix64 {
 
     /// A draw in `0..n`, by remainder.
     ///
-    /// The remainder is biased towards the low values by at most one part in
-    /// `2^64 / n`, which is unobservable for the action counts this game
-    /// produces. A selector that needs an exact uniform draw rejects on
-    /// [`SplitMix64::next_u64`] itself.
+    /// Remainder reduction has modulo bias. Callers requiring rejection
+    /// sampling use [`SplitMix64::next_u64`] directly.
     ///
     /// # Panics
     ///
-    /// If `n` is zero. There is no such thing as a draw from an empty range, and
-    /// returning a substituted zero would hide the caller's bug.
+    /// If `n` is zero.
     #[inline]
     pub fn below(&mut self, n: usize) -> usize {
         assert!(n > 0, "SplitMix64::below(0): an empty range has no draw");

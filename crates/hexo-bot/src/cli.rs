@@ -51,8 +51,7 @@ const DEFAULT_EVAL_GAMES: usize = 32;
 ///
 /// Purely a latency/throughput trade: the batcher waits this long for more
 /// leaves before crossing with what it has. Too small and the device sees narrow
-/// batches; too large and every lane in the sweep idles for it. Two milliseconds
-/// is a starting point, not a measured optimum.
+/// batches; too large and every lane in the sweep idles for it.
 const DEFAULT_BATCH_WAIT_MS: u64 = 2;
 
 /// How many hardware threads the worker pool leaves for everything else.

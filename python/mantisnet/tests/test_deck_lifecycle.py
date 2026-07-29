@@ -44,8 +44,7 @@ def _fake_driver(path):
 
 
 def test_a_launched_run_is_listed_before_its_directory_exists(tmp_path):
-    """The child spends its first seconds inside imports before writing
-    anything; a launched run the list cannot see is a lie."""
+    """A registered child is listed before its run artifacts exist."""
     driver = tmp_path / "slow_driver.py"
     driver.write_text("import time; time.sleep(30)", encoding="utf-8")
     runs = tmp_path / "runs"
@@ -60,15 +59,14 @@ def test_a_launched_run_is_listed_before_its_directory_exists(tmp_path):
         listed = client.get("/api/runs").json()
         row = next(r for r in listed if r["name"] == "slow")
         assert row["state"] == "active" and row["checkpoints"] == []
-        assert row["iterations"] is None  # no config.json yet, honestly absent
+        assert row["iterations"] is None  # No config.json exists yet.
         killed = client.post("/api/runs/slow/kill", json={"confirm": True})
         assert killed.status_code == 202, killed.text
 
 
 def test_launch_defaults_to_the_uncapped_eval_ladder(tmp_path):
-    """The driver's eval defaults are full-strength SealBot at a time limit
-    with a Gumbel search; a depth cap is an explicit weaker rung, not a
-    silent deck default."""
+    """Launch defaults select time-limited SealBot and Gumbel search without
+    adding an evaluation depth cap."""
     driver = tmp_path / "fake_driver.py"
     _fake_driver(driver)
     runs = tmp_path / "runs"

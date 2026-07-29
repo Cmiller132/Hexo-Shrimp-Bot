@@ -21,12 +21,7 @@ export default function LiveRun({ run, refreshRuns }: { run?: Run; refreshRuns: 
   const strength = useApi<Array<Record<string, unknown>>>(run ? `/api/runs/${run.name}/strength` : null, [run?.iteration]);
   const manifest = useApi<{ config: Record<string, unknown>; invocations: Record<string, unknown>[] }>(run ? `/api/runs/${run.name}/manifest` : null, [run?.name]);
 
-  // The pushed heartbeat. `/api/runs` is polled only when an iteration commits —
-  // minutes apart on a real run — but the collector, the fit chunk and the slot
-  // plies move every second, and the stream already carries them: a heartbeat
-  // event is the same `status.json` object `describe()` reports as `heartbeat`.
-  // Whichever of the two was written last wins; both stamp `updated` in UTC, so
-  // the ISO strings order correctly as text.
+  // Use the newest UTC-stamped heartbeat from polling or the event stream.
   const [beat, setBeat] = useState<Run["heartbeat"]>(null);
   useEffect(() => setBeat(null), [run?.name]);
   const heartbeat = useMemo(() => {
@@ -36,12 +31,7 @@ export default function LiveRun({ run, refreshRuns }: { run?: Run; refreshRuns: 
     return beat.updated >= polled.updated ? beat : polled;
   }, [beat, run?.heartbeat]);
 
-  // The handlers close over `series.refresh` and `strength.refresh`, whose
-  // identities change on every iteration because the run's iteration is part of
-  // their request path. Depending on them here would tear the stream down and
-  // rebuild it once per iteration, and the server replays its whole history to
-  // each new connection — which is why the screen arrived in bursts. The stream
-  // is identified by its run alone; the handlers ride in a ref.
+  // Handler refs keep the event stream keyed by run while invoking current refresh functions.
   const onEvent = useRef<(kind: string, data: Record<string, unknown>) => void>(() => {});
   const refreshAll = useRef<() => void>(() => {});
   refreshAll.current = () => { void series.refresh(); void strength.refresh(); refreshRuns(); };
@@ -53,10 +43,7 @@ export default function LiveRun({ run, refreshRuns }: { run?: Run; refreshRuns: 
     if (kind === "heartbeat") setBeat(data as unknown as Run["heartbeat"]);
     if (kind === "lifecycle") refreshRuns();
     if (kind === "iteration") {
-      // A new connection replays every iteration the run has ever committed, so
-      // refetching per event would fire three requests per iteration of history
-      // at mount — thousands on a long run. The queries ask "what is true now",
-      // and one answer after the burst settles says the same thing.
+      // Debounce a burst of iteration events into one refresh.
       clearTimeout(settle.current);
       settle.current = setTimeout(() => refreshAll.current(), 250);
     }
@@ -117,9 +104,7 @@ export default function LiveRun({ run, refreshRuns }: { run?: Run; refreshRuns: 
           series={[{
             id: metric,
             label: metric,
-            // The x is the row's own iteration. A row without one describes an
-            // iteration nobody can name, and plotting it anywhere would invent a
-            // measurement; the y may be null, and the chart breaks the path there.
+            // Each point requires its row's iteration; a null metric breaks the path.
             points: (series.data ?? []).map((row) => {
               const at = row.iteration;
               if (at == null) throw new Error(`iteration series row has no iteration column: ${JSON.stringify(row)}`);

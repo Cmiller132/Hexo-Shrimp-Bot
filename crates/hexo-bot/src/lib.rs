@@ -1,21 +1,14 @@
 //! The training loop behind the `hexo-bot` binary: batched self-play, fitting,
 //! checkpoints, and evaluation, from one long-lived process.
 //!
-//! `docs/CONTAINER_SPEC.md` is the normative target. The binary is a thin shell
-//! over this library — it parses a command line, installs a stop handler, calls
-//! one of three entry points, and maps what comes back onto an exit code — so the
-//! loop is driven in-process by the test suite rather than by spawning a
-//! process and reading its output.
+//! `docs/CONTAINER_SPEC.md` defines the normative contract. The binary parses a
+//! command line, installs a stop handler, calls this library, and maps its
+//! outcome to an exit code.
 //!
-//! # Three subcommands, and why not five
+//! # Public operations
 //!
 //! [`init_checkpoint`], [`train`], and [`play_match`] are the whole surface.
-//! `serve` and `play` are named by §3 of the spec and are deliberately *not*
-//! here, not even as stubs that parse a flag and exit: both are entirely wire
-//! protocol, there is no wire protocol yet, and a stub would publish a command
-//! line before the thing behind it is designed — after which the flags it
-//! guessed become the constraint the real implementation has to argue its way
-//! out of.
+//! The wire-protocol `serve` and `play` operations named by §3 are not exposed.
 //!
 //! # The shape of a run
 //!
@@ -28,9 +21,8 @@
 //!     metrics     one line, appended as it happens
 //! ```
 //!
-//! One implementation of the sweep serves all three phases that play games. The
-//! topology, the queues, and the argument for why it cannot deadlock are in the
-//! crate's `README.md` and in the `driver` module's own documentation.
+//! One sweep implementation serves self-play, evaluation, and matches. The
+//! crate README and `driver` module define its topology and queue invariants.
 
 pub mod cli;
 pub mod registry;
@@ -51,11 +43,8 @@ pub use train::train;
 
 /// How a subcommand ended, when it did not fail.
 ///
-/// `docs/CONTAINER_SPEC.md` §8.1 pins the three exits so that a supervisor, a
-/// shell loop, or a person reading `docker inspect` does not have to infer them:
-/// **0** ran to completion, **2** stopped by signal after finishing cleanly,
-/// **1** failed. A run that ended is not a run that broke, and a `docker stop`
-/// produces a 2 — which is why this is a return value rather than a log line.
+/// `docs/CONTAINER_SPEC.md` §8.1 assigns exit code **0** to completion, **2**
+/// to a clean signal-driven stop, and **1** to failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Outcome {
     /// Everything that was asked for happened.

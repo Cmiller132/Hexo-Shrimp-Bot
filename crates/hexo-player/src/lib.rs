@@ -1,7 +1,7 @@
-//! The player seam, and the loop that drives games.
+//! Player interfaces and synchronous table drivers.
 //!
-//! Nothing here decides a move. [`Player`] is what a driver drives, [`Model`] is
-//! what a trainable player fulfils, and [`Table`] is the loop between them.
+//! [`Player`] supplies decisions, [`Model`] separates self-play and evaluation
+//! policies, and [`Table`] submits those decisions to a game.
 //!
 //! `hexo_engine::Player` is the seat — `P0` or `P1` — and [`Player`] here is what
 //! fills it; a consumer importing both aliases one.
@@ -17,8 +17,7 @@
 //! impl Player for Lowest {
 //!     fn choose(&mut self, game: &Game) -> Decision {
 //!         let action = game.position().nth_legal(0).expect("a running game has a legal placement");
-//!         // The hash is the seat's attestation of the position it chose from —
-//!         // for a seat reading the canonical game, the canonical hash.
+//!         // The decision attests the position used for selection.
 //!         Decision::new(action, game.position().zobrist())
 //!     }
 //! }
@@ -28,11 +27,11 @@
 //!     ..GameSpec::default()
 //! };
 //!
-//! // One game on one thread.
+//! // Drive one game to completion.
 //! let mut table = Table::new(spec, [Lowest, Lowest]);
 //! assert!(table.run().is_contested());
 //!
-//! // Or a hundred, interleaved, with nothing blocking on anything.
+//! // Interleave one step from each unfinished table.
 //! let mut tables: Vec<_> = (0..100).map(|_| Table::new(spec, [Lowest, Lowest])).collect();
 //! while sweep(&mut tables) > 0 {}
 //! assert!(tables.iter().all(|t| t.result().is_some()));

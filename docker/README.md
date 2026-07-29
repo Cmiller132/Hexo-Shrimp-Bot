@@ -1,114 +1,126 @@
-# The container environment
+# Container environment
 
-The owner-stated destination: training, self-play, and everything else run
-in Docker under WSL. This directory is that environment. The image holds
-*dependencies only* — the repository bind-mounts at `/workspace`, so code
-changes never need a rebuild; only a lock change does.
+## Purpose
 
-Why Linux for the GPU work, measured rather than assumed: the win is the
-compiler stack — `torch.compile`'s generated kernels and hand-written
-Triton are first-class on Linux and a port on Windows. The Windows-native
-path stays usable for tests and quick checks.
+`docker/` defines the CUDA-enabled Linux environment for MantisNet training and
+the control deck. The image contains toolchains and locked dependencies; source
+and run artifacts come from repository bind mounts. Compose also provides the
+one-shot frontend build service.
 
-## One-time
+## Public surface
 
-Docker (docker-ce) and the NVIDIA container toolkit live inside the WSL
-Ubuntu distro (installed 2026-07-28; CDI spec generated at
-`/etc/cdi/nvidia.yaml`). GPU access uses the `nvidia` runtime, wired in
-`compose.yaml`.
+[`compose.yaml`](compose.yaml) defines three services:
+
+| Service | Contract |
+| --- | --- |
+| `train` | Interactive MantisNet shell with CUDA, Python, Rust, and SealBot |
+| `frontend-build` | Node 22 build that writes `frontend/dist` |
+| `deck` | Port-8000 FastAPI service, static SPA, GPU inference, and run control |
+
+[`Dockerfile`](Dockerfile) builds `mantisnet-train` from CUDA 12.8 on Ubuntu
+24.04. It installs Rust, `uv`, CPython 3.13, all locked MantisNet dependency
+groups, maturin, setuptools, and pybind11 into `/opt/venv`.
+
+The repository is mounted at `/workspace`. The host SealBot checkout is mounted
+at `/sealbot`. Linux Rust artifacts use `/workspace/target-wsl`.
+
+The `deck` entry point:
+
+1. builds `hexo_py` when it is not importable;
+2. builds the configured SealBot extension when its Linux module is absent;
+3. requires `/workspace/frontend/dist/index.html`;
+4. starts Uvicorn on `0.0.0.0:8000`.
+
+Relevant Compose environment variables are:
+
+| Variable | Meaning |
+| --- | --- |
+| `REPO_ROOT` | Host repository or worktree mounted at `/workspace` |
+| `SEALBOT_ROOT` | In-container SealBot root |
+| `SEALBOT_VARIANT` | SealBot subdirectory selected by the entry point |
+| `DECK_RUNS_ROOT` | Run directory scanned by the deck |
+| `DECK_FRONTEND_DIST` | Static frontend directory |
+| `DECK_DEVICE` | Inference device, default `cuda` |
+| `DECK_RUN_COMMAND` | Optional deck training command override |
+
+## Run / test
+
+From the repository root in the WSL environment:
 
 ```sh
-cd /mnt/d/Hexo-Shrimp-Bot
-sudo docker compose -f docker/compose.yaml build train
+docker compose -f docker/compose.yaml build train
+docker compose -f docker/compose.yaml run --rm train
 ```
 
-## Using it
-
-```sh
-sudo docker compose -f docker/compose.yaml run --rm train
-```
-
-drops into `/workspace/python/mantisnet` with `/opt/venv` (the locked
-dependency set, uv-managed CPython 3.13) on PATH and SealBot mounted at
-`/sealbot`. First use per container — build the engine
-extension from the mounted tree:
+Inside the `train` service, build the mounted extension and run tests:
 
 ```sh
 maturin develop --release -m ../hexo-py/Cargo.toml
+python -m pytest tests -q
 ```
 
-`CARGO_TARGET_DIR=/workspace/target-wsl` keeps the Linux build artifacts
-out of the Windows `target/` (both are gitignored). Then the usual:
+Build and start the control deck:
 
 ```sh
-python -m pytest tests/ -q
-python bench/bench_loop.py collect --checkpoint runs/<r>/checkpoint_N.pt --compile
-python -m mantisnet.klent.run --out runs/<name> ...
-```
-
-Note that `maturin develop` installs into `/opt/venv`, which lives in the
-container layer — a `--rm` container rebuilds it next time. For a
-long-lived workflow, `docker compose up -d train` once and `exec` into it.
-
-SealBot evals need a Linux `minimax_cpp` on the `/sealbot` mount, which is
-writable for exactly that: `python setup.py build_ext --inplace` in
-`/sealbot/current` drops the `.so` beside the Windows `.pyd`, and the `deck`
-entrypoint does it automatically when the `.so` is missing.
-
-## Control deck
-
-Two services complete the LAN dashboard. Both use the same repository bind
-mount, so the generated frontend and run artifacts stay visible on Windows.
-
-```sh
-cd /mnt/d/Hexo-Shrimp-Bot
 docker compose -f docker/compose.yaml run --rm frontend-build
 docker compose -f docker/compose.yaml up -d deck
+docker compose -f docker/compose.yaml logs -f deck
 ```
 
-`frontend-build` is a one-shot Node 22 service. It runs `npm ci && npm run
-build` in `frontend/`, with `node_modules` in the
-`frontend-node-modules` named volume and `frontend/dist` on the repository
-mount.
-
-`deck` uses the `mantisnet-train` image, publishes port 8000, has the GPU and
-SealBot mount, and restarts unless stopped. Its entrypoint refuses to serve
-without `frontend/dist/index.html`. On a cold container it builds `hexo_py`
-with:
+Run the CPU deck receipt:
 
 ```sh
-maturin develop --release -m ../hexo-py/Cargo.toml
-```
-
-and, when the Linux SealBot artifact is absent, runs `python setup.py
-build_ext --inplace` in `$SEALBOT_ROOT/$SEALBOT_VARIANT` (`/sealbot/current`
-by default). It then starts Uvicorn on
-`0.0.0.0:8000`. Training runs launched by the API are ordinary child processes
-inside this service; there is no Docker socket and no Docker-in-Docker.
-
-For a worktree, substitute it without editing Compose:
-
-```sh
-REPO_ROOT=/mnt/d/Hexo-Shrimp-Bot-ui-draft docker compose \
-  -f docker/compose.yaml run --rm frontend-build
-REPO_ROOT=/mnt/d/Hexo-Shrimp-Bot-ui-draft docker compose \
-  -f docker/compose.yaml up -d deck
-```
-
-The CPU end-to-end receipt uses the same Compose service with a bounded
-heuristic fixture driver, then talks only to the published API:
-
-```sh
-docker compose -f docker/compose.yaml down deck
+docker compose -f docker/compose.yaml down
 DECK_DEVICE=cpu \
 DECK_RUN_COMMAND="python /workspace/docker/smoke-driver.py" \
-  docker compose -f docker/compose.yaml up -d deck
+docker compose -f docker/compose.yaml up -d deck
 docker compose -f docker/compose.yaml exec -T deck \
   python /workspace/docker/smoke-deck.py
 ```
 
-It launches the run through `POST /api/runs`, waits for its real heuristic
-telemetry and checkpoint, and asserts the run list, iteration series, game
-plies, first SSE events, a play move, checkpoint inspection, and the SPA.
-Remove `python/mantisnet/runs/deck-smoke` before repeating it; the lifecycle
-correctly refuses to overwrite an existing run.
+Stop the services:
+
+```sh
+docker compose -f docker/compose.yaml down
+```
+
+Use a different checkout without editing Compose:
+
+```sh
+REPO_ROOT=/mnt/d/Hexo-Shrimp-Bot-worktree \
+docker compose -f docker/compose.yaml run --rm frontend-build
+```
+
+## Connections
+
+- `python/mantisnet` supplies the Python package, lockfile, tests, and runs.
+- `python/hexo-py` supplies the mounted maturin extension source.
+- `frontend` supplies the SPA built into `frontend/dist`.
+- `mantisnet.deck` serves that directory and the `/api` surface.
+- `docker/smoke-driver.py` produces bounded receipt artifacts.
+- `docker/smoke-deck.py` checks the published deck API.
+- Container obligations are in
+  [`docs/CONTAINER_SPEC.md`](../docs/CONTAINER_SPEC.md).
+- Deck deployment obligations are in [`docs/DECK_SPEC.md`](../docs/DECK_SPEC.md).
+
+## Invariants & gotchas
+
+- The image contains dependencies and toolchains, not the working source tree.
+- Source changes under the bind mount do not require an image rebuild.
+- Changes to the Dockerfile, lock inputs, or dependency groups require a
+  rebuild.
+- `/opt/venv` is outside the repository mount.
+- A `docker compose run --rm train` container does not preserve an extension
+  installed into `/opt/venv` after the container exits.
+- `target-wsl` separates Linux Rust artifacts from host-platform `target`.
+- The `train` and `deck` services require the NVIDIA container runtime.
+- The `deck` service refuses startup when the frontend bundle is absent.
+- The SealBot mount must be writable when its Linux extension needs building.
+- Deck-launched training processes are children of the deck service.
+- No Docker socket is mounted and the deck does not start nested containers.
+- Port 8000 is the published API, SSE, and SPA endpoint.
+- `frontend-node-modules` is a named volume; `frontend/dist` remains on the
+  repository mount.
+- The smoke run name must not already identify a run directory.
+- Add `sudo` to Docker commands only when the local Docker installation
+  requires it.

@@ -1,4 +1,4 @@
-//! Worker-side bytes and batcher-side MantisNet opinions.
+//! Worker-side encoding and batcher-side MantisNet evaluation.
 
 use crate::encoder;
 use crate::forward::{Forward, RawOutputs};

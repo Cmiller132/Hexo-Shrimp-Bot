@@ -1,7 +1,7 @@
-"""Throughput of the builder (CPU) and the forward (device) at spec defaults.
+"""Benchmark builder and model-forward throughput at specification defaults.
 
-Positions are random legal playouts spread over game phases, which is what a
-self-play sweep actually feeds the model. Run from python/mantisnet:
+Inputs are random legal playouts distributed across game phases. Run from
+``python/mantisnet``:
 
     uv run python bench/bench_forward.py [--batch 256] [--iters 50]
 """
@@ -70,7 +70,7 @@ def main() -> None:
     t0 = time.perf_counter()
     batch = collate(graphs)
     collate_s = time.perf_counter() - t0
-    collate_positions(positions)  # warm the rayon pool
+    collate_positions(positions)  # Exclude Rayon pool startup from the timed call.
     t0 = time.perf_counter()
     batch = collate_positions(positions)
     rust_s = time.perf_counter() - t0
@@ -92,7 +92,7 @@ def main() -> None:
 
     devices = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
     if args.compile:
-        devices = [d for d in devices if d == "cuda"]  # the deploy target
+        devices = [d for d in devices if d == "cuda"]  # Compilation is benchmarked on CUDA.
     for device in devices:
         net_d, batch_d = net.to(device), batch.to(device)
         modes = [("fp32", False)] + ([("bf16", True)] if device == "cuda" else [])

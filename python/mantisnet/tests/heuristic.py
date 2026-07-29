@@ -1,11 +1,9 @@
 """A scripted line-extending player for tests.
 
 Scores each legal cell by the stone count of its best own live window, with
-a six-completing cell scored decisively above every extension — so games
-reliably terminate in tens of plies without a trained model. Exposed through
-the same seams the network uses: an evaluator ``(batch) -> (logits, q)`` for
-the collection loop and a batched chooser ``(positions, rng) -> moves`` for
-matches. Test machinery only; the training path knows nothing of it.
+a six-completing cell assigned the maximum score. It implements the evaluator
+``(batch) -> (logits, q)`` and chooser ``(positions, rng) -> moves`` test
+seams and is not part of the training package.
 """
 
 from __future__ import annotations
@@ -20,7 +18,7 @@ _STONES = torch.from_numpy(PATTERN_STONES)
 
 def heuristic_scores(batch) -> torch.Tensor:
     """Per legal cell: the stone count of its best own live window, with a
-    six-completing cell scored decisively above every extension."""
+    six-completing cell assigned the maximum score."""
     own = batch.window_feat < NUM_PATTERNS
     wscore = torch.where(own, _STONES[batch.window_feat % NUM_PATTERNS], 0)
     per_cell = torch.zeros(batch.n_cells)

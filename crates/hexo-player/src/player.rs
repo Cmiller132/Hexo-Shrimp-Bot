@@ -1,24 +1,16 @@
-//! What a driver needs from a seat.
+//! Seat decision interface.
 
 use hexo_runner::{Decision, Game};
 
 /// Anything that can choose a placement. The mover is
 /// `game.position().current_player()`.
 ///
-/// The seat is handed the whole game rather than a position and a budget: the
-/// record is the game's history, and a model whose features depend on move order
-/// reads it from `game.plies()` or `game.prefix()`. The budget is
-/// `game.spec().budget`; it is stated by the game and never enforced by it, so
-/// honouring it is the seat's job.
+/// The seat receives the complete game. Move-order features may use
+/// `game.plies()` or `game.prefix()`, and the seat is responsible for honoring
+/// `game.spec().budget`.
 ///
-/// The seat returns the whole [`Decision`], not a bare action, because two of
-/// its fields can only be authored here. The `zobrist` is an attestation — the
-/// hash of the position the seat actually chose from, which is
-/// `game.position().zobrist()` for a seat reading the canonical game and its
-/// own mirror's hash for a seat that keeps one — and a driver that filled it in
-/// on the seat's behalf would delete the desync detector. The `diagnostics` are
-/// the seat's annotations for the record, and nothing downstream can invent
-/// them.
+/// The seat authors the complete [`Decision`]. `zobrist` is the hash of the
+/// position used to choose, and `diagnostics` are opaque seat-owned bytes.
 ///
 /// An illegal choice is not an error: the driver submits it and the game
 /// adjudicates it.

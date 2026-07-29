@@ -52,7 +52,7 @@ def test_dropout_config_runs_and_eval_is_deterministic(positions):
     net = MantisNet(MantisConfig(dropout=0.1))
     batch = collate([from_position(positions[-1])])
     net.train()
-    net(batch)  # stochastic, just must run
+    net(batch)  # The CUDA smoke test requires successful execution.
     net.eval()
     with torch.no_grad():
         a, b = net(batch), net(batch)

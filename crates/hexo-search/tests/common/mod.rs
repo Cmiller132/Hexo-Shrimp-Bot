@@ -1,8 +1,6 @@
-//! The test harness: one encoder, the evaluators that answer it, the selectors a
-//! model package would supply, and the single-session driver the tests share.
+//! Test encoder, evaluators, selectors, and session driver.
 //!
-//! Everything here is what a *package* owns. The crate under test ships none of
-//! it, which is the point.
+//! These fixtures represent package-owned implementations.
 
 #![allow(dead_code)]
 
@@ -15,8 +13,7 @@ use hexo_search::{
 
 /// The one test encoder: the mover, then the legal actions in canonical order.
 ///
-/// Ragged on purpose — the legal count grows with the board — so the batch is
-/// carrying items of genuinely different lengths rather than a fixed crop.
+/// Item length varies with the legal count.
 pub struct Ragged;
 
 impl Encoder for Ragged {
@@ -36,8 +33,7 @@ pub struct Decoded {
     pub actions: Vec<Action>,
 }
 
-/// Read one batch item. Every evaluator below answers from this and nothing
-/// else, so the tests really do go through the byte seam.
+/// Decode one test-encoder batch item.
 pub fn decode(item: &[u8]) -> Decoded {
     let mover = match item[0] {
         0 => Player::P0,
@@ -56,7 +52,7 @@ pub fn decode(item: &[u8]) -> Decoded {
     Decoded { mover, actions }
 }
 
-/// Equal priors, value zero: a network with no opinion at all.
+/// Equal priors and zero value.
 pub struct Uniform;
 
 impl Evaluator for Uniform {
@@ -82,10 +78,7 @@ pub fn uniform_evaluation(legal_count: usize) -> Evaluation {
 
 /// Uniform except on the named cells, which take almost all of the mass.
 ///
-/// A stand-in for a network that has an opinion. Without one, a search on a root
-/// with several hundred children has to sweep every one of them before any line
-/// can be explored twice, and a test of *backpropagation* would be spending its
-/// budget proving something about priors instead.
+/// A distribution concentrated on named cells for focused search tests.
 pub struct Focus {
     pub hot: Vec<HexCoord>,
     /// Relative weight of a cold cell against a hot one.
@@ -116,9 +109,7 @@ impl Evaluator for Focus {
     }
 }
 
-/// Plays the most-visited root child, and records the whole child table as the
-/// seat's diagnostics — which is what a real package's diagnostics are for, and
-/// what lets a test read the search's own numbers back out of the record.
+/// Plays the most-visited root child and records the child table.
 pub struct MaxVisits;
 
 impl SelectFromSearch for MaxVisits {

@@ -1,4 +1,4 @@
-//! What a seat sends back, and what it was given to work with.
+//! Seat budgets, decisions, and replies.
 
 use hexo_engine::Action;
 use std::time::Duration;
@@ -17,13 +17,10 @@ pub enum Budget {
     Wall(Duration),
 }
 
-/// A seat's chosen placement — its whole utterance for the turn.
+/// A seat's complete placement decision.
 ///
-/// Every field is authored by the seat, never by the driver. `zobrist` is an
-/// attestation: the hash of the position the seat actually chose from — the
-/// canonical one for a seat that reads the canonical [`crate::Game`], its own
-/// mirror's for a seat that keeps one. A driver that fills it in from the
-/// canonical game on the seat's behalf has deleted the desync detector.
+/// The seat authors every field. `zobrist` is the hash of the position used for
+/// selection, whether canonical or mirrored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Decision {
     /// Where to place.

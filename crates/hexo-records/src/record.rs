@@ -1,4 +1,4 @@
-//! What a shard carries: the header it opens with, and one record per game.
+//! Shard header and game-record types.
 
 use crate::error::RecordError;
 use hexo_runner::{Game, GameSpec, MatchResult, PlyRecord};
@@ -14,12 +14,8 @@ pub enum ShardMode {
 
 /// The preamble of a shard file: what the games in it belong to.
 ///
-/// The four version numbers the file also carries — the record format, the
-/// rules, the action ordering, and the runner protocol — are deliberately not
-/// fields here. A [`crate::ShardReader`] has already proved each one equals the
-/// constant this build links against before it hands the header out, so a copy
-/// could only repeat a constant, and a copy that could be read as data invites
-/// code that branches on it.
+/// Version fields are validated by [`crate::ShardReader`] and are not repeated
+/// in this value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShardHeader {
     /// Which phase produced these games.
@@ -43,12 +39,8 @@ pub struct ShardHeader {
 
 /// One finished game, whole.
 ///
-/// The spec says what the game was played under, the result carries the entire
-/// adjudication payload — including the action and [`MoveError`](hexo_engine::MoveError)
-/// behind an illegal-move loss, and both hashes behind a desync — and the plies
-/// are the game's history. Nothing is summarised: a verdict whose reasons were
-/// discarded is one an operator cannot debug and a training pipeline cannot
-/// filter on.
+/// The record contains the game specification, complete adjudication payload,
+/// and every accepted ply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GameRecord {
     /// The match rules the game was played under.
@@ -64,10 +56,7 @@ impl GameRecord {
     ///
     /// # Errors
     ///
-    /// [`RecordError::Unfinished`] if the game has no result yet. An unfinished
-    /// game is not a record: its move list is a prefix, its adjudication has not
-    /// happened, and writing it would put a game nobody finished into training
-    /// data as though someone had.
+    /// [`RecordError::Unfinished`] if the game has no result.
     pub fn from_game(game: &Game) -> Result<Self, RecordError> {
         let result = game.result().ok_or(RecordError::Unfinished)?;
         Ok(Self {

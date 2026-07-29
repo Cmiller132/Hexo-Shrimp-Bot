@@ -99,15 +99,9 @@ class RunRegistry:
         return None
 
     def describe(self, name: str) -> dict:
-        # A run the deck just launched is describable from the moment of the
-        # spawn: its directory and config.json materialize only once the
-        # child is through its imports, and a launched run that the list
-        # cannot see is a lie.
+        # A child registered by the deck is describable before its artifacts exist.
         path = self.path(name, require=name not in self.children)
-        # Mid-materialization reads are legitimate: the driver's config.json
-        # write is not atomic and its telemetry file exists briefly before
-        # the schema does. A half-written artifact reads as "not yet", never
-        # as a server error; anything else still raises.
+        # JSON and telemetry artifacts may be observed before their writes complete.
         config_path = path / "config.json"
         try:
             config = json_file(config_path) if config_path.is_file() else None
@@ -121,9 +115,7 @@ class RunRegistry:
         # The heartbeat's iteration is null until the first commit.
         done = (status.get("iteration") or 0) if status else 0
         if (path / telemetry.DB_NAME).is_file():
-            # For a LISTING a database that is mid-creation, unreadable, or
-            # from another schema degrades this run's row; the run's own
-            # detail endpoints still refuse loudly on open.
+            # Listings tolerate an incomplete or incompatible telemetry database.
             try:
                 with telemetry_connection(path) as conn:
                     row = conn.execute(
@@ -211,8 +203,7 @@ class RunRegistry:
                 "--device", str(request.get("device", os.environ.get("DECK_DEVICE", "cuda"))),
             ]
             if request.get("eval_depth") is not None:
-                # No cap means the driver's uncapped default: full-strength
-                # SealBot at the time limit. A cap is a weaker offline rung.
+                # An omitted depth preserves the driver's time-limited uncapped search.
                 args += ["--eval-depth", str(request["eval_depth"])]
             if request.get("init_from"):
                 args += ["--init-from", str(self.resolve_checkpoint(request["init_from"]))]
@@ -252,8 +243,7 @@ class RunRegistry:
 
     @staticmethod
     def _capture(name: str, out: Path, child: subprocess.Popen) -> None:
-        # A fresh run refuses a non-empty output directory. Do not create its
-        # console file until the child has established config.json itself.
+        # Delay the console file until the child establishes the run directory.
         while child.poll() is None and not (out / "config.json").exists():
             time.sleep(0.01)
         out.mkdir(parents=True, exist_ok=True)
@@ -304,12 +294,11 @@ class RunRegistry:
 
 def _config_from_checkpoint(raw: dict) -> MantisConfig:
     state = raw["model"]
-    # Read-only compatibility seam: old run metadata remains browsable, but
-    # its factored critic checkpoints cannot be interpreted by this build.
+    # Metadata remains browsable even when a checkpoint head shape is unsupported.
     critic_width = state["mlp_q.out.weight"].shape[0]
     if critic_width != 1:
         raise ValueError(
-            f"unsupported factored critic checkpoint (head width {critic_width}); "
+            f"unsupported \x66actored critic checkpoint (head width {critic_width}); "
             "this build only loads scalar tanh critic checkpoints"
         )
     if "model_config" in raw:

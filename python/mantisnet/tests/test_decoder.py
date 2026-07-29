@@ -1,10 +1,8 @@
-"""The shared decoder aggregation: layout, the folded head matrix, the kernel.
+"""Shared decoder layout, folded head matrix, and kernel contracts.
 
-The oracle here is a literal transcription of the §6 decoder formula — project
-each window row, add its slot-class embedding, sum over the cell's entries,
-overwrite background cells from the bucket table. `decoder` reaches the same
-answer by aggregating first and projecting afterwards, so the two agree only if
-the factoring is right; neither is written in terms of the other.
+The oracle transcribes the §6 decoder formula directly: project window rows,
+add slot-class embeddings, sum each cell's entries, and overwrite background
+cells from the bucket table. The implementation aggregates before projection.
 """
 
 from __future__ import annotations

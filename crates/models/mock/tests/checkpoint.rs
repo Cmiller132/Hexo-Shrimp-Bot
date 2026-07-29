@@ -1,5 +1,4 @@
-//! Writing a checkpoint, proving one on the way in, and what a package refuses
-//! to answer before it has one.
+//! Checkpoint write, load, verification, and not-loaded contracts.
 
 mod common;
 
@@ -55,9 +54,7 @@ fn init_creates_the_checkpoint_directory_it_was_pointed_at() {
 
 #[test]
 fn two_fresh_checkpoints_are_byte_identical() {
-    // Epoch 0 is a fixed constant, not entropy: a probe hash that moved between
-    // two fresh initialisations would be reporting the initialisation rather
-    // than the weights.
+    // Epoch 0 uses a fixed salt and is byte-reproducible.
     let dir = tempfile::tempdir().expect("a scratch directory");
     let one = dir.path().join("one");
     let two = dir.path().join("two");
@@ -102,8 +99,7 @@ fn a_flipped_weight_byte_is_caught_by_the_probe_rather_than_loaded() {
 
 #[test]
 fn a_refused_load_leaves_the_weights_that_were_already_loaded_alone() {
-    // Half a load is worse than none: the process would go on running against
-    // weights it can no longer name.
+    // A failed load preserves the previously verified state.
     let dir = tempfile::tempdir().expect("a scratch directory");
     let good = dir.path().join("good");
     let bad = dir.path().join("bad");
@@ -220,10 +216,7 @@ fn every_answer_satisfies_the_seams_two_conventions() {
 
 #[test]
 fn two_sessions_from_one_package_do_not_share_a_stream() {
-    // `CONTAINER_SPEC.md` §12 leaves seeding to the driver, so the package may
-    // construct with any seed — but it may not hand two concurrent sessions the
-    // same one, or a driver that forgot to reseed would produce a self-play run
-    // of one repeated game.
+    // Concurrent sessions receive distinct package-derived initial seeds.
     let dir = tempfile::tempdir().expect("a scratch directory");
     let package = loaded(dir.path(), "search=policy").expect("initialised and loaded");
     let games = common::self_play_games(&package, 2, 11);

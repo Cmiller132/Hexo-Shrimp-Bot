@@ -1,8 +1,7 @@
-//! What a package gets for free, and what it does not.
+//! Default `ModelPackage` behavior.
 //!
-//! `Bare` implements every required method with a refusal. That is the whole
-//! point: it inherits exactly one thing, and this file is what pins what that
-//! one thing does.
+//! `Bare` refuses every required operation and inherits only
+//! `variant_session`.
 
 use hexo_engine::Position;
 use hexo_model::{Manifest, ModelPackage, PackageError};

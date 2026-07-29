@@ -220,8 +220,7 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 8, max_shrink_iters: 200, ..ProptestConfig::default() })]
 
-    /// Property 6b: a game that deliberately spreads as far from the origin as the
-    /// rules allow stays consistent and never panics.
+    /// Property 6b: a game spreading by the legal radius remains consistent.
     #[test]
     fn spreading_games_stay_consistent_and_never_panic(seed in any::<u64>()) {
         let mut rng = Rng::new(seed);

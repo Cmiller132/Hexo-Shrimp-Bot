@@ -1,19 +1,8 @@
-"""The machine under the run: GPU, process, and host counters, sampled.
+"""Sample GPU, process, and host counters for iteration telemetry.
 
-A metrics row says how many samples an iteration produced; it says nothing
-about whether the card was saturated, throttling, or waiting on the host —
-and every throughput question the run plan asks is one of those. So a
-background thread reads the counters on a fixed period and the run drains
-its aggregate once per iteration, alongside the iteration's own numbers.
-
-The thread is deliberately inert with respect to training: it touches no
-model, no RNG, and no database, and it holds nothing the training threads
-want. Its one interaction is the drain, which is a list swap under a lock.
-
-Sensor failures are kept, not swallowed. A read that raises stops the
-sampler and the exception is re-raised on the training thread at the next
-drain, so a run whose hardware trace has quietly stopped is not a thing
-that can happen.
+A background thread samples on a fixed period. ``drain`` returns means and
+maxima since the preceding drain without touching model or RNG state. A sensor
+failure stops sampling and is raised by the next drain.
 """
 
 from __future__ import annotations
@@ -33,8 +22,8 @@ class HardwareSampler:
     """Counters on a fixed period, aggregated per drain.
 
     ``gpu_index`` is the NVML device to watch, or ``None`` for a run with no
-    GPU at all — a CPU run then reports the process and host columns and
-    leaves the GPU ones empty, which is what "there is no GPU" looks like.
+    GPU. A CPU run reports process and host columns and leaves GPU columns
+    empty.
     """
 
     def __init__(self, gpu_index: int | None, period: float = 1.0):
@@ -83,7 +72,7 @@ class HardwareSampler:
         while not self._stop.wait(self.period):
             try:
                 s = self._sample()
-            except BaseException as exc:  # re-raised on the next drain
+            except BaseException as exc:  # Surface failures at the next drain.
                 with self._lock:
                     self._failure = exc
                 return
@@ -94,10 +83,8 @@ class HardwareSampler:
         """One iteration's hardware columns: means and maxima over the
         samples since the last drain, plus torch's own allocator peaks.
 
-        An iteration shorter than the sample period would otherwise report
-        nothing, so an empty buffer is filled by sampling inline — the read
-        is a few counter lookups, and a column that is always present is
-        worth more to a threshold query than one that is usually present.
+        If no periodic sample is available, this method samples inline so
+        every drain contains one or more observations.
         """
         with self._lock:
             if self._failure is not None:
@@ -131,10 +118,8 @@ class HardwareSampler:
 def hardware_sampler(device: str, period: float = 1.0):
     """The sampler for a run on ``device``, shut down with the run.
 
-    torch's device index is NVML's only while one GPU is visible; the two
-    orderings are independent, and on a multi-GPU host this would quietly
-    trace the wrong card. Rather than guess, it stops — matching the two by
-    UUID is the fix, when there is a host to test it on.
+    CUDA sampling requires at most one visible GPU because torch and NVML
+    device-index orderings are not assumed to match.
     """
     index = None
     if device.startswith("cuda"):
@@ -153,7 +138,7 @@ def hardware_sampler(device: str, period: float = 1.0):
 
 
 def _main() -> None:
-    """A few seconds of the trace, for checking the sensors exist."""
+    """Sample hardware counters for a bounded interval and print one drain."""
     import argparse
     import json
 

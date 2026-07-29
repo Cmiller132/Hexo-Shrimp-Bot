@@ -6,11 +6,8 @@ use hexo_runner::{Decision, Game};
 
 /// Session-scoped handle for one requested leaf evaluation.
 ///
-/// Opaque and never reused: a session mints a fresh serial per leaf and keeps
-/// minting across [`DecisionSession::begin`], so an answer that arrives for a
-/// decision the session has already moved past is *unknown* rather than
-/// plausible. That is the same reasoning as `hexo-runner`'s generation token,
-/// one level down.
+/// Opaque and never reused within a session, including across
+/// [`DecisionSession::begin`] calls.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LeafId(u64);
 
@@ -38,43 +35,28 @@ pub enum SessionStatus {
     Decided,
 }
 
-/// A seat's search as a nonblocking state machine: `Send`, object-safe, and
-/// never in possession of a thread while it waits.
-///
-/// The shape mirrors `hexo_runner::Game` one level down. A game does not call
-/// its players; a session does not call its evaluator. Both invert the obvious
-/// blocking design for the same reason: a search that blocks inside
-/// `evaluate(one_position)` pins a thread per game *and* forecloses batching,
-/// because the one thing the process wants to coalesce is exactly the thing
-/// every thread is asleep on.
+/// A `Send`, object-safe, nonblocking decision state machine.
 ///
 /// The loop is `begin`, then `pump`/`resume` until [`SessionStatus::Decided`],
-/// then `take_decision`. Every call returns promptly; the driver decides how
-/// many sessions to interleave and how large a batch to fill before it crosses
-/// to the device.
+/// then `take_decision`. The driver controls session interleaving and evaluator
+/// batch size.
 pub trait DecisionSession: Send {
     /// Reset onto `game`'s current position and discard any previous search.
     ///
-    /// The session takes its own copy of the position — a seat never holds a
-    /// mutable handle to canonical state — and reuses the buffer it copied into
-    /// last time, so a session driven for ten thousand decisions keeps its
-    /// allocations flat.
+    /// The session copies the game's position and does not retain mutable access
+    /// to canonical game state.
     ///
     /// # Panics
     ///
-    /// If `game` has already finished. A driver only asks a live game's mover,
-    /// and a session asked to search a settled game has been handed the wrong
-    /// game rather than an empty search.
+    /// If `game` has already finished.
     fn begin(&mut self, game: &Game);
 
     /// Run until the decision is ready, the in-flight cap is reached, or the
     /// visit budget is fully dispatched.
     ///
-    /// For each leaf the search wants evaluated, `emit` is called with the
-    /// leaf's handle and the leaf *position*. The caller encodes it right there:
-    /// that position is transient make/unmake state on the session's own board,
-    /// valid only for the duration of the callback, and there is nothing to
-    /// queue but the bytes an [`crate::Encoder`] produces from it.
+    /// For each requested leaf, `emit` receives its handle and transient
+    /// position. The position is valid only for the callback duration and must
+    /// be encoded before the callback returns.
     ///
     /// Calling `pump` again after [`SessionStatus::Decided`] returns `Decided`
     /// and emits nothing.
@@ -88,28 +70,19 @@ pub trait DecisionSession: Send {
     ///
     /// # Panics
     ///
-    /// If `leaf` is not in flight — including an answer for a decision this
-    /// session has already left — or if the evaluation breaks either convention
-    /// on [`Evaluation`]. Both are silent corruption of a training run if
-    /// tolerated: the first plays a move chosen for another position, the second
-    /// indexes the policy head against an action set it does not match.
+    /// If `leaf` is not in flight or if the evaluation violates
+    /// [`Evaluation`]'s conventions.
     fn resume(&mut self, leaf: LeafId, evaluation: Evaluation);
 
     /// Take the finished decision, or `None` until the session is
     /// [`SessionStatus::Decided`].
     ///
-    /// Taking it resets nothing; `begin` does the resetting. The decision is
-    /// authored once, at the moment the search completes, so taking it has no
-    /// side effects and cannot draw from the RNG a second time.
+    /// Taking the decision does not reset the session; [`DecisionSession::begin`]
+    /// performs the next reset.
     fn take_decision(&mut self) -> Option<Decision>;
 
     /// Replace the RNG seed.
     ///
-    /// This is the deliberate seam for `docs/OPEN_DECISIONS.md` B4. Today a
-    /// driver passes entropy at construction and games are non-deterministic,
-    /// which is honest: nothing records a seed, so nothing promises a replay.
-    /// When reproducible self-play is wanted, seeds minted from stable game and
-    /// seat ids — so that scheduling cannot change a run — land here, and
-    /// nothing else about a session has to move.
+    /// Drivers may call this at game boundaries.
     fn reseed(&mut self, seed: u64);
 }

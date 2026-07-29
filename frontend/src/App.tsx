@@ -43,30 +43,24 @@ export default function App() {
   const [launch, setLaunch] = useState(false);
   const [launchError, setLaunchError] = useState<string>();
   const activeRun = runs.data?.find((run) => run.name === runName) ?? runs.data?.find((run) => run.state === "active") ?? runs.data?.at(-1);
-  // History queries the active run, so that is the run any handed-off game is from.
+  // Lab handoffs use the same active run selected for History queries.
   const activeRunName = activeRun?.name ?? "";
   useEffect(() => { if (activeRun && activeRun.name !== runName) { setRunName(activeRun.name); localStorage.setItem("deck-run", activeRun.name); } }, [activeRun, runName]);
   useEffect(() => {
     const key = (event: KeyboardEvent) => { if ((event.metaKey || event.ctrlKey) && event.key === "k") { event.preventDefault(); setPalette((value) => !value); } };
     addEventListener("keydown", key); return () => removeEventListener("keydown", key);
   }, []);
-  // The key guard in the shared transport stands down while a modal is open, so the
-  // dialogs advertise themselves here rather than threading a prop through screens.
+  // Shared key bindings are disabled through `body[data-modal]` while a modal is open.
   useEffect(() => { document.body.dataset.modal = palette || launch ? "open" : ""; }, [palette, launch]);
 
-  // A screen mounts the first time it is opened and then stays mounted; see
-  // `components/Pane.tsx` for why. Nothing is mounted on behalf of a screen the
-  // user has not asked for, so no query fires for an unopened one.
+  // Each screen mounts on first visit and remains mounted; unopened screens issue no queries.
   const [visited, setVisited] = useState<Screen[]>(() => [screen]);
   useEffect(() => { setVisited((current) => (current.includes(screen) ? current : [...current, screen])); }, [screen]);
 
   const navigate = useCallback((next: Screen) => { setScreen(next); location.hash = next; setPalette(false); setMobile(false); }, []);
   const selectRun = useCallback((name: string) => { setRunName(name); localStorage.setItem("deck-run", name); }, []);
 
-  // The whole game travels to the lab, never a truncated prefix: the lab holds a line
-  // and a cursor, and the cursor is where History left it. The lab consumes the
-  // hand-off once, on the token — it stays mounted across a nav, so returning to it
-  // shows what the user left there rather than re-seeding the last handed-off game.
+  // Lab handoffs include the complete game and cursor; the token triggers exactly one reseed.
   const openLab = useCallback((game: Game, ply: number) => {
     setHandoff({
       token: ++handoffToken.current, run: activeRunName, gameId: game.game_id, kind: game.kind,
@@ -90,9 +84,7 @@ export default function App() {
   }
 
   /* --------------------------------------------------------------- the palette --
-     Every deck-wide action the header carries, plus one entry per run — switching
-     runs is the header control most often reached for, and it is a select that has
-     to be found with the mouse. Screen-local work stays on its screen. */
+     The palette contains deck-wide navigation, run selection, and run actions. */
   const commands = useMemo((): Command[] => [
     ...NAV.map(({ id, label, icon }) => ({
       id: `screen:${id}`, group: "SCREENS", label, icon,

@@ -9,14 +9,12 @@ export function Panel({ title, action, children }: {
   </section>;
 }
 
-/** Red. Genuine failures only — a 5xx, a dropped network, a missing checkpoint.
- *  A rejected input or a stale result is a `Notice`, not this. */
+/** Red failure state for server, network, or missing-resource errors. */
 export function ErrorBox({ message }: { message?: string }) {
   return message ? <div className="error-box">{message}</div> : null;
 }
 
-/** `info` (mint) for something normal worth saying; `warn` (amber) for a rejected
- *  input or a result that no longer describes what is on screen. */
+/** Mint informational notice or amber rejected-input/stale-result notice. */
 export function Notice({ kind = "info", children, action }: {
   kind?: "info" | "warn"; children: ReactNode; action?: ReactNode;
 }) {
@@ -47,8 +45,7 @@ export function Segmented<T extends string>({ options, value, onChange, label }:
   </div>;
 }
 
-/** Determinate progress for the whole-line walk. `done`/`total` are always shown:
- *  a bar with no numbers cannot be checked against what it claims. */
+/** Determinate whole-line progress with an explicit `done / total` readout. */
 export function ProgressBar({ done, total, label }: { done: number; total: number; label?: string }) {
   return <div className="walk-status">
     <div className="walk-bar"><div className="walk-fill" style={{ ["--p" as string]: String(total > 0 ? Math.min(1, done / total) : 0) }} /></div>
@@ -56,10 +53,8 @@ export function ProgressBar({ done, total, label }: { done: number; total: numbe
   </div>;
 }
 
-/** The heat ramp key. Always rendered beside a heat-mapped surface: both ramps are
- *  normalised per position, so the shade means nothing without its printed domain.
- *  `seq` is the 7-step mint ramp over four log decades below `max`; `div` is the
- *  9-step violet↔amber ramp with a neutral midpoint, symmetric about 0. */
+/** Per-position heat-ramp key with its numeric domain.
+ *  `seq` has seven logarithmic mint steps; `div` has nine symmetric violet↔amber steps. */
 export function HeatLegend({ kind, max, note }: { kind: "seq" | "div"; max: number; note?: string }) {
   const steps = kind === "seq"
     ? [0, 1, 2, 3, 4, 5, 6].map((step) => `s${step}`)

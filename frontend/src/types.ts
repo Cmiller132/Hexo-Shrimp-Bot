@@ -27,8 +27,7 @@ export interface Run {
   checkpoints: Checkpoint[];
 }
 
-/** One legal move as `/api/inspect` returns it, in the engine's legal ordering.
- *  `rank` is that ordering's index — it carries no quality information. */
+/** One legal move from `/api/inspect`; `rank` is its engine-order index. */
 export interface InspectLegal {
   move: Move;
   rank: number;
@@ -38,11 +37,10 @@ export interface InspectLegal {
   improved: number;
 }
 
-/** An `InspectLegal` carrying the derived quality rank, and optionally the signed
- *  difference against a compare checkpoint. Produced by `withPolicyRank`. */
+/** An `InspectLegal` with policy-derived rank and an optional checkpoint difference. */
 export interface Candidate extends InspectLegal {
   /** 0-based index of this move when the legal set is sorted by `policy` descending.
-   *  This is the real quality rank; `rank` is engine order. */
+   *  `rank` remains the engine-order index. */
   policyRank: number;
   /** Signed Δ against the compare checkpoint for the active overlay quantity.
    *  Required when a Board is rendered with `overlay="delta"`. */
@@ -84,9 +82,7 @@ interface GameFacts {
   opponent_depth_mean: number | null;
 }
 
-/** A telemetry game as the listing returns it. The canonical `opening` is
- *  computed by the listing query alone — the detail endpoint does not carry it,
- *  so it lives here and not on `Game`. */
+/** A telemetry listing row; only the listing endpoint supplies canonical `opening`. */
 export interface GameRow extends GameFacts {
   opening: Move[];
 }
@@ -122,8 +118,7 @@ export interface Game extends GameFacts {
   review: GameReview;
 }
 
-/** History → Lab hand-off. The whole game travels, never a truncated prefix;
- *  `token` is bumped on every hand-off so re-sending the same game re-seeds. */
+/** History → Lab handoff containing the complete game; each handoff gets a new token. */
 export interface LabHandoff {
   token: number;
   run: string;

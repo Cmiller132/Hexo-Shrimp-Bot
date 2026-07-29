@@ -2,8 +2,8 @@
 
 The shared Rust encoder owns the representation and ``MODEL_REPR_VERSION``;
 this package's Python builder is its independent parity reference. The model
-owns the weights, the losses pin the raw heads, and the Python-free container
-package owns the improved evaluator opinion and sessions.
+owns the weights, the losses define raw-head targets, and the Python-free
+container package owns improved evaluation and sessions.
 """
 
 from .builder import (

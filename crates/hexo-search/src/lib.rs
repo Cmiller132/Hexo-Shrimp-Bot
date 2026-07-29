@@ -1,18 +1,11 @@
-//! The evaluator seam and the nonblocking decision sessions: how a seat
-//! searches, and how its network questions get batched across a thousand
-//! concurrent games.
+//! Evaluator batching and nonblocking decision sessions.
 //!
-//! Model-agnostic by construction. Nothing here learns what a feature, a
-//! network, or a temperature is: a model package supplies the [`Encoder`], the
-//! [`Evaluator`], and the selection policy, and this crate supplies the
-//! machinery between them. It is the settled form of `docs/SUGGESTIONS.md` S3.
+//! A model package supplies the [`Encoder`], [`Evaluator`], and selection
+//! policy. This crate owns the session state machines and their batching seam.
 //!
-//! Three implementations of [`DecisionSession`] ship. [`PolicySession`] asks
-//! one question per move; [`MctsSession`] runs PUCT with virtual loss and an
-//! in-flight cap; [`GumbelSession`] spends a fixed budget deepening sampled root
-//! lines by sequential halving. They are the same trait so that policy-only
-//! training and either search are the same driver loop rather than paths that
-//! drift.
+//! [`PolicySession`] evaluates one root per move. [`MctsSession`] implements PUCT
+//! with virtual loss and an in-flight cap. [`GumbelSession`] applies sequential
+//! halving to sampled root lines. All three implement [`DecisionSession`].
 //!
 //! ```
 //! use hexo_engine::{Action, Position};
@@ -23,9 +16,9 @@
 //! };
 //! use std::num::NonZeroU32;
 //!
-//! // Everything in this example except the loop belongs to a model package.
+//! // The encoder, evaluator, and selector are package-owned.
 //!
-//! /// Worker-side: the position becomes bytes while it still exists.
+//! /// Encodes the legal-action count.
 //! struct Count;
 //! impl Encoder for Count {
 //!     fn encode(&self, position: &Position, out: &mut Vec<u8>) {
@@ -33,7 +26,7 @@
 //!     }
 //! }
 //!
-//! /// Batcher-side: one call answers the whole batch. This is the crossing.
+//! /// Returns a uniform evaluation for each batch item.
 //! struct Uniform;
 //! impl Evaluator for Uniform {
 //!     fn evaluate(&mut self, batch: &EncodedBatch, out: &mut Vec<Evaluation>) {
@@ -47,7 +40,7 @@
 //!     }
 //! }
 //!
-//! /// Move selection is the model's. This crate ships none.
+//! /// Selects the highest-prior action.
 //! struct Highest;
 //! impl SelectFromPolicy for Highest {
 //!     fn select(&mut self, root: &Position, e: &Evaluation, _rng: &mut SplitMix64) -> Action {
@@ -80,9 +73,7 @@
 //!     loop {
 //!         batch.clear();
 //!         leaves.clear();
-//!         // Waiting is data: the leaf goes into a batch, not onto a blocked
-//!         // thread. A real driver fills the rest of this batch from the other
-//!         // nine hundred and ninety-nine games it is running.
+//!         // Emitted leaves are encoded before their transient positions expire.
 //!         let status = session.pump(&mut |leaf, position| {
 //!             leaves.push(leaf);
 //!             batch.push_with(&Count, position);

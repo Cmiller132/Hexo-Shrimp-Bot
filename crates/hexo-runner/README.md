@@ -1,155 +1,119 @@
 # hexo-runner
 
-Match orchestration: the authoritative game, and the policy that decides how a
-match ends.
+## Purpose
 
-**Status: the game state machine is implemented.** Transport is not. The rest of
-what used to be missing here moved *out* of the crate rather than into it: the
-seats are `hexo-player`'s and `hexo-search`'s, the on-disk record format is
-`hexo-records`', and the binary is `hexo-bot`.
+`hexo-runner` is the authoritative match-orchestration state machine around one
+`hexo-engine::Position`. It records accepted plies, issues generation-tagged
+decision requests, validates replies, and adjudicates all non-rule outcomes.
+It owns no player handles, loop, transport, persistence, search, or model code.
 
-## Shape
+## Public surface
 
-Pure Rust library crate, depends only on `hexo-engine`.
+The crate root re-exports:
 
-```
-crates/hexo-runner/
-  Cargo.toml
-  README.md
-  src/
-    lib.rs          # crate root, flat re-exports, PROTOCOL_VERSION
-    game.rs         # Game, GameSpec, Step, Transition, PlyRecord, FailurePolicy
-    decision.rs     # Reply, Decision, Failure, Budget
-    outcome.rs      # MatchResult, WinReason, DrawReason, NoContest
-    error.rs        # SubmitError
-  tests/
-    game.rs         # adjudication, the guards, and both drive shapes
-```
-
-## Module map
-
-| Module | Role |
+| Module | Consumer-facing contract |
 | --- | --- |
-| `game` | `Game` owns the one canonical `Position` and the record of the game, and is the only code that advances either. A state machine: `step()` says what it wants, `submit()` says what happened. |
-| `decision` | What a seat comes back with — a placement, a resignation, or a driver-reported failure — and the `Budget` it was told it had. |
-| `outcome` | `MatchResult` and the adjudication vocabulary. Everything the engine refuses to model. |
-| `error` | `SubmitError`: a submission the game would not act on. |
+| `decision` | `Budget`, `Decision`, `Failure`, `Reply` |
+| `game` | `Game`, `GameSpec`, `FailurePolicy`, `PlyRecord`, `Step`, `Transition` |
+| `outcome` | `MatchResult`, `WinReason`, `DrawReason`, `NoContest` |
+| `error` | `SubmitError` |
 
-There is deliberately no `player.rs` and no `Player` trait *here*. See below. The
-trait a driver drives lives in `hexo-player`, which depends on this crate — the
-arrow points that way and never back.
+`PROTOCOL_VERSION` versions the runner-level request, reply, and result
+semantics used by manifests and record shards.
 
-## Design notes
+A driver follows this state machine:
 
-- **`Game` is a state machine, not a loop.** It never blocks, holds no player
-  handle, and has no transport, clock, or I/O. It cannot block because there is
-  nobody to block on.
+```rust
+use hexo_runner::{Game, GameSpec, Reply, Step};
 
-  The obvious alternative is a `Player` trait the runner calls, blocking inside
-  `decide` until the seat answers. That makes a game equal to a thread — ten
-  thousand self-play games is ten thousand OS threads — and worse, it forecloses
-  batching, because every thread is blocked inside its search on a
-  single-position evaluation with nothing left to coalesce into the batch a GPU
-  wants.
+let mut game = Game::new(GameSpec::default());
+match game.step() {
+    Step::NeedDecision { seat, generation, budget, .. } => {
+        # let _ = (seat, generation, budget);
+        // Obtain a Reply from the named seat, then call game.submit.
+    }
+    Step::Finished(result) => {
+        # let _ = result;
+    }
+}
+```
 
-  Inverting it gives both shapes from one type: a fifteen-line loop for one game
-  on one thread, or one actor sweeping thousands of `Game` values for everyone
-  in `NeedDecision` and handing that whole set to a batched evaluator. This is
-  *more* synchronous than the callback design — no `async fn`, no executor, no
-  futures, no channels.
+`Game` provides:
 
-- **Players never hold a mutable handle to canonical state.** Enforced by
-  ownership, not convention: `Game::position()` returns a shared borrow and
-  there is no mutable counterpart. `submit` is the only way to advance.
+- `new`, `spec`, and read-only `position`;
+- `plies` and `prefix` for accepted placement history;
+- `result` and `step` for state observation;
+- `submit(generation, reply)` for the only state transition.
 
-- **`Game::plies` is the game's history, not a mirror of one.** `Position` keeps
-  no move list, so this record is the only one: it is what a game is written out
-  as, and `Game::prefix()` decodes it back into placements. Nothing here
-  cross-checks a second copy on the board, because there is no second copy —
-  what is checked instead is that the record replays into the canonical position,
-  which is a claim about two independently built things.
+`Reply::Place` carries a `Decision`; `Reply::Resign` and `Reply::Failed` carry
+non-placement outcomes. `Transition` reports the accepted placement and current
+result after submission.
 
-- **A remote seat is handed a move prefix, not a position.** `Game::prefix()` is
-  a move list the seat replays with `Position::replay`. A container cannot be
-  handed a `Position`, and board-shaped construction is the rule-bypass hole the
-  engine refuses to reopen. An in-process driver hands the whole `Game` to the
-  seat, which reads `position()` directly and needs no mirror.
+`MatchResult` distinguishes:
 
-- **Two guards on every submission, both structural.** `generation` stops a late
-  or duplicated reply from playing a move chosen for a position the game has
-  moved past — reachable the moment decisions are batched or cross a process
-  boundary. The echoed `zobrist` catches a mirror whose *board content* has
-  drifted, on the ply it drifts rather than at the end of a corrupted game. The
-  echo is the **seat's** attestation — its own mirror's hash, if it keeps one —
-  and a driver must never fill it in from the canonical position, which would be
-  the check vouching for itself. A refused desync leaves the game live at the
-  same generation, so a driver that can resync its seat may retry; one that
-  cannot reports `Failure::Desync` and the failure policy adjudicates.
+- `Decisive { winner, reason }`;
+- `Drawn { reason }`;
+- `NoContest { reason }`.
 
-  Neither guard sees move order within a turn. A mirror that replays an
-  opponent's non-winning two-stone turn in the opposite order reaches the same
-  occupied cells and the same mover, so it produces the same hash and submits
-  cleanly. Catching that needs a digest over the record, which belongs to the
-  wire protocol when it lands (C1, C2) rather than to a second hash here.
+## Run / test
 
-- **An illegal move is a result, not an error.** `SubmitError` means *nothing
-  happened*; the submission was unusable and the same request is still
-  outstanding. A seat that plays illegally has lost, and that comes back as a
-  `MatchResult`. Putting it in the error type would push adjudication into every
-  driver.
+From the repository root:
 
-  The exception is a refusal the engine reports as its own limit rather than a
-  rule violation. `MoveError::is_rule_violation` tells the two apart, and a
-  `NoContest::EngineLimit` blames nobody.
+```sh
+cargo test -p hexo-runner
+cargo test -p hexo-runner --test game
+cargo doc -p hexo-runner --no-deps
+cargo check -p hexo-runner
+```
 
-  Either way the result keeps its evidence: `WinReason::IllegalMove` carries the
-  `ActionId` played and the exact `MoveError` it was refused with, as
-  `NoContest::EngineLimit` carries its seat and error. A verdict whose reasons
-  were discarded is one an operator cannot debug and a training pipeline cannot
-  filter on, and both facts were in hand at the point the game ended.
+Run the complete workspace gates:
 
-- **Three result arms, not two.** A completed/aborted split cannot say what a
-  training pipeline needs to know: a game that legitimately hit its action cap
-  and a game where a player crashed are both unusable as signal, but only the
-  second is anybody's fault. `MatchResult` splits by whose fault it was, and
-  `is_contested()` answers "did this match reach a verdict" directly.
+```sh
+cargo xtask verify
+```
 
-  It does not answer "is this game usable as training data". A forfeit —
-  `WinReason::Timeout`, `Crash`, `Protocol`, or `Desync` — is a decisive, contested
-  result, and it is real evidence in a match: a seat that cannot answer has
-  lost. But it says nothing about the play on the board, and the stones on it
-  are an abandoned game. A consumer selecting positions to learn from matches on
-  `WinReason`, not on `is_contested()` alone.
-
-  `GameSpec::ply_cap` is nonzero by type. Adjudication checks a placement's win
-  before the cap, so a win on the capping placement is a win, not a draw. The
-  cap is only tested on a placement that ended the mover's turn, so a cap
-  falling mid-turn stops the game one placement later rather than giving one
-  seat a half turn. Driver failures retain the `Player` and `Failure` in
-  `NoContest::SeatFailure`; the no-contest policy declines to charge the
-  failure to either seat without erasing where it happened.
-
-- **Diagnostics are opaque and actually persisted.** A seat attaches bytes; the
-  game stores them verbatim and never parses them. The field is only worth
-  having if it reaches the record — a diagnostics channel that is documented but
-  dropped pushes every model package onto its own shard-writing path that
-  bypasses the runner entirely.
-
-  `PlyRecord` stores facts that vary by placement. The match-wide thinking
-  budget remains in `GameSpec` rather than being repeated in every record.
-
-## Not built yet
-
-| Thing | Blocked on |
-| --- | --- |
-| Wire protocol and transport | C1, C2 — line-delimited stdio over a handshake pinning protocol, rules, and action-order versions |
-| Seed ownership | B4. Deliberately absent rather than decorative — replay determinism comes from the stored action list, so a seed field would reproduce nothing. `hexo-search`'s sessions take a seed and `hexo-bot` draws one from entropy per game; nothing mints or records one |
+The crate is a library state machine and has no standalone executable.
+Use `hexo-player::Table` for a blocking loop or the `hexo-bot` driver for
+batched model sessions.
 
 ## Connections
 
-- Depends on `hexo-engine` for rules and state.
-- A driver — in-process, subprocess, or container — sits between `Game` and the
-  seats. The runner never learns what a model is. `hexo-bot`'s driver is the
-  in-process one, and it advances `Game` directly.
-- `hexo-records` is the byte layout of the shapes defined here — `GameSpec`,
-  `MatchResult`, `PlyRecord` — and adds no field this crate does not have.
+- `crates/hexo-engine` owns legal moves, wins, canonical position state, and
+  position hashing.
+- `crates/hexo-player` provides a blocking driver around `Game`.
+- `crates/hexo-search` authors `Decision` values through nonblocking sessions.
+- `crates/hexo-records` serializes `GameSpec`, `MatchResult`, and `PlyRecord`.
+- `crates/hexo-bot` owns the concurrent driver and process lifecycle.
+- The normative runner obligations are in
+  [`docs/CONTAINER_SPEC.md`](../../docs/CONTAINER_SPEC.md).
+
+## Invariants & gotchas
+
+- `Game` owns the single canonical position and exposes no mutable position
+  reference.
+- `submit` is the only public operation that can advance a game.
+- `Game::step` returns either one outstanding decision request or the finished
+  result.
+- Every decision request carries the current seat, generation, and budget.
+- The runner states the budget; the driver and seat enforce it.
+- A reply with a stale or future generation is rejected without changing the
+  game.
+- A placement decision must echo the hash of the position the seat used.
+- A hash mismatch is a retryable `SubmitError::Desync`; the game remains live
+  at the same generation.
+- An illegal placement is adjudicated as a match result, not returned as a
+  submission error.
+- Engine representation-limit failures produce `NoContest::EngineLimit`.
+- `FailurePolicy` controls whether a seat failure forfeits or produces a
+  no-contest result.
+- Diagnostics are opaque bytes and are stored verbatim in `PlyRecord`.
+- `prefix()` decodes the accepted `ActionId` sequence; `Position` itself has no
+  history.
+- Consecutive accepted plies may belong to the same seat.
+- A placement win is adjudicated before the ply cap.
+- The ply cap is applied at a completed turn boundary.
+- `GameSpec::ply_cap` is nonzero by type.
+- `MatchResult::is_contested` classifies verdicts; it does not classify
+  suitability as training data.
+- Result reasons retain the seat, action, engine error, or desync hashes needed
+  to interpret the outcome.

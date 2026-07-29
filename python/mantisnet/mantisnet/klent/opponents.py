@@ -1,10 +1,8 @@
-"""Evaluation opponents: one chooser seam, with SealBot as an adapter.
+"""Evaluation-opponent contract and the SealBot adapter.
 
-An opponent is only an identity (``name`` plus strength-defining ``config``)
-and ``make_chooser(ply_cap)``. A future champion network therefore needs one
-adapter whose chooser batches its own forwards; the in-loop evaluation and
-offline sweep can both seat it without another match implementation or a
-telemetry change.
+An opponent provides an identity (``name`` and strength-defining ``config``)
+and ``make_chooser(ply_cap)``. Both in-loop evaluation and offline sweeps use
+this interface.
 
 Chooser objects may expose per-game lifecycle hooks when they maintain a
 second rules state. The generic loop merely calls those hooks. SealBot uses
@@ -25,8 +23,7 @@ from typing import Protocol
 import numpy as np
 
 _COORD_LIMIT = 60
-# Each MinimaxBot owns a ~32 MiB transposition table. Construct and release
-# bots one wave at a time so a large match cannot multiply that by its games.
+# MinimaxBot instances are scoped to a wave to bound transposition-table memory.
 _SEALBOT_WAVE = 16
 _loaded_variant: str | None = None
 
@@ -81,9 +78,7 @@ def _mirror(game_mod, moves):
     return game
 
 
-# An opponent's admission of an unplayable proposal: returned in a move's
-# place, it ends that game as a model win, recorded as a forfeit. The generic
-# loop scores it; the chooser that returns it has already dropped the game.
+# An unplayable opponent proposal ends the game as a recorded forfeit.
 FORFEIT = object()
 
 
@@ -143,18 +138,12 @@ class _SealBotChooser:
                 move, *state["pending"] = self._consult(state, position)
             legal = set(position.legal_moves())
             if move not in legal:
-                # SealBot's search occasionally proposes a cell from nowhere
-                # near the stones. Its own rules accept any empty cell, so
-                # the fault is upstream of legality — a poisoned line out of
-                # its transposition table or its timeout rollback — and a
-                # fresh consultation of the same bot on the same state was
-                # observed to recover. Retry once; a second offence forfeits
-                # the game rather than killing an unattended run.
+                # The second unusable proposal forfeits after one retry.
                 self.retries += 1
                 state["pending"].clear()
                 move, *state["pending"] = self._consult(state, position)
             if move not in legal:
-                state["bot"] = None  # release the ~32 MiB transposition table
+                state["bot"] = None  # Release the per-game transposition table.
                 self.games.pop(id(position))
                 moves.append(FORFEIT)
                 continue
@@ -172,7 +161,7 @@ class _SealBotChooser:
             assert final.game_over and final.winner.value - 1 == position.winner, (
                 "rules mismatch: the two implementations name different winners"
             )
-        state["bot"] = None  # release the ~32 MiB transposition table
+        state["bot"] = None  # Release the per-game transposition table.
         return {"depths": state["depths"]}
 
 
@@ -303,7 +292,7 @@ def opponent_match(
             for idx in indices:
                 state = wave[idx]
                 if state["forfeit"]:
-                    continue  # ended; the forfeiting chooser dropped its side
+                    continue  # The forfeiting chooser already dropped its state.
                 if state["pos"].is_terminal:
                     pass
                 elif len(state["moves"]) >= ply_cap:
@@ -359,7 +348,7 @@ def opponent_match(
     for state in states:
         if state["forfeit"]:
             forfeits += 1
-            game_score = 1.0  # an unplayable proposal loses the game
+            game_score = 1.0  # An unplayable proposal forfeits the game.
         elif state["capped"]:
             capped += 1
             game_score = 0.5

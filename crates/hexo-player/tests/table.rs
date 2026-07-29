@@ -1,4 +1,4 @@
-//! The player seam: dispatch, the driver, and what the driver deliberately does not do.
+//! Player dispatch, table submission, and sweep contracts.
 
 use hexo_engine::{Action, HexCoord, MoveError, Player as Seat, Position};
 use hexo_player::{Mode, Model, ModelPlayer, Player, Table, sweep};
@@ -103,11 +103,7 @@ impl Player for Recorder {
     }
 }
 
-/// Plays off a mirror rebuilt from the record rather than off the canonical board,
-/// which is the whole reason a seat is handed the game and not a position — and
-/// attests the *mirror's* hash, which the game accepts exactly because the record
-/// replays to the canonical position. A diverged mirror would end the game as a
-/// desync here, so the run itself is the parity check.
+/// Selects from a mirror rebuilt from the record and attests the mirror hash.
 #[derive(Clone, Debug, Default)]
 struct Mirrorer {
     plies_seen: Vec<usize>,
@@ -214,8 +210,7 @@ fn a_table_reports_the_win_it_ended_on() {
     assert!(result.is_contested());
 }
 
-/// The driver submits what the seat returned. Checking legality first would be a
-/// second implementation of the rules, and the game already adjudicates it.
+/// The driver submits the seat's action without pre-validating legality.
 #[test]
 fn an_illegal_choice_is_adjudicated_rather_than_prevented() {
     let seats: [Box<dyn Player>; 2] = [Box::new(Lowest), Box::new(AlwaysOrigin)];
@@ -239,8 +234,7 @@ fn an_illegal_choice_is_adjudicated_rather_than_prevented() {
     );
 }
 
-/// The reason `choose` returns the whole `Decision`: the seat's annotations reach
-/// the record verbatim, and nothing downstream could have invented them.
+/// Seat-authored diagnostics reach the record verbatim.
 #[test]
 fn seat_diagnostics_reach_the_record() {
     let seats: [Box<dyn Player>; 2] = [Box::new(Annotator), Box::new(Lowest)];
@@ -261,8 +255,7 @@ fn seat_diagnostics_reach_the_record() {
     }
 }
 
-/// A wrong attestation is a seat failure like any other, adjudicated by policy —
-/// not masked by the driver echoing the canonical hash on the seat's behalf.
+/// A wrong attestation is reported as a desync failure and adjudicated by policy.
 #[test]
 fn a_wrong_attestation_forfeits_the_seat_under_the_default_policy() {
     let seats: [Box<dyn Player>; 2] = [Box::new(WrongEcho), Box::new(Lowest)];
@@ -324,8 +317,7 @@ fn a_step_after_the_end_changes_nothing() {
     assert_eq!(table.game().plies().len(), plies);
 }
 
-/// A seat that is only ever asked as one side is the whole indexing claim, so this
-/// records which side it saw rather than merely counting calls.
+/// Record the seat identity used for each call.
 #[test]
 fn each_seat_is_only_ever_asked_as_its_own_side() {
     let mut table = Table::new(spec(9), [Recorder::default(), Recorder::default()]);
@@ -349,8 +341,7 @@ fn each_seat_is_only_ever_asked_as_its_own_side() {
     assert_eq!((p0.seen.len(), p1.seen.len()), (5, 4));
 }
 
-/// The seam hands over the whole game, not a position and a budget, so a seat can
-/// build move-order features from the record — which is the only history there is.
+/// A seat can rebuild move-order features from the game's ply record.
 #[test]
 fn a_seat_can_replay_the_record_it_is_handed() {
     let mut table = Table::new(spec(9), [Mirrorer::default(), Mirrorer::default()]);
@@ -402,8 +393,7 @@ fn only_the_bound_mode_is_ever_called() {
     assert!(p1.model().eval_calls > 0);
 }
 
-/// The mixed-kind case the design exists for: a plain seat against a model-backed
-/// one. `[P; 2]` cannot hold two types, so this is what `Box<dyn Player>` is for.
+/// `Box<dyn Player>` permits two different player implementations in one table.
 #[test]
 fn a_plain_seat_can_face_a_model_backed_one() {
     let seats: [Box<dyn Player>; 2] = [

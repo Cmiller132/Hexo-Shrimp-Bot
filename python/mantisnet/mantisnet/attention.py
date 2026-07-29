@@ -19,13 +19,7 @@ except ImportError:
 
 _PAD_BIAS = -3.0e4
 
-# Fixed launch geometry keeps symbolic shape changes out of Triton's tuning
-# cache. On the target RTX 4070 Ti, bench_loop forward milliseconds at cohort
-# 1024 for 200/400 stones were: 32x32 s2 446.5/826.9, s3 464.7/859.9;
-# 32x64 s2 448.1/830.4, s3 448.3/827.2; 64x32 s2 452.2/822.4, s3
-# 444.3/822.1; 64x64 s2 444.6/823.3, s3 444.5/823.3. The selected 64x64
-# s3 stayed within 0.2% of the best long-T result and retained the 33.1 ms
-# 50-stone/256-position baseline.
+# Fixed launch geometry keeps symbolic shape changes out of Triton's tuning cache.
 _BLOCK_M = 64
 _BLOCK_N = 64
 _NUM_WARPS = 4

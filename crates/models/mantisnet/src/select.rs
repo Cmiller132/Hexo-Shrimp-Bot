@@ -39,7 +39,7 @@ fn diagnostics(evaluation: &Evaluation) -> Vec<u8> {
     bytes
 }
 
-/// Policy acting samples `pi_prime`; self-play additionally records its opinion.
+/// Policy acting samples `pi_prime`; self-play additionally records diagnostics.
 pub(crate) struct ActingPolicy {
     pub(crate) record_diagnostics: bool,
 }

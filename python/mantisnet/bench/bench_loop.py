@@ -1,24 +1,19 @@
-"""Production-workflow benchmarks for the KLENT loop.
+"""Benchmark the KLENT collection and fitting paths.
 
-Three modes, each replicating the real path rather than a proxy of it:
+The three modes are:
 
 ``sweep``   Stage costs — Rust collate, network forward, improve+sample —
-            over a (stone count × cohort size) grid, chunked under the real
-            memory budgets exactly as collection chunks them. Answers
-            "what does a position of T stones cost at cohort size B, and
-            in which stage".
+            over a (stone count × cohort size) grid, chunked under the
+            collection memory budgets.
 
-``collect`` A real ``Collector.collect`` call (checkpoint or scripted
-            evaluator), instrumented per lockstep step: per-phase busy
-            time, step trace, game-length distribution, and the carry left
-            in the slots. Answers "where does an iteration's wall clock
-            actually go". Phases overlap across the collector's pipeline
-            lanes, so their busy seconds can legitimately sum past wall
-            clock — full overlap is the design working.
+``collect`` A ``Collector.collect`` call with a checkpoint or scripted
+            evaluator, instrumented per lockstep step. It reports per-phase
+            busy time, a step trace, game-length distribution, and remaining
+            slot state. Overlapping phases can sum to more than wall time.
 
-``fit``     A real ``fit`` epoch over the corpus ``collect`` produced.
+``fit``     A ``fit`` epoch over the corpus produced by ``collect``.
 
-Run from python/mantisnet (the GPU must be free — stop any training run):
+Run from ``python/mantisnet`` with the selected device available:
 
     uv run python bench/bench_loop.py sweep --device cuda --compile
     uv run python bench/bench_loop.py collect --checkpoint runs/<r>/checkpoint_N.pt \
@@ -26,10 +21,9 @@ Run from python/mantisnet (the GPU must be free — stop any training run):
     uv run python bench/bench_loop.py fit --checkpoint runs/<r>/checkpoint_N.pt \
         --games 256 --cap 512
 
-Phase timing in ``collect`` wraps the seams the collector already calls
-(`_chunk_live`, `collate_positions`, the evaluator, `improved_policy`) so
-the production loop itself stays uninstrumented; the residual after those
-phases is engine advance plus Python bookkeeping.
+``collect`` times ``_chunk_live``, ``collate_positions``, the evaluator, and
+``improved_policy``. Residual time contains engine advance and Python
+bookkeeping.
 """
 
 from __future__ import annotations
@@ -54,8 +48,7 @@ from mantisnet.klent.train import KlentConfig, fit, network_evaluate
 
 def positions_at(stones: int, count: int, seed: int) -> list[hexo_py.Position]:
     """``count`` live positions of exactly ``stones`` stones, by uniform
-    random legal playout (which essentially never terminates — the property
-    that makes long positions generable at all)."""
+    random legal playout, retrying playouts that terminate early."""
     rng = np.random.default_rng(seed)
     out: list[hexo_py.Position] = []
     while len(out) < count:
@@ -148,16 +141,15 @@ def bench_sweep(args) -> None:
 
 
 class _PhaseTimer:
-    """Wraps the seams the collector calls, accumulating per-phase busy
-    time and a per-step trace. The seams run on different pipeline lanes,
-    so a lock guards the sums and the phases measure *busy* time — under
-    full overlap they sum past wall clock, and the gap between their sum
-    and the wall is exactly the overlap won."""
+    """Accumulate collector per-phase busy time and a per-step trace.
+
+    The lock protects counters updated by separate pipeline lanes; overlapping
+    phase times may sum to more than wall time."""
 
     def __init__(self, evaluate):
         self._evaluate = evaluate
         self.phases = {"chunk": 0.0, "collate": 0.0, "network": 0.0, "improve": 0.0}
-        self.steps: list[float] = []  # step-start times
+        self.steps: list[float] = []  # Monotonic time at each step start.
         self._lock = threading.Lock()
         self._chunk_live = selfplay_mod._chunk_live
         self._collate = selfplay_mod.collate_positions
@@ -264,7 +256,7 @@ def bench_fit(args) -> None:
     model = _load_or_fresh(args)
     cfg = _cfg(args)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
-    fit(model, samples, optimizer, cfg, np.random.default_rng(0))  # compile warm
+    fit(model, samples, optimizer, cfg, np.random.default_rng(0))  # Exclude compilation from timing.
     _sync(args.device)
     t0 = time.perf_counter()
     out = fit(model, samples, optimizer, cfg, np.random.default_rng(1))

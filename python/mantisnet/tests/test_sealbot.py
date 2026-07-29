@@ -1,8 +1,8 @@
 """SealBot integration: two independent rule implementations must agree.
 
 These tests need a SealBot checkout with a built ``minimax_cpp``; point
-``SEALBOT_ROOT`` at one to enable them. Elsewhere they skip with this reason
-visible — the checkout is machine-local, deliberately not vendored here.
+``SEALBOT_ROOT`` at one to enable them. They skip when that external checkout
+is unavailable.
 """
 
 from __future__ import annotations
@@ -22,8 +22,7 @@ pytestmark = pytest.mark.skipif(
 
 def test_rules_agree_over_heuristic_games():
     """Every hexo-engine game replays into SealBot's HexGame placement for
-    placement — same legality, same turn structure, same winner. A second,
-    unrelated rules implementation acting as an oracle."""
+    placement with the same legality, turn structure, and winner."""
     from mantisnet.klent.sealbot import _mirror, load_sealbot
 
     from .heuristic import heuristic_game
@@ -44,8 +43,8 @@ def test_rules_agree_over_heuristic_games():
 
 
 def test_sealbot_match_smoke():
-    """A tiny untrained model survives a real paired match: legal moves
-    only, agreed winners, sane accounting."""
+    """A tiny untrained model completes a paired match with legal moves,
+    agreed winners, and internally consistent accounting."""
     import torch
 
     from mantisnet import MantisConfig, MantisNet
@@ -55,9 +54,7 @@ def test_sealbot_match_smoke():
     model = MantisNet(
         MantisConfig(h=32, blocks=1, heads=2, value_queries=2, value_bins=5)
     )
-    # The zero-init policy head argmaxes to the first legal cell every ply —
-    # a monotone march off SealBot's board. Untrained-but-varied is the
-    # scenario wanted here, so give the head real weights.
+    # Random policy-head weights avoid the zero head's first-legal sequence.
     torch.nn.init.normal_(model.mlp_p.out.weight, std=0.1)
     result, per_game = sealbot_match(
         model, "cpu", games=2, ply_cap=80, rng=np.random.default_rng(0),
@@ -83,9 +80,8 @@ def test_sealbot_match_smoke():
 
 
 def test_a_real_match_lands_in_the_telemetry_database(tmp_path):
-    """The capture side of the yardstick: a match becomes one opponent row,
-    one match row, and its games — replayable, and keyed on the opponent
-    rather than on SealBot being the opponent."""
+    """A match produces one opponent row, one match row, and replayable games
+    keyed by opponent identity."""
     import torch
 
     from mantisnet import MantisConfig, MantisNet

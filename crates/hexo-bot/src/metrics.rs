@@ -90,7 +90,7 @@ pub(crate) struct EvalResult {
     pub losses: usize,
     /// Games that ended on the ply cap.
     pub draws: usize,
-    /// Games that measured nothing.
+    /// Games adjudicated as no-contest.
     pub no_contests: usize,
 }
 
@@ -168,11 +168,8 @@ impl EpochMetrics {
 
     /// Append this epoch's line to the run's `metrics.jsonl`.
     ///
-    /// Appended as it happens rather than written at the end, because
-    /// `docs/CONTAINER_SPEC.md` §8.1 wants a run that has been up for days to be
-    /// observable without being stopped, and one line per epoch in a file is the
-    /// whole of that requirement — no dashboard, no metrics service, no scraping
-    /// endpoint.
+    /// Each completed epoch is appended immediately, making committed metrics
+    /// observable while the run continues (`docs/CONTAINER_SPEC.md` §8.1).
     ///
     /// # Errors
     ///

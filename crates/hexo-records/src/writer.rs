@@ -1,4 +1,4 @@
-//! Writing a shard: to a temporary name, then renamed into place.
+//! Atomic shard writer.
 
 use crate::error::RecordError;
 use crate::format::{ENTRY_PREFIX_BYTES, encode_game, encode_header};
@@ -11,11 +11,8 @@ use std::path::{Path, PathBuf};
 ///
 /// The bytes go to `<path>.tmp` and arrive at `path` only when
 /// [`finalize`](ShardWriter::finalize) has patched the true game count in and
-/// synced the file, so a reader never sees a shard that is missing games or
-/// states a count it does not hold. A writer that is dropped instead — because
-/// the run crashed, or the epoch was abandoned — removes its temporary file and
-/// leaves nothing at `path` at all. That is what makes a crashed run leave a
-/// partial directory rather than a corrupt shard.
+/// synced the file. Dropping an unfinalized writer removes its temporary file
+/// best-effort and never creates `path`.
 pub struct ShardWriter {
     /// `None` once the file has been closed, by `finalize` or by `drop`.
     file: Option<BufWriter<File>>,
@@ -37,9 +34,7 @@ impl ShardWriter {
     /// # Errors
     ///
     /// [`RecordError::HeaderGameCount`] if `header` presets a game count;
-    /// [`RecordError::AlreadyExists`] if `path` or `<path>.tmp` is taken — a
-    /// shard is written once, and a name that is already in use is either
-    /// another writer's or a previous run's, never this one's to overwrite;
+    /// [`RecordError::AlreadyExists`] if `path` or `<path>.tmp` exists;
     /// [`RecordError::StringTooLong`] for a header string past the format's
     /// `u16` length; [`RecordError::Io`] for anything the filesystem refuses.
     pub fn create(path: impl AsRef<Path>, header: &ShardHeader) -> Result<Self, RecordError> {
@@ -54,10 +49,8 @@ impl ShardWriter {
         tmp.push(".tmp");
         let tmp = PathBuf::from(tmp);
 
-        // The destination is checked here rather than left to the rename, where
-        // the platforms disagree: a POSIX rename replaces an existing file and a
-        // Windows one refuses. Refusing up front is the same answer everywhere,
-        // and it comes before a whole shard has been written rather than after.
+        // Check the destination before writing to make overwrite behavior
+        // platform-independent.
         if path.exists() {
             return Err(RecordError::AlreadyExists { path });
         }
@@ -143,9 +136,7 @@ impl ShardWriter {
 
     /// Finish the temporary file and move it to its final name.
     ///
-    /// The handle is closed before the rename: Windows will not rename a file
-    /// that is still open, and a closed handle is what makes the durability
-    /// claim — everything is on disk before anything is at `path`.
+    /// The handle is synced and closed before the rename.
     fn commit(
         mut file: BufWriter<File>,
         tmp: &Path,
@@ -167,8 +158,7 @@ impl ShardWriter {
 }
 
 impl core::fmt::Debug for ShardWriter {
-    /// Where the shard is going and how much of it is written. The encoding
-    /// buffer is left out: it is scratch, and it can be megabytes.
+    /// Report paths, game count, and open state without the scratch buffer.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ShardWriter")
             .field("path", &self.path)
@@ -180,10 +170,7 @@ impl core::fmt::Debug for ShardWriter {
 }
 
 impl Drop for ShardWriter {
-    /// A writer that was never finalized leaves nothing behind: the file at
-    /// `<path>.tmp` is closed and removed best-effort, and `path` was never
-    /// written to. Removal is best-effort because a `Drop` has nowhere to report
-    /// a failure to, and a leftover `.tmp` is inert — no reader will open it.
+    /// Close and remove an unfinalized temporary file best-effort.
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
             drop(file);

@@ -1,4 +1,4 @@
-//! What a trainable player must provide, and how it becomes a [`Player`].
+//! Trainable-player modes and their [`Player`] adapter.
 
 use crate::player::Player;
 use hexo_runner::{Decision, Game};
@@ -12,21 +12,15 @@ pub enum Mode {
     Eval,
 }
 
-/// A trainable player. Encoding, search, and move selection are all its own.
+/// A trainable player with distinct self-play and evaluation policies.
 ///
-/// Two methods rather than one taking a [`Mode`], because a mode argument can be
-/// ignored: that compiles, passes, and yields a self-play run of one repeated
-/// game.
-///
-/// Both return the whole [`Decision`], because the model is where its extra
-/// fields originate: the `diagnostics` are the training annotations — visit
-/// counts, value targets, whatever the trainer wants on the record — and the
-/// `zobrist` attests the position the model chose from (see [`Player::choose`]).
+/// Both methods return a complete [`Decision`], including the model-authored
+/// position hash and optional diagnostics.
 pub trait Model {
-    /// Choose by sampling. Must vary between calls, or the training set collapses.
+    /// Choose under the model's self-play policy.
     fn self_play_move(&mut self, game: &Game) -> Decision;
 
-    /// Choose near-best. Not argmax — two deterministic seats replay one game.
+    /// Choose under the model's evaluation policy.
     fn eval_move(&mut self, game: &Game) -> Decision;
 }
 

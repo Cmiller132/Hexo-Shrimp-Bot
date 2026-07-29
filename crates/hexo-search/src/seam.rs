@@ -1,27 +1,19 @@
-//! The evaluator seam: what a network answer is, who turns positions into
-//! bytes, who turns bytes into answers, and the arena a batch is built in.
+//! Position encoding, evaluator outputs, and reusable encoded batches.
 
 use crate::session::LeafId;
 use hexo_engine::Position;
 
 /// One network answer for one evaluated position.
 ///
-/// Both fields carry a convention that is **normative for every model package**,
-/// because both are indexed or signed by something the package cannot see from
-/// its own side:
+/// Both fields follow conventions required of every model package:
 ///
 /// - `priors` are in the engine's canonical legal order. Entry `i` belongs to
 ///   `nth_legal(i)` of the position that was evaluated, and the length must
-///   equal that position's `legal_count()`. The engine owns that ordering in
-///   both directions precisely so that training, search, and serving cannot each
-///   derive a private copy of it — a divergence there is silent, because the
-///   network keeps training against scrambled targets.
+///   equal that position's `legal_count()`.
 /// - `value` is the expected outcome from the perspective of the **side to move
 ///   at the evaluated position**, not of the seat that is searching and not of
-///   `P0`. In this game a turn is two placements, so consecutive plies of the
-///   tree can have the same mover; a value signed by depth parity is wrong here
-///   in a way it would not be in chess or Go, and the search compares movers
-///   rather than counting plies for exactly that reason.
+///   `P0`. Consecutive plies may have the same mover, so search signs values by
+///   comparing movers rather than by depth parity.
 ///
 /// A session checks both on delivery: a length mismatch or an out-of-range value
 /// panics rather than being clamped or padded.
@@ -37,9 +29,7 @@ pub struct Evaluation {
 }
 
 impl Evaluation {
-    /// Hold this answer to the two conventions on [`Evaluation`], naming `leaf`
-    /// so a driver batching a thousand games can find the position that produced
-    /// it.
+    /// Validate this answer against [`Evaluation`]'s conventions.
     ///
     /// # Panics
     ///
@@ -73,17 +63,10 @@ impl Evaluation {
 
 /// Package-owned: turns a position into bytes.
 ///
-/// This runs **worker-side**, inside the callback a session hands its leaf
-/// position to. Two reasons it lives there rather than next to the evaluator.
-/// The position is transient make/unmake state that is valid only for the
-/// duration of that callback, so there is nothing to queue but bytes. And
-/// encoding is the CPU half of the work: run on the actor threads it scales with
-/// cores, run on the batcher thread it serialises the one place the whole
-/// process converges.
+/// Encoding runs inside the leaf callback while the transient position is
+/// valid. Only the encoded bytes may be queued after that callback returns.
 ///
-/// `&self` rather than `&mut self`: an encoder is a description of a feature
-/// layout, and one description is shared by every worker. Scratch space belongs
-/// in `out`.
+/// Encoders are shared by reference; scratch space belongs in `out`.
 pub trait Encoder: Send {
     /// Append the encoding of `position` to `out`.
     ///
@@ -94,30 +77,19 @@ pub trait Encoder: Send {
 
 /// Package-owned: answers one whole batch in one call.
 ///
-/// That call is the single GPU or Python crossing per batch, which is the whole
-/// point of the seam. One crossing per 256 leaves instead of 256 crossings turns
-/// the GIL from a wall into a rounding error, and it is the shape a GPU wants
-/// anyway.
-///
-/// `&mut self` because an implementation owns a session, a device buffer, or an
-/// interpreter handle, and there is exactly one batcher per device.
+/// Implementations may own mutable runtime, interpreter, or device state.
 pub trait Evaluator: Send {
     /// Append one [`Evaluation`] per item of `batch`, in batch order.
     ///
-    /// An implementation appends and never clears `out`; the caller decides when
-    /// the answer buffer is recycled. Producing a different number of answers
-    /// than `batch.len()` is a package bug, and the driver that pairs them back
-    /// up with their [`LeafId`]s is where it surfaces.
+    /// Implementations append and never clear `out`. They must append exactly
+    /// `batch.len()` answers.
     fn evaluate(&mut self, batch: &EncodedBatch, out: &mut Vec<Evaluation>);
 }
 
 /// A reusable arena of encoded items: one byte buffer plus the offsets that cut
 /// it into items, so assembling a batch costs no per-item allocation.
 ///
-/// Ragged by construction. Items are not required to be the same length, because
-/// a fixed action crop is exactly what this workspace refuses — the board has no
-/// edge, so an encoder that wanted to emit a per-action row emits `n` of them for
-/// this position and `m` for the next.
+/// Item lengths may differ.
 #[derive(Clone, Debug)]
 pub struct EncodedBatch {
     data: Vec<u8>,
@@ -142,8 +114,7 @@ impl EncodedBatch {
         }
     }
 
-    /// An empty batch sized for `items` items totalling `bytes` bytes, so a
-    /// driver that knows its batch size pays its allocations once.
+    /// An empty batch reserved for `items` items totalling `bytes` bytes.
     #[must_use]
     pub fn with_capacity(items: usize, bytes: usize) -> Self {
         let mut offsets = Vec::with_capacity(items + 1);
@@ -159,9 +130,7 @@ impl EncodedBatch {
     ///
     /// # Panics
     ///
-    /// If the encoder shrank the arena. `out` holds every earlier item, so an
-    /// encoder that clears or truncates it has destroyed the batch, and a
-    /// silently short item would surface as somebody else's priors.
+    /// If the encoder shrinks the arena containing prior items.
     pub fn push_with<E: Encoder + ?Sized>(&mut self, encoder: &E, position: &Position) -> usize {
         let start = self.data.len();
         encoder.encode(position, &mut self.data);
@@ -177,11 +146,8 @@ impl EncodedBatch {
 
     /// Append one already-encoded item verbatim, returning its index.
     ///
-    /// [`EncodedBatch::push_with`] is the worker-side append, taken while the
-    /// leaf position still exists. By the time those bytes are merged into a
-    /// device-bound batch on a batcher thread the position is gone — which is
-    /// the point of encoding worker-side — so the merge appends the bytes
-    /// themselves rather than pretending to re-encode.
+    /// This supports merging worker-encoded items after their source positions
+    /// are no longer available.
     pub fn push_bytes(&mut self, item: &[u8]) -> usize {
         self.data.extend_from_slice(item);
         self.offsets.push(self.data.len());

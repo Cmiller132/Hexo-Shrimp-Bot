@@ -90,11 +90,7 @@ pub enum BotError {
     },
     /// A checkpoint directory exists but this build cannot load it.
     ///
-    /// Deliberately not repaired by deleting it. A checkpoint is placed by
-    /// renaming a finished directory into position, so one that is present and
-    /// unloadable was not left half-written by this code, and throwing away
-    /// weights nobody asked to throw away is not a decision a resume gets to
-    /// make.
+    /// Resume retains placed but unloadable checkpoints for explicit recovery.
     UnloadableCheckpoint {
         /// The checkpoint directory.
         path: PathBuf,

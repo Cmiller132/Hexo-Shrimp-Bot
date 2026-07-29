@@ -1,11 +1,7 @@
-//! Move selection and the diagnostics format: the two things `hexo-search`
-//! ships none of, and this package owns.
+//! Mock-package move selection and diagnostics encoding.
 //!
-//! Four selectors, two per session shape, because the two modes are two
-//! contracts. A self-play seat samples broadly and writes its distribution into
-//! the record; an eval seat samples sharply and writes nothing. Neither is
-//! argmax: two deterministic seats replay one game, so a thousand-game match
-//! would carry no more information than one.
+//! Self-play selectors sample the source distribution and emit diagnostics.
+//! Evaluation selectors sample cubed weights and emit no diagnostics.
 
 use crate::weights::mix;
 use hexo_engine::{Action, Position};
@@ -22,24 +18,15 @@ pub(crate) const TAG_PRIORS: u8 = 1;
 /// How sharply an eval seat samples: it draws proportional to the **cube** of
 /// each candidate's weight.
 ///
-/// A cube rather than an argmax, and rather than a fourth power, for two
-/// reasons. Sharp enough that the move a search actually preferred wins the
-/// overwhelming majority of the time, so an eval match measures the checkpoint
-/// and not the sampler; soft enough that a close second is played often enough
-/// for a thousand-game match to be a thousand different games. An odd power also
-/// needs no absolute value: visits and priors are both non-negative, so the
-/// ordering survives untouched.
+/// Visits and priors are non-negative, so the odd power preserves ordering
+/// without an absolute-value transform.
 const EVAL_POWER: i32 = 3;
 
 /// Draw an index in proportion to `weights`.
 ///
 /// # Panics
 ///
-/// If the weights do not sum to something positive. Every table this package
-/// hands in is either a visit count summing to the search budget or a prior from
-/// [`crate::seam::MockEvaluator`], which is strictly positive — so a
-/// non-positive total means the search or the evaluator broke, and silently
-/// falling back to a uniform draw would turn that into a seat that still plays.
+/// If the weights do not have a finite, positive sum.
 fn sample(weights: &[f64], rng: &mut SplitMix64) -> usize {
     let total: f64 = weights.iter().sum();
     assert!(
@@ -88,12 +75,7 @@ fn encode_priors(root: &Position, evaluation: &Evaluation) -> Vec<u8> {
     out
 }
 
-/// A self-play seat behind a tree search: samples proportional to visits, and
-/// records the whole visit table.
-///
-/// Proportional rather than sharpened because the visit distribution *is* the
-/// policy target, and a self-play run that only ever played its own argmax would
-/// collect a target it never explored around.
+/// A self-play tree-search selector that samples visits and records the table.
 pub(crate) struct SelfPlaySearch;
 
 impl SelectFromSearch for SelfPlaySearch {
@@ -111,13 +93,8 @@ impl SelectFromSearch for SelfPlaySearch {
     }
 }
 
-/// An eval seat behind a tree search: samples proportional to the cube of the
-/// visits, and records nothing.
-///
-/// Nothing, because the annotations exist to be trained on and an eval game
-/// trains nothing. Its shard is written to be read for results — which
-/// checkpoint beat which, and how — and diagnostics on it would be bytes nobody
-/// consumes taking up the largest field in the format.
+/// An evaluation tree-search selector that samples cubed visits and records no
+/// diagnostics.
 pub(crate) struct EvalSearch;
 
 impl SelectFromSearch for EvalSearch {
@@ -171,15 +148,7 @@ impl SelectFromPolicy for EvalPolicy {
     }
 }
 
-/// The seed a session is constructed with, derived from the loaded salt and a
-/// per-package serial.
-///
-/// `docs/CONTAINER_SPEC.md` §12 leaves seeding to the driver — a session takes a
-/// seed at construction and exposes `reseed`, and nothing above that seam exists
-/// yet — so the package may construct with any seed it likes. What it may not do
-/// is hand two concurrent sessions the same stream, which is why the serial is
-/// here: a driver that forgets to reseed gets sessions that differ from each
-/// other, rather than a self-play run of one repeated game.
+/// Derive a session's initial seed from the loaded salt and package serial.
 pub(crate) const fn session_seed(salt: u64, serial: u64) -> u64 {
     mix(salt ^ serial.wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23))
 }

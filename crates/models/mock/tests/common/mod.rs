@@ -1,9 +1,7 @@
-//! Driving whole games with the package's own sessions, the way `hexo-bot`'s
-//! driver will: pump for leaves, encode them into one batch, cross once, resume.
+//! Whole-game test driver for mock-package sessions.
 //!
-//! The loop is `hexo-search`'s doctest with one session per seat instead of one,
-//! and it is deliberately not in the library: a driver is `hexo-bot`'s, and a
-//! package that shipped one would be the second implementation of it.
+//! Each round pumps leaves, encodes one batch, evaluates once, and resumes the
+//! originating sessions.
 
 #![allow(dead_code)]
 
@@ -37,8 +35,7 @@ pub fn loaded(dir: &Path, config: &str) -> Result<MockPackage, PackageError> {
 
 /// Play one whole game with two sessions and one evaluator.
 ///
-/// Every round assembles a real [`EncodedBatch`] and answers it with one
-/// `evaluate` call, so the bytes really do cross the seam.
+/// Every round assembles one [`EncodedBatch`] and performs one `evaluate` call.
 pub fn play(
     encoder: &dyn Encoder,
     evaluator: &mut dyn Evaluator,
@@ -129,8 +126,7 @@ pub fn write_shard(path: &Path, epoch: u32, games: &[Game]) -> PathBuf {
     write_shard_for(path, epoch, games, "mock")
 }
 
-/// The same, with the header naming `package` — so a test can produce a shard
-/// that is somebody else's.
+/// The same, with the header naming `package`.
 pub fn write_shard_for(path: &Path, epoch: u32, games: &[Game], package: &str) -> PathBuf {
     let header = ShardHeader {
         mode: ShardMode::SelfPlay,
@@ -170,11 +166,9 @@ pub struct Diagnostics {
     pub entries: Vec<Entry>,
 }
 
-/// Read the package's diagnostics format, exactly as its README states it.
+/// Decode the package's documented diagnostics format.
 ///
-/// Written out here rather than exported from the crate on purpose: a decoder
-/// derived from the encoder would agree with it by construction, and would stop
-/// being able to notice that the format drifted from what is documented.
+/// This independent test decoder freezes the documented byte layout.
 pub fn decode_diagnostics(bytes: &[u8]) -> Diagnostics {
     let tag = bytes[0];
     let count = u32::from_le_bytes(bytes[1..5].try_into().expect("four bytes")) as usize;

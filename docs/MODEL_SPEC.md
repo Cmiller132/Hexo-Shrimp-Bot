@@ -7,10 +7,8 @@ where a training target defines what an output *means*. Game rules are owned
 by `docs/ENGINE_SPEC.md`; where this document restates a rule, the engine
 spec wins.
 
-The architecture in this document is a decision. Dimensions and table sizes
-are named parameters (§2) so size tiers can be swept without touching the
-architecture; each has a suggested default, and "the default model" below
-means the model at those defaults.
+Dimensions and table sizes are named parameters (§2). "The default model"
+means the model instantiated with the defaults listed there.
 
 ---
 
@@ -33,6 +31,9 @@ inputs, and no nodes for empty cells.
   is computed on demand from the live windows passing through it (or from a
   background path when there are none). Trunk cost therefore scales with
   stones and live windows, not with the legal halo.
+- The **action-value** head is an independently parameterized decoder with the
+  same routing as policy. It emits one tanh-bounded scalar per legal cell
+  (appendix B).
 - The **value** head reads the board through multi-query attention over the
   window embeddings and outputs a binned distribution over `[−1, 1]`,
   decoded to a scalar in-forward.
@@ -44,7 +45,7 @@ group D6, so the whole model is D6-invariant by construction (§8).
 
 ## 2. Named parameters
 
-| Symbol | Meaning | Suggested default |
+| Symbol | Meaning | Default |
 |---|---|---|
 | `H` | embedding width, everywhere | 128 |
 | `B` | number of trunk blocks | 4 |
@@ -53,15 +54,15 @@ group D6, so the whole model is D6-invariant by construction (§8).
 | `D_MAX` | hex-distance clamp for the attention bias table | 12 |
 | `Q` | learned value-readout queries | 4 |
 | `K` | value bins | 65 |
-| `P_H` | policy decoder MLP hidden width | 128 |
+| `P_H` | policy and action-value decoder MLP hidden width | 128 |
 | `V_H` | value MLP hidden width | 128 |
 | `DROPOUT` | dropout probability (trunk sub-blocks) | 0.0 |
 
 Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
 slot classes = 3 (§4.3), `moves_remaining ∈ {1, 2}`.
 
-Rough size at defaults: ≈ 16·H² per block ⇒ ≈ 1.05 M trunk + ≈ 0.15 M heads
-≈ **1.2 M parameters**.
+The default configuration has 1,249,699 parameters: 1,063,648 in the four
+trunk blocks and 186,051 across input/final parameters and the three heads.
 
 ---
 
@@ -94,9 +95,8 @@ such positions are terminal and are never evaluated, so live windows carry
 Builder: enumerate, for each stone, the 18 windows through it (3 axes × 6
 offsets — the same walk the engine's win check performs), deduplicate by
 window identity (axis + anchor cell), discard mixed. The window count is
-therefore bounded by `18 · n_stones` before deduplication and death, and is
-far lower in contested regions. Terminal positions are a builder error, not
-a silent default.
+therefore bounded by `18 · n_stones` before deduplication and death.
+Terminal positions are a builder error, not a silent default.
 
 Each window's initial embedding is a table lookup on
 `(colour, canonical occupancy pattern)`:
@@ -106,12 +106,7 @@ Each window's initial embedding is a table lookup on
 - canonicalized under reversal: `canon(m) = min(m, reverse6(m))`, because a
   reflection reverses slot order. There are 34 canonical patterns of 1–5
   bits — the 62 nonempty, nonfull masks fold to `(62 + 6 palindromes) / 2`
-  orbits — so the table has `2 × 34 = 68` entries. (An earlier draft
-  miscounted 32; the builder's enumeration and a pinned test agree on 34.)
-
-The pattern hands the network shape distinctions (broken versus consecutive
-runs) at the input, rather than asking message passing to reconstruct them
-from counts.
+  orbits — so the table has `2 × 34 = 68` entries.
 
 ### 3.3 The global token
 
@@ -120,16 +115,15 @@ One learned token per position, initialized as a base embedding plus a
 move still has this turn). This is the model's **only** temporal input.
 Side-to-move never appears as a feature: every colour in the input is
 already side-to-move relative. The token participates in the attention
-sub-block (§5.3) and in both heads.
+sub-block (§5.3) and in all three heads.
 
-### 3.4 Deliberate absences
+### 3.4 Excluded inputs and entities
 
 No empty-cell nodes (the policy decoder covers them, §6). No global
 "virtual node" wired into message passing (the token lives in attention).
 No coordinates, axis identities, signed distances, or absolute colours
 anywhere (§8 depends on this). No history planes. No jumping-knowledge
-aggregation (the attention pathway removes the depth-vs-reach tension that
-motivates it).
+aggregation.
 
 ---
 
@@ -178,8 +172,8 @@ agg_w = Σ_{i ∈ w}  ( U · LN(S_i)  +  E_ws[class(i, w)] )
 W_w   = W_w + MLP_W( [ LN(W_w) ; agg_w ] )        # MLP_W: 2H → H → H, ReLU
 ```
 
-Sum aggregation (not mean): the stone count of a window is bounded by 5 and
-is itself signal.
+Aggregation is a sum, not a mean; the stone count remains represented in its
+magnitude.
 
 ### 5.2 Stone ← windows
 
@@ -202,9 +196,8 @@ bias_h[i,j] = b_h[ bucket(i, j) ]                  # per-head table, §4.1
 [S; g]  += FFN( LN([S; g]) )                       # H → F·H → H, ReLU
 ```
 
-Windows do not attend; they receive global context through their stones on
-the next block. In a batch, attention is masked block-diagonal per position
-(§9).
+Windows do not attend. In a batch, attention is masked block-diagonal per
+position (§9).
 
 ---
 
@@ -260,12 +253,8 @@ v_logits    = MLP_V( [ r_1 ; … ; r_Q ] )           # Q·H → V_H → K, ReLU
 - **Perspective: side to move.** The training target is the game outcome
   from the position's mover (`+1` eventual win, `−1` loss), projected onto
   the bins as an exact-in-expectation two-hot distribution and trained with
-  cross-entropy. If self-play ever labels non-decisive games (e.g. a move
-  cap), that label is a training-target constant, not a model concern.
-
-Attention (rather than mean pooling) is the point of this head: the value
-of a position is dominated by its sharpest line, and a softmax readout can
-place its mass on one window; a mean cannot.
+  cross-entropy. Any non-decisive outcome label is defined by the training
+  target, not by the model.
 
 ---
 
@@ -273,8 +262,8 @@ place its mass on one window; a mean cannot.
 
 Requirement: **the model is exactly D6-invariant** — for every position and
 every one of the 12 board symmetries, the value is identical and the policy
-maps through the coordinate transform. No symmetry augmentation is used in
-training; it would be redundant.
+maps through the coordinate transform. Training does not use symmetry
+augmentation.
 
 The invariance is architectural, and rests on an input audit — every input
 is a D6 invariant:
@@ -324,13 +313,13 @@ the forward contains no data-dependent index discovery.
   transparency is required).
 - Activations: ReLU throughout.
 - Init: framework defaults for linears; embedding tables and the learned
-  value queries `N(0, 0.02)`; attention-bias tables zero (start unbiased);
-  the token base embedding `N(0, 0.02)`.
+  value queries `N(0, 0.02)`; attention-bias tables zero; the token base
+  embedding `N(0, 0.02)`.
 - Optimizer grouping: parameters with `ndim ≤ 1`, all embedding tables,
   and the attention-bias tables are excluded from weight decay.
-- Outputs: raw policy logits; the value bin distribution and its scalar
-  decode. Nothing in the model applies softmax to the policy or clamps the
-  value.
+- Outputs: raw policy logits; tanh-bounded scalar action values; the state-value
+  bin distribution and its scalar decode. The model applies no policy softmax
+  and does not clamp the decoded state value.
 
 ---
 
@@ -341,10 +330,10 @@ legal-move list in engine order; `moves_remaining`. The builder (§3, §9) is
 part of the model, not the engine: the engine exposes rules and ordering,
 the model owns its representation.
 
-Outputs (per position): `policy_logits` (one per legal move, engine
-order), `value` (scalar), `value_dist` (`K` bins). The scalar is the
-canonical inference output; the distribution is available to consumers
-that want it.
+Outputs (per position): `policy_logits` and `q_values` (one of each per legal
+move in engine order), `value` (state-value scalar), `value_dist` (`K`
+probabilities), and `value_logits` (`K` raw bin logits). Appendix B defines
+the action-value semantics.
 
 Two version constants govern compatibility:
 
@@ -364,17 +353,17 @@ Two version constants govern compatibility:
    walk (the engine's own window geometry qualifies as the independent
    implementation only if the model builder does not call it — otherwise
    write the naive re-derivation in the test).
-2. **Ordering:** a direct assertion that policy index `j` maps to
-   `legal_moves[j]` — not inferred from output parity, asserted on the
-   decoder table itself.
+2. **Ordering:** a direct assertion that policy and action-value index `j`
+   maps to `legal_moves[j]` — not inferred from output parity, asserted on
+   the decoder table itself.
 3. **D6 invariance:** as specified in §8.
 4. **Batching equivalence:** batched forward equals per-position forward
    (`atol 1e-6`).
 5. **Liveness:** placing an opponent stone into a window removes it from
    the entity set; a position differing only by a dead window's contents
    beyond the mix produces an identical graph.
-6. **Decoder coverage:** every legal cell is scored exactly once; cells on
-   the background path are exactly those with no live window.
+6. **Decoder coverage:** both cell heads score every legal cell exactly once;
+   cells on the background path are exactly those with no live window.
 7. If a second forward implementation ever exists, committed random-weight
    parity fixtures with pinned tolerances and provenance-gated
    real-checkpoint fixtures, failing loudly when weights are absent.
@@ -383,9 +372,8 @@ Two version constants govern compatibility:
 
 ## Appendix A — auxiliary window head (optional extension)
 
-A training-only head over the final window embeddings, never exported and
-absent from the inference interface. Purpose: dense, structured
-supervision on the entities the trunk already has, at near-zero cost.
+A training-only head over the final window embeddings. It is not exported
+and is absent from the inference interface.
 
 ```
 aux_logits_w = MLP_A( W_w )        # H → H → 3, ReLU
@@ -400,9 +388,8 @@ Three-class target per window, judged over the remainder of the game:
 | 2 | the window completes (is one of the winning windows) |
 
 Loss: cross-entropy, mean over windows, added to the total with weight
-`λ_AUX` (suggested 0.25 when enabled, 0.0 = head absent). Class balance is
-skewed (few windows complete); if enabled, per-class weighting is a
-training-side choice, not a model change.
+`λ_AUX`; 0.0 means the head is absent. The nonzero weight and any per-class
+weighting are training configuration and do not change the model.
 
 Enabling or disabling this head does not touch `MODEL_REPR_VERSION` — it
 reads the trunk's output and adds no inputs. Checkpoints that carry it
@@ -411,44 +398,44 @@ explicit allowlist, not silent prefix matching).
 
 ---
 
-## Appendix B — action-value head (the KLENT path)
+## Appendix B — action-value head (the KLENT interface)
 
-The KLENT training path (`docs/KLENT_DESIGN.md`) evaluates positions through
-a per-action value and no state value: its improvement step is
-`π′ ∝ exp[(s·Q + τ·log π_θ)/(τ+λ)]` for a critic gain `s` (the paper's
-operator is `s = 1`; `KLENT_RUN_PLAN.md` §3 records why a calibrated head
-needs one) and its bootstrap is `v̂ = E_{π′}[Q]`, over unscaled `Q`. The
-head that supplies `Q` is the §6 decoder shape with its own parameters
-everywhere — its own window projection, slot-class table, background-bucket
-table, and MLP. Its MLP emits two logits per legal cell in engine legal
-order:
+The action-value head has the §6 decoder shape and emits one scalar per legal
+cell in engine legal-move order. It owns a window projection, slot-class
+table, background-bucket table, and MLP distinct from the policy decoder's
+parameters. The policy and action-value heads may share the parameter-free
+pass over the decoder incidence table.
+
+For each legal cell `a`, the head uses the same window/background routing as
+§6:
 
 ```
-p = sigmoid(p_logit)
-m = sigmoid(m_logit)
-Q = (2p - 1) · m
+h_a     = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[class(a, w)] )
+q_raw   = MLP_Q( [ h_a ; g ] )                    # 2H → P_H → 1, ReLU
+Q(s, a) = tanh(q_raw)
 ```
 
-The composition is fp32 and gives acting consumers one `Q ∈ (−1, 1)`.
-For the taken action, training applies binary cross-entropy with logits to
-`p_logit` against `y_p = (1 + sign(G)) / 2` and independently to `m_logit`
-against `y_m = |G|`, where `G` is that sample's λ-return. Policy
+For a background cell, `h_a = E_qbg[nearest-stone bucket(a)]`. The head applies
+`tanh`, so each action value lies in `(−1, 1)`. The KLENT operator and loss cast
+these values to fp32 before arithmetic.
+
+The KLENT operator and training contract are specified in
+[`KLENT_FOR_HEXO.md`](KLENT_FOR_HEXO.md). The improvement step consumes the
+policy logits and action values without an additional gain:
+
+```
+π′(a|s) ∝ exp[(Q(s,a) + τ·log π_θ(a|s)) / (τ+λ)]
+v̂(s)    = E_{a~π′}[Q(s,a)]
+```
+
+Training selects the taken action and minimizes its squared error
+`(Q(s,a_taken) − G)²` against the sample's λ-return `G`. Policy
 cross-entropy is unchanged.
 
-Under `gamma < 1`, a scalar return target entangles who wins with how far
-away the outcome is. The factorization gives the sign a well-conditioned
-classification loss and quarantines distance in the magnitude head. At
-`gamma = 1, lam_ret = 1` it degenerates cleanly: `m` learns the constant
-one and `Q → 2p − 1`.
+**Both the policy decoder's and action-value decoder's MLP output layers
+initialize to zero**, overriding §10's framework default for those two
+layers. Initial policy logits and action values are therefore exactly zero.
 
-**Both the policy decoder's and this head's MLP output layers initialize to
-zero**, overriding §10's framework-default for those two layers. The critic
-therefore opens at `p = m = 0.5` and `Q ≡ 0`; the policy opens uniform.
-KLENT's improvement exponentiates `Q/(τ+λ)`, so this prevents initialization
-noise from becoming sharp, arbitrary `π′` targets.
-
-This head reads the trunk's output and adds no inputs, so
-`MODEL_REPR_VERSION` is untouched. Its two-wide output makes its checkpoint
-shape deliberately incompatible with the scalar readout; normal loaders stay
-strict. Under KLENT the §7 value head sits outside the loss entirely,
-faithful to the paper's no-V-head ablation.
+This head reads the trunk output and adds no inputs, so it does not change
+`MODEL_REPR_VERSION`. The §7 state-value head is neither called nor trained
+by the KLENT path.

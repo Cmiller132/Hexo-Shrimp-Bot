@@ -1,4 +1,4 @@
-//! Cross-language receipts for the shared Gumbel line session.
+//! Cross-language parity vectors for the Gumbel line session.
 
 use hexo_engine::{Action, HexCoord, Position};
 use hexo_runner::{Decision, Game, GameSpec, Reply, Step};
@@ -207,8 +207,7 @@ fn run_case(case: Case) {
         case.name,
     );
 
-    // Keep the game live until after every comparison so the fixture is also
-    // exercising the normal driver-owned position rather than a direct root.
+    // Keep the fixture live through every comparison.
     let Step::NeedDecision { generation, .. } = game.step() else {
         panic!("fixture root is live")
     };

@@ -1,30 +1,18 @@
-"""The run's telemetry database: every iteration, game, and ply, queryable.
+"""Store and query run telemetry in ``runs/<name>/telemetry.db``.
 
-`metrics.jsonl` is the ``KLENT_FOR_HEXO.md`` §8 record and stays the run's
-ground truth. This is
-the substrate beside it — one `runs/<name>/telemetry.db` per run — holding
-what the metrics row averaged away: which games were played and how they
-went, what the policy believed at each ply, how a checkpoint scored against
-each opponent, and what the machine was doing while it happened.
+The database holds iteration metrics, self-play and evaluation games,
+self-play ply traces, evaluation matches, crossplay, invocation metadata, and
+hardware aggregates. Each self-play ply stores its action rank and five
+quantized scalars: ``v_hat``, KL, normalized entropy, improved-policy maximum,
+and improved-policy probability of the sampled move. It does not store the
+full improved-policy vector. Evaluation games store their move lists but no
+training-time ply trace, regardless of their chooser.
 
-**π′ is not stored.** The improved policy is `|A_legal|` floats per ply,
-kilobytes where the ply's row is tens of bytes, and it is reproducible
-exactly from a checkpoint and a move prefix — which is what
-`inspect.inspect_position` does. The database keeps the four scalars a
-query needs (its KL to π_θ, its normalized entropy, its maximum, and its
-value at the sampled move) and recomputes the rest on demand. That is the
-storage decision this schema is built around; everything else follows from
-having chosen scalars over arrays. Evaluation's model-side Gumbel simulation
-count is recorded in ``config.json`` and ``invocations.jsonl``, not duplicated
-in this telemetry schema.
-
-Writes are one transaction per iteration into a WAL database, so a crash
-loses at most the iteration in flight and never the file, and a dashboard
-can read the run while it is still being written.
-
-The schema is versioned and there are no migrations: a database this build
-did not write is refused rather than adapted to, and the fix is to
-regenerate it.
+An iteration is committed in one transaction. WAL mode permits concurrent
+readers. ``begin_run`` removes driver-generated rows at and beyond the restored
+iteration before replay, so the database has at most one self-play row per
+``(iteration, game_index)``. Opening a mismatched schema is refused; schema v1
+has an explicit offline ``convert`` command.
 
 CLI::
 
@@ -43,24 +31,18 @@ from pathlib import Path
 
 import numpy as np
 
-# Covers every table, column, and packing below. Bumped, never migrated.
+# Covers every table, column, and packing below; mismatches are refused on open.
 SCHEMA_VERSION = 2
 
 DB_NAME = "telemetry.db"
 
-# Per-ply scalars are stored quantized: integers in units of 1/_Q (v2). The
-# five REALs were 40 bytes of a ~71-byte row and SQLite has no float32; at
-# 1e-4 resolution a typical value is a 2-3 byte varint and no consumer's
-# noise floor is anywhere near the rounding. Writers multiply, readers
-# divide, and both live in this file — nothing outside sees an integer.
+# Per-ply scalars are integers in units of 1/_Q. Public readers dequantize them.
 _Q = 10_000
 
 # The five quantized columns, in schema order.
 _PLY_SCALARS = ("v_hat", "kl", "norm_entropy", "pi_top1", "pi_chosen")
 
-# The KLENT_FOR_HEXO.md §8 metrics that become their own iteration columns. Everything in the
-# metrics row is also kept verbatim in ``metrics_json``; these are the ones a
-# threshold query ("where did calibration collapse?") must not have to parse.
+# These metrics have queryable columns and also remain in ``metrics_json``.
 _ITERATION_METRICS = (
     ("f", "REAL"),
     ("acting_kl", "REAL"),
@@ -114,9 +96,7 @@ def _columns(spec) -> str:
 _SCHEMA = f"""
 CREATE TABLE schema_version (version INTEGER NOT NULL);
 
--- One row per process that trained into this run: the database's mirror of
--- invocations.jsonl, so a metric's meaning can be traced to the knobs live
--- when it was written.
+-- One row per process invocation that trained into this run.
 CREATE TABLE runs (
     id              INTEGER PRIMARY KEY,
     created         TEXT NOT NULL,
@@ -137,10 +117,7 @@ CREATE TABLE iterations (
     metrics_json TEXT NOT NULL
 );
 
--- Whoever a checkpoint was measured against. The opponent's own knobs live
--- in config_json rather than in columns here: SealBot is the yardstick
--- today and will not be the only one, and a stronger engine arriving must
--- not need a schema change to be recorded.
+-- Opponent identity and strength-defining configuration.
 CREATE TABLE opponents (
     opponent_id INTEGER PRIMARY KEY,
     name        TEXT NOT NULL,
@@ -194,8 +171,8 @@ CREATE UNIQUE INDEX games_eval_key ON games(match, game_index)
 -- are `_GAME_INDEXES`, applied by `_index_games` rather than declared here.
 CREATE INDEX games_iteration ON games(iteration);
 
--- Acting-time scalars, self-play only: an evaluation game plays argmax
--- π_θ and has no π′ to reduce.
+-- Acting-time scalars are recorded for self-play only. Evaluation does not
+-- execute the training-time improvement-and-sampling path.
 -- The five scalar columns hold integers in units of 1/10000 (see _Q): the
 -- write path quantizes, every read path in this file dequantizes.
 CREATE TABLE plies (
@@ -213,8 +190,7 @@ CREATE TABLE plies (
     PRIMARY KEY (game_id, t)
 ) WITHOUT ROWID;
 
--- The A7 round-robin, replaced wholesale by each run of it, exactly as
--- crossplay.json is.
+-- Checkpoint crossplay, replaced wholesale by each crossplay invocation.
 CREATE TABLE crossplay (
     checkpoint_a TEXT NOT NULL,
     checkpoint_b TEXT NOT NULL,
@@ -236,12 +212,8 @@ CREATE TABLE crossplay (
 def pack_moves(moves) -> bytes:
     """A move list to the `games.moves` blob.
 
-    The packing, defined here and nowhere else: little-endian ``int16``
-    ``(q, r)`` pairs in play order, four bytes a ply and nothing more, so
-    ``len(blob) // 4`` is the game's length. Coordinates outside ``int16``
-    are refused rather than wrapped — a real game stays within a few dozen
-    steps of the origin, and a coordinate that does not is a bug worth
-    hearing about.
+    Packing is little-endian ``int16`` ``(q, r)`` pairs in play order, four
+    bytes per ply. Coordinates outside the ``int16`` range raise ``ValueError``.
     """
     arr = np.asarray(moves, dtype=np.int64).reshape(-1, 2)
     if arr.size and (arr.min() < -32768 or arr.max() > 32767):
@@ -266,9 +238,7 @@ def _d6_transforms():
 
     Generators are the 60-degree rotation ``(q, r) -> (-r, q + r)`` and the
     reflection ``(q, r) -> (r, q)``. Both permute the three window axes and
-    preserve hex distance, so the rules are invariant under all twelve — a
-    transformed game is legal placement for placement and ends with the same
-    winner, which is what `tests/test_telemetry.py` holds them to.
+    preserve hex distance, legality, and winner.
     """
 
     def rot(m):
@@ -293,11 +263,8 @@ def canonical_opening(moves, plies: int | None = None) -> tuple:
     """A move sequence's representative under the board's symmetries: the
     lexicographic minimum over all twelve transforms of it.
 
-    Every game opens at the origin and the rules are invariant about it, so
-    two openings differing by a rotation or a reflection are one opening;
-    counting raw move lists would split each of them twelve ways. ``plies``
-    truncates first, which is what an atlas over the first few placements
-    wants.
+    Rotation- or reflection-equivalent openings have the same representative.
+    ``plies`` truncates the sequence before transformation.
     """
     seq = list(moves)[:plies] if plies is not None else list(moves)
     return min(tuple(t(m) for m in seq) for t in D6_TRANSFORMS)
@@ -315,34 +282,12 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-# What `search_games` needs to answer a page without reading the table:
-# one index per entry of GAME_ORDERS, named after it. Each leads with
-# `kind`, since every browse filters on it, and then repeats that order's
-# sort key column for column, in the direction the order reads each one —
-# so the whole ORDER BY comes off the index and only the page's rows are
-# ever touched. Without them SQLite has no ordered path into `games` and
-# sorts every matching row to hand back fifty: measured on a 575,342-game
-# run, ~480 ms warm on a local disk and ~44 s through the deck's mount, per
-# request.
-#
-# One index per order rather than a shared pair, because sharing depends on
-# the planner turning an index around and sorting only the trailing term of
-# the sort key inside each tie group. It will, sometimes: SQLite 3.45 does
-# it for both reversed orders, 3.53 for one of them and a full sort for the
-# other. Matching each order exactly costs ~14 MB apiece on a run that size
-# and is a decision the planner cannot get wrong.
-#
-# `winner`, `capped`, and the length bounds stay out of them: the ordered
-# scan tests those per row as it walks, which is free at fifty rows,
-# whereas indexing them would mean an index per combination of filters. An
-# iteration range conjoined with a *length* order is the one shape still
-# answered by a sort — no index can lead with both columns — and there the
-# sort is bounded by the range the filter selected.
-#
-# `games_search(kind, winner, length)` is dropped by the same list: it can
-# satisfy a filter but never an order, so with these present the planner has
-# no reason to pick it, and an index the planner never picks is weight on
-# every insert.
+# Each browse order has a matching index beginning with ``kind`` so SQLite can
+# satisfy its ORDER BY without sorting the full filtered set. Winner, capped,
+# and range predicates remain row filters; indexing every filter combination
+# would multiply write cost. A length order combined with an iteration range
+# may still sort the range-selected rows because neither column can lead both
+# constraints.
 _GAME_INDEXES = (
     "CREATE INDEX IF NOT EXISTS games_browse_recent"
     " ON games(kind, iteration DESC, game_index)",
@@ -359,17 +304,8 @@ _GAME_INDEXES = (
 def _index_games(conn: sqlite3.Connection) -> None:
     """Bring a database's `games` indexes up to `_GAME_INDEXES`.
 
-    Called from `Telemetry.__init__` alone, which is the only path that
-    holds a writable connection — the deck opens telemetry read-only, and a
-    reader cannot create an index. Idempotent, because a database written
-    before these indexes existed has to gain them the next time a writer
-    opens it, and one written after must not be touched twice.
-
-    This is deliberately not a schema version. An index is derived from
-    rows already in the file and stores no format of its own, so a database
-    with these and one without hold the same bytes and answer the same
-    queries — SCHEMA_VERSION stays where it is, and every run database ever
-    written stays readable by this build.
+    Only the writer calls this function. Statements are idempotent, and index
+    presence does not change the schema's stored data contract.
     """
     with conn:
         for statement in _GAME_INDEXES:
@@ -428,17 +364,15 @@ def open_telemetry(run_dir) -> "Telemetry":
 class Telemetry:
     """One connection, one transaction per iteration.
 
-    The connection belongs to the thread that opened it — sqlite3's default
-    — so a stray write from the collection worker fails loudly instead of
-    interleaving with the driver's transaction.
+    The connection belongs to the thread that opened it, so collection-worker
+    writes fail sqlite3 thread validation rather than interleave with the
+    driver's transaction.
     """
 
     def __init__(self, path: Path):
         self.path = Path(path)
         self._conn = _connect(self.path)
-        # The only moment a run's telemetry is open for writing, and so the
-        # only moment a database written by an earlier build can be given
-        # the game browser's indexes.
+        # A writable open ensures all derived browse indexes are present.
         _index_games(self._conn)
         self._run: int | None = None
         self._next_game_id = self._max_game_id() + 1
@@ -467,16 +401,11 @@ class Telemetry:
     # -- the run driver ----------------------------------------------------
 
     def begin_run(self, config: dict, versions: dict, start_iteration: int) -> None:
-        """Record this process, and drop the tail it is about to replay.
+        """Record an invocation and remove its replay range.
 
-        A resume restarts at its checkpoint's iteration, which may be behind
-        the last iteration recorded — those rows describe work about to be
-        redone. They go, with their games and their plies, rather than
-        colliding with the replay or double-counting it. An id from the
-        discarded tail may then be handed out again, which is correct: the
-        row it named no longer exists, and every id in the database still
-        names exactly one game. Evaluation matches from the offline CLI are
-        keyed by checkpoint rather than by the loop's position, and survive.
+        Driver evaluation, self-play games, plies, and iteration rows at or
+        beyond ``start_iteration`` are deleted. Offline evaluation rows remain.
+        Deleted game identifiers may be allocated again.
         """
         with self._conn:
             self._conn.execute(
@@ -695,8 +624,7 @@ class Telemetry:
 
 
 def _ply_rows(ids, episodes):
-    """Every episode's per-ply rows, streamed into ``executemany`` rather
-    than materialised — an iteration is tens of thousands of them."""
+    """Yield each episode's per-ply rows for ``executemany``."""
     for game_id, ep in zip(ids, episodes):
         n = len(ep.ranks)
         lengths = {
@@ -736,15 +664,11 @@ def _ply_rows(ids, episodes):
 
 
 def convert_v1(run_dir) -> None:
-    """Regenerate a v1 database as v2, deliberately and once.
+    """Convert an inactive schema-v1 database to schema v2.
 
-    There are no migrations-on-open — a version mismatch refuses, always.
-    But a finished run's telemetry is history that cannot be replayed, so
-    "regenerate the data" for it means this: build a fresh v2 file, copy
-    every table across (plies quantizing REAL to 1/_Q units; the two v2
-    match columns are NULL — v1 never measured them), swap it in, and keep
-    the original beside it as ``telemetry.db.v1.bak``. Never run it against
-    a database a live process is writing.
+    The conversion builds a fresh database, quantizes ply scalars, sets
+    v2-only match columns to NULL, swaps the files, and retains the v1 file as
+    ``telemetry.db.v1.bak``. The caller must ensure no process is writing it.
     """
     path = db_path(run_dir)
     if not path.exists():
@@ -819,8 +743,7 @@ def _iteration_range(iterations, table=""):
 def iteration_series(conn, columns, *, iterations=None) -> list[dict]:
     """Metric columns against iteration, in order — a line chart's data.
 
-    Column names are checked against the table rather than interpolated
-    blind, so a typo names itself instead of becoming a SQL error.
+    Column names must exist in the ``iterations`` table.
     """
     known = {r["name"] for r in conn.execute("PRAGMA table_info(iterations)")}
     unknown = [c for c in columns if c not in known]
@@ -835,10 +758,8 @@ def iteration_series(conn, columns, *, iterations=None) -> list[dict]:
     )
 
 
-# The orders the game browser offers, by name. Every one ends in the game's
-# natural key so paging is stable when the sort column ties. Adding one
-# means checking `_GAME_INDEXES` still covers it: an order with no index
-# behind it sorts every matching game to return a page of fifty.
+# Every browser order ends in the natural game key for stable paging and must
+# have a corresponding entry in ``_GAME_INDEXES``.
 GAME_ORDERS = {
     "recent": "iteration DESC, game_index",
     "oldest": "iteration, game_index",
@@ -863,10 +784,8 @@ def search_games(
     """The game browser's query. Every filter is optional and they conjoin;
     the moves blob is left behind, since a list of games does not need it.
 
-    ``winner=None`` means "any", which capped games (winner NULL) satisfy
-    too — filter them with ``capped``. ``order`` is a name from
-    :data:`GAME_ORDERS` rather than a SQL fragment: this is the query a web
-    layer will hand user input to, and a name cannot be an injection.
+    ``winner=None`` includes capped games; use ``capped`` to filter them.
+    ``order`` must name an entry in :data:`GAME_ORDERS`.
     """
     if order not in GAME_ORDERS:
         raise ValueError(f"order must be one of {sorted(GAME_ORDERS)}: {order!r}")
@@ -899,7 +818,7 @@ def search_games(
 def fetch_game(conn, game_id: int) -> dict:
     """One game with its moves unpacked and its plies attached — the viewer's
     payload. A self-play game has a ply per move; an evaluation game has
-    none, and the empty list is the honest answer."""
+    no stored ply trace and returns an empty list."""
     row = conn.execute("SELECT * FROM games WHERE game_id = ?", (game_id,)).fetchone()
     if row is None:
         raise KeyError(f"no game {game_id}")
@@ -915,8 +834,7 @@ def fetch_game(conn, game_id: int) -> dict:
 
 
 def calibration(conn, *, by="v_hat", bucket=0.1, iterations=None) -> list[dict]:
-    """v̂ against the outcome it was predicting, bucketed — the instrument
-    for the overestimation bias in ``KLENT_FOR_HEXO.md`` §8.
+    """Bucket acting-time v̂ against the realized outcome.
 
     Self-play games that finished only: a capped game has no realized
     outcome to compare against. ``by`` chooses the axis — ``'v_hat'`` for a
@@ -968,12 +886,9 @@ _SWING = (
 
 
 def blunders(conn, *, threshold=0.5, iterations=None, limit=50) -> list[dict]:
-    """Plies where the position's value collapsed on the next one.
+    """Return plies whose mover-frame value changes by at least ``threshold``.
 
-    A large negative swing is the mover watching its own assessment fall
-    apart across one placement — either a real mistake or a spot where the
-    Q head is unstable, and the policy debugger is how the two are told
-    apart. Ordered by how hard the swing was.
+    Results are ordered by descending absolute swing.
     """
     where, params = _iteration_range(iterations, "g")
     return _rows(
@@ -996,11 +911,8 @@ def blunders(conn, *, threshold=0.5, iterations=None, limit=50) -> list[dict]:
 def opening_atlas(conn, *, plies=4, kind="selfplay", iterations=None, limit=50):
     """The openings the run actually plays, symmetry-reduced.
 
-    Canonicalization is query-time by :func:`canonical_opening` — storage
-    keeps raw moves, because a stored canonical form would be a second
-    representation to keep true. Games shorter than ``plies`` are skipped:
-    a truncation that is not a prefix of length ``plies`` is a different
-    key.
+    Canonicalization is query-time by :func:`canonical_opening`; storage keeps
+    raw moves. Games shorter than ``plies`` are skipped.
     """
     where, params = _iteration_range(iterations)
     rows = conn.execute(

@@ -1,9 +1,6 @@
-//! Shared scaffolding: parsing a command line the way the binary does, and
-//! reading back what a run left on disk.
+//! Shared command-line parsing and run-artifact fixtures.
 //!
-//! The tests drive the library entry points in-process rather than spawning the
-//! binary, which is why `main.rs` is thin: what is worth testing is the loop,
-//! and a child process would only add a way for a failure to become a string.
+//! Tests call library entry points in-process and inspect their artifacts.
 
 #![allow(dead_code)]
 

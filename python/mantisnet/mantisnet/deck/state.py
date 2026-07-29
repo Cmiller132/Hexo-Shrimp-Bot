@@ -1,4 +1,4 @@
-"""Deck-owned persistence, kept deliberately separate from run telemetry."""
+"""Deck-owned persistence, separate from run telemetry."""
 
 from __future__ import annotations
 

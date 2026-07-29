@@ -1,16 +1,13 @@
 //! Gumbel root sampling with sequential halving over deterministic lines.
 //!
-//! This is deliberately a line search, not a tree. Hexo transitions are
-//! deterministic, so evaluating an identical path twice reveals nothing new;
-//! the useful way to spend a small evaluation budget is to extend the most
-//! promising root lines by another ply. Each extension follows the evaluated
-//! position's prior argmax, and sequential halving decides which lines keep
-//! receiving depth.
+//! Each line starts from a sampled root action and is extended through the
+//! evaluated position's prior argmax. Sequential halving selects which lines
+//! receive additional depth.
 //!
 //! The root evaluation is outside the simulation budget. A round gives every
-//! surviving line the same number of deepenings, leaving an integer remainder
-//! unused rather than giving unequal resources within a round. Terminal lines
-//! are frozen at their exact root-frame value and need no network question.
+//! surviving line the same number of deepenings; any integer remainder is
+//! unused. Terminal lines retain their exact root-frame value and emit no
+//! evaluation request.
 
 use crate::rng::SplitMix64;
 use crate::seam::Evaluation;
@@ -26,8 +23,7 @@ const UNIT_SCALE: f64 = 1.0 / 9_007_199_254_740_992.0;
 
 /// The explicit search shape for a [`GumbelSession`].
 ///
-/// There is no `Default`: both the evaluation budget and the root width are
-/// package decisions.
+/// There is no `Default`; both fields are required.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GumbelConfig {
     /// Total equal-deepening allocations below the root.
@@ -116,8 +112,8 @@ pub struct GumbelSession {
 }
 
 impl GumbelSession {
-    /// Construct a production session whose Gumbels come from its seeded
-    /// [`SplitMix64`] stream.
+    /// Construct a session whose Gumbels come from its seeded [`SplitMix64`]
+    /// stream.
     #[must_use]
     pub fn new(config: GumbelConfig, seed: u64) -> Self {
         Self::build(config, seed, None)
@@ -159,9 +155,8 @@ impl GumbelSession {
 
     /// Append deterministic Gumbels and make the session use only that queue.
     ///
-    /// This is the parity seam: fixtures inject their noise rather than trying
-    /// to make another language's RNG reproduce [`SplitMix64`]. Once enabled,
-    /// the queue remains authoritative across `reseed` and `begin`.
+    /// Once enabled, the injected queue remains authoritative across `reseed`
+    /// and `begin`.
     pub fn queue_gumbels(&mut self, gumbels: impl IntoIterator<Item = f64>) {
         self.injected
             .get_or_insert_with(VecDeque::new)

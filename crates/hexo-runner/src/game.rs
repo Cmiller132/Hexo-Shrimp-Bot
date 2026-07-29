@@ -1,4 +1,4 @@
-//! The authoritative game: a state machine that never blocks and never calls out.
+//! Authoritative nonblocking game state machine.
 
 use crate::decision::{Budget, Failure, Reply};
 use crate::error::SubmitError;
@@ -64,10 +64,10 @@ pub enum Step {
         generation: u64,
         /// What this seat is told it may spend.
         budget: Budget,
-        /// The hash of the position being decided in. Request framing for the
-        /// seat — a mirror-keeping seat compares it against its own before it
-        /// spends any search. It is not for the driver to copy into a
-        /// [`crate::Decision`]: the decision's hash is the seat's attestation.
+        /// The hash of the position being decided in.
+        ///
+        /// Mirror-keeping seats compare this with their own state. The seat,
+        /// not the driver, authors [`crate::Decision::zobrist`].
         zobrist: u64,
         /// Placements made so far.
         ply: u32,
@@ -126,9 +126,7 @@ impl Game {
         &self.position
     }
 
-    /// Every placement so far, oldest first, with what the match knows about it.
-    ///
-    /// This is the game's history. Nothing else in the workspace keeps one.
+    /// Every accepted placement so far, oldest first.
     #[inline]
     #[must_use]
     pub fn plies(&self) -> &[PlyRecord] {
@@ -142,11 +140,9 @@ impl Game {
         self.result
     }
 
-    /// The move prefix a seat needs to build its own mirror, derived from the record.
+    /// The accepted move prefix, derived from [`Game::plies`].
     ///
-    /// [`Game::plies`] is the authoritative history — the position carries none — so
-    /// this is the record decoded back into placements. Feeding it to
-    /// [`Position::replay`] reproduces [`Game::position`].
+    /// Replaying this prefix reproduces [`Game::position`].
     #[must_use]
     pub fn prefix(&self) -> Vec<Action> {
         self.plies
@@ -254,10 +250,8 @@ impl Game {
         } else if matches!(applied.phase_after, TurnPhase::FirstStone)
             && self.position.stone_count() >= self.spec.ply_cap.get()
         {
-            // `FirstStone` is the phase left behind by the opening placement and by
-            // every second stone, so the cap is only tested where the mover's turn
-            // is complete. Halting mid-turn would hand one seat a turn the other
-            // never got.
+            // `FirstStone` follows the opening and every completed two-stone turn,
+            // so the cap is tested only at turn boundaries.
             Some(MatchResult::Drawn {
                 reason: DrawReason::PlyCap,
             })

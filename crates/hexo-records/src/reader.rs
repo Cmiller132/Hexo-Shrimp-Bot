@@ -1,4 +1,4 @@
-//! Reading a shard, strictly.
+//! Strict shard reader.
 
 use crate::codec::Cursor;
 use crate::error::RecordError;
@@ -10,17 +10,9 @@ use std::path::{Path, PathBuf};
 
 /// Reads one shard, refusing anything it cannot account for.
 ///
-/// Opening validates the magic and all four versions against the constants this
-/// build links, so a shard produced by a different engine, action ordering,
-/// runner protocol, or record format is refused before a single game is decoded
-/// rather than silently reinterpreted. Iterating yields exactly the games the
-/// header declares: a file that ends early, holds a different number of entries,
-/// or carries a byte past the last of them is an error, never a short read that
-/// looks like a smaller shard.
-///
-/// What none of that can see is a shard whose bytes drifted somewhere every
-/// field still parses from. [`crate::verify`] is the detector for that, and it
-/// is a separate call because it costs a replay per game.
+/// Opening validates magic and all four versions before decoding entries.
+/// Iteration requires exactly the declared game count and rejects truncation or
+/// trailing bytes. [`crate::verify`] separately checks engine semantics.
 pub struct ShardReader {
     /// The file, positioned at the next entry.
     file: BufReader<File>,
@@ -63,10 +55,8 @@ impl ShardReader {
         let len = file.metadata().map_err(io)?.len();
         let mut file = BufReader::new(file);
 
-        // The header is variable-length, so the whole of what one could possibly
-        // occupy is read up front and decoded with the same cursor every other
-        // shape uses. A streaming header reader would be a second statement of
-        // the layout, and the peek is bounded by three `u16`-capped strings.
+        // Buffer the bounded variable-length header and decode it with the common
+        // cursor.
         let peek = len.min(HEADER_MAX_BYTES);
         let mut bytes = Vec::new();
         file.by_ref()
@@ -111,8 +101,7 @@ impl ShardReader {
 
         let left = self.len - self.offset;
         if left < ENTRY_PREFIX_BYTES as u64 {
-            // A file that stops exactly on an entry boundary holds fewer games
-            // than the header claims; one that stops inside a prefix is torn.
+            // Distinguish a missing entry from a partial length prefix.
             return Err(if left == 0 {
                 RecordError::GameCountMismatch {
                     declared: self.header.game_count,
@@ -190,8 +179,7 @@ impl core::fmt::Debug for ShardReader {
 impl Iterator for ShardReader {
     type Item = Result<GameRecord, RecordError>;
 
-    /// The next game. One error ends the iteration: a shard that failed to
-    /// decode is not a shard some of whose games can still be trusted.
+    /// Return the next game; any decoding error ends iteration.
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;

@@ -6,17 +6,15 @@ export const AXES: Move[] = [[1, 0], [0, 1], [1, -1]];
 export const moveKey = (move: Move) => `${move[0]},${move[1]}`;
 export const lineKey = (moves: Move[]) => moves.map(moveKey).join(";");
 
-/** Which player placed ply `i`. P0 opens alone at the origin, then each player
- *  places two stones per turn. Every screen derives the mover from this. */
+/** Player that placed ply `i`: P0 opens, then players alternate two-stone turns. */
 export function playerAt(ply: number): 0 | 1 {
   if (ply === 0) return 0;
   return Math.floor((ply - 1) / 2) % 2 ? 0 : 1;
 }
 
 /**
- * The six-or-more run of one player's stones through the last stone placed, or
- * null. A win is created by the placement that completes it, so only the last
- * stone can start a new run — searching from it is both cheap and complete.
+ * Returns the six-or-more run through the last placed stone, or null.
+ * Only that stone can complete a new winning run.
  */
 export function findWinningLine(moves: Move[], cursor?: number): Move[] | null {
   const end = Math.min(cursor ?? moves.length, moves.length);

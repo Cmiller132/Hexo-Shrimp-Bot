@@ -1,9 +1,7 @@
 """§12.5 liveness: blocking is absence, and dead windows have no contents.
 
-The second half uses the builder's raw-array entry point to construct a dense
-mixed ball no legal playout would be likely to reach — build() trusts its
-inputs by design (the engine owns legality), which is exactly what makes the
-construction possible.
+The dense mixed-ball fixture enters through the builder's raw-array API,
+whose caller owns position legality.
 """
 
 from __future__ import annotations

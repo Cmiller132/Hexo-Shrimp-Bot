@@ -1,15 +1,12 @@
-//! Why a shard could not be written, read, or trusted.
+//! Shard write, read, and verification errors.
 
 use hexo_engine::{MoveError, Player};
 use std::path::PathBuf;
 
 /// Everything that can go wrong writing, reading, or verifying a shard.
 ///
-/// Every variant carries what it takes to locate the problem without opening the
-/// file in a hex editor. Decoding failures carry the absolute byte offset of the
-/// field that failed; failures about the shard as a whole carry the index of the
-/// game entry they were raised on; version failures name both numbers, because
-/// "version mismatch" alone does not say which side is old.
+/// Decoding failures carry absolute byte offsets, entry failures identify the
+/// game index, and version failures carry expected and found values.
 #[derive(Debug)]
 pub enum RecordError {
     /// The filesystem refused an operation.
@@ -60,10 +57,8 @@ pub enum RecordError {
         /// What the file states.
         found: u32,
     },
-    /// A header handed to [`crate::ShardWriter::create`] stated a game count.
-    /// The count is the writer's to state, and it patches the true one in on
-    /// finalize; a preset one could only ever be a claim about a file that does
-    /// not exist yet.
+    /// A header handed to [`crate::ShardWriter::create`] stated a nonzero game
+    /// count; the writer owns and patches this field.
     HeaderGameCount {
         /// The count the caller stated.
         found: u32,

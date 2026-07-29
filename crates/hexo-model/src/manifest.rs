@@ -1,5 +1,4 @@
-//! The checkpoint manifest: which package wrote these weights, under which
-//! versions, and what they are supposed to answer.
+//! Checkpoint identity, compatibility versions, metadata, and probe hash.
 
 use crate::error::PackageError;
 use serde::{Deserialize, Serialize};
@@ -10,20 +9,14 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 
 /// What a checkpoint says about itself.
 ///
-/// The common fields are `docs/CONTAINER_SPEC.md` §10's list. A package can
-/// additionally state the semantic configuration its weights require in
-/// [`Manifest::package_metadata`]. That value is deliberately opaque here: the
-/// package writes and validates it, while the container merely preserves it.
-/// Layer counts and tensor shapes still belong in the package's weight file.
-/// The container's manifest answers only which package wrote this, which
-/// versions and package semantics apply, and whether it is compatible with this
-/// binary — which is exactly what makes adding a GNN package a new crate and one
-/// registry entry rather than a schema change here.
+/// The common fields follow `docs/CONTAINER_SPEC.md` §10.
+/// [`Manifest::package_metadata`] is opaque to this crate and is written and
+/// validated by the package. Architecture-specific data belongs in the
+/// package's weight file.
 ///
-/// Every version is checked against the constant this build links, and a
-/// disagreement is a startup failure rather than a warning. The three that come
-/// from other crates are filled in by [`Manifest::new`] rather than passed in,
-/// so a package cannot write a manifest claiming rules it was not built against.
+/// [`Manifest::validate`] requires every common version to equal the constants
+/// linked into the current build. [`Manifest::new`] fills linked-crate versions
+/// directly.
 ///
 /// ```
 /// use hexo_model::{Manifest, PackageError};
@@ -36,11 +29,11 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 /// assert_eq!(read, manifest);
 /// read.validate("mock", 1, 1)?;
 ///
-/// // The hash is stored as a hex string, so a checkpoint tree is greppable.
+/// // The hash is stored as a fixed-width hexadecimal string.
 /// let json = std::fs::read_to_string(dir.path().join("manifest.json"))?;
 /// assert!(json.contains("\"0xfeedfacedeadbeef\""));
 ///
-/// // A package that bumped its encoder refuses last epoch's weights by name.
+/// // An encoder-version mismatch is reported explicitly.
 /// let err = read.validate("mock", 1, 2).expect_err("the encoder moved");
 /// assert!(matches!(
 ///     err,
@@ -53,7 +46,7 @@ pub const MANIFEST_FILE: &str = "manifest.json";
 pub struct Manifest {
     /// The registry name of the package that wrote these weights.
     pub package: String,
-    /// The package's own version, bumped when its behaviour changes meaning.
+    /// The package semantics version.
     pub package_version: u32,
     /// The package's encoder version, bumped whenever the bytes its encoder
     /// writes change meaning.
@@ -64,31 +57,25 @@ pub struct Manifest {
     pub action_order_version: u32,
     /// `hexo_runner::PROTOCOL_VERSION` as the writing build linked it.
     pub protocol_version: u32,
-    /// Which epoch of the run produced this checkpoint. Epoch 0 is the
-    /// untrained checkpoint [`crate::ModelPackage::init`] writes.
+    /// The checkpoint epoch. [`crate::ModelPackage::init`] writes epoch 0.
     pub epoch: u32,
     /// Package-owned semantic configuration required to interpret the weights.
     ///
-    /// This crate neither names nor validates fields inside the JSON value. A
-    /// package that changes their meaning bumps its package version and checks
-    /// the value during load. Packages with no additional metadata write `{}`.
+    /// This crate neither names nor validates fields inside the JSON value.
+    /// Packages with no additional metadata write `{}`.
     pub package_metadata: serde_json::Value,
     /// The probe hash of these weights (`docs/CONTAINER_SPEC.md` §10.2).
     ///
-    /// Serialised as a `0x`-prefixed, zero-padded, 16-digit lowercase hex
-    /// string, so that a hash in a log line can be grepped for across a tree of
-    /// checkpoint manifests. A JSON number would be the same value written in
-    /// the one base nobody prints it in, and large `u64`s are exactly where JSON
-    /// readers start quietly turning integers into floats.
+    /// Serialized as a `0x`-prefixed, zero-padded, 16-digit lowercase
+    /// hexadecimal string to preserve the full `u64` value across JSON readers.
     #[serde(with = "hex_u64")]
     pub probe_hash: u64,
 }
 
 impl Manifest {
-    /// The manifest for a checkpoint this build is writing.
+    /// Construct a manifest for a checkpoint written by this build.
     ///
-    /// The three linked versions are read from the crates this build links
-    /// rather than taken as arguments: a package supplies only what it owns.
+    /// Rules, action-order, and protocol versions come from the linked crates.
     #[must_use]
     pub fn new(
         package: &str,
@@ -122,10 +109,7 @@ impl Manifest {
 
     /// Write `manifest.json` into an existing `dir`.
     ///
-    /// The directory is the caller's: a checkpoint is placed atomically by
-    /// writing it under a temporary name and renaming it in
-    /// (`docs/CONTAINER_SPEC.md` §9), which is a decision about the whole
-    /// directory and belongs to whoever is making one.
+    /// The caller owns checkpoint-directory placement and atomic publication.
     ///
     /// # Errors
     ///
@@ -142,9 +126,8 @@ impl Manifest {
     /// # Errors
     ///
     /// [`PackageError::Io`] if the file is missing or unreadable, and
-    /// [`PackageError::ManifestParse`] if it is not a manifest this build
-    /// knows — including one carrying a field this build does not have, which is
-    /// a file from another build rather than an extension to tolerate.
+    /// [`PackageError::ManifestParse`] if it does not match the manifest schema,
+    /// including when it contains unknown fields.
     pub fn read(dir: &Path) -> Result<Self, PackageError> {
         let path = dir.join(MANIFEST_FILE);
         let text = std::fs::read_to_string(&path).map_err(|source| PackageError::Io {
@@ -154,13 +137,12 @@ impl Manifest {
         serde_json::from_str(&text).map_err(|source| PackageError::ManifestParse { path, source })
     }
 
-    /// Hold this manifest to the build that is about to use it.
+    /// Validate common manifest fields against a package and this build.
     ///
-    /// The three package-owned values come from the caller — a package checks
-    /// itself against the checkpoint it is loading — and the three linked ones
-    /// are compared against `hexo_engine::RULES_VERSION`,
-    /// `hexo_engine::ACTION_ORDER_VERSION`, and `hexo_runner::PROTOCOL_VERSION`
-    /// directly. Each mismatch is its own error naming both numbers.
+    /// Package identity and versions come from the caller. Linked versions are
+    /// compared directly with `hexo_engine::RULES_VERSION`,
+    /// `hexo_engine::ACTION_ORDER_VERSION`, and
+    /// `hexo_runner::PROTOCOL_VERSION`.
     ///
     /// # Errors
     ///
@@ -218,9 +200,7 @@ impl Manifest {
 
 /// The probe hash's JSON shape: `"0x"` and exactly sixteen lowercase hex digits.
 ///
-/// Written by one function and read by one function, and the reader is exact —
-/// a short string, a missing prefix, or a stray sign character is a refusal
-/// rather than a value that parsed to something plausible.
+/// The reader requires the prefix, width, and hexadecimal syntax exactly.
 mod hex_u64 {
     use serde::de::Error as _;
     use serde::{Deserialize, Deserializer, Serializer};

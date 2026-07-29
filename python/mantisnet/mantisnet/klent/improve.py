@@ -3,11 +3,9 @@
     π′(a|s) ∝ exp[ (Q(s,a) + τ·log π_θ(a|s)) / (τ + λ) ]
     v̂(s)    = E_{A~π′(·|s)}[ Q(s, A) ]
 
-τ weighs the reverse KL to the current policy, λ the entropy of π′. Both
-diagnostics of ``KLENT_FOR_HEXO.md`` §2.1 — per-position KL(π′‖π_θ) and entropy normalised
-by log|A_legal| — come out of the same pass, because they are the
-``KLENT_FOR_HEXO.md`` §8 metrics
-that decide whether the run is working at all.
+τ weighs reverse KL to the current policy, and λ weighs entropy of π′. The
+result also contains per-position KL(π′‖π_θ) and entropy normalized by
+log|A_legal| as specified by ``KLENT_FOR_HEXO.md`` §2.1.
 """
 
 from __future__ import annotations

@@ -79,9 +79,7 @@ const CALIBRATION_BUCKET: Record<string, number> = { v_hat: 0.1, ply: 10, length
 
 type TraceGroup = "value" | "swing" | "policy" | "entropy" | "kl" | "legal";
 
-/** Elapsed-time pending state. Mounted only while a request is outstanding, so the
- *  clock starts when the request does. Every query on this screen has a measured
- *  cost in tens of seconds; a spinner with no number cannot be told from a hang. */
+/** Pending state with elapsed time, mounted only for the request lifetime. */
 function Pending({ children }: { children: ReactNode }) {
   const [seconds, setSeconds] = useState(0);
   useEffect(() => {
@@ -99,14 +97,8 @@ function elapsed(ms: number | null): string {
 
 export default function History({ run, openLab }: { run?: Run; openLab: (game: Game, ply: number) => void }) {
   /* ------------------------------------------------------------------ listing --
-     Measured against the live deck's 1.4 GB telemetry database: an unfiltered page
-     of 50 answers in ~40 ms, but adding `kind=selfplay` costs ~45 s, because that
-     database was written before the browse indexes existed and the planner falls
-     back to sorting every matching row. Nothing on this screen can fix that, so the
-     screen is built so it never has to wait for it: filters are staged and applied
-     deliberately rather than firing a query per keystroke, the cost of the last
-     query is printed beside the row count, a game can be opened by id without the
-     listing at all, and every panel loads independently. */
+     Filters are staged until Apply, request time is shown, direct game-id lookup
+     bypasses the listing, and aggregate panels load independently. */
   const [draft, setDraft] = useState<Filters>(NO_FILTERS);
   const [applied, setApplied] = useState<Filters>(NO_FILTERS);
   const [offset, setOffset] = useState(0);
@@ -115,20 +107,16 @@ export default function History({ run, openLab }: { run?: Run; openLab: (game: G
     [draft, applied],
   );
   const isDefault = (filters: Filters) => FILTER_FIELDS.every((field) => filters[field] === NO_FILTERS[field]);
-  // A non-numeric bound would be a 422 from the server. Say which field, rather
-  // than dropping it and quietly querying something else.
+  // Invalid numeric bounds are reported locally instead of being omitted from the query.
   const badField = NUMERIC_FIELDS.find((field) => draft[field] !== "" && !/^\d+$/.test(draft[field].trim()));
 
   const listPath = run
     ? `/api/runs/${run.name}/games?${query({ ...applied, limit: PAGE, offset })}`
     : null;
-  // `manual` so a filter change clears the held page instead of leaving last
-  // query's rows under this query's heading; the effect below then asks for it.
+  // Manual mode clears rows when the listing path changes before the visible pane refetches.
   const games = useApi<GameRow[]>(listPath, [], { manual: true });
   const listRefresh = games.refresh;
-  // Once per query, and never while the screen is hidden: this page costs tens of
-  // seconds against the database the live run is writing to, so a run switch made
-  // from another screen must not spend it.
+  // Each listing path is fetched once while the pane is visible.
   const onShow = usePaneActive();
   const queried = useRef<string | null>(null);
   useEffect(() => {
@@ -137,9 +125,7 @@ export default function History({ run, openLab }: { run?: Run; openLab: (game: G
     void listRefresh();
   }, [onShow, listPath, listRefresh]);
 
-  // What the last page actually cost. The spread between an unfiltered page and a
-  // filtered one is three orders of magnitude, and only the deployed database can
-  // say which one this is — so it is measured rather than predicted.
+  // Request elapsed time starts at the transition into loading.
   const [listMs, setListMs] = useState<number | null>(null);
   const listStarted = useRef(0);
   const listWasLoading = useRef(false);
@@ -158,15 +144,12 @@ export default function History({ run, openLab }: { run?: Run; openLab: (game: G
   const [gameIdInput, setGameIdInput] = useState("");
 
   const detail = useApi<Game>(run && selected != null ? `/api/runs/${run.name}/games/${selected}` : null, []);
-  // Never render one game's payload under another game's heading while the fetch
-  // for the second is still out.
+  // Detail data is visible only when its game id matches the selection.
   const game = detail.data?.game_id === selected ? detail.data : undefined;
   const moves = game?.moves ?? [];
   const plies = game?.plies ?? [];
 
-  // Seed the cursor once per game, keyed on its id rather than on the payload
-  // object: saving a review refetches the game, and that must not throw the
-  // cursor back to the end of the line.
+  // Cursor seeding is keyed by game id so review refetches preserve the current ply.
   const seeded = useRef<number | null>(null);
   useEffect(() => {
     if (!game || seeded.current === game.game_id) return;
@@ -182,8 +165,7 @@ export default function History({ run, openLab }: { run?: Run; openLab: (game: G
     if (selected == null && games.data?.length) setSelected(games.data[0].game_id);
   }, [games.data, selected]);
 
-  /** Open a game at a ply. Re-selecting the loaded game does not refetch, so the
-   *  cursor moves directly; otherwise the wanted ply is applied on arrival. */
+  /** Opens a game at an optional ply, applying the ply immediately when already loaded. */
   const open = useCallback((gameId: number, at?: number) => {
     if (gameId === selected) {
       if (at != null) setPly(Math.max(0, Math.min(moves.length, at)));
@@ -230,9 +212,7 @@ export default function History({ run, openLab }: { run?: Run; openLab: (game: G
   const [group, setGroup] = useState<TraceGroup>("value");
   const [frame, setFrame] = useState<"mover" | "p0">("mover");
 
-  // The stored swing, ply by ply: the mover's own assessment across one placement,
-  // with the sign flipped when the seat changes. Same definition the blunders query
-  // ranks on, so a row there and this curve are the same number.
+  // Stored swing is the mover-frame value change across one placement.
   const swingPoints = useMemo<Array<[number, number | null]>>(() => plies.map((row, index) => {
     const next = plies[index + 1];
     if (!next || next.t !== row.t + 1) return [row.t, null];
@@ -296,9 +276,7 @@ export default function History({ run, openLab }: { run?: Run; openLab: (game: G
   const read = plies[ply];
 
   /* --------------------------------------------------------------- aggregates -- */
-  // The aggregates scan the same slice of the run the browser is filtered to, so a
-  // window narrowed above narrows them too — and changing it clears their held
-  // results, which described a different slice.
+  // Aggregate queries use the listing's applied iteration window.
   const iterations = { from_iteration: applied.from_iteration, to_iteration: applied.to_iteration };
   const windowLabel = applied.from_iteration || applied.to_iteration
     ? `iterations ${applied.from_iteration || "0"}–${applied.to_iteration || "latest"}`

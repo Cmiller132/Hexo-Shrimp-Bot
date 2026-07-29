@@ -297,9 +297,7 @@ fn an_odd_ply_cap_is_reached_exactly() {
     assert_eq!(game.position().stone_count(), 13);
 }
 
-/// The bug the boundary rule exists to stop: a cap reached on a turn's first stone
-/// must not end the game there, because it would give the mover one placement of
-/// the two its opponent got.
+/// Reaching the cap on a turn's first stone does not end the game mid-turn.
 #[test]
 fn the_cap_never_ends_a_turn_after_its_first_stone() {
     for ply_cap in 2..=16 {

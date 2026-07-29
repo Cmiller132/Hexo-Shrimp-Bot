@@ -199,8 +199,7 @@ class MatchRunner:
                     variant=request.sealbot_variant, max_depth=request.sealbot_depth,
                 )
                 with telemetry.open_telemetry(path_a.parent) as writer:
-                    # The opponent's identity rides in the summary (the seam
-                    # put it there); the variant is part of that identity.
+                    # The summary's opponent identity includes the variant.
                     match_id = record_match(
                         writer, result, games, source="deck",
                         checkpoint=path_a.name,

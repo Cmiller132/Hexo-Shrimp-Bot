@@ -1,10 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { format } from "./Ui";
 
-/** Categorical slots, assigned in this fixed order and never cycled. Validated
- *  all-pairs against the panel surface #121820 (worst CVD ΔE 9.1 deutan, worst
- *  normal-vision ΔE 16.5, all ≥ 3:1 contrast). `muted` is context ink, not an
- *  identity slot — it is only for a series the caller has explicitly greyed. */
+/** Fixed, non-cycling categorical slots; `muted` is caller-selected context ink. */
 export type Tone = "mint" | "blue" | "red" | "amber" | "muted";
 const SLOTS: Tone[] = ["mint", "blue", "red", "amber"];
 
@@ -17,8 +14,7 @@ export interface Series {
   /** Redundant second cue: solid = this checkpoint now, dashed = the stored
    *  acting-net trace, dotted = the compare checkpoint. */
   dash?: "solid" | "dashed" | "dotted";
-  /** Render the legend entry greyed and draw nothing — for a series that is
-   *  genuinely unavailable, rather than drawing it flat at zero. */
+  /** Render a disabled legend entry and no path for an unavailable series. */
   absent?: boolean;
   absentReason?: string;
 }
@@ -67,9 +63,8 @@ function logTicks(lo: number, hi: number): number[] {
 }
 
 /**
- * One chart for the whole deck: LiveRun plots against iteration, History and the
- * Lab against ply. There is exactly one y-axis by design — two scales on one plot
- * invent a correlation that is not in the data.
+ * Renders deck series against iteration or ply on one y-axis.
+ * A single scale prevents unrelated units from implying a shared magnitude.
  */
 export default function Chart({
   series, title, xLabel, yLabel, xDomain, yDomain, yScale = "linear",
@@ -146,7 +141,7 @@ export default function Chart({
     let open = false;
     for (const [x, value] of item.points) {
       const usable = value != null && Number.isFinite(value) && (yScale === "linear" || value > 0);
-      // A null breaks the path rather than joining across it: the gap is the fact.
+      // Null and unusable values break the path.
       if (!usable) { open = false; continue; }
       const px = sx(x), py = sy(value as number);
       line += `${open ? "L" : "M"}${px.toFixed(2)},${py.toFixed(2)}`;
@@ -188,8 +183,7 @@ export default function Chart({
   }).filter((entry): entry is { item: Series & { tone: Tone }; value: number | null } => entry != null), [toned, hidden]);
 
   const hasData = visible.some((item) => item.points.some(([, value]) => value != null));
-  // A lone series takes no legend box — the title names it. Direct end-labels only
-  // while there are few enough lines for them not to collide.
+  // A single series omits the legend; direct labels are limited to four visible series.
   const showLegend = toned.length > 1;
   const showDirect = visible.length <= 4;
   const straddles = yd[0] < 0 && yd[1] > 0;

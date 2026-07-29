@@ -1,5 +1,4 @@
-//! One question per move, and nothing else: what makes policy-only training the
-//! same loop as a tree search rather than a second path.
+//! Policy-session one-evaluation-per-move contract.
 
 mod common;
 

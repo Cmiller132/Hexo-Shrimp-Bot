@@ -219,8 +219,7 @@ def test_checkpoint_sentinel(tmp_path):
 
 
 def test_starvation_stops_the_run(tmp_path, monkeypatch):
-    """The unattended-run guard: consecutive empty-buffer iterations end the
-    run with a checkpoint instead of collecting dead games until morning."""
+    """Consecutive empty-buffer iterations stop at the configured limit and checkpoint."""
     from mantisnet import MantisConfig, MantisNet
     from mantisnet.klent import run as run_mod
     from mantisnet.klent.train import KlentConfig

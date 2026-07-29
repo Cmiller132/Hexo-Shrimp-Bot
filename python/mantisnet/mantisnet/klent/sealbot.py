@@ -2,8 +2,8 @@
 
 SealBot is an independent C++ iterative-deepening alpha-beta bot for Hexo.
 Its adapter, rules oracle, and memory-bounded wave machinery live in
-``opponents.py``; this module supplies the historical command-line entry point,
-telemetry recording, and checkpoint-curve orchestration.
+``opponents.py``; this module supplies the command-line entry point, telemetry
+recording, and checkpoint-curve orchestration.
 
 CLI::
 

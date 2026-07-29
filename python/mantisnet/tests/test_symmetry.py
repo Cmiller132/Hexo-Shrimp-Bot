@@ -1,4 +1,4 @@
-"""§12.3 / §8: exact D6 invariance on real positions.
+"""§12.3 / §8: exact D6 invariance on engine positions.
 
 Value equal and per-move policy equal through the coordinate transform, for
 all 11 non-identity symmetries, to atol 1e-5 — exact in exact arithmetic;

@@ -1,9 +1,9 @@
 """The MantisNet input builder: positions to graphs, graphs to batches.
 
-This module owns the representation of ``docs/MODEL_SPEC.md`` §3–§4 and the
-batching of §9, and is covered by ``MODEL_REPR_VERSION``. It re-derives live
-windows from the stone list itself — it never calls the engine's window walk,
-which is what lets §12.1 use the engine as an independent oracle.
+This module implements the representation of ``docs/MODEL_SPEC.md`` §3–§4
+and the batching contract of §9 under ``MODEL_REPR_VERSION``. It derives live
+windows from the stone list without calling the engine's window walk, which
+remains the independent oracle for §12.1.
 
 Index conventions this module fixes (each is part of the representation):
 
@@ -45,8 +45,8 @@ _MASKS = np.arange(64, dtype=np.int64)
 # canon(m) = min(m, reverse6(m)): a reflection reverses slot order (§3.2).
 _CANON = np.minimum(_MASKS, _reverse6(_MASKS))
 _CANONICAL = np.unique(_CANON[1:63])  # 1–5 bits set; 0 and 63 are not windows
-# Rank of each canonical mask; -1 marks masks that are not canonical (or are
-# empty/full) so a bad lookup fails loudly downstream rather than aliasing.
+# Rank of each canonical mask; -1 leaves noncanonical, empty, and full masks
+# outside the embedding index range.
 _PATTERN_RANK = np.full(64, -1, dtype=np.int64)
 _PATTERN_RANK[_CANONICAL] = np.arange(len(_CANONICAL))
 
@@ -325,12 +325,11 @@ def _batch_from_arrays(raw: dict) -> Batch:
 
 
 def collate_positions(positions) -> Batch:
-    """Positions straight to one collated batch, through the Rust builder.
+    """Build and collate positions with the Rust builder.
 
-    The production path: `hexo_py.build_batch` builds every position in
-    parallel with the GIL released. Field-for-field equal to
-    ``collate([from_position(p) ...])`` — the parity tests are what let the
-    two share `MODEL_REPR_VERSION`.
+    ``hexo_py.build_batch`` runs in parallel with the GIL released and returns
+    the same fields as ``collate([from_position(p) ...])`` under
+    ``MODEL_REPR_VERSION``.
     """
     import hexo_py
 
@@ -340,7 +339,7 @@ def collate_positions(positions) -> Batch:
 def collate_prefixes(games, ts) -> Batch:
     """Move prefixes to one collated batch: replay + build, in parallel.
 
-    The fitting path — a stored position is a move prefix
+    Stored fitting positions are move prefixes
     (``docs/KLENT_FOR_HEXO.md`` §4.3).
     """
     import hexo_py

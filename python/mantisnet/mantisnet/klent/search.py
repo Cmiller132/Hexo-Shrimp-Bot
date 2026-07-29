@@ -1,10 +1,9 @@
 """Batched Gumbel sequential-halving search for evaluation.
 
-The search is deliberately lines, not a tree. Hexo transitions are
-deterministic, so revisiting an identical path would reveal nothing; a small
-evaluation budget is better spent extending promising lines. Training imports
-nothing from this module: KLENT's closed-form operator remains the only
-training-time policy improvement.
+The search extends independent lines rather than retaining a tree. Hexo
+transitions are deterministic, and the evaluation budget is allocated by
+sequential halving. Training does not import this module; KLENT's closed-form
+operator is the training-time policy improvement.
 
 ``gumbel_choose`` follows the standard chooser contract
 ``choose(positions, rng) -> moves``. A positive-budget call draws one uint64
@@ -148,9 +147,7 @@ def gumbel_choose(evaluate, tau: float, lam: float, sims: int, rng=None):
             legal_count = hi - lo
             candidate_count = min(16, sims // 2, legal_count)
             if candidate_count < 1:
-                # Positive budgets below two cannot form the prescribed root
-                # set; policy argmax is the only meaningful zero-expansion
-                # fallback.
+                # Budgets below two use policy argmax because no root set can expand.
                 rank = int(root_logits[lo:hi].argmax())
                 searches.append((rank, None))
                 continue

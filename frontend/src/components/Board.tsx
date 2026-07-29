@@ -6,12 +6,10 @@ import { format, HeatLegend } from "./Ui";
 
 export type Overlay = "none" | "policy" | "q" | "improved" | "delta";
 
-/** Hex circumradius in user units. Constant: the viewBox does the scaling, so a
- *  size that shrank with the board only shrank the cells relative to their text. */
+/** Hex circumradius in user units; the viewBox owns board scaling. */
 const HEX_R = 10;
 const SQRT3 = Math.sqrt(3);
-/** Labelled-cell counts the top-k slider steps through. Exported so a screen's
- *  keyboard shortcut steps the same ladder the slider does. */
+/** Label-count ladder shared by the slider and screen-level keyboard controls. */
 export const TOP_K_STEPS = [0, 3, 6, 12, 24, 48];
 
 function axialToPixel(q: number, r: number): { x: number; y: number } {
@@ -29,9 +27,7 @@ function hexPoints(x: number, y: number, radius = HEX_R): string {
 
 /* ------------------------------------------------------------------- heat maps */
 
-/** Sequential ramp step for a magnitude, over four log decades below `max`.
- *  Policy is extremely skewed (πmax 1.0 against cells at 1e-11), so a linear ramp
- *  paints a black board. Returns 0..6, or null for "no wash". */
+/** Logarithmic magnitude step over four decades below `max`; returns 0..6 or null. */
 export function sequentialStep(value: number, max: number): number | null {
   if (!(value > 0) || !(max > 0)) return null;
   const u = Math.min(1, Math.max(0, (Math.log10(value) - Math.log10(max) + 4) / 4));
@@ -57,10 +53,7 @@ export interface BoardProps {
    *  `policyRank`. Omit when nothing has read the position, when the read is
    *  stale, or when the position is terminal. */
   legal?: Candidate[];
-  /** The legal cells at `cursor` with no read behind them. They are clickable and
-   *  hoverable and print their coordinates and nothing else: a legality mask is a
-   *  fact from the engine, and no π, Q or rank may be implied from it. Pass this
-   *  or `legal`, never both. */
+  /** Unscored legal cells at `cursor`; pass this or `legal`, never both. */
   mask?: Move[];
   /** `inspect.played` — the move the line plays next from `cursor`. */
   played?: Move | null;
@@ -90,8 +83,7 @@ export interface BoardProps {
 
 interface Box { minX: number; minY: number; maxX: number; maxY: number }
 
-/** The single legal cell on an empty board: P0 opens at the origin. A rule of the
- *  game, so it is known without asking anything — but it is legality only. */
+/** Engine-known legality mask for the empty board: P0 opens at the origin. */
 const ORIGIN: Move[] = [[0, 0]];
 
 export default function Board({
@@ -102,7 +94,7 @@ export default function Board({
   const drawn = Math.max(0, Math.min(cursor ?? moves.length, moves.length));
   const clickable = interactive ?? onSelect != null;
   const candidates = useMemo(() => legal ?? [], [legal]);
-  /** Every legal cell, read or not: what is clickable, hit-tested and framed. */
+  /** Complete legal-cell set used for clicks, hit testing, and framing. */
   const cells = useMemo(
     () => legal?.map((candidate) => candidate.move) ?? mask ?? (clickable && moves.length === 0 ? ORIGIN : []),
     [legal, mask, clickable, moves.length],
@@ -115,12 +107,9 @@ export default function Board({
   const activeTopK = topK ?? ownTopK;
   const setOverlay = onOverlayChange ?? setOwnOverlay;
   const setTopK = onTopKChange ?? setOwnTopK;
-  // Δ is the one overlay that needs a second checkpoint's answer. Until every
-  // candidate carries one, there is nothing to draw: a board painted at the
-  // diverging ramp's midpoint says the two checkpoints agree exactly.
+  // The Δ overlay renders only when every candidate has a comparison value.
   const deltaReady = activeOverlay !== "delta" || candidates.every((candidate) => candidate.delta != null);
-  // Move numbers and future ghosts default on for a short line and off for a long
-  // one, where they are noise; the toolbar overrides either.
+  // Move numbers default on below 60 drawn plies; the toolbar overrides the default.
   const [ownNumbers, setOwnNumbers] = useState<boolean | null>(null);
   const numbers = ownNumbers ?? drawn < 60;
   const [ghosts, setGhosts] = useState(true);
@@ -133,10 +122,7 @@ export default function Board({
     return map;
   }, [stones]);
 
-  // A legal cell sitting on an occupied one means the legal set describes a
-  // different ply than the stones do. Drawing either over the other would state a
-  // position that never existed, so it is an error: a caller must withhold a legal
-  // set it knows to be stale.
+  // A legal-cell overlap with a stone is rejected as a stale-position invariant violation.
   const cellKeys = useMemo(() => {
     const set = new Set<string>();
     for (const move of cells) {
@@ -269,8 +255,7 @@ export default function Board({
     return { diverging, max, painted, labelled };
   }, [activeOverlay, candidates, activeTopK, qDomain, deltaReady]);
 
-  // Only a read can name a top move. With a bare legality mask there is none —
-  // the engine's first legal cell is not the model's choice.
+  // Only scored candidates define a top move; an engine-order mask does not.
   const topCandidate = useMemo(
     () => candidates.find((candidate) => candidate.policyRank === 0) ?? null,
     [candidates],
@@ -299,10 +284,7 @@ export default function Board({
   /* ------------------------------------------------------- hover and selection - */
   const [hover, setHover] = useState<Move | null>(null);
   const [focusKey, setFocusKey] = useState<string | null>(null);
-  // The board's own arrow keys walk its candidate ring, and the deck's transport
-  // binds the same arrows to the ply cursor. They are reconciled by modality: the
-  // ring is live only while the board holds *keyboard* focus, so clicking a cell
-  // — the primary interaction — leaves the transport's map alone.
+  // Board arrow navigation is active only after keyboard focus, leaving click focus to transport keys.
   const [keyNav, setKeyNav] = useState(false);
   const pointerHeld = useRef(false);
 
@@ -321,9 +303,7 @@ export default function Board({
 
   const setHovered = useCallback((move: Move | null) => setHover(move), []);
 
-  // One delegated lookup, not a closure per cell. `event.target` is retargeted to
-  // the SVG while a pan holds pointer capture, so fall back to hit-testing the
-  // point — otherwise no click would ever resolve to a cell mid-capture.
+  // Pointer-captured events fall back to point hit testing when the SVG is the target.
   const cellFromEvent = (event: { target: EventTarget | null; clientX: number; clientY: number }): Move | null => {
     let node = (event.target as Element | null)?.closest?.("[data-q]") as SVGGElement | null;
     if (!node) node = document.elementFromPoint(event.clientX, event.clientY)?.closest("[data-q]") as SVGGElement | null;
@@ -407,8 +387,7 @@ export default function Board({
         role="grid"
         aria-label={caption ?? `Hexo position after ${drawn} of ${moves.length} plies`}
         onPointerDown={(event) => {
-          // Focus arrives between this and the pointer-up, so the flag is what tells
-          // a click-focus from a tab-focus.
+          // The flag distinguishes pointer focus from keyboard focus.
           pointerHeld.current = true;
           setKeyNav(false);
           drag.current = { id: event.pointerId, x: event.clientX, y: event.clientY, moved: false };
@@ -446,8 +425,7 @@ export default function Board({
         onPointerLeave={() => setHovered(null)}
         onKeyDown={(event) => {
           if (event.key === "Escape") { setKeyNav(false); setFocusKey(null); setHovered(null); (event.currentTarget as SVGSVGElement).blur(); return; }
-          // Everything below preventDefaults, which also stands the transport's
-          // document-level bindings down — so it runs only in keyboard modality.
+          // Handled board keys prevent the document-level transport binding.
           if (!keyNav) return;
           if (event.key === "ArrowRight" || event.key === "ArrowDown") { event.preventDefault(); walkFocus(1); }
           else if (event.key === "ArrowLeft" || event.key === "ArrowUp") { event.preventDefault(); walkFocus(-1); }

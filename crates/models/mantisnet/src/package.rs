@@ -24,7 +24,7 @@ const EVAL_SIMULATIONS: NonZeroU32 = NonZeroU32::new(32).expect("32 is nonzero")
 /// Root candidates under the package's fixed evaluation mode.
 const EVAL_CANDIDATES: NonZeroUsize = NonZeroUsize::new(16).expect("16 is nonzero");
 
-/// The loaded state published only after its probe agrees.
+/// Probe-verified loaded state.
 struct Loaded {
     forward: Arc<Mutex<Box<dyn Forward>>>,
     probe_hash: u64,
@@ -54,9 +54,8 @@ impl MantisPackage {
     }
 
     fn metadata(&self) -> serde_json::Value {
-        // Serialize the shortest decimal that names the configured f32. A
-        // direct f32-to-f64 widening would expose binary rounding noise in the
-        // JSON number and would not compare equal after a manifest round trip.
+        // Serialize through the shortest f32 decimal so manifest round trips
+        // preserve numeric equality.
         let tau: f64 = self
             .config
             .tau
@@ -171,9 +170,7 @@ impl ModelPackage for MantisPackage {
             source,
         })?;
 
-        // Probe the copy, not its source. The manifest is a claim about the
-        // bytes in this directory and must be computed through the evaluator
-        // that will answer after a later load.
+        // Probe the checkpoint copy through the evaluator used by normal loads.
         let candidate = self.candidate(&weights)?;
         let manifest = Manifest::new(
             PACKAGE_NAME,
@@ -206,8 +203,7 @@ impl ModelPackage for MantisPackage {
             });
         }
 
-        // Last, after every refusal point: a failed load leaves the previously
-        // proved module intact.
+        // Publish only after all validation and probe checks succeed.
         self.loaded = Some(candidate);
         Ok(manifest)
     }
@@ -257,8 +253,7 @@ impl ModelPackage for MantisPackage {
     }
 }
 
-/// SplitMix64's finaliser, used only to give successive fresh sessions
-/// different construction seeds before the driver reseeds them from entropy.
+/// SplitMix64 finalizer used to derive distinct session construction seeds.
 const fn mix(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);

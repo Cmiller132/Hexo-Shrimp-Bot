@@ -1,10 +1,8 @@
-//! MantisNet's closed-form KLENT policy improvement.
+//! Closed-form KLENT policy improvement for MantisNet.
 //!
 //! The network supplies one policy logit and one action value for every legal
 //! action in canonical order. [`improve_policy`] applies equation 3 from the
-//! model specification to that single ragged row. Keeping this operation in
-//! the model package makes `pi_prime` part of MantisNet's opinion rather than a
-//! search-session concern.
+//! model specification to one ragged row.
 
 use std::{error::Error, fmt};
 
@@ -170,11 +168,8 @@ pub fn improve_policy(
     if !v_hat.is_finite() {
         return Err(ImprovementError::NumericalFailure);
     }
-    // Mathematically this is a convex combination of values in [-1, 1].
-    // Sequential f32 accumulation can overshoot an endpoint by a few ulps
-    // (e.g. eighteen identical Q=1 actions), but Evaluation's public
-    // convention is exact and sessions deliberately refuse out-of-range
-    // values. Project only that arithmetic noise back onto the closed interval.
+    // Sequential f32 accumulation of a convex combination can overshoot
+    // [-1, 1] by a few ulps, so clamp to Evaluation's exact interval.
     let v_hat = v_hat.clamp(-1.0, 1.0);
 
     Ok(ImprovedPolicy { pi_prime, v_hat })

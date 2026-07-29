@@ -1,18 +1,13 @@
-//! The selection hooks: what a package is handed when a search is done, and
-//! what it must hand back.
+//! Package-owned move-selection hooks.
 //!
-//! This crate ships **no** implementation of either trait — no sampler, no
-//! temperature, no argmax. Move selection is the model's, as its encoding is,
-//! and `crates/hexo-player/README.md` argues why at length: a shared default
-//! that can be inherited without being chosen compiles, passes, and yields a
-//! self-play run in which every game is identical, and no downstream stage can
-//! detect it because the data is well-formed.
+//! This crate defines the policy and search selection contracts but provides no
+//! selector implementation.
 
 use crate::rng::SplitMix64;
 use crate::seam::Evaluation;
 use hexo_engine::{Action, Position};
 
-/// One root child as the search left it.
+/// One root child in a completed search.
 ///
 /// Children are in the engine's canonical legal order, so `children()[i]`
 /// corresponds to `root.nth_legal(i)` and to prior `i` of the root's own
@@ -21,8 +16,7 @@ use hexo_engine::{Action, Position};
 pub struct Child {
     /// The placement this child plays.
     pub action: Action,
-    /// How many visits the search spent below it. Virtual loss is settled by the
-    /// time a decision exists, so this is a real count.
+    /// Settled visits below this child; no virtual loss remains.
     pub visits: u32,
     /// Mean backed-up value, from the perspective of the **root's** mover, or
     /// `0.0` for an unvisited child.
@@ -31,7 +25,7 @@ pub struct Child {
     pub prior: f32,
 }
 
-/// The root and its children, as the search left them.
+/// A completed search root and its children.
 ///
 /// A borrowed view, not a snapshot: it exists only for the duration of the
 /// selector call. It is publicly constructible so a package can unit-test its
@@ -50,8 +44,7 @@ impl<'a> SearchOutcome<'a> {
         Self { root, children }
     }
 
-    /// The position the search started from — the session's own copy of the
-    /// game's, which is what its [`hexo_runner::Decision`] attests.
+    /// The position the search started from.
     #[inline]
     #[must_use]
     pub const fn root(&self) -> &'a Position {
@@ -75,17 +68,13 @@ impl<'a> SearchOutcome<'a> {
     }
 }
 
-/// Package-owned: turns a finished tree search into the seat's whole utterance.
+/// Package-owned conversion from a completed tree search to a decision payload.
 ///
-/// Both methods are required. A defaulted `diagnostics` returning `None` would
-/// be inherited by every package that never thought about it, and the training
-/// annotations — the visit distribution a policy target is built from — would
-/// vanish into a record that looks complete.
+/// Both selection and diagnostics behavior are required.
 pub trait SelectFromSearch: Send {
     /// Choose the placement to play.
     ///
-    /// `rng` is the session's stream. Using it is what makes a self-play seat
-    /// vary; a selector that ignores it plays one game forever.
+    /// `rng` is the session's stream.
     fn select(&mut self, outcome: &SearchOutcome<'_>, rng: &mut SplitMix64) -> Action;
 
     /// The seat-owned diagnostics for the record, or `None` to record nothing.
@@ -95,11 +84,7 @@ pub trait SelectFromSearch: Send {
     fn diagnostics(&mut self, outcome: &SearchOutcome<'_>) -> Option<Vec<u8>>;
 }
 
-/// Package-owned: turns one root evaluation into the seat's whole utterance.
-///
-/// The policy-only counterpart of [`SelectFromSearch`], and the reason
-/// policy-only training is the same loop as MCTS rather than a second path
-/// through the driver.
+/// Package-owned conversion from one root evaluation to a decision payload.
 pub trait SelectFromPolicy: Send {
     /// Choose the placement to play. `evaluation.priors[i]` belongs to
     /// `root.nth_legal(i)`.

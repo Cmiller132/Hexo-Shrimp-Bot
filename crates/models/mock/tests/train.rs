@@ -1,6 +1,4 @@
-//! The whole loop the container will run, with nothing above it: play games with
-//! the package's own sessions, write a shard, fit on it, and load what the fit
-//! wrote.
+//! Mock-package play, shard, fit, and load integration.
 
 mod common;
 
@@ -94,8 +92,7 @@ fn an_eval_game_records_nothing_because_it_trains_nothing() {
 
 #[test]
 fn two_variants_of_one_package_play_each_other_over_the_same_weights() {
-    // What variants are for: a benchmark match between two search shapes, with
-    // nothing else different between the seats.
+    // Compare two search variants over the same loaded weights.
     let dir = tempfile::tempdir().expect("a scratch directory");
     let package = loaded(dir.path(), "search=policy").expect("initialised and loaded");
     let encoder = package.encoder();
@@ -143,9 +140,7 @@ fn fit_writes_a_checkpoint_that_loads_and_whose_weights_actually_moved() {
         std::fs::read(epoch1.join("weights.mock")).expect("read"),
     );
 
-    // The fit did not load what it wrote — the container does, through the same
-    // load as any other checkpoint, which is what puts the fit's own output
-    // behind the probe.
+    // Fitting writes but does not load the output checkpoint.
     assert_eq!(answers(&package), before);
     let loaded_back = package.load(&epoch1).expect("the new checkpoint proves");
     assert_eq!(loaded_back, fitted);
@@ -172,9 +167,7 @@ fn fit_on_the_same_shards_twice_writes_the_same_weights() {
 
 #[test]
 fn fit_reads_every_shard_it_is_handed() {
-    // The weights are a function of the games read, so a fit that quietly
-    // stopped after the first shard would write different weights than one that
-    // read both — which is a thing a test can say, unlike "it opened a file".
+    // The training digest covers games from every supplied shard.
     let dir = tempfile::tempdir().expect("a scratch directory");
     let package = loaded(&dir.path().join("epoch-0"), MCTS).expect("initialised and loaded");
     let first = write_shard(
@@ -275,8 +268,7 @@ fn fit_refuses_a_path_that_is_not_a_shard_with_the_readers_own_error() {
         .fit(&[junk], &dir.path().join("epoch-1"), 1)
         .expect_err("not a shard");
     match error {
-        // The record error survives whole rather than being flattened to a
-        // message: `source` still hands back the `RecordError` that said so.
+        // The boxed source remains downcastable to `RecordError`.
         PackageError::Failed {
             package,
             doing,

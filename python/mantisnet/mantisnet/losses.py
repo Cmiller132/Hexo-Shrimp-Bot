@@ -42,18 +42,13 @@ def policy_loss(logits: Tensor, offsets: Tensor, target: Tensor) -> Tensor:
 
     ``logits`` and ``target`` are flat over every legal cell of every position
     (engine order, the model's output layout); ``offsets`` is the (P + 1,)
-    CSR boundary from the batch. Each position's target must be a
-    distribution: a target that quietly summed to something else would train
-    against a policy nobody stated.
+    CSR boundary from the batch. Each position's target must sum to one.
     """
     p = offsets.shape[0] - 1
     seg = segment_ids(offsets)
 
     target = target.float()
-    # The check accumulates in f64: at Hexo widths (10^4+ legal cells) honest
-    # fp32 index_add rounding alone approaches the tolerance, and this guard
-    # exists to catch corrupt targets, not accumulator noise. NaN, Inf, and
-    # truncation still fail it.
+    # Accumulating in f64 keeps fp32 rounding below the normalization tolerance.
     sums = segment_sum(target.double(), seg, p)
     if not torch.allclose(sums, torch.ones_like(sums), atol=1e-4):
         dev = (sums - 1.0).abs()

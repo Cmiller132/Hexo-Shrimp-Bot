@@ -169,10 +169,8 @@ fn error_board_extent_exceeded() {
     assert!(p.advance(act(q - 8, 1)).is_ok());
 }
 
-/// Regression: the growth policy grew both arena dimensions on every growth event, so a
-/// straight walk along `q` — every ply exactly [`LEGAL_RADIUS`] from the last stone,
-/// so every ply legal — was refused at ply 65 with `BoardExtentExceeded { cells:
-/// 16777216 }` while `is_legal` still said yes.
+/// A legal straight walk along `q` must remain representable through this test
+/// length.
 #[test]
 fn a_straight_q_walk_is_never_refused_by_the_arena() {
     let mut p = play(&[(0, 0)]);
@@ -293,8 +291,7 @@ fn an_excursion_along_r_does_not_shorten_a_later_q_walk() {
         );
         assert_eq!(ra, rb, "ply {ply} at ({q}, 0)");
     }
-    // Only the observables must agree: the excursion may leave the searched arena a
-    // wider shape, but the walk above proves that never costs a placement.
+    // Arena geometry may differ, but all public observables must agree.
     assert_eq!(a, b);
 }
 
@@ -369,9 +366,7 @@ fn every_rejection_is_atomic() {
         (-crate::COORD_LIMIT - 1, 0),
         (300, -300),
     ];
-    // The spec's atomicity is bit identity *including arena geometry*, which
-    // `PartialEq`, `zobrist`, and `audit` all deliberately ignore — so the
-    // geometry is probed directly.
+    // Atomicity includes arena geometry, which public equality and hashes omit.
     let shape = |p: &Position| {
         (
             p.grid.rows(),
@@ -468,8 +463,8 @@ fn second_stone_win_freezes_at_second_stone_with_first_occupied() {
     let p = second_stone_win();
     assert_eq!(p.outcome(), Some(Outcome { winner: Player::P1 }));
     assert_eq!(p.phase(), TurnPhase::SecondStone);
-    // The turn's first stone, still on the board: a frozen phase names no cell, but the
-    // cell it used to name is occupied, which is the trap in spec §7.4 H2.
+    // The first stone remains occupied after the terminal phase clears its
+    // phase-local coordinate.
     assert_eq!(p.get(HexCoord::new(5, 0)), Some(Player::P1));
     assert_eq!(p.current_player(), Player::P1);
     assert_eq!(p.legal_count(), 0);

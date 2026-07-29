@@ -1,11 +1,7 @@
-//! The batched sweep: many games in flight, a pool sized to the silicon, and
-//! one evaluator crossing per batch.
+//! Shared batched sweep for self-play, evaluation, and matches.
 //!
-//! One implementation, shared verbatim by self-play, by evaluation, and by
-//! `match` — `docs/CONTAINER_SPEC.md` §8's "one implementation of the loop, not
-//! a loop plus a set of pieces that could drift from it". What differs between
-//! the three is what a caller hands in: which sessions fill the seats, how many
-//! evaluator slots there are, and whether finished games are written down.
+//! Callers supply seat sessions, evaluator slots, game quota, and an optional
+//! record sink. `docs/CONTAINER_SPEC.md` §7.1 and §8 define the topology.
 //!
 //! # Topology (§7.1)
 //!
@@ -21,33 +17,22 @@
 //!   writer, 1 thread ---> records/<epoch>/shard-0000.hxr
 //! ```
 //!
-//! **There is no thread per game.** A lane is a slot, not a stack: a session
-//! with leaves outstanding is a struct holding a few vectors, so the number of
-//! concurrent games is bounded by memory rather than by scheduler pressure. That
-//! is the whole architecture, and it is what `hexo-runner` inverted its loop for
-//! and what `hexo-search` made its sessions nonblocking for.
+//! A lane is data rather than a dedicated thread. Each lane contains one game,
+//! two sessions, and its outstanding leaves and evaluations.
 //!
-//! # Why it cannot deadlock
+//! # Queue invariants
 //!
-//! **A lane is a token, and there are exactly as many tokens as lanes.** A lane
-//! is in exactly one place at any moment: the ready queue, one worker's hand,
-//! the job channel, or the batcher's slate. So the ready queue's occupancy can
-//! never exceed the lane count — it is bounded structurally rather than by a
-//! capacity nobody could pick — and the batcher can therefore *always* hand a
-//! lane back without blocking.
+//! A lane is in exactly one place: the ready queue, a worker, the job channel,
+//! or the batcher's slate. The ready queue capacity equals the lane count, so
+//! the batcher can always return a lane without blocking.
 //!
-//! That is the property the whole thing rests on. Only workers ever block on a
-//! queue: on the job channel when the batcher is behind, and on the record
-//! channel when the writer is. Both of those consumers run to completion without
-//! ever blocking on a producer, so there is no cycle of waits to close. The
-//! backpressure a saturated device applies therefore stops the workers, which is
-//! the point, instead of growing a queue until the process is killed.
+//! Only workers block on the bounded job and record channels. Their consumers
+//! do not block on producers, so the topology contains no wait cycle and
+//! backpressure remains bounded.
 //!
-//! Draining is the same argument from the other end. When the phase's quota is
-//! met, a lane whose game ends retires instead of restarting; workers wait on a
-//! condition variable — never a spin — until every lane has retired, which the
-//! in-flight evaluations are free to make happen because the batcher is still
-//! running. A worker leaves only when no lane exists anywhere.
+//! After quota completion, finished lanes retire instead of restarting. Workers
+//! wait on a condition variable until every lane retires while the batcher
+//! continues to settle in-flight evaluations.
 
 use crate::Outcome;
 use crate::error::BotError;
@@ -67,9 +52,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How many jobs and records may be queued per worker before it blocks.
 ///
-/// Small on purpose. The queues exist to keep the batcher fed across a
-/// scheduling hiccup, not to store work: a deep queue would hide the device
-/// being the bottleneck by letting the workers run ahead into memory.
+/// Bounded queues prevent workers from accumulating unconsumed work.
 const QUEUE_PER_WORKER: usize = 2;
 
 /// The two sessions filling one lane's seats, and where each of them gets its
@@ -341,12 +324,8 @@ impl Lane {
 
     /// Give both seats a fresh stream.
     ///
-    /// `docs/CONTAINER_SPEC.md` §12: the driver seeds sessions from entropy,
-    /// games are deliberately non-deterministic, and nothing mints or records a
-    /// per-game seed. `OPEN_DECISIONS.md` B4 is the deferral, and
-    /// `DecisionSession::reseed` is the seam it will land on — a recorded seed
-    /// that does not reproduce the game is worse than none, because it reads as
-    /// a guarantee nobody ever checked.
+    /// `docs/CONTAINER_SPEC.md` §12 requires entropy-derived, unrecorded
+    /// per-seat streams; runs do not promise game replay.
     fn reseed(&mut self) {
         for seat in 0..2 {
             let seed = entropy_seed(self.index, self.serial, seat);
@@ -524,20 +503,8 @@ fn winding_up(stop: &AtomicBool, abort: &AtomicBool) -> bool {
 
 /// Ends the sweep when the thread holding it unwinds.
 ///
-/// Panicking is how the layers below report a broken evaluation — a prior count
-/// that does not match the position's legal set, a value outside `[-1, 1]`, an
-/// answer to a question no session asked — and every one of those is a package
-/// bug worth stopping for. What must not happen is that stopping becomes
-/// *hanging*: a worker that dies with a lane checked out leaves the queue
-/// counting a lane that no longer exists, and every other worker would wait on
-/// the condition variable for it to come back. So the thread that unwinds halts
-/// the sweep and sets the abort flag on its way out — the flag as well as the
-/// halt, because a shard whose phase died must not be finalized as though the
-/// phase had finished.
-///
-/// Only on a panic. A worker that returns normally has already halted, and
-/// setting the abort flag then would tell the writer to throw away a shard that
-/// is complete.
+/// During panic unwinding it sets the abort flag and halts the pool, which wakes
+/// waiters and prevents shard finalization. Normal drop has no effect.
 struct EndOnPanic<'a> {
     /// The sweep to halt.
     pool: &'a Pool,
@@ -896,11 +863,8 @@ fn cross(
 
 /// The one thread that touches a record file.
 ///
-/// A shard that was abandoned is never finalized, so `ShardWriter`'s temporary
-/// file is removed and nothing appears at the shard's name at all. That is
-/// `docs/CONTAINER_SPEC.md` §8.1's rule for a stop mid-self-play: the games were
-/// on-policy and are worthless without the fit that was going to consume them,
-/// so a half epoch of them is not a smaller epoch, it is nothing.
+/// An aborted shard is not finalized; dropping its writer removes the temporary
+/// file as required by `docs/CONTAINER_SPEC.md` §8.1.
 fn write_shard(
     records: Receiver<GameRecord>,
     sink: RecordSink,

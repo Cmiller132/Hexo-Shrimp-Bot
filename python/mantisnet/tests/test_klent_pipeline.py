@@ -1,9 +1,7 @@
-"""Self-play collection, the buffer rules, fitting, and the whole iteration.
+"""Self-play collection, buffer, fitting, and iteration contracts.
 
-The collection loop is exercised through the evaluator seam with the
-scripted line-extending evaluator (``tests/heuristic.py``) — the same seam
-the network uses — so games reliably terminate and every buffer rule is
-observable without a trained model.
+The collection tests use the evaluator seam with the scripted line-extending
+evaluator in ``tests/heuristic.py``.
 """
 
 from __future__ import annotations
@@ -151,8 +149,7 @@ def test_heuristic_selfplay_terminates_and_buffers_correctly():
         assert len(samples) == len(ep.moves)
         assert samples[-1].g == 1.0
         assert all(np.isfinite(s.g) for s in samples)
-        # At the Monte Carlo endpoint the returns are exactly ±1, whatever
-        # the evaluator's (here deliberately unbounded) v̂ said.
+        # At the Monte Carlo endpoint the returns are ±1 independent of v̂.
         assert all(s.g in (1.0, -1.0) for s in episode_samples(ep, 1.0, 1.0))
 
 
@@ -192,11 +189,7 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
 
 
 def test_collect_and_fit_end_to_end():
-    """The whole iteration through an untrained network: collection runs the
-    real evaluator, the metrics row is complete, and whatever the games
-    produced fits cleanly — including the honest zero-data case, since an
-    untrained policy rarely finishes a game
-    (the ``KLENT_FOR_HEXO.md`` §4.2 premise)."""
+    """An untrained network collects complete metrics and fits any resulting samples."""
     model = _tiny_model()
     cfg = KlentConfig(games_per_iteration=4, envs=4, ply_cap=60, batch_size=64)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)

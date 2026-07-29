@@ -1,16 +1,14 @@
-//! The batched MantisNet graph builder: positions to collated index arrays.
+//! Batched MantisNet graph encoding and collation.
 //!
-//! This is the one production implementation of the representation that
-//! `python/mantisnet/mantisnet/builder.py` defines: both the container package
-//! and the PyO3 binding consume it. The Python builder remains the normative
-//! reference and parity oracle; `python/mantisnet/tests/test_rust_builder.py`
-//! holds every array this module emits exactly equal to that independent path.
+//! The container package and PyO3 binding share this implementation. The Python
+//! builder defines the parity reference checked by
+//! `python/mantisnet/tests/test_rust_builder.py`.
 //!
 //! Orderings that parity depends on (all inherited from the Python builder):
 //! windows sort by the packed key `(q·2²¹ + r)·4 + axis`; incidence is
 //! window-major then slot; the decoder table is legal-cell-major, then axis,
 //! then offset. Positions build in parallel under rayon; assembly into flat
-//! arrays is single-threaded and cheap.
+//! arrays is single-threaded.
 
 use hexo_engine as engine;
 use rayon::prelude::*;
