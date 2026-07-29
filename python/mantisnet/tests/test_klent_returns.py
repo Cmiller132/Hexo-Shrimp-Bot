@@ -75,8 +75,19 @@ def test_monte_carlo_identity_at_lambda_one(moves):
     # on either half of a turn (K2).
     mr, movers, pos = _walk(moves)
     assert pos.is_terminal and pos.winner == 0
-    g = lambda_returns(signs_from_moves_remaining(mr), np.zeros(len(moves)), 1.0)
+    g = lambda_returns(signs_from_moves_remaining(mr), np.zeros(len(moves)), 1.0, 1.0)
     expected = np.where(movers == pos.winner, 1.0, -1.0)
+    assert np.allclose(g, expected)
+
+
+@pytest.mark.parametrize("moves", [FIRST_STONE_WIN, SECOND_STONE_WIN])
+def test_gamma_discounts_by_distance_to_terminal(moves):
+    # λ = 1, γ < 1: |G_t| = γ^(T−t), the sign still the mover's frame.
+    mr, movers, pos = _walk(moves)
+    assert pos.is_terminal and pos.winner == 0
+    g = lambda_returns(signs_from_moves_remaining(mr), np.zeros(len(moves)), 1.0, 0.9)
+    steps = len(moves) - 1 - np.arange(len(moves))
+    expected = np.where(movers == pos.winner, 1.0, -1.0) * 0.9**steps
     assert np.allclose(g, expected)
 
 
@@ -86,7 +97,7 @@ def test_one_step_bootstrap_identity_at_lambda_zero(moves):
     rng = np.random.default_rng(4)
     v = rng.uniform(-1, 1, len(moves))
     signs = signs_from_moves_remaining(mr)
-    g = lambda_returns(signs, v, 0.0)
+    g = lambda_returns(signs, v, 0.0, 1.0)
     assert g[-1] == 1.0
     for t in range(len(moves) - 1):
         assert g[t] == pytest.approx(signs[t] * v[t + 1])
@@ -94,12 +105,16 @@ def test_one_step_bootstrap_identity_at_lambda_zero(moves):
 
 def test_hand_computed_intermediate_lambda():
     signs = signs_from_moves_remaining([1, 2, 1, 2])
-    g = lambda_returns(signs, [0.1, 0.2, 0.3, 0.4], 0.5)
+    g = lambda_returns(signs, [0.1, 0.2, 0.3, 0.4], 0.5, 1.0)
     assert np.allclose(g, [0.0, -0.2, -0.7, 1.0])
 
 
 def test_validation():
     with pytest.raises(ValueError, match="lam_ret"):
-        lambda_returns(np.array([1.0]), [0.0], 1.5)
+        lambda_returns(np.array([1.0]), [0.0], 1.5, 1.0)
+    with pytest.raises(ValueError, match="gamma"):
+        lambda_returns(np.array([1.0]), [0.0], 1.0, 0.0)
+    with pytest.raises(ValueError, match="gamma"):
+        lambda_returns(np.array([1.0]), [0.0], 1.0, 1.5)
     with pytest.raises(ValueError, match="equal-length"):
-        lambda_returns(np.array([1.0, -1.0]), [0.0], 0.9)
+        lambda_returns(np.array([1.0, -1.0]), [0.0], 0.9, 1.0)

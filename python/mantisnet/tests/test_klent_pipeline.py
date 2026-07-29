@@ -67,7 +67,7 @@ def test_accumulated_gradients_match_one_big_batch():
     chunks accumulates to the same gradients as one whole-buffer batch."""
     rng = np.random.default_rng(3)
     episodes, _ = _collect(heuristic_evaluate, 4, 100, 0.1, 0.03, rng)
-    samples = [s for e in episodes for s in episode_samples(e, 0.939)][:24]
+    samples = [s for e in episodes for s in episode_samples(e, 0.939, 1.0)][:24]
     assert len(samples) >= 12
 
     grads = []
@@ -143,7 +143,7 @@ def test_heuristic_selfplay_terminates_and_buffers_correctly():
     assert metrics["acting_kl"] >= 0 and 0 <= metrics["acting_norm_entropy"] <= 1
 
     for ep in episodes:
-        samples = episode_samples(ep, lam_ret=0.883)
+        samples = episode_samples(ep, lam_ret=0.883, gamma=1.0)
         if ep.winner is None:
             assert samples == []  # K4: capped episodes contribute nothing
             continue
@@ -153,13 +153,13 @@ def test_heuristic_selfplay_terminates_and_buffers_correctly():
         assert all(np.isfinite(s.g) for s in samples)
         # At the Monte Carlo endpoint the returns are exactly ±1, whatever
         # the evaluator's (here deliberately unbounded) v̂ said.
-        assert all(s.g in (1.0, -1.0) for s in episode_samples(ep, 1.0))
+        assert all(s.g in (1.0, -1.0) for s in episode_samples(ep, 1.0, 1.0))
 
 
 def test_samples_replay_to_their_positions():
     rng = np.random.default_rng(8)
     episodes, _ = _collect(heuristic_evaluate, 1, ply_cap=200, tau=0.03, lam=0.1, rng=rng)
-    samples = episode_samples(episodes[0], lam_ret=0.9)
+    samples = episode_samples(episodes[0], lam_ret=0.9, gamma=1.0)
     assert samples, "seed 8 should produce a finished game"
     for s in samples[:: max(len(samples) // 6, 1)]:
         pos = hexo_py.Position.replay(list(s.moves[: s.t]))
@@ -172,7 +172,7 @@ def test_samples_replay_to_their_positions():
 def test_fit_trains_policy_and_q_and_never_the_value_head():
     rng = np.random.default_rng(10)
     episodes, _ = _collect(heuristic_evaluate, 4, ply_cap=200, tau=0.03, lam=0.1, rng=rng)
-    samples = [s for e in episodes for s in episode_samples(e, 0.883)]
+    samples = [s for e in episodes for s in episode_samples(e, 0.883, 1.0)]
     assert samples
 
     model = _tiny_model()
@@ -206,7 +206,7 @@ def test_collect_and_fit_end_to_end():
     assert len(episodes) >= 4
     for key in ("f", "acting_kl", "acting_norm_entropy", "v_hat_mae"):
         assert key in metrics
-    samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret)]
+    samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret, cfg.gamma)]
     if samples:
         out = fit(model, samples, optimizer, cfg, np.random.default_rng(12))
         assert np.isfinite(out["policy_loss"])

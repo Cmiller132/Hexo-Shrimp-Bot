@@ -34,6 +34,10 @@ class KlentConfig:
     # e^{-1/16}: the paper's 8-turn horizon at Hexo's two placements per turn
     # (KLENT_PROPOSALS A1). The paper's literal e^{-1/8} would halve it.
     lam_ret: float = 0.939
+    # Per-ply return-discount magnitude (the mover-change sign is separate).
+    # 1.0 is the reference objective; below 1 it ranks faster wins above
+    # slower ones — the conversion pressure an infinite no-draw board lacks.
+    gamma: float = 1.0
     ply_cap: int = 512  # §5: capped episodes are dropped whole
     # The completion quota: an iteration's buffer is at least this many
     # *finished* games, from however many slots are in flight.

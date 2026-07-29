@@ -123,7 +123,7 @@ def test_sampled_returns_average_to_q_star():
                 break
             s = nxt
         g = lambda_returns(
-            signs_from_moves_remaining(mrs), np.zeros(len(mrs)), 1.0
+            signs_from_moves_remaining(mrs), np.zeros(len(mrs)), 1.0, 1.0
         )
         for (state, action), value in zip(visited, g):
             cell = totals[(state, ACTIONS[action])]

@@ -300,12 +300,12 @@ def collection_stats(episodes: list[Episode]) -> dict:
     }
 
 
-def episode_samples(episode: Episode, lam_ret: float) -> list[Sample]:
+def episode_samples(episode: Episode, lam_ret: float, gamma: float) -> list[Sample]:
     """The buffer entries of one episode: empty for a capped one (§5.1)."""
     if episode.winner is None:
         return []
     signs = signs_from_moves_remaining(episode.moves_remaining)
-    returns = lambda_returns(signs, episode.v_hats, lam_ret)
+    returns = lambda_returns(signs, episode.v_hats, lam_ret, gamma)
     moves = tuple(episode.moves)
     return [
         Sample(

@@ -262,7 +262,7 @@ def run_training(
             overlap = i > start_iteration
             if overlap and i + 1 < iterations:
                 pending = submit_collect(pool, i + 1)  # overlaps the fit below
-            samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret)]
+            samples = [s for e in episodes for s in episode_samples(e, cfg.lam_ret, cfg.gamma)]
             metrics["buffer_samples"] = len(samples)
             if samples:
 
@@ -364,6 +364,10 @@ def main(argv=None) -> None:
     ap.add_argument("--lam", type=float, default=KlentConfig.lam)
     ap.add_argument("--lam-ret", type=float, default=KlentConfig.lam_ret)
     ap.add_argument(
+        "--gamma", type=float, default=KlentConfig.gamma,
+        help="per-ply return-discount magnitude (1.0 = undiscounted)",
+    )
+    ap.add_argument(
         "--batch", type=int, default=KlentConfig.batch_size,
         help="effective fitting batch, accumulated across packed chunks",
     )
@@ -435,6 +439,7 @@ def main(argv=None) -> None:
         tau=args.tau,
         lam=args.lam,
         lam_ret=args.lam_ret,
+        gamma=args.gamma,
         ply_cap=args.cap,
         games_per_iteration=args.games,
         envs=args.envs,

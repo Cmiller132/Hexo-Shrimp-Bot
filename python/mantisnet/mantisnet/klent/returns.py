@@ -11,7 +11,14 @@ episodes are dropped whole before this module ever sees them (§5.1) — so
 there is exactly one case:
 
     G_T = +1
-    G_t = s_t · [ (1 − λ)·v̂_{t+1} + λ·G_{t+1} ]        t < T
+    G_t = s_t · γ · [ (1 − λ)·v̂_{t+1} + λ·G_{t+1} ]        t < T
+
+γ is the per-ply discount *magnitude* — the mover-change sign is carried
+entirely by ``s_t``. At γ = 1 this is the reference objective, under which a
+win in 5 plies and a win in 300 plies are the same return, so every move of
+a decided position carries the same Q and eq. 3 flattens π′ there
+(conversion diffusion). γ < 1 ranks faster wins above slower ones, which is
+what keeps a gradient alive in won positions.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ def signs_from_moves_remaining(moves_remaining) -> np.ndarray:
     return np.where(mr == 2, 1, -1).astype(np.float64)
 
 
-def lambda_returns(signs: np.ndarray, v_hats, lam_ret: float) -> np.ndarray:
+def lambda_returns(signs: np.ndarray, v_hats, lam_ret: float, gamma: float) -> np.ndarray:
     """Per-ply returns ``G_0..G_T`` of a won episode, each in its mover's frame.
 
     ``signs`` and ``v_hats`` cover plies ``0..T`` — the acting-time values of
@@ -37,11 +44,13 @@ def lambda_returns(signs: np.ndarray, v_hats, lam_ret: float) -> np.ndarray:
     """
     if not 0.0 <= lam_ret <= 1.0:
         raise ValueError(f"lam_ret must lie in [0, 1], got {lam_ret}")
+    if not 0.0 < gamma <= 1.0:
+        raise ValueError(f"gamma must lie in (0, 1], got {gamma}")
     v = np.asarray(v_hats, dtype=np.float64)
     if v.shape != np.shape(signs) or v.ndim != 1 or len(v) == 0:
         raise ValueError("signs and v_hats must be equal-length, nonempty 1-d arrays")
     g = np.empty_like(v)
     g[-1] = 1.0
     for t in range(len(v) - 2, -1, -1):
-        g[t] = signs[t] * ((1.0 - lam_ret) * v[t + 1] + lam_ret * g[t + 1])
+        g[t] = signs[t] * gamma * ((1.0 - lam_ret) * v[t + 1] + lam_ret * g[t + 1])
     return g
