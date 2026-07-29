@@ -123,7 +123,7 @@ def bench_sweep(args) -> None:
                     t1 = time.perf_counter()
                     policy, q = evaluate(batch)
                     t2 = time.perf_counter()
-                    imp = improved_policy(policy, q, batch.legal_offsets, 0.1, 0.03)
+                    imp = improved_policy(policy, q, batch.legal_offsets, 0.1, 0.03, 1.0)
                     offsets = batch.legal_offsets.numpy()
                     flat = imp.probs.numpy().astype(np.float64)
                     widths = np.diff(offsets)
@@ -187,9 +187,9 @@ class _PhaseTimer:
             self._add("collate", time.perf_counter() - t0)
             return out
 
-        def improved(policy, q, offsets, tau, lam):
+        def improved(policy, q, offsets, tau, lam, q_scale):
             t0 = time.perf_counter()
-            out = self._improved(policy, q, offsets, tau, lam)
+            out = self._improved(policy, q, offsets, tau, lam, q_scale)
             self._add("improve", time.perf_counter() - t0)
             return out
 
@@ -208,7 +208,7 @@ def bench_collect(args) -> tuple[list, dict]:
     evaluate = network_evaluate(_load_or_fresh(args), cfg)
     timer = _PhaseTimer(evaluate)
     collector = Collector(
-        args.envs, args.cap, 0.1, 0.03, np.random.default_rng(args.seed),
+        args.envs, args.cap, 0.1, 0.03, 1.0, np.random.default_rng(args.seed),
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
     )

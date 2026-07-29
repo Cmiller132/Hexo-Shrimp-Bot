@@ -50,7 +50,7 @@ def test_collection_stats_by_hand():
 
 def test_collection_stats_from_real_collection():
     rng = np.random.default_rng(21)
-    episodes, _ = Collector(6, 200, 0.1, 0.03, rng).collect(heuristic_evaluate, 6)
+    episodes, _ = Collector(6, 200, 0.1, 0.03, 1.0, rng).collect(heuristic_evaluate, 6)
     stats = collection_stats(episodes)
     assert 0.0 <= stats["f"] <= 1.0
     assert 0.0 <= stats["p0_win_rate"] <= 1.0

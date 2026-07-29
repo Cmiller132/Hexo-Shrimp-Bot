@@ -48,8 +48,11 @@ crate. Runtime forward errors are fatal: an evaluator cannot substitute an
 opinion after the network failed.
 
 The equation-3 transcription uses the package's configured `tau` and `lambda`
-in `f32`, matching `mantisnet.klent.improve.improved_policy`. Its committed
-fixtures are regenerated, CPU-only, from `python/mantisnet`:
+in `f32`. It is eq. 3 verbatim; the Python operator has since gained a critic
+gain `q_scale` inside the softmax (`KlentConfig.q_scale`, default 1.0), so the
+two agree exactly only at gain 1 and this package cannot yet act for a run
+trained at another gain. Its committed fixtures are regenerated, CPU-only,
+from `python/mantisnet`:
 
 ```text
 python ../../crates/models/mantisnet/tests/fixtures/regenerate_improvement.py

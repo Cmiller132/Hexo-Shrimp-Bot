@@ -5,14 +5,15 @@ losses — plus the KLENT training path of `docs/KLENT_DESIGN.md`: the
 closed-form policy improvement that replaces tree search, implemented
 faithful-first against that document.
 
-**Status: implemented, green, and past its first training run.** The model
+**Status: implemented, green, and in production training.** The model
 is 1.25 M parameters at the §2 defaults — the spec's 1.2 M plus the
 appendix-B Q head — with the spec's §12 obligations as tests; KLENT carries
 the design doc's §4.7 obligations as its own. Batch building is Rust and
 rayon-parallel (~0.1 ms/position), the forward is `torch.compile`d (~2.1×
-over eager), and a full KLENT iteration at the design's settings (64 games,
-cap 512) runs in ~36 s at its iteration-0 worst on the 4070 Ti — the
-Performance section below has the numbers and the two hazards worth knowing.
+over eager), and the pipelined loop holds ~4.9 k samples/s steady on the
+4070 Ti at the default operating point (4096 games an iteration, 1024
+self-play slots, cap 512) — the Performance section below has the numbers
+and the hazards worth knowing.
 **Now consumed by a `ModelPackage`:** `crates/models/mantisnet` supplies the
 container-side encoder, KLENT-improved evaluator opinion, policy/Gumbel
 sessions, diagnostics, and proving checkpoint loads. `hexo-bot` calls this same
@@ -35,7 +36,7 @@ python/mantisnet/
     losses.py         # §6, §7, §10: targets, cross-entropies, decay grouping
     segments.py       # ragged per-position reductions, shared by losses and klent
     klent/
-      improve.py      # eq. 3 closed form: π′, v̂, and the §13 diagnostics
+      improve.py      # eq. 3 closed form at gain s: π′, v̂, and the §13 diagnostics
       returns.py      # the sign on mover change, the λ-return
       selfplay.py     # batched collection, acting-time v̂, buffer rules, stats
       train.py        # KlentConfig, the fit epoch, the iteration
@@ -48,13 +49,16 @@ python/mantisnet/
       telemetry.py    # the run's SQLite capture + the queries over it, + CLI
       hardware.py     # the GPU/process/host counter trace behind an iteration
       inspect.py      # the policy debugger: one checkpoint's view of one position
+      graft.py        # one-time converter: a scalar-critic checkpoint to the factored head
     deck/
+      __main__.py     # the uvicorn entry point the container service runs
       app.py          # FastAPI routes, SSE, static SPA, play/match orchestration
       service.py      # run registry, child lifecycle, read-only queries, checkpoint LRU
       state.py        # schema-versioned deck.db annotations, probes, presets, match jobs
   tests/              # the two specs' obligations, one file per concern
   bench/
     bench_forward.py  # builder and forward throughput at spec defaults
+    bench_loop.py     # the loop's own stages: sweep, a real collect, a real fit
 ```
 
 ## Deck
@@ -106,12 +110,16 @@ uv run pytest                        # the whole suite
 uv run python bench/bench_forward.py # throughput on CPU and the local GPU
 ```
 
+Inside the training container the locked environment is already `/opt/venv`
+on PATH and the repository is mounted at `/workspace`, so the same commands
+drop their `uv run` — `python -m pytest -q`. See `docker/README.md`.
+
 ## Module map
 
 | Module | Role |
 | --- | --- |
 | `builder` | `build` (raw §11 inputs to a `PositionGraph`), `from_position` (the `hexo_py` wrapper), `collate` (graphs to one `Batch` of index tensors). It is the independent parity reference and imports `MODEL_REPR_VERSION` from the shared Rust owner. |
-| `model` | `MantisConfig` (the §2 named parameters), `MantisNet`, `ModelOutput`. `trunk`, `cell_heads`, and `value_head` are separate so a caller pays only for the heads it reads; `policy_head` is the one-head entry the argmax chooser wants. |
+| `model` | `MantisConfig` (the §2 named parameters), `MantisNet`, `ModelOutput`. `trunk`, `cell_heads`, and `value_head` are separate so a caller pays only for the heads it reads; `policy_head` is the one-head entry the argmax chooser wants. `cell_heads` composes the factored critic's two logits into Q; fitting takes the raw pair instead. |
 | `decoder` | `aggregate` (the pass over the decoder incidence both cell heads read) and `head_matrix` (a head's projection and embedding tables folded into the matrix reading an aggregate row). Holds no parameters. |
 | `losses` | `value_target` (two-hot projection), `value_loss`, `policy_loss` (segmented CE over ragged engine-order logits), `param_groups` (§10 decay split). |
 | `segments` | The ragged per-position reductions everything above and below shares. |
@@ -179,20 +187,48 @@ against the authors' reference implementation
 of `KLENT_PROPOSALS.md` (the λ_intra split, the Bernoulli critic, the dual
 controller) are deliberately not in it: the design doc lists them as diffs to
 be decided, and a faithful baseline has to exist before a deviation from it
-can be measured. The in-loop crutches an earlier revision carried — seeded
-starts from line-builder prefixes, a warm-start heuristic phase, an f-driven
-seed-cut anneal, and SealBot grounding inside collection — were removed whole
-(owner decision, 2026-07-28): self-play runs from the empty board, period.
+can be measured. Self-play runs from the empty board, period: no seeded
+line-builder prefixes, no warm-start heuristic phase, no seed-cut anneal, and
+no external-bot grounding inside collection (owner decision, 2026-07-28).
 If a cold start starves (an untrained policy essentially never finishes a
 game — the design doc's §5 premise), the sanctioned bootstrap is a prefit on
 a foreign corpus *before* KLENT begins, not machinery inside the loop.
 
 - **The model KLENT trains is trunk + policy head + Q head.** The Q head is
-  the §6 decoder shape with its own parameters (spec appendix B); the §7
-  value head is outside the loss, per the paper's no-V-head ablation, and
-  `v̂ = E_{π′}[Q]` supplies the bootstrap. The forward is split into `trunk`
-  plus per-head methods precisely so the loop never computes the readout it
-  never reads.
+  the §6 decoder shape with its own parameters (spec appendix B). Per legal
+  cell it emits mover-win and magnitude logits, then acting composes
+  `Q = (2·sigmoid(p_logit) − 1)·sigmoid(m_logit)` in fp32. Fitting uses
+  taken-action BCE-with-logits losses `p_loss` against the λ-return's sign
+  and `m_loss` against its absolute value; these replace the scalar
+  `q_loss` metric. This separates winner classification from discounted
+  distance under `gamma < 1`; at `gamma=1, lam_ret=1`, magnitude learns one
+  and the critic reduces to `2p−1`. The §7 value head is outside the loss,
+  per the paper's no-V-head ablation, and `v̂ = E_{π′}[Q]` supplies the
+  bootstrap. The forward is split into `trunk` plus per-head methods so the
+  loop never computes the readout it never reads.
+- **The operator carries a critic gain, `q_scale`.**
+  `π′ ∝ softmax((s·Q + τ·log π)/(τ + λ))` with `s = q_scale`; `s = 1` is
+  eq. 3 verbatim. The gain exists because the operator's sharpening has to
+  outweigh the flattening prior exponent `τ/(τ+λ) < 1`, and whether it does
+  depends on the spread of Q across a position's moves against `τ+λ`. The
+  scalar tanh critic's overconfident magnitudes cleared that bar implicitly;
+  the factored critic's calibrated magnitudes in contested positions do not.
+  It applies *only* inside the softmax — v̂ averages the unscaled Q, so
+  returns and the magnitude target stay in (−1, 1). `improved_policy` takes
+  it with no default, for the same reason it takes τ and λ with none: π′ is
+  a function of it, and a reader assuming 1 would misreport a run acted at
+  another gain. `KlentConfig.q_scale` (default 1.0), `--q-scale`, and the
+  acting paths that thread it: `Collector`, `gumbel_choose`,
+  `inspect_position`, the SealBot CLI, and the deck service.
+- **A scalar-era checkpoint is converted once, explicitly.**
+  `python -m mantisnet.klent.graft OLD.pt NEW.pt` reshapes the critic
+  readout to two rows, zeroing the new tensors and their Adam moments and
+  resetting that parameter's step, which preserves the trained trunk and
+  MantisNet's zero-init contract; everything else must match the current
+  architecture exactly. The training loaders stay strict — a pre-factoring
+  checkpoint is refused rather than adapted. Only the deck's inspection path
+  reads the head's width off the state dict, which is what keeps a
+  pre-factoring run browsable on the same axes.
 - **The sign follows mover change, read off `moves_remaining`** — K1, the
   design doc's most likely catastrophic bug. The detector it prescribes is a
   test here: the phase-derived sign against the engine's own reported movers
@@ -215,10 +251,16 @@ a foreign corpus *before* KLENT begins, not machinery inside the loop.
   rules are testable without a trained model.
 - **The default coefficients are paper-verified, not carried.** `τ = 0.1`
   (reverse KL) and `λ = 0.03` (entropy) per the paper's eq. 2 — the design
-  doc's original pair was transposed and is corrected — and
-  `λ_ret = e^{-1/16}`, the paper's 8-turn horizon at Hexo's two placements
-  per turn. `docs/KLENT_RUN_PLAN.md` §2/§3 record the verification and the
-  measured history.
+  doc's original pair was transposed and is corrected — `λ_ret = 0.939`
+  (`e^{-1/16}`, the paper's 8-turn horizon at Hexo's two placements per
+  turn), `γ = 1.0` (the reference objective's undiscounted return), and
+  `q_scale = 1.0` (eq. 3 verbatim). The *reference recipe* the runs are on
+  is not the default set: `--gamma 0.99 --lam 0.01 --lam-ret 0.939`, τ = 0.1,
+  with `--q-scale 2.0` under ablation for the factored critic. `γ < 1` is
+  what ranks faster wins above slower ones — the conversion pressure an
+  infinite no-draw board lacks — and `λ = 0.01` is what stops the prior
+  exponent flattening decided positions. `docs/KLENT_RUN_PLAN.md` §2/§3
+  record the verification and the measured history.
 - **Evaluation search is Gumbel sequential halving over deterministic
   lines.** The root samples at most 16 candidates by policy logit plus
   Gumbel noise, then spends the simulation budget deepening surviving lines
@@ -262,9 +304,7 @@ a foreign corpus *before* KLENT begins, not machinery inside the loop.
   0.1 s/turn. `--max-depth` remains an offline weaker-rung knob, while
   offline `--sims` defaults to zero so old argmax curves stay comparable;
   `--run <dir> --every N` writes a strength curve to
-  `sealbot_curve.jsonl`. First measurement
-  (2026-07-28): the overnight-3 endpoint loses 0/64 even at depth 1 — the
-  run plan §4 has the table and what it says about racing vs defending.
+  `sealbot_curve.jsonl`. Run plan §4 carries the measured scores.
 
 ## Telemetry
 
@@ -286,7 +326,7 @@ other shape here follows from having chosen scalars over arrays.
 | Table | One row per | Carrying |
 | --- | --- | --- |
 | `runs` | process that trained into the run | resolved knobs + versions, the database's mirror of `invocations.jsonl` |
-| `iterations` | iteration | every `metrics.jsonl` field as its own column (so a threshold query needs no JSON parse), the row verbatim in `metrics_json`, and the hardware trace |
+| `iterations` | iteration | the §13 metrics as their own columns (so a threshold query needs no JSON parse), the row verbatim in `metrics_json`, and the hardware trace |
 | `games` | game, self-play *and* evaluation | winner, length, capped, eval seat/opening, and the move list as a blob |
 | `plies` | self-play ply | mover, `moves_remaining`, `legal_count`, the taken `rank`, and the five acting-time scalars |
 | `opponents` | opponent *at a setting* | `name` + `config_json`; uncapped SealBot at 0.1 s and a depth-capped rung are two opponents |
@@ -319,6 +359,20 @@ other shape here follows from having chosen scalars over arrays.
   split each opening twelve ways), `strength_curve`, `crossplay_matrix`.
   `python -m mantisnet.klent.telemetry --run runs/<name> summary | games |
   game <id>` is the operator's sanity check over the same functions.
+- **The game browser's orders are indexed, one index per order, and the
+  indexes arrive on the write path.** `games_browse_<order>` leads with
+  `kind` and then repeats that `GAME_ORDERS` entry's sort key column for
+  column and direction for direction, so a page walks fifty index entries
+  instead of sorting the run's whole history for each request: measured on
+  a 575,342-game run, 484 ms → 0.05 ms warm, and 44 s → milliseconds
+  through the deck's mount. Sharing one index between an order and its
+  reverse depends on a planner heuristic that differs between SQLite
+  releases, so each order gets its own; the four cost ~56 MB on a run that
+  size. They are *not* part of `SCHEMA_VERSION` — an index is derived from
+  rows already in the file and stores no format of its own — so
+  `_index_games` applies them idempotently whenever a **writer** opens a
+  run, which is how a database written before they existed gains them. The
+  deck reads `telemetry.db` read-only and cannot create them itself.
 
 **Measured cost** (1024 games × ~30 plies, the operating point): the write
 is **~72 ms an iteration**, ~1% of a 5–7 s iteration, on the driver thread
@@ -531,8 +585,8 @@ of that regime; Linux (the deploy target) raises OOM honestly.
 
 **Platforms.** The destination is Docker on Linux for *everything* —
 training, self-play, and evaluation, not just serving — and the
-environment exists: `docker/` at the repo root (owner pulled it forward
-2026-07-28; see `docker/README.md`). On the pre-fused-attention tree,
+environment exists: `docker/` at the repo root (see `docker/README.md`).
+On the pre-fused-attention tree,
 identical code on the same card ran collection **1.44× faster in the
 container than Windows-native** (5.0 k vs 3.5 k samples/s,
 cold-compile-inclusive). The fused kernel above was implemented and

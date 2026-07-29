@@ -8,9 +8,13 @@ observable without a trained model.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import hexo_py
 import numpy as np
+import pytest
 import torch
+import torch.nn.functional as F
 
 from mantisnet import MantisConfig, MantisNet
 from mantisnet.klent import (
@@ -21,7 +25,7 @@ from mantisnet.klent import (
     play_match,
 )
 from mantisnet.klent.evaluate import argmax_choose
-from mantisnet.klent.train import _pack, fit, network_evaluate
+from mantisnet.klent.train import _pack, _rebuild, fit, network_evaluate
 
 from .heuristic import heuristic_choose, heuristic_evaluate
 
@@ -38,7 +42,7 @@ def _tiny_model():
 
 def _collect(evaluate, games, ply_cap, tau, lam, rng, **budgets):
     """One fresh-cohort collect call: as many slots as the quota."""
-    return Collector(games, ply_cap, tau, lam, rng, **budgets).collect(evaluate, games)
+    return Collector(games, ply_cap, tau, lam, 1.0, rng, **budgets).collect(evaluate, games)
 
 
 def test_fit_packing_respects_budgets_and_loses_nothing():
@@ -103,7 +107,7 @@ def test_collector_carries_games_across_calls():
     flight, the next call finishes them, and every returned record is a
     whole game from the empty board."""
     rng = np.random.default_rng(10)
-    collector = Collector(4, 200, 0.1, 0.03, rng)
+    collector = Collector(4, 200, 0.1, 0.03, 1.0, rng)
     first, _ = collector.collect(heuristic_evaluate, 1)
     assert len(first) >= 1
     assert sum(len(e.moves) for e in collector.episodes) > 0, "no game in flight"
@@ -119,11 +123,11 @@ def test_collector_progress_observer():
     """The per-step observer sees every lockstep step: monotone finished
     counts toward the quota and one live ply count per slot — and, being an
     observer, changes nothing about what collection returns."""
-    episodes, _ = Collector(6, 200, 0.1, 0.03, np.random.default_rng(21)).collect(
+    episodes, _ = Collector(6, 200, 0.1, 0.03, 1.0, np.random.default_rng(21)).collect(
         heuristic_evaluate, 6
     )
     calls = []
-    observed, _ = Collector(6, 200, 0.1, 0.03, np.random.default_rng(21)).collect(
+    observed, _ = Collector(6, 200, 0.1, 0.03, 1.0, np.random.default_rng(21)).collect(
         heuristic_evaluate, 6,
         progress=lambda done, quota, plies: calls.append((done, quota, list(plies))),
     )
@@ -179,7 +183,10 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
     cfg = KlentConfig(batch_size=64)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     metrics = fit(model, samples, optimizer, cfg, rng)
-    assert np.isfinite(metrics["policy_loss"]) and np.isfinite(metrics["q_loss"])
+    assert np.isfinite(metrics["policy_loss"])
+    assert np.isfinite(metrics["p_loss"])
+    assert np.isfinite(metrics["m_loss"])
+    assert "q_loss" not in metrics
     assert metrics["fit_steps"] == (len(samples) + 63) // 64
 
     value_only = {"value_queries", "ln_value", "mlp_v"}
@@ -191,6 +198,43 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
             assert p.grad is not None, f"{name} received no gradient"
 
 
+def test_fit_uses_return_sign_and_magnitude_targets():
+    rng = np.random.default_rng(22)
+    episodes, _ = _collect(heuristic_evaluate, 2, 200, 0.1, 0.03, rng)
+    source = [s for e in episodes for s in episode_samples(e, 0.883, 1.0)]
+    assert len(source) >= 3
+    returns = torch.tensor([-0.25, 0.0, 0.75])
+    samples = [replace(sample, g=float(g)) for sample, g in zip(source[:3], returns)]
+
+    model = _tiny_model()
+    torch.manual_seed(23)
+    torch.nn.init.normal_(model.mlp_q.out.weight)
+    torch.nn.init.normal_(model.mlp_q.out.bias)
+    batch = _rebuild(samples)
+    with torch.no_grad():
+        _s, w, token = model.trunk(batch)
+        _policy, critic = model._cell_head_logits(w, token, batch)
+        ranks = torch.tensor([sample.rank for sample in samples])
+        taken = critic.index_select(0, batch.legal_offsets[:-1] + ranks)
+        expected_p = F.binary_cross_entropy_with_logits(
+            taken[:, 0], torch.tensor([0.0, 0.5, 1.0])
+        )
+        expected_m = F.binary_cross_entropy_with_logits(
+            taken[:, 1], torch.tensor([0.25, 0.0, 0.75])
+        )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    metrics = fit(
+        model,
+        samples,
+        optimizer,
+        KlentConfig(batch_size=len(samples)),
+        np.random.default_rng(24),
+    )
+    assert metrics["p_loss"] == pytest.approx(float(expected_p), abs=1e-6)
+    assert metrics["m_loss"] == pytest.approx(float(expected_m), abs=1e-6)
+
+
 def test_collect_and_fit_end_to_end():
     """The whole iteration through an untrained network: collection runs the
     real evaluator, the metrics row is complete, and whatever the games
@@ -200,7 +244,7 @@ def test_collect_and_fit_end_to_end():
     cfg = KlentConfig(games_per_iteration=4, envs=4, ply_cap=60, batch_size=64)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     collector = Collector(
-        cfg.envs, cfg.ply_cap, cfg.tau, cfg.lam, np.random.default_rng(12)
+        cfg.envs, cfg.ply_cap, cfg.tau, cfg.lam, cfg.q_scale, np.random.default_rng(12)
     )
     episodes, metrics = collect_episodes(model, collector, cfg)
     assert len(episodes) >= 4

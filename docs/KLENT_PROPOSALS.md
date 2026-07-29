@@ -57,7 +57,7 @@ recommendations are used.**
 | # | Proposal | Verdict |
 | --- | --- | --- |
 | P1 | Separate `λ` for intra-turn and inter-turn transitions | **Accept.** The best item in the set — but its recommended direction is wrong (A1) |
-| P2 | Bernoulli win-probability critic, `Q = 2p − 1`, BCE on `(G+1)/2` | **Accept.** Under-ranked by the source (A2) |
+| P2 | Bernoulli win-probability critic, `Q = 2p − 1`, BCE on `(G+1)/2` | **Accepted and landed 2026-07-29**, factored into sign and magnitude because `γ < 1` (A2) |
 | P3 | Normalised-entropy target adapted by a dual | **Accept, reparameterised** to one dimension (A3) |
 | P4 | Staged budgets, screen-then-promote, ≥5 seeds | **Accept.** Addresses O1 directly (A4) |
 | P5 | Do not use coordinate novelty as intrinsic reward | **Accept as an explicit exclusion.** Correct, and worse than stated (A5) |
@@ -164,6 +164,19 @@ sigmoid link is additive in *logit* space. Decomposing in logits is fine, but
 then zero-meaning `A` no longer makes `V = E[Q]`, which is A6's entire point.
 These two are alternatives at the same seam, and if both are wanted the
 decomposition must be in logits with the centring understood to be approximate.
+
+**Landed 2026-07-29, in a factored form this review did not anticipate.**
+`γ = 0.99` (design doc §4.4) entangles *who wins* with *how far away the win
+is* in a single scalar target, so the head emits two logits: `p` for the sign
+and `m` for the magnitude, composed as `Q = (2p − 1)·m` (`MODEL_SPEC.md`
+appendix B). At `γ = λ_ret = 1` it degenerates to exactly the proposal's
+`Q = 2p − 1`. The measured consequence corrects point 2 above: bounding `Q`
+does cap the noise-driven overestimate, but *calibrating* it exposed the
+opposite failure — a truthful critic's spread across plausible moves in an
+undecided position (~0.04) is below `τ + λ = 0.11`, so `π′` flattens instead
+of concentrating, and the run collapses. The overconfidence this proposal
+treats as a defect was doing load-bearing work as an implicit gain
+(`KLENT_RUN_PLAN.md` §3, and design doc O4 for what is still open).
 
 ### A3. A dual on the temperature — reparameterised to one dimension
 
@@ -612,24 +625,20 @@ absorbed silently:
 
 ## What this would change in `KLENT_DESIGN.md`
 
-Not applied. Listed so the diff is a decision rather than a discovery:
+The `λ_ret` rescaling and A2 have since been applied; the rest is not. Listed
+so the remaining diff is a decision rather than a discovery:
 
 1. **§4.4** — `λ_intra` / `λ_inter` in the return recursion, with the bias
-   direction stated (A1), and `λ_inter` starting at `e^{-1/16} ≈ 0.939` on the
-   per-turn-horizon argument rather than the paper's per-transition `0.883`.
-2. **Fidelity ledger** — the `λ_ret` row changes from a carried constant to a
-   rescaled one; a new row for the `Q` head's output parameterisation (A2).
-3. **§9** — A2 inserted ahead of the reserve ensemble as the second-cheapest
-   response, with its bound-the-damage/does-not-fix-the-bias limit stated; R1's
-   shared-trunk decorrelation objection recorded against the ensemble option.
-4. **§8** — the dual controller as the mechanism for reaching a normalised-entropy
+   direction stated (A1). *(The `λ_inter = e^{-1/16} ≈ 0.939` half is applied,
+   in the single-λ form; the split is not.)*
+2. **§8** — the dual controller as the mechanism for reaching a normalised-entropy
    target, one-dimensional over `T = τ+λ` at fixed `ρ = τ/(τ+λ)` (A3).
-5. **§11 / §13** — checkpoint cross-play matrix and worst-case historical win
+3. **§11 / §13** — checkpoint cross-play matrix and worst-case historical win
    rate (A7).
-6. **§15** — novelty-based intrinsic reward as an explicit exclusion with the
+4. **§15** — novelty-based intrinsic reward as an explicit exclusion with the
    maximal-spreader reason (A5); the dueling row amended to `π′` centring and
-   its incompatibility with A2 noted (A6).
-7. **§16** — the ledger gains the `λ_intra` decision and the `Q`
-   parameterisation; **§17** gains nothing, and O3 is reaffirmed rather than
-   settled by R8.
-8. **Nothing** in §5, §6, §7, §12, or §14 changes.
+   its incompatibility with A2 noted (A6) — now a live conflict rather than a
+   hypothetical, since A2 has landed.
+5. **§16** — the ledger gains the `λ_intra` decision if A1 lands; O3 is
+   reaffirmed rather than settled by R8.
+6. **Nothing** in §5, §6, §7, §12, or §14 changes.

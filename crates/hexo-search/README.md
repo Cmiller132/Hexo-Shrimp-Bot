@@ -32,6 +32,8 @@ crates/hexo-search/
     topology.rs   # the reference sweep: 32 games, 64 seats, one batch
     mcts.rs       # terminals, the mover comparison, the books, authorship
     policy.rs     # one question per move, and nothing else
+    gumbel.rs     # the halving schedule, tie-breaks, and the parity fixture
+    fixtures/     # gumbel_parity.json + regenerate_gumbel.py (--check/--emit)
 ```
 
 ## Module map
@@ -125,15 +127,18 @@ crates/hexo-search/
   twice, or applied to a path that was then edited, cancels perfectly in any
   round-trip test; that assert is what sees it.
 
-- **Make/unmake, not clones.** A session owns one `Position` — its own copy of
-  the game's, taken with `clone_from` into the buffer it kept from last time —
-  and every descent walks it with `hexo_engine::Search`, unwinding explicitly
-  before it returns. `Search::drop` would unwind too, but a single `Search`
-  serves every descent of one `pump`, so the unwind has to be the descent's job
-  and not the call's. The engine measured copy-on-descend at 2.0x make/unmake,
-  which is a smaller gap than folklore suggests — the reason to walk is that the
-  budget times the branching factor of clones is memory the process does not
-  have at a thousand games.
+- **Make/unmake in the tree; clones on lines.** An `MctsSession` owns one
+  `Position` — its own copy of the game's, taken with `clone_from` into the
+  buffer it kept from last time — and every descent walks it with
+  `hexo_engine::Search`, unwinding explicitly before it returns.
+  `Search::drop` would unwind too, but a single `Search` serves every descent
+  of one `pump`, so the unwind has to be the descent's job and not the call's.
+  The reason to walk is that the budget times the branching factor of clones
+  is memory the process does not have at a thousand games. `GumbelSession`
+  clones one `Position` per candidate line instead and advances it in place:
+  a line is a single path, never re-descended, so there is nothing to unwind
+  — and the engine's 3-bit-plane rewrite made a clone (~175 ns at ply 256)
+  cheaper than an apply+undo pair anyway.
 
 - **Children are materialised at emit, priors at resume.** Expansion needs the
   leaf's legal set, and by the time an answer arrives the descent has unwound and

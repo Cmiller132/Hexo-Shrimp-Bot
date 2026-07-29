@@ -30,6 +30,7 @@ def inspect_position(
     t: int,
     tau: float,
     lam: float,
+    q_scale: float,
     device: str = "cpu",
 ) -> dict:
     """A checkpoint's policy, Q, π′, and v̂ over the legal set at ``moves[:t]``.
@@ -39,10 +40,11 @@ def inspect_position(
     difference between a responsive branch-and-play view and one that reads
     a checkpoint per node.
 
-    ``tau`` and ``lam`` have no defaults on purpose: π′ is a function of
-    them, and a run that used other values would be silently misreported by
-    a debugger that assumed the current ones. Read them from the run's
-    `config.json`.
+    ``tau``, ``lam``, and ``q_scale`` have no defaults on purpose: π′ is a
+    function of them, and a run that used other values would be silently
+    misreported by a debugger that assumed the current ones. Read them from
+    the run's `config.json` (a config written before the knob existed ran
+    at 1.0).
 
     Returns the position's own scalars plus one entry per legal move, in the
     engine's order — which is the order every rank in the database indexes
@@ -72,7 +74,7 @@ def inspect_position(
         logits, q_values = logits.float().cpu(), q_values.float().cpu()
     offsets = batch.legal_offsets.cpu()
     log_pi = segment_log_softmax(logits, offsets)
-    imp = improved_policy(logits, q_values, offsets, tau, lam)
+    imp = improved_policy(logits, q_values, offsets, tau, lam, q_scale)
 
     legal = position.legal_moves()
     if len(legal) != logits.shape[0]:
@@ -89,6 +91,7 @@ def inspect_position(
         "legal_count": len(legal),
         "tau": tau,
         "lam": lam,
+        "q_scale": q_scale,
         "v_hat": float(imp.v_hat[0]),
         "kl": float(imp.kl[0]),
         "norm_entropy": float(imp.norm_entropy[0]),

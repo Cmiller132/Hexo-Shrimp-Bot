@@ -214,7 +214,7 @@ impl Grid {
         }
     }
 
-    /// Flat cell index of `c` within the byte-per-cell planes, or `None` if `c`
+    /// Flat cell index of `c` within the bit planes, or `None` if `c`
     /// is outside the arena.
     #[inline]
     pub(crate) fn cell_index(&self, c: HexCoord) -> Option<usize> {

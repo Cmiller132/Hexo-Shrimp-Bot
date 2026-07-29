@@ -193,8 +193,9 @@ neither gets a module.
 catches; they are defined in `xtask/src/main.rs`. The whole set takes well under
 a minute, of which `cargo xtask test` is about 20 seconds.
 
-Four of them exist for this crate specifically — the release lint, the rustdoc
-gate, and the two `wasm32` gates each see a class the debug test run cannot.
+Four of them see a class the debug test run cannot — the release lint, the
+rustdoc gate, and the two `wasm32` gates. The `wasm32` pair is scoped to this
+crate; the release lint and rustdoc gates run workspace-wide.
 
 The deep smoke run is `cargo xtask smoke`: ten times as many line-building
 games and more than sixteen times as many uniform games, release profile,
@@ -222,8 +223,9 @@ dependency set changes, and the `wasm32` gate is unaffected.
 The suite exists so that every optimisation `docs/ENGINE_SPEC.md` §12 and
 `docs/ENGINE_RL_AUDIT.md` defer "if profiling ever shows it" is answerable with
 a number rather than an argument. The groups are `advance`, `apply_undo`,
-`clone`, `enumerate`, `ordering`, `windows`, `replay`, and `new_game`, each
-reported at plies 1, 32, 96, and 256.
+`clone`, `enumerate`, `ordering`, `windows`, `replay`, and `new_game`; the
+first six are each reported at plies 1, 32, 96, and 256, while `replay` is
+parameterised by its record's length and `new_game` is a single benchmark.
 
 Three fixture choices carry the weight:
 

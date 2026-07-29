@@ -27,9 +27,10 @@ from the empty board with no curriculum; the cold-start bootstrap, when
 needed, is a prefit on a foreign corpus before KLENT starts (design doc
 §5.2); SealBot is the only evaluation, in-driver via `--eval-every`.
 The same check landed two model-side fidelity fixes from the reference
-`PQNet`: the Q head is tanh-bounded to `(−1, 1)`, and *both* decoder output
-layers zero-initialize (the Q-side half of which the first training night
-had already discovered empirically). The §3 history below records the
+`PQNet`: `Q` is bounded to `(−1, 1)` (by `tanh` then, by the factored
+composition now — §3, 2026-07-29), and *both* decoder output layers
+zero-initialize (the Q-side half of which the first training night had
+already discovered empirically). The §3 history below records the
 seeded/grounded era as measured; its mechanics are gone from the code.
 
 ---
@@ -55,7 +56,9 @@ turns. Eight transitions in Hexo is 4 turns, so carrying 0.883 would halve
 the strategic horizon while appearing faithful (`KLENT_PROPOSALS.md` A1's
 correction). `KlentConfig.lam_ret` defaults to 0.939; the paper's literal
 0.883 stays one flag away, and if the λ_intra split (A1) ever lands the two
-knobs separate cleanly.
+knobs separate cleanly. Measured 2026-07-29 (§3): 0.939 beat the
+Monte-Carlo fallback `λ_ret = 1.0` that the bootstrap-collapse era had
+forced, once γ = 0.99 was in place — 0.875 vs a 0.76 plateau.
 
 ### 2.3 Seed annealing — removed with the seeding (2026-07-28)
 
@@ -304,6 +307,106 @@ winner/loser v̂ means are defined against ±1, so they read differently
 under γ — compare critics on the ply-bucket telemetry (decided =
 `|v̂| ≥ 0.5`), not on those columns.
 
+> **Superseded 2026-07-29.** That live run plateaued and was stopped at
+> iteration 151; `λ_ret` is back at 0.939, which is the strongest arm in the
+> lineage. The rest of the recipe stands. See below.
+
+### λ_ret restored, and the factored critic (2026-07-29)
+
+The long run at the γ recipe (`runs/conv-disc-lam01`, γ = 0.99, λ = 0.01,
+τ = 0.1, λ_ret = 1.0) **plateaued at ~0.76** against uncapped SealBot over
+150 iterations *while `q_loss` kept falling* — the signature of a
+variance-limited critic, not a capacity-limited one: Monte-Carlo returns
+carry the full noise of a 60-ply game into every ply's target. Stopped at
+`checkpoint_000151`, which is the fork point for every arm below.
+
+**`runs/lam-ret-939`** (λ_ret = `e^{-1/16}` = 0.939, fork ckpt151, seed 21,
+50 iterations) is the new best: evals **0.8125 @ 24** and **0.875 @ 49**,
+with `H` stable at 0.20–0.26 throughout. Mechanism 3's self-erasing
+bootstrap does not recur because γ = 0.99 keeps the targets' near-terminal
+spread alive and the critic forked in already trained. Won lengths shifted
+61–66 → 68–75 plies, which reads as the wandering signature — but the
+ply-bucket telemetry decomposes it and it is benign: **decided plies per
+game (`|v̂| ≥ 0.5`) *fell* 12.4 → 11.0** while the contested phase
+lengthened. Better defense, not worse conversion.
+
+**Reference recipe: `--gamma 0.99 --lam 0.01 --lam-ret 0.939`, τ = 0.1.**
+Champion checkpoint `runs/lam-ret-939/checkpoint_000050.pt` (scalar
+critic). Note the paper's own best triple is `(α, β, λ_ret) = (0.03, 0.1,
+e^{-1/8})`; the 0.883 and 0.97 arms were deliberately skipped rather than
+missed — 0.939 is §2.2's per-turn rescaling of exactly that value, and it
+won on the first arm that tested it.
+
+#### Calibration undershoot — a seventh mechanism
+
+The staged deviation was A2's Bernoulli critic, generalized: the Q readout
+became **two logits per cell** instead of a tanh scalar trained by MSE
+against the λ-return. `p = σ(p_logit)` is the mover's win probability,
+`m = σ(m_logit)` the discounted-return magnitude, composed as
+`Q = (2p − 1)·m` for acting; training applies taken-action BCE to
+`sign(G)` and `|G|`, so `p_loss`/`m_loss` replace `q_loss` in the metrics
+row (`MODEL_SPEC.md` appendix B). Scalar checkpoints convert through
+`mantisnet/klent/graft.py` — only `mlp_q.out` reshapes, and the Adam
+moments are repaired for the new rows.
+
+**`runs/factored-939`** (identical knobs to `lam-ret-939`, fork = the
+grafted ckpt151) matched for half the run and then died: 0.8125 @ 24,
+0.8125 @ 49, **collapse to 0.547 @ 74**, acting `H` climbing monotonically
+0.28 → 0.45. Stopped at 79. The ply-bucket telemetry against the scalar
+sibling proves the mechanism, and it is a property of the *operator*, not
+of the head:
+
+In undecided positions — **~78 % of all plies** — a *calibrated* critic's
+Q-spread across plausible moves is only **~0.04**, because plausible moves
+in a balanced position genuinely are worth nearly the same. That is below
+the operator temperature `τ + λ = 0.11`, so `exp(Q/(τ+λ))` is essentially
+constant and `π′` degenerates to `≈ π_θ^0.909` — strictly flatter than the
+policy. The fitting phase then trains π_θ toward a flatter copy of itself,
+every iteration. It is the `conv-rho1` mechanism's cousin, but seated in
+the midgame where the corpus mass is, so it *collapses* rather than
+stalling: undecided `H` 0.309 → 0.422 and top-1 0.524 → 0.442 across the
+run, against the scalar sibling's stable 0.198–0.229 / 0.651–0.606.
+
+Why the scalar head never hit this: MSE against a bounded tanh output is
+systematically *overconfident*, and that overconfidence acted as an
+implicit, state-dependent gain on Q — the thing that kept the spread above
+the temperature. The paper's `(α, β)` were tuned around a head with that
+property. Honest calibration removed the gain, and 0.11 stopped being a
+sane temperature.
+
+The factored head's real benefits showed up even while it was dying, which
+is why it is being re-tried rather than reverted: decided-position top-1
+**0.623 vs the scalar's 0.596** (sharper conversion, which is what the γ
+work was chasing), the shortest games in the lineage (50–57 plies), and
+iterations ~2× cheaper (45–77 s vs 111–150 s).
+
+#### The `q_scale` response — under judgment as of this writing
+
+`improved_policy` gained a required critic gain `s`:
+
+```
+π′ ∝ softmax( (s·Q + τ·log π_θ) / (τ + λ) )
+```
+
+`v̂` still averages **unscaled** Q under `π′`, so returns and the `m`
+target stay inside `(−1, 1)`. The identity worth recording: gain `s` at
+`(τ, λ)` is exactly the paper's operator at `(τ/s, λ/s)` — the same
+family, with the prior exponent `ρ = τ/(τ+λ)` preserved. This is a re-tune
+of the paper's own temperature for a head with an honest output scale, not
+a new mechanism, and `s` has no default for the same reason τ and λ have
+none.
+
+**`runs/factored-939-s2`** (s = 2.0, same fork and knobs) is live. Kill
+criterion, stated in advance: it must match the scalar sibling's
+0.8125/0.875 with `H` stable at ≈ 0.20–0.26 — watching both `H > 0.35`
+(flattening, the collapse above) and `H → 0` (over-sharpening, the λ = 0.01
+failure of the first training night) — or the factored critic is shelved
+and the long run resumes on the scalar champion. If it is adopted, `s`
+folds into τ and λ and the knob is deleted; carrying three parameters for
+a two-parameter family is exactly the kind of drift this document exists to
+catch. Queued behind the judgment: a 2× data arm (`--games 8192`) on
+whichever critic wins, then resuming the long run.
+
 ---
 
 ## 4. Evaluation — SealBot, in the driver
@@ -376,9 +479,13 @@ checkpoints steal the occasional game from both seats. But even a
 pattern eval) wins every game in near-minimal time: the self-play
 equilibrium races and does not defend, exactly the §3 mechanism-5 story at
 external resolution. The gap to close is tactical defense, and the
-yardstick for closing it now exists: **score against depth-1 SealBot is
-the next headline metric**, with survival plies as the gradient while the
-score sits at zero.
+yardstick for closing it exists.
+
+**That gap is closed, and the table above is now only a floor.** The pure
+runs pass depth-1 outright; the headline metric since is the score against
+*uncapped* SealBot at 0.1 s/turn, which the current champion holds at
+**0.875** (§3, 2026-07-29). Depth-1 and `--sims 0` remain the offline rungs
+that make older checkpoints comparable.
 
 ### Opponent grounding — landed and removed the same day (2026-07-28)
 
@@ -401,19 +508,11 @@ in every metrics row. Grounding stays off during warm; `--init-from`
 forks arms from a shared parent checkpoint.
 
 Measured at landing: grounding at depth 1 costs ~nothing (~1 ms/turn, one
-shared engine); a 15-iteration shakeout forked from the overnight-3
-endpoint moved `gnd` 0.00 → 0.05 with acting entropy rising 0.136 → 0.204
-— the corpus getting harder in real time. Games-per-iteration probe:
-throughput plateaus at ~3.2 k samples/s from 256 through 1024 (the loop
-is orchestration-bound); 512 chosen — double the grounded games per
-iteration of 256, twice the improvement rounds per hour of 1024.
-
-The first grounding ablation (running as this is written): three arms
-forked from `overnight-3/checkpoint_002062`, 1300 iterations,
-`--ground-fraction` 0 / 0.25 / 0.5 (`runs/abl-gnd0`, `runs/abl-gnd25`,
-`runs/abl-gnd50`), judged by the depth-1 SealBot curve over each arm's
-checkpoints plus the anchor eval for regression. The winner's setting
-carries into the next long run.
+shared engine), and a 15-iteration shakeout moved `gnd` 0.00 → 0.05 with
+acting entropy rising 0.136 → 0.204 — the corpus getting harder in real
+time. The ablation that would have priced it never finished, and the
+question it asked has been answered from the other side: pure self-play
+passed depth-1 SealBot without any of this.
 
 ### The pipelined loop (landed the same afternoon)
 
@@ -521,9 +620,10 @@ In order; each rung is small and none blocks the one above it being useful.
    SealBot eval.
 2. **Measured deviations from the baseline**, each gated on the baseline's
    own curves and staged per `KLENT_PROPOSALS.md` A4 (screen at ~10% budget,
-   promote on improvement): the λ_intra split (A1), the Bernoulli
-   win-probability critic (A2, the cheapest §9 mitigation), the
-   normalized-entropy dual controller (A3, one dimension at fixed ρ).
+   promote on improvement). A2's Bernoulli critic landed 2026-07-29 as the
+   factored `(p, m)` readout and is under judgment (§3); still queued are
+   the λ_intra split (A1) and the normalized-entropy dual controller (A3,
+   one dimension at fixed ρ).
 3. **Artefact hygiene**: the value-head decision (§2.4), a checkpoint
    retention policy, and pruning `runs/` deliberately.
 4. **Provenance**: per-game seeds minted from stable ids (the B4 shape) so a
@@ -558,7 +658,11 @@ In order; each rung is small and none blocks the one above it being useful.
 
 - **§9 overestimation bias** is the predicted failure of this design at
   b ≈ 1000. Its instrument (v̂ calibration) is in every iteration's metrics;
-  its cheapest mitigations are rung 2's A2 and a higher ρ.
+  its cheapest mitigations are A2's bounded critic (landed, §3) and a
+  higher ρ. Its counterpart is now measured too: a critic calibrated
+  *honestly* undershoots the operator temperature in undecided positions
+  and flattens the policy (§3, calibration undershoot). Both failures are
+  read off the same instrument, in opposite directions.
 - **Corpus conditioning** (§5.1 of the design): everything trained on is a
   game somebody won within the cap. Watched via `f` and game lengths; not
   patched.

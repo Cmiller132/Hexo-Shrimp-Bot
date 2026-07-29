@@ -115,7 +115,7 @@ arrow points that way and never back.
   `is_contested()` answers "did this match reach a verdict" directly.
 
   It does not answer "is this game usable as training data". A forfeit —
-  `WinReason::Timeout`, `Crash`, or `Protocol` — is a decisive, contested
+  `WinReason::Timeout`, `Crash`, `Protocol`, or `Desync` — is a decisive, contested
   result, and it is real evidence in a match: a seat that cannot answer has
   lost. But it says nothing about the play on the board, and the stones on it
   are an abandoned game. A consumer selecting positions to learn from matches on

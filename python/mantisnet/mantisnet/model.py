@@ -39,6 +39,11 @@ class MantisConfig:
     policy_hidden: int = 128  # P_H
     value_hidden: int = 128  # V_H
     dropout: float = 0.0
+    # Width of the action-value head. Two is the factored critic this build
+    # trains: a mover-win logit and a return-magnitude logit. One is the
+    # single tanh-bounded Q of the checkpoints written before the factoring,
+    # which the analysis surfaces still read — see :func:`_compose_q`.
+    critic_factors: int = 2
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
@@ -72,6 +77,27 @@ class ModelOutput:
     value: Tensor  # (P,) scalar decode, in [-1, 1]
     value_dist: Tensor  # (P, K) softmax over bins, fp32
     value_logits: Tensor  # (P, K) the bins' raw logits — what value_loss trains
+
+
+def _compose_q(critic_logits: Tensor) -> Tensor:
+    """Compose critic output into action values in fp32.
+
+    The factored head emits ``[p_logit, m_logit]`` per cell: the first factor
+    classifies which player wins and the second carries only discounted-return
+    magnitude. Keeping the composition here gives every acting path the same
+    bounded scalar while fitting can train the factors directly.
+
+    A one-wide head is a checkpoint from before the factoring, whose single
+    score was bounded by ``tanh``. Both compose to a Q in (-1, 1), which is
+    what π′ requires — it exponentiates Q/(τ+λ), so an unbounded Q could
+    sharpen without limit. Reading them costs one branch on a shape and lets
+    the debugger put a pre-factoring run and this one on the same axes;
+    training is not offered the choice and fits the factors it built.
+    """
+    if critic_logits.ndim == 1:
+        return torch.tanh(critic_logits.float())
+    p_logit, m_logit = critic_logits.float().unbind(dim=-1)
+    return (2.0 * torch.sigmoid(p_logit) - 1.0) * torch.sigmoid(m_logit)
 
 
 def _mlp(d_in: int, d_hidden: int, d_out: int) -> nn.Sequential:
@@ -205,11 +231,11 @@ class MantisNet(nn.Module):
         self.mlp_p = _PairMlp(h, cfg.policy_hidden, 1)
 
         # Appendix B action-value decoder: the same shape as §6 with its own
-        # parameters everywhere, one raw Q per legal cell. KLENT's head.
+        # parameters everywhere, two factor logits per legal cell.
         self.q = nn.Linear(h, h, bias=False)
         self.e_qw = nn.Embedding(3, h)
         self.e_qbg = nn.Embedding(NEAREST_BUCKETS, h)
-        self.mlp_q = _PairMlp(h, cfg.policy_hidden, 1)
+        self.mlp_q = _PairMlp(h, cfg.policy_hidden, cfg.critic_factors)
 
         # §7 value head.
         self.value_queries = nn.Parameter(torch.empty(cfg.value_queries, h))
@@ -275,10 +301,13 @@ class MantisNet(nn.Module):
         e_bg: nn.Embedding,
         mlp: _PairMlp,
     ) -> Tensor:
-        """One head's scalar per legal cell, off the shared aggregation. The
-        head's projection and both its embedding tables live in the matrix
-        that reads an aggregate row; the token half of the MLP runs per
-        position."""
+        """One head's output per legal cell, off the shared aggregation.
+
+        A one-wide head returns ``(N,)``; a wider head returns ``(N, D)``.
+        The head's projection and both its embedding tables live in the
+        matrix that reads an aggregate row; the token half of the MLP runs
+        per position.
+        """
         matrix = decoder.head_matrix(
             lin.weight, e_w.weight, e_bg.weight, mlp.lin_a.weight
         )
@@ -294,28 +323,37 @@ class MantisNet(nn.Module):
             rows, g_half, batch, self.p, self.e_pw, self.e_bg, self.mlp_p
         )
 
-    def cell_heads(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor]:
-        """§6 and appendix B over the same legal cells: policy logits and
-        action values, from one pass over the decoder incidence.
+    def _cell_head_logits(
+        self, w: Tensor, g: Tensor, batch: Batch
+    ) -> tuple[Tensor, Tensor]:
+        """Raw policy and factored-critic logits from one decoder pass.
 
-        The pair, not two calls, is what the KLENT operator consumes — π′
-        needs both — and the two heads read an identical incidence, so
-        aggregating it once is the whole point of the shared pass. Q is
-        bounded to (−1, 1) by tanh as in the KLENT reference net: π′
-        exponentiates Q/(τ+λ), so an unbounded Q could sharpen without
-        limit."""
+        Both heads read an identical incidence, so the aggregation is shared.
+        The raw critic output is ``[p_logit, m_logit]`` per legal cell so
+        fitting can train both factors without decoding the trunk twice.
+        """
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
         rows = self._decoder_rows(w, batch, g_p.dtype)
         return (
             self._cell_scores(
                 rows, g_p, batch, self.p, self.e_pw, self.e_bg, self.mlp_p
             ),
-            torch.tanh(
-                self._cell_scores(
-                    rows, g_q, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q
-                )
+            self._cell_scores(
+                rows, g_q, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q
             ),
         )
+
+    def cell_heads(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor]:
+        """Policy logits and composed action values over the legal cells.
+
+        The critic predicts mover-win probability ``p`` and discounted-return
+        magnitude ``m``; acting consumers see ``Q = (2p - 1)m`` in fp32.
+        Factoring keeps the return's sign on a well-conditioned
+        classification loss while magnitude carries distance under
+        ``gamma < 1``.
+        """
+        policy_logits, critic_logits = self._cell_head_logits(w, g, batch)
+        return policy_logits, _compose_q(critic_logits)
 
     def value_head(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """§7: (value, value_dist, value_logits). Multi-query attention

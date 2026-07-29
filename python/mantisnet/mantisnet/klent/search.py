@@ -89,13 +89,14 @@ def _terminal_value(position, root_player: int) -> float:
     return 1.0 if position.winner == root_player else -1.0
 
 
-def gumbel_choose(evaluate, tau: float, lam: float, sims: int, rng=None):
+def gumbel_choose(evaluate, tau: float, lam: float, q_scale: float, sims: int, rng=None):
     """Build a batched Gumbel root-sampling and sequential-halving chooser.
 
     ``evaluate(batch)`` returns flat CPU ``(policy_logits, q_values)`` tensors
-    in engine legal order. ``tau`` and ``lam`` are the run's KLENT
-    coefficients; every interior line step acts by the same improved policy
-    used during collection. ``sims == 0`` is exactly policy-logit argmax.
+    in engine legal order. ``tau``, ``lam``, and ``q_scale`` are the run's
+    KLENT coefficients; every interior line step acts by the same improved
+    policy used during collection. ``sims == 0`` is exactly policy-logit
+    argmax.
 
     ``rng`` is accepted for construction symmetry with other chooser
     factories, but the chooser contract's call-time generator is authoritative.
@@ -139,6 +140,7 @@ def gumbel_choose(evaluate, tau: float, lam: float, sims: int, rng=None):
             root_batch.legal_offsets,
             tau,
             lam,
+            q_scale,
         )
 
         searches = []
@@ -236,6 +238,7 @@ def gumbel_choose(evaluate, tau: float, lam: float, sims: int, rng=None):
                     leaf_batch.legal_offsets,
                     tau,
                     lam,
+                    q_scale,
                 )
                 leaf_offsets = leaf_batch.legal_offsets.tolist()
                 for j, (search, line) in enumerate(pending):

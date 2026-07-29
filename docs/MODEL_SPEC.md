@@ -415,30 +415,40 @@ explicit allowlist, not silent prefix matching).
 
 The KLENT training path (`docs/KLENT_DESIGN.md`) evaluates positions through
 a per-action value and no state value: its improvement step is
-`π′ ∝ exp[(Q + τ·log π_θ)/(τ+λ)]` and its bootstrap is `v̂ = E_{π′}[Q]`. The
+`π′ ∝ exp[(s·Q + τ·log π_θ)/(τ+λ)]` for a critic gain `s` (the paper's
+operator is `s = 1`; `KLENT_RUN_PLAN.md` §3 records why a calibrated head
+needs one) and its bootstrap is `v̂ = E_{π′}[Q]`, over unscaled `Q`. The
 head that supplies `Q` is the §6 decoder shape with its own parameters
 everywhere — its own window projection, slot-class table, background-bucket
-table, and MLP — emitting one scalar per legal cell in engine legal order,
-**bounded to `(−1, 1)` by a final `tanh`** as in the KLENT reference net's
-`PQNet` (its Q dense layer carries `activation="tanh"`): the improvement
-step exponentiates `Q/(τ+λ)`, and the bound caps how sharp π′ can get.
-Trained by squared error against the λ-return of the action actually taken
-(KLENT eq. 4).
+table, and MLP. Its MLP emits two logits per legal cell in engine legal
+order:
+
+```
+p = sigmoid(p_logit)
+m = sigmoid(m_logit)
+Q = (2p - 1) · m
+```
+
+The composition is fp32 and gives acting consumers one `Q ∈ (−1, 1)`.
+For the taken action, training applies binary cross-entropy with logits to
+`p_logit` against `y_p = (1 + sign(G)) / 2` and independently to `m_logit`
+against `y_m = |G|`, where `G` is that sample's λ-return. Policy
+cross-entropy is unchanged.
+
+Under `gamma < 1`, a scalar return target entangles who wins with how far
+away the outcome is. The factorization gives the sign a well-conditioned
+classification loss and quarantines distance in the magnitude head. At
+`gamma = 1, lam_ret = 1` it degenerates cleanly: `m` learns the constant
+one and `Q → 2p − 1`.
 
 **Both the policy decoder's and this head's MLP output layers initialize to
-zero**, overriding §10's framework-default for those two layers — the
-reference implementation's `zero_init` — so the policy opens uniform and
-`Q ≡ 0` until trained. This is a measured requirement, not a preference
-(2026-07-27, later found to match the reference config): KLENT's
-improvement exponentiates `Q/(τ+λ)`, which at the §10 default turns
-initialization noise into sharp, arbitrary π′ targets; the first fitting
-epoch trains the policy toward them and the training loop starves before Q
-has learned anything real. With a zero start, π′ opens uniform and sharpens
-only as fitted returns give it reason to.
+zero**, overriding §10's framework-default for those two layers. The critic
+therefore opens at `p = m = 0.5` and `Q ≡ 0`; the policy opens uniform.
+KLENT's improvement exponentiates `Q/(τ+λ)`, so this prevents initialization
+noise from becoming sharp, arbitrary `π′` targets.
 
-Like appendix A, this head reads the trunk's output and adds no inputs, so
-`MODEL_REPR_VERSION` is untouched. Under KLENT the §7 value head sits outside
-the loss entirely — faithful to the paper's no-V-head ablation — and whether
-a KLENT checkpoint carries §7's tensors at all is a packaging decision that
-arrives with the `ModelPackage` wiring, not a model question; appendix A's
-drop-loudly rule applies either way.
+This head reads the trunk's output and adds no inputs, so
+`MODEL_REPR_VERSION` is untouched. Its two-wide output makes its checkpoint
+shape deliberately incompatible with the scalar readout; normal loaders stay
+strict. Under KLENT the §7 value head sits outside the loss entirely,
+faithful to the paper's no-V-head ablation.

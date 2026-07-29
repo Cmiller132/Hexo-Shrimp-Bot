@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 import mantisnet.decoder as decoder_impl
 from mantisnet import collate, from_position
+from mantisnet.model import _compose_q
 from mantisnet.decoder import (
     _FAILED_SHAPES,
     _aggregate_reference,
@@ -116,15 +117,22 @@ def test_cell_heads_match_the_spec_decode(positions, model):
     _s, w, g = model.trunk(batch)
     policy, q = model.cell_heads(w, g, batch)
 
-    for scores, tail, proj, e_class, e_bg, mlp in (
-        (policy, lambda x: x, model.p, model.e_pw, model.e_bg, model.mlp_p),
-        (q, torch.tanh, model.q, model.e_qw, model.e_qbg, model.mlp_q),
+    for scores, compose, proj, e_class, e_bg, mlp in (
+        (
+            policy,
+            lambda x: x.squeeze(-1),
+            model.p,
+            model.e_pw,
+            model.e_bg,
+            model.mlp_p,
+        ),
+        (q, _compose_q, model.q, model.e_qw, model.e_qbg, model.mlp_q),
     ):
         h = _spec_decoder_input(w, batch, proj.weight, e_class.weight, e_bg.weight)
         spec = mlp.out(
             F.relu(mlp.lin_a(h) + mlp.lin_b(g).index_select(0, batch.cell_pos))
-        ).squeeze(-1)
-        torch.testing.assert_close(scores, tail(spec), rtol=1e-4, atol=1e-4)
+        )
+        torch.testing.assert_close(scores, compose(spec), rtol=1e-4, atol=1e-4)
 
 
 @torch.no_grad()

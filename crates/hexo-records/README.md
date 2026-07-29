@@ -11,8 +11,8 @@ hands it to the package's `fit`.
 ## Shape
 
 Pure Rust library crate, depends on `hexo-engine` and `hexo-runner`. No serde,
-and no other dependency — the format is hand-rolled binary and the crate is the
-only thing that speaks it.
+and no other runtime dependency (`tempfile` is a dev-dependency) — the format
+is hand-rolled binary and the crate is the only thing that speaks it.
 
 ```
 crates/hexo-records/

@@ -135,6 +135,7 @@ class Collector:
         ply_cap: int,
         tau: float,
         lam: float,
+        q_scale: float,
         rng: np.random.Generator,
         pair_budget: int = 24_000_000,
         cell_budget: int = 2_400_000,
@@ -147,6 +148,7 @@ class Collector:
         self.ply_cap = ply_cap
         self.tau = tau
         self.lam = lam
+        self.q_scale = q_scale
         self.rng = rng
         self.pair_budget = pair_budget
         self.cell_budget = cell_budget
@@ -216,7 +218,8 @@ class Collector:
         """One chunk's improvement, sampling, and advance — the single
         sampling lane, run strictly in chunk order."""
         imp = improved_policy(
-            policy_logits, q_values, batch.legal_offsets, self.tau, self.lam
+            policy_logits, q_values, batch.legal_offsets, self.tau, self.lam,
+            self.q_scale,
         )
         stats["kl"] += float(imp.kl.sum())
         stats["ent"] += float(imp.norm_entropy.sum())

@@ -122,10 +122,11 @@ entirely**. They return only at test time (§14).
 
 | Paper element | Hexo status |
 | --- | --- |
-| Objective (eq. 2), closed form (eq. 3) | **Unchanged.** |
-| Loss (eq. 4) | **Unchanged in form**, ragged over the legal set instead of dense over `|A|`. |
+| Objective (eq. 2), closed form (eq. 3) | **Unchanged in form**; the operator carries a critic gain `s` (`π′ ∝ softmax[(s·Q + τ·log π_θ)/(τ+λ)]`), which is the same operator at `(τ/s, λ/s)` — a temperature re-tune, not a new mechanism (`KLENT_RUN_PLAN.md` §3). `s = 1` is the paper. |
+| Loss (eq. 4) | **Unchanged for the policy**, ragged over the legal set instead of dense over `|A|`. The `(Q − G)²` term is replaced by A2's factored critic: taken-action BCE on `sign(G)` and `|G|` (`MODEL_SPEC.md` appendix B). Under judgment against the scalar head it replaced. |
 | λ-returns as value target | **Tweaked — necessary.** Sign follows mover *change*, not ply parity (§4). |
-| Reward `±1`, `γ = 1`, terminal-only | **Unchanged.** Hexo has no rules-draw, so the terminal reward is strictly `±1`. |
+| Reward `±1`, terminal-only | **Unchanged.** Hexo has no rules-draw, so the terminal reward is strictly `±1`. |
+| `γ = 1` | **Tweaked — necessary.** `γ = 0.99` as a per-ply return-discount magnitude (§4.4). At `γ = 1` a winner that wanders scores the same as one that converts, and `π′` provably flattens across a decided position's moves — measured as conversion diffusion, not anticipated. |
 | On-policy buffer, discarded per iteration | **Unchanged.** |
 | Policy head + action-value head, no V head | **Unchanged.** Dueling `Q = V + A` sits in §15. |
 | Shared trunk, separate heads | **Unchanged as a shape**; the trunk is a GNN, not a ResNet (§6). |
@@ -134,7 +135,7 @@ entirely**. They return only at test time (§14).
 | Dense `π′` vector per buffer sample | **Replaced — necessary.** Ragged storage (§12). |
 | Natural game termination | **Replaced — necessary.** 512-ply cap; capped episodes are dropped (§5). |
 | Self-play from the initial state | **Unchanged.** Every episode starts from the empty board; the cold-start bootstrap, if one is needed, is a prefit that finishes before KLENT starts (§5.2). |
-| `(τ, λ) = (0.1, 0.03)`, verified against the paper | **Starting values, expected to move** (§8). |
+| `(τ, λ) = (0.1, 0.03)`, verified against the paper | **Moved, as §8 expected**: `(0.1, 0.01)`, i.e. `ρ = 0.909` against the paper's 0.77. λ = 0.03's exponent is the conversion-diffusion mechanism. |
 | `λ_ret = e^{-1/16} ≈ 0.939`, rescaled from the paper's `e^{-1/8}` | **Tweaked — necessary.** The paper's horizon is 8 transitions = 8 turns; 8 Hexo transitions is 4 turns, so carrying 0.883 would halve the strategic horizon (`KLENT_PROPOSALS.md` A1's correction). |
 | Adam, lr 1e-3, batch 4096 | **Unchanged as starting values.** |
 | Evaluate with `argmax π_θ`, no search | **Upgraded after training**: evaluation uses a 32-simulation Gumbel line search; zero simulations remains the parity anchor (§11). |
@@ -149,7 +150,7 @@ fitting. The KLENT operator remains the only training-time policy improvement.
 
 ## 3. What Hexo forces, in one list
 
-The six necessary deviations, each traceable to a property of the game rather
+The seven necessary deviations, each traceable to a property of the game rather
 than to preference:
 
 1. **Ragged per-node heads** — the action space is unbounded (§6).
@@ -160,8 +161,11 @@ than to preference:
    terminate on its own (§5).
 5. **Ragged/sparse `π′` storage** — a dense `|A|` vector does not exist (§12).
 6. **GroupNorm or LayerNorm instead of BatchNorm** — inputs vary in size (§6.3).
+7. **`γ < 1` in the return** — the winner controls termination and the board is
+   unbounded, so an undiscounted return pays nothing for converting a won
+   position (§4.4).
 
-An earlier revision carried a seventh — self-play seeded from foreign game
+An earlier revision carried an eighth — self-play seeded from foreign game
 prefixes, with a warm-start heuristic phase and an annealed cut behind it —
 because item 4 leaves an untrained policy's buffer empty. It was removed
 whole (owner decision, 2026-07-28): the machinery grew into a curriculum the
@@ -253,17 +257,27 @@ acting time (paper Algorithm 1 line 9) rather than recomputed during fitting:
 
 ```
 G_T = r_T = +1
-G_t = r_t + s_t·[ (1 − λ)·v̂_{t+1} + λ·G_{t+1} ]      for t < T
+G_t = s_t·γ·[ (1 − λ)·v̂_{t+1} + λ·G_{t+1} ]          for t < T
 ```
 
-with `γ = 1` folded in and `r_t = 0` at every non-final ply. There is no
-truncation case: episodes that do not reach `T` are discarded whole (§5.1).
+with `r_t = 0` at every non-final ply. There is no truncation case: episodes
+that do not reach `T` are discarded whole (§5.1).
 
-Two sanity identities, both cheap unit tests:
+`γ` is a per-ply discount **magnitude**; the mover-change sign is carried
+entirely by `s_t`. The paper's `γ = 1` is a degenerate objective on a game
+whose winner controls termination — a win in 5 plies and a win in 300 score
+identically, so every move of a decided position carries the same `Q` and
+eq. 3 flattens `π′` there. That is measured, not predicted
+(`KLENT_RUN_PLAN.md` §3, conversion diffusion), and `γ = 0.99` is the
+resolved setting: it ranks faster wins above slower ones, which is what
+keeps a gradient alive in won positions.
+
+Two sanity identities, both cheap unit tests, stated at `γ = 1`:
 
 - **`λ = 1`** collapses to the Monte Carlo return: `G_t = +1` where
   `m_t == m_T` and `−1` otherwise. Winner's plies `+1`, loser's `−1`.
-- **`λ = 0`** collapses to the one-step bootstrap `G_t = s_t·v̂_{t+1}`.
+  At `γ < 1` the same signs carry a `γ^{T−t}` magnitude.
+- **`λ = 0`** collapses to the one-step bootstrap `G_t = s_t·γ·v̂_{t+1}`.
 
 ### 4.5 Buffer contents
 
@@ -523,13 +537,25 @@ Their own sensitivity result is the evidence this is real rather than
 theoretical: at b=42, shrinking to `(0.01, 0.03)` produced "a notable decline in
 performance… likely due to the improved policy becoming overly sharp."
 
+**Measured, and the prediction held.** Hexo runs at `ρ = 0.909`
+(`(τ, λ) = (0.1, 0.01)`), above the paper's 0.77 as this section expected,
+because λ's exponent `π_θ^ρ` is what flattens the policy wherever `Q` is flat
+across actions — the diffusion mechanism of `KLENT_RUN_PLAN.md` §3. `ρ = 1`
+(λ = 0) was tested and is worse than either: the run sharpens and then
+stagnates whole. The other half of the ratio matters as much: the *temperature*
+`τ + λ` is only meaningful relative to `Q`'s realised spread across plausible
+actions, which a well-calibrated critic makes small (~0.04 in undecided
+positions, against `τ + λ = 0.11`). That is the `q_scale` finding, and it means
+`τ + λ` cannot be set once and read as a property of the game — it is a
+property of the game *and* the critic's output scale.
+
 ---
 
 ## 9. Action-value target sparsity
 
 The loss trains the policy head against a **full distribution** over legal
-actions and the value head against **one scalar** — the `Q` entry of the action
-actually taken. Coverage of a state's `Q` row per visit is `1/b`: 1/90 on their
+actions and the critic against **the action actually taken** — one `Q` entry,
+or one `(sign, magnitude)` pair under the factored readout. Coverage of a state's `Q` row per visit is `1/b`: 1/90 on their
 Hex, ~1/1000 here. And Hexo positions are essentially never revisited, since the
 board is unbounded, stones are permanent, and no position repeats, so unlike Go
 there is no revisit process filling the row in. Generalisation does all of the
@@ -540,7 +566,7 @@ cell, the same reason AlphaZero's single-scalar value head works. The downstream
 consequence is what deserves attention:
 
 **`π′` is an argmax-like operator over `b` noisy `Q` estimates, and its bias
-grows with `b`.** With `τ + λ = 0.13`, eq. 3 puts `Q` on a ±7.7 logit scale. The
+grows with `b`.** With `τ + λ = 0.11`, eq. 3 puts `Q` on a ±9 logit scale. The
 expected maximum of estimation noise over 1000 candidates is materially larger
 than over 90, so `π′` systematically concentrates mass on cells whose `Q` is
 *overestimated by noise* rather than cells that are good. `v̂ = E_{π′}[Q]`
@@ -551,11 +577,22 @@ action count, and the paper's sensitivity finding at b=42 is a milder form of it
 Predicted symptom: the policy latches onto junk cells, and normalised entropy
 either stays pinned high or collapses onto noise. Both are visible in §13.
 
+The opposite failure is also real, and it is the reason `Q`'s output scale is
+now a stated parameter rather than an accident. A `tanh`-plus-MSE head is
+systematically overconfident, and that overconfidence was an implicit gain
+keeping `Q`'s spread above `τ + λ`; an honestly calibrated head undershoots the
+temperature in undecided positions, `π′` degenerates to `π_θ^ρ`, and the fit
+trains the policy toward a flatter copy of itself. Measured as calibration
+undershoot in `KLENT_RUN_PLAN.md` §3; the response is the operator's critic
+gain `s`.
+
 Responses, cheapest first: **larger `τ/(τ+λ)`** (§8), which is a hyperparameter
-rather than a design change; **dueling `Q = V + A`** with `A` zero-meaned over
-the legal set, so the value loss reaches `V` from every sample regardless of
-which action was taken and `V` gets one dense sample per state instead of `1/b`
-(§15); ensembling or pessimistic `Q`, held in reserve as expensive.
+rather than a design change; **the bounded factored critic** (A2, landed —
+`MODEL_SPEC.md` appendix B), which makes an out-of-range noise estimate
+unreachable without removing the ranking bias; **dueling `Q = V + A`** with `A`
+zero-meaned over the legal set, so the value loss reaches `V` from every sample
+regardless of which action was taken and `V` gets one dense sample per state
+instead of `1/b` (§15); ensembling or pessimistic `Q`, held in reserve as expensive.
 
 ---
 
@@ -797,6 +834,13 @@ DAG: the evaluation budget buys depth, while training remains search-free.
     carrying keeps episodes whole and adds only the one-fit-behind staleness
     class the pipelined driver already accepts. Mixed-vintage episodes are
     the recorded cost.
+16. **`γ < 1` in the return, as a discount magnitude carried separately from
+    the mover-change sign** (2026-07-29). `γ = 0.99`. The undiscounted
+    objective is degenerate on a game whose winner controls termination, and
+    the degeneracy is in `π′` rather than in the returns: with `Q` equal
+    across a decided position's moves, eq. 3 reduces to `π_θ^ρ` and the
+    winner learns to wander. Discounting is the smallest change that ranks
+    faster wins above slower ones; reward shaping (R6) is not reopened.
 
 ---
 
@@ -813,3 +857,12 @@ DAG: the evaluation budget buys depth, while training remains search-free.
   passes. One epoch, ~512 gradient steps, is the assumption until contradicted.
 - **O3 — derived window features in the observation.** §7. Deferred; an ablation,
   not an argument.
+- **O4 — the critic's output parameterisation.** A2's factored `(p, m)` readout
+  is implemented (`MODEL_SPEC.md` appendix B) and is measurably better at
+  converting won positions, but at `s = 1` it undershoots the operator
+  temperature and collapses the policy (§9). The open question is whether the
+  critic gain `s` fixes it — `runs/factored-939-s2` is the arm, with the kill
+  criterion stated in `KLENT_RUN_PLAN.md` §3. Resolves one of three ways: `s`
+  folded into `(τ, λ)` and the factored head kept, the head shelved for the
+  scalar champion, or the gain kept as a live knob, which would need an
+  argument this design does not currently have.

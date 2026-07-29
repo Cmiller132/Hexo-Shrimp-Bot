@@ -5,13 +5,16 @@ checkpoint manifest and probe that hold it honest.
 
 **Status: implemented.** The trait, the manifest, and the probe ship. No model
 ships — this crate is the shape of one, and it never learns what a feature, a
-layer, or a loss is. `crates/models/mock` is the first package built to it.
+layer, or a loss is. `crates/models/mock` and `crates/models/mantisnet` are
+the packages built to it.
 
 ## Shape
 
 Pure Rust library crate, depending on `hexo-engine`, `hexo-runner`,
-`hexo-search`, and `serde`. No threads, no I/O beyond two files in a checkpoint
-directory, and no knowledge of any particular model.
+`hexo-search`, `serde`, and `serde_json` (the manifest's package-owned
+metadata is a `serde_json::Value` in the public API). No threads, no I/O
+beyond two files in a checkpoint directory, and no knowledge of any
+particular model.
 
 ```
 crates/hexo-model/
@@ -34,7 +37,7 @@ crates/hexo-model/
 | Module | Role |
 | --- | --- |
 | `package` | `ModelPackage`: the whole of what the container knows a model by. Object-safe, because the registry holds `Box<dyn ModelPackage>`. |
-| `manifest` | `Manifest`: which package wrote these weights, under which versions, at which epoch, and what they answer. `write`, `read`, `validate`. |
+| `manifest` | `Manifest`: which package wrote these weights, under which versions, at which epoch, and what they answer — plus `package_metadata`, a `serde_json::Value` the package owns. `new`, `with_package_metadata`, `write`, `read`, `validate`. |
 | `probe` | The frozen probe set and the hash over the evaluator's exact output bytes — `docs/CONTAINER_SPEC.md` §10.2's detector. |
 | `error` | `PackageError`, carrying the path, the pair of versions, or the package's own error that locates the problem. |
 
@@ -78,8 +81,10 @@ crates/hexo-model/
 
 - **The manifest does not describe the architecture.** How many layers there are
   and what shape they have lives inside the package's own weight file. The
-  manifest answers only which package wrote this, which version, which epoch, and
-  whether it is compatible with this binary. That is what keeps "add a GNN
+  manifest answers which package wrote this, which version, which epoch, and
+  whether it is compatible with this binary — plus a `package_metadata` value
+  whose meaning is entirely the package's (semantic knobs like τ/λ live there,
+  opaque to the container). That is what keeps "add a GNN
   package" a new crate and one registry entry instead of a schema change here —
   the moment the container can describe an architecture, it has an opinion about
   models, and every package afterwards has to fit the opinion.
@@ -136,7 +141,10 @@ crates/hexo-model/
   `CONTAINER_SPEC.md` §5 builds the mock to catch. `InvalidConfig` and
   `MalformedWeights` carry the package's own words, because config syntax and
   weight format are the package's and a shared enum that enumerated them would be
-  the container having an opinion about a model.
+  the container having an opinion about a model. `PackageMetadata` locates a
+  manifest whose package-owned metadata the package itself cannot read, and
+  `Unsupported` is a package declining an operation it deliberately does not
+  implement — how `mantisnet` answers `fit` while training lives in Python.
 
 ## Deliberately absent
 

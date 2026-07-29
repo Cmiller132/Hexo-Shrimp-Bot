@@ -50,7 +50,7 @@ def test_immediate_win_overrides_a_better_policy_logit():
         calls += 1
         return logits, q
 
-    choose = gumbel_choose(evaluate, tau=0.1, lam=0.03, sims=32)
+    choose = gumbel_choose(evaluate, tau=0.1, lam=0.03, q_scale=1.0, sims=32)
     move = choose([pos], np.random.default_rng(4))[0]
     assert pos.nth_legal(decoy_rank) != winning_move
     assert move == winning_move
@@ -64,7 +64,7 @@ def test_batching_matches_ordered_singleton_calls():
     ]
     batch_rng = np.random.default_rng(71)
     single_rng = np.random.default_rng(71)
-    choose = gumbel_choose(heuristic_evaluate, 0.1, 0.03, 16)
+    choose = gumbel_choose(heuristic_evaluate, 0.1, 0.03, 1.0, 16)
     together = choose(positions, batch_rng)
     separately = [choose([position], single_rng)[0] for position in positions]
     assert together == separately
@@ -75,7 +75,7 @@ def test_same_seed_is_deterministic():
         hexo_py.Position.replay([(0, 0)]),
         hexo_py.Position.replay([(0, 0), (1, 2), (-2, 1)]),
     ]
-    choose = gumbel_choose(heuristic_evaluate, 0.1, 0.03, 32)
+    choose = gumbel_choose(heuristic_evaluate, 0.1, 0.03, 1.0, 32)
     first = choose(positions, np.random.default_rng(92))
     second = choose(positions, np.random.default_rng(92))
     assert first == second
@@ -93,7 +93,7 @@ def test_zero_simulations_is_exact_policy_argmax():
         hexo_py.Position.replay([(0, 0), (1, 1), (2, 0)]),
     ]
     searched = gumbel_choose(
-        network_evaluate(model, cfg), cfg.tau, cfg.lam, sims=0
+        network_evaluate(model, cfg), cfg.tau, cfg.lam, cfg.q_scale, sims=0
     )
     search_rng = np.random.default_rng(8)
     untouched_peer = np.random.default_rng(8)
@@ -139,9 +139,9 @@ def test_depth_exposes_an_opponent_reply_trap():
                 q[lo:hi] = -root_value
         return logits, q
 
-    argmax = gumbel_choose(evaluate, 0.1, 0.03, sims=0)
-    shallow = gumbel_choose(evaluate, 0.1, 0.03, sims=2)
-    searched = gumbel_choose(evaluate, 0.1, 0.03, sims=32)
+    argmax = gumbel_choose(evaluate, 0.1, 0.03, 1.0, sims=0)
+    shallow = gumbel_choose(evaluate, 0.1, 0.03, 1.0, sims=2)
+    searched = gumbel_choose(evaluate, 0.1, 0.03, 1.0, sims=32)
     assert argmax([root], np.random.default_rng(0))[0] == trap_move
     assert shallow([root], np.random.default_rng(0))[0] == trap_move
     assert searched([root], np.random.default_rng(0))[0] == safe_move
@@ -160,7 +160,7 @@ def test_network_expansion_budget_is_never_exceeded():
         return heuristic_evaluate(batch)
 
     sims = 32
-    choose = gumbel_choose(spy, 0.1, 0.03, sims)
+    choose = gumbel_choose(spy, 0.1, 0.03, 1.0, sims)
     choose(positions, np.random.default_rng(19))
     assert rows[0] == len(positions)  # the shared root forward is not a sim
     assert sum(rows[1:]) <= sims * len(positions)
