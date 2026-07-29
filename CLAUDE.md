@@ -64,5 +64,7 @@ substituted default.
 
 Comments say what the code does and why it does it that way, not the story of
 how it got there. Keep each crate's `README.md` current. Prune `docs/` when a
-document stops being true — a settled question moves to a `README.md` and leaves
-the open-questions file — but prune deliberately, not aggressively.
+document stops being true — but prune deliberately, not aggressively. Docs and
+READMEs are pure contract: measured results live in `docs/ABLATIONS.md`, open
+questions in `docs/KLENT_FOR_HEXO.md`, and run history in neither comments nor
+READMEs.
