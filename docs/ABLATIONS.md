@@ -1,0 +1,625 @@
+# Ablation and experimental record
+
+This file is the technical record of the retained KLENT training runs and engineering experiments. It records configurations, measurements, artifact limits, and dispositions. It does not rank runs or prescribe a next experiment.
+
+The comparison reference used below is: \(\gamma=0.99\), \(\lambda=0.01\), \(\tau=0.1\), \(\lambda_{\mathrm{ret}}=0.939\), and a scalar tanh critic; 4096 completed games per iteration, 1024 environments, ply cap 512, and learning rate \(10^{-3}\). Unless a run configuration says otherwise, in-driver evaluations are 64 seat-balanced games against uncapped SealBot at 0.1 s/move, using the 32-simulation Gumbel line search.
+
+Training metric iteration numbers are the zero-based values stored in `metrics.jsonl` and `iterations`. `eval_matches.iteration` is the completed-iteration count, so an evaluation on metrics row 24 is stored as evaluation 25. Legacy results are labeled “metrics row”; database results are labeled “@”. `H` means `acting_norm_entropy`, or the corresponding quantized per-ply `norm_entropy` after division by 10000. “Decided” means \(|\hat v| \ge 0.5\).
+
+## Training runs
+
+### `shakeout-1`
+
+| Field | Record |
+| --- | --- |
+| Dates | 2026-07-27, 19:23–20:11 EDT from artifact timestamps |
+| Init/fork | Fresh initialization; seed 1 |
+| Delta from reference | Historical \(\gamma=1.0\) objective; `--lam 0.03`; `--games 64`; pre-auto-reset collector with no `--envs`; `--seed-fraction 1.0 --seed-cut 1 8 --seed-noise 0.1`; `--batch 256`; `--iterations 100 --checkpoint-every 10 --eval-every 10 --eval-games 64`; legacy line-builder anchor evaluation |
+| Question | Loop stability, crash/resume behavior, instrumentation, and baseline training dynamics |
+| Disposition | Completed 100 iterations; superseded by the packed-batch sweep runs and later recipe changes |
+
+| Measurement | Artifact record |
+| --- | --- |
+| Run shape | 114 metrics rows, 100 unique iterations 0–99, duplicate resume spans 10–16 and 90–96, and ten checkpoints through `checkpoint_000100.pt` |
+| Initial transient | Won length 176.704 at iteration 0, 60.063 at 4, and 18.875 at 8; acting KL 3.894 at 0; winner/loser \(\hat v\) 1.788/1.778 at 0, 0.321/0.324 at 1, and approximately zero at 2 |
+| Entropy/KL interval | H ranged 0.1247–0.9173. During iterations 64–75, H was generally 0.89–0.92, KL was 0.0026–0.0122, and `f_seeded` reached 0.5469 at iteration 71. |
+| Legacy-anchor evals | Metrics rows `9:.515625, 19:.328125, 29:.34375, 39:.6875, 49:.421875, 59:.609375, 69:0, 79:0, 89:0, 99:0`; 64 games each, zero capped |
+| Crash/resume diagnostic | Two crashes were attributed to the fp32 policy-target sum check; worst \(\lvert\mathrm{sum}-1\rvert=1.3\times10^{-4}\) at width about 14k with zero NaN/Inf, followed by f64 accumulation for the check **(run plan, not re-derived)**. |
+
+Measured relationship: the interval with H near 0.91 and KL near zero coincided with the first zero evaluation at metrics row 69; later evaluations remained zero after `f_seeded` returned to 1.0.
+
+Artifact discrepancies:
+
+- The run plan rounds the peak evaluation to 0.688 **(run plan, not re-derived)**; the artifact value is 0.6875.
+- The run plan says `v_hat_mae` never fell below about 0.7 **(run plan, not re-derived)**; the metrics minimum is 0.590697 at iteration 74.
+- The run plan says winner-side \(\hat v\) remained at or below about 0.4 after iteration 1 **(run plan, not re-derived)**; metrics contain 0.647, 0.860, 0.808, and 0.867 at iterations 65, 67, 68, and 74.
+- The run-plan sequence “177 → 60 → 20 by iteration 4” **(run plan, not re-derived)** is stored at iterations 0, 4, and 8.
+
+### `sweep-a`
+
+| Field | Record |
+| --- | --- |
+| Dates | 2026-07-27, 21:47–21:59 EDT |
+| Init/fork | Fresh initialization; seed 1 |
+| Delta from reference | Historical \(\gamma=1.0\); `--lam 0.03`; `--games 64`; no `--envs`; full seeding at cut 1–8 with noise 0.1; `--batch 4096 --pair-budget 8000000 --cell-budget 400000`; `--iterations 100 --checkpoint-every 25 --eval-every 10 --eval-games 64`; legacy anchor evaluation |
+| Question | Packed-batch continuation of the \(\lambda=0.03\) baseline and the initialization behavior of that setting |
+| Disposition | Stopped after iteration 10; no stored stop criterion or reason; superseded by the 256-game sweep arms |
+
+| Measurement | Artifact record |
+| --- | --- |
+| Run shape | Iterations 0–10; no checkpoint |
+| Start | Iteration 0: acting KL 3.904, H 0.322, `f_seeded=0.406`, winner/loser \(\hat v=1.791/1.779\) |
+| Corpus loss | By iteration 3, H was 0.983, `f_seeded=0`, and the buffer was empty. Iterations 3–10 remained near H 0.982 with an empty buffer. |
+| Eval | Metrics row 9: 3/64 = 0.046875 against the legacy anchor; zero capped; no CI or Elo artifact |
+
+Measured relationship: high initial KL and same-sign winner/loser \(\hat v\) preceded the empty-buffer interval.
+
+### `sweep2-a`
+
+| Field | Record |
+| --- | --- |
+| Dates | 2026-07-27, 22:00–22:11 EDT |
+| Init/fork | Fresh initialization; seed 1 |
+| Delta from reference | Historical \(\gamma=1.0\); `--lam 0.03`; `--games 256`; no `--envs`; `--seed-fraction 1.0 --seed-cut 1 8 --seed-noise 0.1`; `--batch 4096 --pair-budget 8000000 --cell-budget 400000`; `--iterations 100 --checkpoint-every 25 --eval-every 10 --eval-games 128`; legacy anchor evaluation |
+| Question | \(\lambda=0.03\) arm of the 256-game comparison |
+| Disposition | Stopped after iteration 3; no stored stop criterion or reason; superseded by the zero-Q initialization arm |
+
+| Iteration | KL | H | `f_seeded` | Winner/loser \(\hat v\) | Won length | Seconds |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 3.894 | 0.322 | 0.473 | 1.765 / 1.770 | 210.64 | 97.0 |
+| 1 | 4.951 | 0.710 | 1.000 | -0.887 / -0.880 | 72.79 | 12.2 |
+| 3 | 0.978 | 0.9935 | 0.0586 | -0.156 / -0.156 | 143.27 | 573.9 |
+
+No evaluation, checkpoint, status file, telemetry database, or run-specific log is present.
+
+### `sweep2-b`
+
+| Field | Record |
+| --- | --- |
+| Dates | 2026-07-27, 23:01–23:44 EDT |
+| Init/fork | Fresh initialization; seed 1 |
+| Delta from reference | Historical \(\gamma=1.0\); `--games 256`; no `--envs`; `--seed-fraction 1.0 --seed-cut 1 8 --seed-noise 0.1`; `--batch 4096 --pair-budget 8000000 --cell-budget 400000`; `--iterations 100 --checkpoint-every 25 --eval-every 10 --eval-games 128`; legacy anchor evaluation; \(\lambda=0.01\), \(\lambda_{\mathrm{ret}}=0.939\), and lr \(10^{-3}\) match the numerical reference |
+| Question | \(\lambda=0.01\) arm of the 256-game comparison |
+| Disposition | Stopped after iteration 9; no stored stop criterion or reason; superseded by `abl-zeroq-lam01` |
+
+| Measurement | Artifact record |
+| --- | --- |
+| Start | Iteration 0: KL 4.336, H 0.259, `f_seeded=0.441`, winner/loser \(\hat v=1.784/1.784\) |
+| Completion | `f_seeded` was 0.0078 at iterations 5–6, 0.0039 at 7, and 0 at 8–9. |
+| Entropy/buffer | H was 0.964 at iterations 8–9 and the buffer was empty. |
+| Eval | Metrics row 9: 0/128 against the legacy anchor; zero capped; no CI or Elo artifact |
+
+Lowering \(\lambda\) did not remove the observed high-initial-Q/empty-buffer sequence in this arm.
+
+### `abl-zeroq-lam01`
+
+| Field | Record |
+| --- | --- |
+| Dates | 2026-07-27 23:47–2026-07-28 01:55 EDT |
+| Init/fork | Fresh initialization; seed 1; zero-initialized Q output. The code-level initialization change is not serialized in `config.json`; iteration-0 winner/loser \(\hat v=0/0\) and the run plan identify it. |
+| Delta from reference | Historical \(\gamma=1.0\); `--games 256`; no `--envs`; `--seed-fraction 1.0 --seed-cut 1 8 --seed-noise 0.1`; `--iterations 100 --checkpoint-every 25 --eval-every 10 --eval-games 128 --starve-limit 4`; legacy anchor evaluation |
+| Question | Whether zero Q initialization removes the sweep initialization behavior at \(\lambda=0.01\) |
+| Disposition | Stopped by the four-iteration starvation criterion; `checkpoint_000008.pt` written; warm collection adopted in the next runs |
+
+| Measurement | Artifact record |
+| --- | --- |
+| Run shape | Iterations 0–7 |
+| Start | KL 0.001653, H 0.984913, winner/loser \(\hat v=0/0\), `f_seeded=0.0546875` |
+| Completion | `f_seeded` sequence `.05469, .00391, .15625, .01953, .00391, 0, .00391, .00391`; mean 0.030762 |
+| Other metrics | H stayed 0.978–0.998; `v_hat_mae` stayed approximately 1.0 |
+| Eval | None before stop |
+
+Measured relationship: zero initialization removed the initial Q/KL spike present in the sweep arms, while the initial improved policy was near-uniform and completion remained low. The adjacent log records the criterion as four consecutive iterations under one sample per game.
+
+### `overnight-1`
+
+| Field | Record |
+| --- | --- |
+| Dates | 2026-07-28, 02:00–02:39 EDT |
+| Init/fork | Fresh initialization; seed 2 |
+| Delta from reference | Historical \(\gamma=1.0\); `--lam 0.03`; `--games 256`; no `--envs`; `--seed-fraction 0.9 --seed-cut 1 8 --seed-noise 0.1`; `--warm-iterations 15 --starve-limit 6`; `--iterations 3000 --checkpoint-every 25 --eval-every 25 --eval-games 128`; legacy anchor evaluation |
+| Question | Whether a 15-iteration line-builder warm phase survives handoff with \(\lambda_{\mathrm{ret}}=0.939\) |
+| Disposition | Stopped after metrics row 23 with `checkpoint_000024.pt`; superseded by `overnight-2`. The configured starvation limit is present, but no status or log independently records the stop path. |
+
+| Interval | Artifact measurements |
+| --- | --- |
+| Warm, iterations 0–14 | `f_seeded=f_unseeded=1`; q-loss 1.000 → 0.863736 |
+| Handoff, iteration 15 | q-loss 0.400856; winner/loser \(\hat v=0.1626/0.0857\); H 0.7050 |
+| Iteration 16 | q-loss 0.130942; \(\hat v=0.0222/0.0142\); H 0.9620 |
+| Iteration 18 | q-loss 0.056555; \(\hat v=-0.00664/-0.00083\); `f_seeded=.00420`; `f_unseeded=0` |
+| Iterations 19–21 | Empty buffer |
+| Final row 23 | `f_seeded=.00452`; `f_unseeded=0` |
+
+Measured relationship: winner/loser \(\hat v\) converged to similar near-zero values while q-loss fell after handoff, followed by near-zero completion. The run plan characterizes a long-game target at this setting as about 94% bootstrap **(run plan, not re-derived)**.
+
+### `overnight-2`
+
+| Field | Record |
+| --- | --- |
+| Dates | 2026-07-28, 02:41–02:59 EDT |
+| Init/fork | Fresh initialization; seed 3 |
+| Delta from reference | Historical \(\gamma=1.0\); `--lam 0.03 --lam-ret 1.0 --lr 0.00025`; `--games 256`; no `--envs`; `--seed-fraction 0.9 --seed-cut 1 8 --seed-noise 0.1`; `--warm-iterations 30 --starve-limit 6`; `--iterations 3000 --checkpoint-every 25 --eval-every 10 --eval-games 128`; legacy anchor evaluation |
+| Question | Monte-Carlo returns and reduced learning rate after a 30-iteration warm phase |
+| Disposition | Stopped after metrics row 39; superseded by `overnight-3`. Only checkpoint 25 is present; the configured starvation limit is not confirmed by status or log. |
+
+| Interval | Artifact measurements |
+| --- | --- |
+| Warm, iterations 0–29 | q-loss 1.000 → 0.868446 |
+| Warm evals | Metrics rows `9:.671875` (86/128), `19:.71875` (92/128), `29:.734375` (94/128); zero capped |
+| Handoff, iteration 30 | H 0.5067; q-loss 0.9062; winner/loser \(\hat v=0.1941/0.0666\) |
+| Iteration 33 | `f_unseeded=0`; `f_seeded=.4526` |
+| Iteration 39 | H 0.9020; q-loss 1.02795; \(\hat v=-0.1859/-0.1922\); `f_seeded=.01293`; eval 0/128 |
+
+The 0.868446 q-loss at warm handoff is the artifact value behind the run plan’s rounded 0.87.
+
+### `overnight-3`
+
+| Field | Record |
+| --- | --- |
+| Dates | 2026-07-28, 03:00–07:40 EDT; offline SealBot curve written later that day |
+| Init/fork | Fresh initialization; seed 4 |
+| Config phases | (1) Initial: historical \(\gamma=1.0\), `--lam .01 --lam-ret 1.0 --lr .00025 --games 256 --seed-fraction .9 --seed-cut 1 8 --seed-noise .1 --warm-iterations 300 --starve-limit 6 --eval-every 25 --eval-games 128`; (2) resume at 350 adds `--anneal`; (3) resume at 1100 changes `--lam .03`; (4) final resume at 2050 keeps \(\lambda=.03\), uses `--eval-every 5 --iterations 2062`. All in-driver evals were against the legacy anchor. |
+| Question | Warm-duration sufficiency, static versus annealed seed cuts, and the measured \(\lambda=.01\) and \(\lambda=.03\) regimes |
+| Disposition | `checkpoint_002062.pt` retained as the later fork; superseded by the no-seeding/no-grounding `pure-1` reset |
+
+The append-only metrics file contains superseded branches: 0–354 initial, 350–1122 annealed at \(\lambda=.01\), 1100–2088 annealed at \(\lambda=.03\), and a final 2050–2061 re-anneal that produced checkpoint 2062. Duplicate spans are 350–354, 1100–1122, and 2050–2061.
+
+| Phase | Decisive artifact trajectory |
+| --- | --- |
+| Warm, 0–299 | q-loss 1.000 → 0.075586, with 0.059527 at 249 and 0.045994 at 274; 12 evals ranged 0.65625–0.78125 |
+| First handoff, 300 | Winner/loser \(\hat v=0.613202/-0.369469\); `v_hat_mae=0.511420` |
+| Static cut, 324–349 | Eval 0.6328125 → 0 while `f_seeded=f_unseeded=1` at 349 |
+| Annealed \(\lambda=.01\), 350–1099 | `seed_cut_hi` 10 at 350, 508 at 599, then 512; eval 0 at parent row 349 → 0.6953125 at 374. At 899: H 0.09919, q-loss 0.04057, winner/loser \(\hat v=0.893/-0.846\), won length 11.00. At 1074: H 0.08632, q-loss 0.02338, MAE 0.04256, won length 11.21, eval 0.140625. At 1099: H 0.03171, won length 28.58, eval 0.03125. |
+| Restarted \(\lambda=.03\), 1100 onward | H 0.06839 at 1100 → 0.29251 at 1122 → 0.30352 at 1374. Eval 0.0234375 at 1124 → 0.640625 at 1274 → 0.6953125 at 1324 → 0.7421875 at 1374; later values were variable. |
+| Final branch, 2050–2061 | `seed_cut_hi` 10 → 32; H 0.23082 → 0.17051; eval 0.8046875 at 2054 and 0.8671875 at 2059 |
+
+<details>
+<summary>Complete legacy-anchor evaluation series</summary>
+
+| Branch | Metrics rows and scores; 128 games each, zero capped |
+| --- | --- |
+| Initial | `24:.671875, 49:.65625, 74:.671875, 99:.71875, 124:.7421875, 149:.78125, 174:.703125, 199:.7109375, 224:.6953125, 249:.7265625, 274:.671875, 299:.7265625, 324:.6328125, 349:0` |
+| Annealed \(\lambda=.01\) | `374:.6953125, 399:.140625, 424:.6328125, 449:.625, 474:.703125, 499:.65625, 524:.6640625, 549:.5859375, 574:.8828125, 599:.75, 624:.390625, 649:.21875, 674:.703125, 699:.171875, 724:.8125, 749:.0703125, 774:.0078125, 799:.2109375, 824:.09375, 849:.4765625, 874:.2421875, 899:.8125, 924:.0859375, 949:.25, 974:.1328125, 999:.109375, 1024:.1328125, 1049:.125, 1074:.140625, 1099:.03125` |
+| \(\lambda=.03\), later superseded after 2050 | `1124:.0234375, 1149:.0625, 1174:.1953125, 1199:.4765625, 1224:.4609375, 1249:.484375, 1274:.640625, 1299:.59375, 1324:.6953125, 1349:.59375, 1374:.7421875, 1399:.4453125, 1424:.6953125, 1449:.578125, 1474:.1328125, 1499:.7109375, 1524:.4921875, 1549:.4453125, 1574:.6328125, 1599:.6484375, 1624:.8203125, 1649:.1171875, 1674:.65625, 1699:.609375, 1724:.625, 1749:.625, 1774:.6484375, 1799:.7109375, 1824:.640625, 1849:.65625, 1874:.6171875, 1899:.2109375, 1924:.75, 1949:.703125, 1974:.796875, 1999:.78125, 2024:.8984375, 2049:.8359375, 2074:.78125` |
+| Final branch | `2054:.8046875, 2059:.8671875` |
+
+</details>
+
+Measured relationships:
+
+- Extending warmup from 30 to 300 iterations changed the first-handoff measurements from `overnight-2`’s 0.194/0.067 winner/loser \(\hat v\) to 0.613/-0.369.
+- At the static cut, completion remained 1.0 while evaluation fell to zero; the annealed fork from the same checkpoint measured 0.6953125 at row 374.
+- In the annealed \(\lambda=.01\) branch, low H, short games, low q-loss/MAE, and low legacy-anchor evaluations occurred in the same interval.
+- The \(\lambda=.03\) restart raised H during the restarted anneal; its evaluations were not confined to one narrow band.
+
+Artifact discrepancies:
+
+- Root `config.json` reflects the initial \(\lambda=.01\), no-anneal invocation. Later invocations define the final \(\lambda=.03\) checkpoint.
+- The run plan’s “eval about 0.65, peaks 0.82” **(run plan, not re-derived)** does not match the artifact maximum: metrics contain 0.8828125 at row 574 and 0.8984375 at row 2024.
+- The run-plan statement that evaluation held in 0.60–0.72 for 500+ iterations **(run plan, not re-derived)** is not literal in the metrics; the \(\lambda=.03\) branch includes 0.1171875 at 1649, 0.2109375 at 1899, 0.8203125 at 1624, and 0.8984375 at 2024.
+- The checkpoint-350 result “lost 63/64 with all three heads” and the later 9:1 anchor result are **(run plan, not re-derived)**. The stored in-driver result at row 349 is 0/128.
+
+### `abl-gnd25`
+
+| Field | Record |
+| --- | --- |
+| Dates | 2026-07-28, 09:24–09:47 EDT |
+| Init/fork | `runs/overnight-3/checkpoint_002062.pt`; seed 11 |
+| Delta from reference | Historical \(\gamma=1.0\); `--lam .03 --lam-ret 1.0 --lr .00025`; `--games 1024`; no `--envs`; `--seed-fraction .9 --seed-cut 1 8 --seed-noise .1 --anneal`; `--ground-fraction .25 --ground-depth 1 --ground-time .05 --sealbot D:\SealBot`; `--cell-budget 800000 --pair-budget 8000000`; `--warm-iterations 0 --starve-limit 6`; `--iterations 1300 --checkpoint-every 100 --eval-every 25 --eval-games 64`; legacy anchor evaluation |
+| Question | Measurements from seating depth-1 SealBot in 25% of collection games |
+| Disposition | Stopped unfinished after metrics row 277 of 1300; opponent grounding removed on 2026-07-28; no final checkpoint or stored stop reason |
+
+| Measurement | Artifact record |
+| --- | --- |
+| Run shape | Iterations 0–277; checkpoints 100 and 200 |
+| Completion/cut | `f_grounded=f_seeded=f_unseeded=1.0` throughout; `seed_cut_hi` 10 at iteration 0, 508 at 249, and 512 from 251 |
+| Grounded score / H | Iteration `0:0/.13523`, `23:.046875/.22404`, `49:.074219/.27545`, `99:.136719/.26961`, `149:0/.46375`, `199:0/.16169`, `249:.011719/.20922`, `274:.078125/.16505`, `277:.066406/.23078` |
+| Legacy-anchor evals | Metrics rows `24:.65625, 49:.875, 74:.65625, 99:.703125, 124:.625, 149:.578125, 174:.640625, 199:.796875, 224:.8125, 249:.6875, 274:.78125`; 64 games each, zero capped |
+| Critic trajectory | q-loss 0.8608 at 0 → 0.4265 at 124 → 0.1229 at 149 while winner/loser \(\hat v\) reached 0.889/-0.870 and MAE 0.162; q-loss returned to 0.8099 at 199 and 0.8562 at 274 |
+
+The grounded score was not monotone, and the retained artifact set has no completed ungrounded control arm for a causal comparison.
+
+The separate 15-iteration landing probe measured grounded score 0.00 → 0.05, H 0.136 → 0.204, and about 1 ms per opponent turn **(run plan, not re-derived)**. Those values are not from `abl-gnd25`: this run’s iterations 0→14 measure grounded score 0→0.01171875 and H 0.135235→0.214780; its grounded score first reaches 0.046875 at iteration 23.
+
+### `pure-1`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-28 |
+| Init/fork | `runs/overnight-3/checkpoint_002062.pt`; seed 20 |
+| Delta from reference | Historical \(\gamma=1.0\) (no `gamma` key); `--lam .03`; `--games 1024`; no `--envs`; `--eval-depth 1 --eval-time .05`; no `--eval-sims`; `--iterations 2000 --checkpoint-every 100 --eval-every 25 --eval-games 64`; `--starve-limit 10`; no seeding or grounding |
+| Question | Behavior of unseeded, ungrounded self-play from the trained `overnight-3` fork under \(\lambda_{\mathrm{ret}}=.939\) |
+| Disposition | Stopped after metrics row 174; no stored stop criterion or `status.json`; superseded by `pure-2` |
+
+| Iteration range | Measurements |
+| --- | --- |
+| 0–174 | 175 metrics rows; only checkpoint 100 is retained |
+| Evaluations | After iterations `25:0/64`, `50:1/64=.015625`, `75:0/64`, `100:4/64=.0625`, `125:8/64=.125`, `150:1/64=.015625`, `175:1/64=.015625`. No `telemetry.db` is retained, so Wilson intervals and Elo are unavailable. |
+| 130 | H 0.184668; winner/loser \(\hat v=0.398711/-0.164323\); q-loss 0.314766; mean game length 24.36 |
+| 130–174 | H range 0.152766–0.960126; mean game length reached 196.10; maximum iteration time 610.96 s |
+| 159 and 174 | At 159, winner/loser \(\hat v=0.041083/-0.010698\), q-loss 0.070411. At 174, the same measurements were 0.050525/-0.146271 and 0.209785. |
+
+The artifact minimum `v_hat_mae` is 0.507515 at row 61. This differs from the run-plan statement that it never fell below about 0.7 **(run plan, not re-derived)**.
+
+### `pure-2`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-28 |
+| Init/fork | `runs/pure-1/checkpoint_000100.pt`; seed 21 |
+| Delta from reference | Historical \(\gamma=1.0\); `--lam .03 --lam-ret 1.0`. Initial branch: `--games 1024`, no `--envs`, `--iterations 2000 --checkpoint-every 100 --eval-depth 1 --eval-time .05`, no `--eval-sims`. Resume from checkpoint 100: `--games 4096 --envs 1024`, depth-1 evaluation, checkpoint interval 100. Resume from checkpoint 200: `--games 4096 --envs 1024 --checkpoint-every 25 --eval-time .1 --eval-sims 32`, uncapped search evaluation. All branches used `--eval-every 25 --eval-games 64 --starve-limit 10`. |
+| Question | Whether the pure-self-play direction seen in `pure-1` reproduced after a checkpoint-100 fork, and how it behaved at the reference operating point |
+| Disposition | Latest branch stopped after completed iteration 239; `status.json` records iteration 240 incomplete in collection/fit. Checkpoint 200 became the common fork for the \(\gamma\) conversion arms; superseded by `conv-disc`. |
+
+The append-only metrics contain 344 physical rows but 240 distinct iteration numbers because resumed branches overlap. `telemetry.db` represents the latest branch for iterations 100–239.
+
+| Completed iteration | Evaluator | Score | Wilson 95% CI | Elo 95% CI | Seat wins | Provenance |
+| ---: | --- | ---: | --- | --- | --- | --- |
+| 25 | depth 1, .05 s | 6/64 = 0.09375 | — | — | — | metrics only |
+| 50 | depth 1, .05 s | 1/64 = 0.015625 | — | — | — | metrics only |
+| 75 | depth 1, .05 s | 9/64 = 0.140625 | — | — | — | metrics only |
+| 100 | depth 1, .05 s | 30/64 = 0.46875 | — | — | — | metrics only |
+| 125, initial branch | depth 1, .05 s | 20/64 = 0.3125 | — | — | — | metrics only |
+| 150, initial branch | depth 1, .05 s | 29/64 = 0.453125 | — | — | — | metrics only |
+| 125, resumed branch | depth 1, .05 s | 41/64 = 0.640625 | 0.518206–0.747118 | 100.422 [12.657, 188.188] | 22/19 | `eval_matches` |
+| 150, resumed branch | depth 1, .05 s | 40/64 = 0.625 | 0.502502–0.733342 | 88.739 [1.738, 175.741] | 17/23 | `eval_matches` |
+| 175 | depth 1, .05 s | 49/64 = 0.765625 | 0.648665–0.852502 | 205.642 [106.520, 304.764] | 23/26 | `eval_matches` |
+| 200 | depth 1, .05 s | 54/64 = 0.84375 | — | — | — | metrics only; resume cleanup removed the match row |
+| 225, older branch | depth 1, .05 s | 46/64 = 0.71875 | — | — | — | metrics only |
+| 225, resumed branch | uncapped, .1 s, 32 simulations | 44/64 = 0.6875 | 0.566074–0.787691 | 136.969 [46.183, 227.755] | 21/23 | `eval_matches`; zero forfeits |
+
+| Iteration range | Measurements |
+| --- | --- |
+| 199 | Eval 0.84375; H 0.329250; mean length 54.41; q-loss 0.863650 |
+| Latest replay, 200–239 | H 0.333506 → 0.499105; mean length 48.84 → 71.01; q-loss 0.843716 → 0.528065 |
+| 238 | H 0.559391; mean length 82.843; iteration time 548.227 s |
+| Telemetry 235–239, games lasting at least 100 plies | 146,538 plies; mean \(\lvert\hat v\rvert=0.909462\); winner/loser \(\hat v=0.856889/-0.845826\); policy top-1 probability 0.105932; mean legal-action count 2660.69 |
+
+The direction reproduced across the two stored branches, but the numerical trajectories were not identical. This is a discrepancy with the run plan’s word “identically.”
+
+### `conv-disc`
+
+| Field | Record |
+| --- | --- |
+| Dates | 2026-07-28–2026-07-29 local; 2026-07-29 03:40–05:50 UTC |
+| Init/fork | `runs/pure-2/checkpoint_000200.pt`; seed 21 |
+| Delta from reference | `--lam .03 --lam-ret 1.0`; all reference operating-point and evaluator flags present; 100 iterations |
+| Question | Effect of changing \(\gamma\) from 1.0 to 0.99 while retaining \(\lambda=.03\) and \(\lambda_{\mathrm{ret}}=1.0\) |
+| Disposition | Completed 100 iterations; \(\gamma=.99\) retained for subsequent arms; superseded by `conv-disc-lam01` |
+
+| Completed iteration | Score | Wilson 95% CI | Elo 95% CI | Seat wins |
+| ---: | ---: | --- | --- | --- |
+| 25 | 39/64 = 0.609375 | 0.486917–0.719446 | 77.250 [-9.093, 163.593] | 22/17 |
+| 50 | 40/64 = 0.625 | 0.502502–0.733342 | 88.739 [1.738, 175.741] | 23/17 |
+| 75 | 47/64 = 0.734375 | 0.615169–0.827038 | 176.660 [81.490, 271.829] | 28/19 |
+| 100 | 37/64 = 0.578125 | 0.456098–0.691304 | 54.735 [-30.585, 140.055] | 19/18 |
+
+All four `eval_matches` rows contain 64 games and no caps or forfeits.
+
+| Iteration range | Measurements |
+| --- | --- |
+| 0 → 74 → 99 | q-loss 0.455834 → 0.295219 → 0.318616 |
+| 0–99 | Mean game length 41.13–60.35; H 0.334573 → 0.454542, maximum 0.546314 |
+| Decided ply bucket, 0 → 49 → 99 | H 0.334511 → 0.704091 → 0.729728; top-1 probability 0.553107 → 0.243057 → 0.232766 |
+| Decided bucket, 95–99 aggregate | H 0.713595; top-1 probability 0.247647 |
+
+The run plan’s scale comparison \(\gamma^k\lambda_{\mathrm{ret}}\approx0.12\) versus \(\tau+\lambda=0.13\) is **(run plan, not re-derived)**.
+
+### `conv-rho1`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-29 UTC |
+| Init/fork | `runs/pure-2/checkpoint_000200.pt`; seed 21 |
+| Delta from reference | `--gamma 1.0 --lam 0 --tau .13 --lam-ret 1.0`; \(\tau+\lambda=.13\); all reference operating-point and evaluator flags present |
+| Question | Effect of removing entropy regularization’s flattening term while holding \(\tau+\lambda=.13\) |
+| Disposition | Stopped after completed iteration 50; `status.json` records iteration 51 incomplete in the next collection; shelved |
+
+| Completed iteration | Score | Wilson 95% CI | Elo 95% CI | Seat wins |
+| ---: | ---: | --- | --- | --- |
+| 25 | 37/64 = 0.578125 | 0.456098–0.691304 | 54.735 [-30.585, 140.055] | 21/16 |
+| 50 | 40/64 = 0.625 | 0.502502–0.733342 | 88.739 [1.738, 175.741] | 24/16 |
+
+Both `eval_matches` rows contain 64 games and zero forfeits.
+
+| Iteration range | Measurements |
+| --- | --- |
+| 0 → 50 | H 0.292128 → 0.108288; KL 0.038430 → 0.008324, with minimum 0.006236; q-loss 0.879319 → 0.890106, range 0.868207–0.911336; mean length 58.09 → 80.98, maximum 87.14; iteration time 93.68 → 245.09 s, maximum 327.18 s |
+| Ply buckets, rows 0–4 → 45–50 | Decided top-1 0.619346 → 0.730996 and H 0.279468 → 0.197477; undecided top-1 0.550077 → 0.770883 and H 0.254379 → 0.105704 |
+
+The run plan’s top-1 summary “0.64 → 0.73” **(run plan, not re-derived)** uses an unstated aggregation window; the explicit artifact aggregates above are used here.
+
+### `conv-disc-lam01`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-29, 09:00–13:23 UTC |
+| Init/fork | `runs/pure-2/checkpoint_000200.pt`; seed 21; later resumed from this run’s checkpoint 50 |
+| Delta from reference | `--lam-ret 1.0`; otherwise the reference recipe and operating point. Initial invocation: `--iterations 50 --checkpoint-every 25`; resume at checkpoint 50: `--iterations 2000 --checkpoint-every 25`. |
+| Question | Effect of \(\lambda=.01\) under \(\gamma=.99\) while retaining \(\lambda_{\mathrm{ret}}=1.0\) |
+| Pre-stated abort signature | Acting H below approximately 0.1 together with short races **(run plan, not re-derived)** |
+| Disposition | Abort signature not observed; stopped after checkpoint 151, with the next collection incomplete; superseded by `lam-ret-939` |
+
+| Completed iteration | Score | Wilson 95% CI | Elo 95% CI | Seat wins | Provenance |
+| ---: | ---: | --- | --- | --- | --- |
+| 25 | 48/64 = 0.75 | 0.631835–0.839852 | 190.849 [93.824, 287.873] | 29/19 | `eval_matches` |
+| 50 | 45/64 = 0.703125 | — | — | — | metrics only; resume cleanup removed the match row |
+| 75 | 52/64 = 0.8125 | 0.700254–0.889355 | 254.729 [147.401, 362.057] | 28/24 | `eval_matches` |
+| 100 | 50/64 = 0.78125 | 0.665670–0.864978 | 221.137 [119.633, 322.640] | 23/27 | `eval_matches` |
+| 125 | 48/64 = 0.75 | 0.631835–0.839852 | 190.849 [93.824, 287.873] | 24/24 | `eval_matches` |
+| 150 | 48/64 = 0.75 | 0.631835–0.839852 | 190.849 [93.824, 287.873] | 22/26 | `eval_matches` |
+
+Every retained database match row has zero forfeits.
+
+| Iteration range | Measurements |
+| --- | --- |
+| Initial 0 → 49 | H 0.299091 → 0.197119; KL 0.030841 → 0.007220; q-loss 0.442303 → 0.374989; mean length 54.80 → 70.85 |
+| Ply buckets, rows 0–4 → 45–49 | Decided H 0.291828 → 0.287828 and top-1 0.603515 → 0.613259; undecided top-1 0.523668 → 0.659543 and H 0.277218 → 0.179858 |
+| Continued 50–150 | H median 0.208104, range 0.171031–0.240448; q-loss 0.404108 → 0.358927, minimum 0.331376; mean length range 56.49–77.46 |
+| Six evaluations | Arithmetic mean 0.7578125 |
+
+### `lam-ret-939`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-29 |
+| Init/fork | `runs/conv-disc-lam01/checkpoint_000151.pt`; seed 21 |
+| Delta from reference | None; 50 iterations |
+| Question | Effect of changing \(\lambda_{\mathrm{ret}}\) from 1.0 to 0.939 from the checkpoint-151 fork |
+| Disposition | Completed 50 iterations; adopted as the scalar reference recipe |
+
+| Completed iteration | Score | Wilson 95% CI | Elo 95% CI | Seat wins |
+| ---: | ---: | --- | --- | --- |
+| 25 | 52/64 = 0.8125 | 0.700254–0.889355 | 254.729 [147.401, 362.057] | 29/23 |
+| 50 | 56/64 = 0.875 | 0.772252–0.935278 | 338.039 [212.122, 463.957] | 29/27 |
+
+Both `eval_matches` rows contain 64 games and zero forfeits.
+
+| Iteration range | Measurements |
+| --- | --- |
+| 0 → 49 | H 0.202198 → 0.237155, full range 0.192162–0.271776; q-loss 0.100018 → 0.083034, minimum 0.075008 |
+| 1–5 versus 44–49 | Mean game-length ranges 63.98–65.45 versus 64.87–73.71 |
+| Decided plies per game | Parent `conv-disc-lam01` rows 145–150: 12.5129; this run rows 0–4: 12.7165; rows 45–49: 12.3632; halves 0–24 and 25–49: 12.3714 and 11.8836; row 40: 11.0727 |
+
+The run-plan description “H stable at 0.20–0.26 throughout” **(run plan, not re-derived)** is approximate; the artifact extrema are 0.192162 and 0.271776.
+
+The run-plan summary “decided plies/game 12.4 → 11.0” has no matching natural start/end aggregation in the retained telemetry. Its endpoints are **(run plan, not re-derived)**; the explicit queries above show the available aggregations.
+
+### `factored-939`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-29 |
+| Init/fork | `runs/grafts/ckpt151-factored.pt`; seed 21; later resumes from checkpoints 50 and 53 |
+| Delta from reference | `--critic-factors 2`; factored sign/magnitude critic instead of the scalar tanh critic. Initial invocation used `--iterations 50`; resumes at checkpoints 50 and 53 used `--iterations 100`; all used `--checkpoint-every 25`. |
+| Question | Measurements from replacing the scalar critic with \(p=\operatorname{sigmoid}(p_\ell)\), \(m=\operatorname{sigmoid}(m_\ell)\), \(Q=(2p-1)m\), trained with sign and magnitude binary cross-entropy terms |
+| Disposition | Stopped after completed iteration 78, with the next collection incomplete; superseded by `factored-939-s2`; factored critic subsequently shelved |
+
+| Completed iteration | Score | Wilson 95% CI | Elo 95% CI | Seat wins | Provenance |
+| ---: | ---: | --- | --- | --- | --- |
+| 25 | 52/64 = 0.8125 | 0.700254–0.889355 | 254.729 [147.401, 362.057] | 30/22 | `eval_matches` |
+| 50 | 52/64 = 0.8125 | — | — | — | metrics only; resume cleanup removed the match row |
+| 75 | 35/64 = 0.546875 | 0.425734–0.662707 | 32.668 [-51.990, 117.326] | 20/15 | `eval_matches` |
+
+The retained database match rows have zero forfeits.
+
+| Iteration range | Measurements |
+| --- | --- |
+| 1 → 24 → 49 → 74 | H 0.224310 → 0.280948 → 0.313316 → 0.447296; maximum 0.459299 |
+| 1–24, 25–49, 53–78 | Median mean game lengths 52.37, 55.92, and 56.05; the final window’s maximum was 62.03. Median iteration times were 52.84, 76.78, and 81.94 s. |
+| Scalar sibling timing | `lam-ret-939` first/second-half median iteration times 116.15/137.58 s |
+| Undecided ply bucket, rows 4 → 26 → 74 → 78 | H/top-1 `0.220646/0.620199` → `0.307274/0.527330` → `0.448330/0.411954` → `0.424660/0.441843` |
+| Full telemetry | Undecided fraction 0.791535; decided top-1 0.595958, versus 0.590929 for the scalar sibling |
+
+The run-plan H summary “0.309 → 0.422” **(run plan, not re-derived)** uses unstated rolling windows. The artifact H series is not monotone: it contains 37 row-to-row decreases, including 0.459299 at row 72 → 0.351021 at row 73, contrary to the run-plan word “monotonically.”
+
+The run-plan decided-position top-1 comparison, 0.623 versus scalar 0.596 **(run plan, not re-derived)**, differs from the full-run telemetry aggregates 0.595958 and 0.590929; no aggregation window is stated. The run-plan statement that Q-action spread was approximately 0.04 is **(run plan, not re-derived)**.
+
+### `factored-939-s2`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-29 |
+| Init/fork | `grafts/ckpt151-factored.pt`; seed 21 |
+| Delta from reference | `--q-scale 2.0` and the factored critic; otherwise the reference recipe; `--iterations 50 --checkpoint-every 25` |
+| Question | Whether doubling the factored critic’s Q contribution matched the scalar sibling’s evaluation and acting-entropy measurements |
+| Pre-stated kill criterion | Match 0.8125/0.875 with acting H stable at approximately 0.20–0.26 |
+| Disposition | Criterion missed; stopped 2026-07-29 via `STOP` sentinel; shelved |
+
+Manager-measured run report, 2026-07-29:
+
+> factored-939-s2 (q_scale=2.0, fork `grafts/ckpt151-factored.pt`, seed 21, otherwise reference recipe): eval @25 = 0.625 (40/64, Wilson CI 0.503–0.733, Elo 89 [2, 176], seats 20/20, no forfeits). Kill criterion stated in advance in KLENT_RUN_PLAN §3 — match 0.8125/0.875 with acting H stable ≈0.20–0.26 — was missed. Acting H/log|A| climbed 0.208 (it 1) → 0.312 (it 24) → 0.381 (it 38); run stopped 2026-07-29 at ~iteration 38 via STOP sentinel.
+
+Manager-measured ply-bucket decomposition:
+
+> Ply-bucket decomposition (telemetry, decided = |v̂| ≥ 0.5): factored-939 undecided-bucket H 0.221 (it 4) → 0.307 (it 26), vs factored-939-s2 0.186 → 0.351 over the same window; the s2 decided bucket sharpened to H 0.155–0.177 / top-1 0.73–0.76 and held there.
+
+The artifact boundary contains metrics rows 0–39 and checkpoint 40; `status.json` records iteration 40 incomplete in the next collection. The stop was issued at approximately iteration 38 and observed after in-flight work.
+
+`runs/grafts/` contains only `ckpt151-factored.pt`; it has no config, metrics, status, telemetry, or transform manifest. Run-plan prose and downstream invocations identify it as the checkpoint-151 factored graft. It is not a training run.
+
+### Critic ranking-stability probe
+
+Manager-measured setup, verbatim: “Critic ranking-stability probe (64 contested positions, |v̂| < 0.2, ply 20–60, sampled from factored-939 iterations 48–52; plausible set = policy top-16 per position; Spearman per position, medians):”
+
+| Comparison | Manager-measured result, verbatim |
+| --- | --- |
+| ckpt50 vs ckpt53 | Q 0.894 (q25 0.793), π 0.937; Q-top1 agreement 0.73, π-top1 0.81 |
+| ckpt75 vs ckpt79 | Q 0.879 (q25 0.775), π 0.953; Q-top1 agreement 0.72 |
+| ckpt50 vs ckpt75 | Q 0.800, π 0.844; Q-top1 agreement 0.56 |
+| Spread | σ(Q) over the top-16, median per checkpoint: 0.020–0.032 (ckpts 50/53/75/79); full-legal max−min median 0.28–0.38. |
+
+Measured reading: contested-position Q rankings are stable across 3–4 iterations (comparable to the policy head's own stability), and measured σ(Q) in contested positions is 0.02–0.03 against operator temperature τ+λ = 0.11.
+
+## Engineering experiments
+
+### Fused Triton block attention
+
+| Field | Record |
+| --- | --- |
+| Setup | RTX 4070 Ti; compiled BF16; fixed 64×64 tiles, four warps, three stages; distance-bucket bias and the live-prefix mask applied inside the kernel |
+| Question | Runtime and allocation change from fusing block attention’s score, distance bias, masking, softmax, and value accumulation |
+| Disposition | Retained for supported collection shapes. Dense SDPA remains for CPU, unsupported/failed shapes, and fit-time recomputation. Further custom attention kernels are deliberately absent. |
+
+| Stones | Cohort | Dense (ms) | Fused (ms) | Ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 256 | 33.1 | 32.9 | 1.01× |
+| 50 | 1024 | 136.0 | 134.0 | 1.01× |
+| 200 | 256 | 112.9 | 111.1 | 1.02× |
+| 200 | 1024 | 455.1 | 445.4 | 1.02× |
+| 400 | 256 | 214.6 | 206.4 | 1.04× |
+| 400 | 1024 | 860.1 | 822.8 | 1.05× |
+
+At 400 stones, peak allocated memory changed from 2.32 GiB to 2.05 GiB. The 1.4× whole-forward latency target was not met; the largest measured ratio was 1.05×.
+
+| End-to-end measurement | Dense | Fused | Reading |
+| --- | --- | --- | --- |
+| Collection, cold | 41.8 s; 3.48k samples/s | 59.88 s; 2.42k samples/s | Cold fused run was slower |
+| Collection, warm | — | 17.55 s; 8.16k samples/s; 15.76 s in network execution | Warm result |
+| Fit, different sampled corpora | 8,215 samples / 0.86 s = 9,569 samples/s | 7,784 / 0.82 s = 9,487 samples/s | Normalized throughput -0.9% |
+
+### FlexAttention distance bias
+
+| Field | Record |
+| --- | --- |
+| Setup | Distance-bucket bias expressed as a FlexAttention `score_mod`; dynamic lengths required padding to 128 and eager block-mask construction |
+| Correctness | Maximum output difference approximately \(2\times10^{-6}\); maximum gradient difference approximately \(2\times10^{-8}\) |
+| Performance | Approximately 5× slower in fit and 2.7× slower in collection; peak memory reduction at most 0.2 GiB |
+| Disposition | Removed; the branch and generated cache were deleted |
+
+### Shared decoder aggregation and Triton segment reduction
+
+| Field | Record |
+| --- | --- |
+| Setup | Both cell heads share one incidence aggregation, with projection moved after aggregation; a single-warp Triton segment reduction operates on cell-sorted decoder entries. `inc_window` is sorted for this path, while `inc_stone` remains separate. |
+| Question | Cost of repeated per-cell decoder aggregation and the gather/scatter component of that cost |
+| Disposition | Retained |
+
+| Stones | Cohort | Before (ms) | Shared/reduced (ms) | Ratio |
+| ---: | ---: | ---: | ---: | ---: |
+| 50 | 256 | 44.5 | 24.5 | 1.82× |
+| 50 | 1024 | 142.0 | 100.5 | 1.41× |
+| 200 | 256 | 116.6 | 83.1 | 1.40× |
+| 200 | 1024 | 468.4 | 335.3 | 1.40× |
+| 400 | 256 | 217.3 | 156.7 | 1.39× |
+| 400 | 1024 | 871.3 | 624.8 | 1.39× |
+
+Peak allocation changed from 3.04 to 1.96 GiB at 50 stones/cohort 1024, and from 2.07 to 1.66 GiB at 200 stones/cohort 256. Sharing only the index tensors, before the segment kernel, measured 1.12–1.15×.
+
+| Stones | Gather/scatter before | Gather/scatter after | Total before | Total after |
+| ---: | --- | --- | ---: | ---: |
+| 50 | 9.51 ms, 29.1% | 0.62 ms, 2.8% | 32.7 ms | 22.1 ms |
+| 400 | 49.2 ms, 22.9% | 3.04 ms, 2.0% | 214.9 ms | 154.4 ms |
+
+Fit throughput changed from 32,864 samples / 4.18 s = 7,871 samples/s to 33,043 / 3.54 s = 9,346 samples/s, a normalized ratio of 1.19×. Collection changed from 15.61 s / 9.3k samples/s to 14.75–15.25 s / 9.5–9.8k samples/s. After the change, the trunk accounted for 18.8–19% of the measured profile.
+
+### Loop pipelining: collection/fit overlap
+
+| Field | Record |
+| --- | --- |
+| Baseline | Approximately 3.2k samples/s and 6% GPU utilization before overlap **(run plan, not re-derived)** |
+| Setup | Collection for iteration \(i+1\) overlaps fit for iteration \(i\); training is one fit behind collection. Sampling uses CDF/searchsorted and prefetch. The first iteration remains sequential. |
+| Warm operating point | Approximately 6.3k samples/s at the 1,024-game operating point, 2.3 s collection cadence, 90–98% GPU utilization, approximately 5 GiB resident allocation, approximately 2× throughput, and approximately 1,540 rounds/hour **(run plan, not re-derived)** |
+| Additional measurement | Thread-local compilation increased startup from seconds to minutes and introduced a compilation lock. Cold reservation reached 18.9 GiB with 6.6 GiB allocated; the README records approximately 5 GiB after warm-up. |
+| Disposition | Retained |
+
+### Auto-reset cohort collector
+
+| Field | Record |
+| --- | --- |
+| Baseline | Same-size synchronous cohorts ranged from 2.7 to 144 s; cohort duration/game-length correlation was -0.02 **(run plan, not re-derived)**; 30% of wall time had fewer than 6% of slots active; measured throughput was 671 samples/s |
+| Setup | 1,024 persistent slots collect a 4,096-game quota with carry-over and reset a finished slot immediately. Three lanes pipeline the collate worker, GPU, and sampling worker. |
+| Initial measurement | 145k samples in 41.8 s cold and approximately 30 s warm, about 4.9k samples/s; approximately 7× the baseline; 96% of time in forward execution; 0.26 GiB collector allocation **(run plan, not re-derived)** |
+| Current fused-path measurement | 144k samples in 59.88 s cold and 17.55 s warm: 2.42k and 8.16k samples/s |
+| Disposition | Retained |
+
+### VRAM budget packing
+
+The initial batch-size probe below is **(run plan, not re-derived)**.
+
+| `--batch` | Time/step | Observed memory/result |
+| ---: | ---: | --- |
+| 128 | 0.23 s | 2.5 GiB |
+| 256 | 1.41 s | 5.7 GiB |
+| 512 | 88 s | 17.1 GiB and host spill |
+| 1,024–4,096 | — | More than 25 GiB / out of memory |
+
+| Field | Record |
+| --- | --- |
+| Setup | Separate pair/cell memory budgets and a batch maximum; fit batches sorted by length; collection retains game order |
+| Long-state measurement | At approximately 5,500 legal cells per sample near ply 500, collection used 0.36 GiB and fit used approximately 2.9 GiB; throughput was approximately 2× the unpacked path |
+| Host-spill measurement | Windows host spill was approximately 50× slower |
+| Disposition | Retained |
+
+### Telemetry quantization and browse-order indexes
+
+| Field | Record |
+| --- | --- |
+| Baseline writer | Approximately 72 ms/iteration and approximately 1% overhead; approximately 78 bytes/ply and approximately 1.4 GB/hour **(run plan, not re-derived)** |
+| Quantization setup | Schema v2 stores five scalar ply columns as integers in units of \(10^{-4}\); readers divide by 10,000. The former REAL values accounted for 40 of 71 row bytes. |
+| Quantization measurements | Maximum rounding error \(5\times10^{-5}\); a short synthetic workload at mean length 11 measured approximately 65 bytes/ply |
+| Migration behavior | Normal opening refuses schema v1. Explicit conversion is limited to a finished run, creates v2, preserves `telemetry.db.v1.bak`, and never runs against a live database. |
+| Index benchmark | On 575,342 games, a warm lookup changed from 484 ms to 0.05 ms; a deck-order browse changed from 44 s to milliseconds; four indexes added approximately 56 MB |
+| Writer/read behavior | Writers add indexes idempotently without changing the schema version; read-only browsing does not create them |
+| Disposition | Quantization and browse-order indexes retained |
+
+### Opponent grounding and SealBot anchored evaluation
+
+#### Opponent grounding
+
+| Field | Record |
+| --- | --- |
+| Setup | `--ground-fraction F` selected games for a depth-1 SealBot opponent and alternated the model’s seat. Only model decision plies entered training; returns were pure Monte Carlo across unrecorded opponent plies; capped games were scored as draws; the remainder of the cohort stayed self-play. |
+| Landing probe | Grounded score 0.00 → 0.05, H 0.136 → 0.204, approximately 1 ms per opponent turn over 15 iterations **(run plan, not re-derived)** |
+| Longer run | `abl-gnd25` reached metrics row 277 of 1,300. Its grounded score and critic measurements are reported in the training-run section. |
+| Disposition | Landed, then removed on 2026-07-28 |
+
+#### SealBot as anchored evaluator
+
+| Field | Record |
+| --- | --- |
+| Setup | Independent C++ SealBot evaluator; 64 seat-balanced games with shared openings. The later driver default is uncapped SealBot at 0.1 s/move with the 32-simulation Gumbel line search. |
+| Early line-builder checks | Depth 1: 0/64; uncapped: 1/64; mean survival approximately 16 plies **(run plan, not re-derived)** |
+| Disposition | Retained as an anchored evaluator; opponent grounding was not retained as a training input |
+
+Offline `overnight-3` checkpoint curve, depth-1 SealBot at 0.1 s/move using the historical pre-search evaluator:
+
+| Checkpoint | Score | Wilson 95% CI | Elo 95% CI | Seat wins | Mean plies |
+| ---: | ---: | --- | --- | --- | ---: |
+| 250 | 0/64 = 0 | 0–0.056626 | \(-\infty\) [\(-\infty\), -488.667] | 0/0 | 15.3125 |
+| 500 | 1/64 = 0.015625 | 0.002763–0.083343 | -719.736 [-1022.937, -416.535] | 0/1 | 17.59375 |
+| 750 | 0/64 = 0 | 0–0.056626 | \(-\infty\) [\(-\infty\), -488.667] | 0/0 | 20.546875 |
+| 1000 | 0/64 = 0 | 0–0.056626 | \(-\infty\) [\(-\infty\), -488.667] | 0/0 | 15.796875 |
+| 1250 | 0/64 = 0 | 0–0.056626 | \(-\infty\) [\(-\infty\), -488.667] | 0/0 | 14.875 |
+| 1500 | 0/64 = 0 | 0–0.056626 | \(-\infty\) [\(-\infty\), -488.667] | 0/0 | 18.25 |
+| 1750 | 0/64 = 0 | 0–0.056626 | \(-\infty\) [\(-\infty\), -488.667] | 0/0 | 23.6875 |
+| 2000 | 2/64 = 0.03125 | 0.008612–0.106975 | -596.545 [-824.457, -368.633] | 1/1 | 22.375 |
+| 2062 | 0/64 = 0 | 0–0.056626 | \(-\infty\) [\(-\infty\), -488.667] | 0/0 | 23.3125 |
+
+At the later scalar-reference endpoint, `lam-ret-939` measured 56/64 = 0.875, Wilson CI 0.772252–0.935278, Elo 338.039 [212.122, 463.957].
+
+## Provenance
+
+| Source | Use in this record |
+| --- | --- |
+| `metrics.jsonl` | Legacy evaluation rows and iteration trajectories, including append-only/resumed branches |
+| `telemetry.db` | `eval_matches` score, win rate, Wilson interval, Elo, seat scores, capped count, and forfeits; `iterations` trajectories; `plies` bucket queries. Every database was opened with a read-only URI, `mode=ro`, followed by `PRAGMA query_only=ON`; the five quantized ply scalars were divided by 10,000. |
+| `sealbot_curve.jsonl` | Offline `overnight-3` depth-1 checkpoint scores, Wilson intervals, Elo, seat scores, and mean plies |
+| `config.json`, `invocations.jsonl`, `status.json`, adjacent logs/errors | Forks, exact flags, branch boundaries, dates, completion state, and stop-sentinel evidence |
+| `KLENT_RUN_PLAN.md` §§2–4a | Historical claims and experiment criteria not encoded in the run artifacts. Such measurements are labeled **(run plan, not re-derived)**. |
+| Manager measurements dated 2026-07-29 | `factored-939-s2` report, ply-bucket decomposition, and critic ranking-stability probe |
+| `python/mantisnet/README.md`, “Performance” and “Deliberately absent” | Engineering benchmark receipts and retained/removed implementation dispositions |
+
+Every evaluation score was compared with `eval_matches` when the run retained a database row. No score mismatch was found. Resume cleanup left metrics-only evaluations at `pure-2` iteration 200 (0.84375), `conv-disc-lam01` iteration 50 (0.703125), and `factored-939` iteration 50 (0.8125); those rows consequently have no retained database CI or Elo.
+
+Artifact limits relevant to verification:
+
+| Scope | Limit |
+| --- | --- |
+| `shakeout-1`, `sweep-a`, `sweep2-a`, `sweep2-b`, `abl-zeroq-lam01`, `overnight-1`, `overnight-2`, `overnight-3`, `abl-gnd25` | No retained `telemetry.db`; Wilson intervals/Elo and ply buckets cannot be re-derived. All nine lack `status.json`; only `abl-gnd25` has adjacent log/error files. |
+| `sweep2-a` | Four metrics rows only; no evaluation, checkpoint, run-specific log, status, or telemetry record |
+| `pure-1` | No retained `telemetry.db` or `status.json`; evaluation counts are metrics-only and the stop criterion is not recorded. |
+| `runs/grafts/` | Checkpoint only; no transform manifest or run metadata. |
+| Engineering microbenchmarks | No raw benchmark-output files are retained in the cited source set; the README and run plan are the available receipts. |
+
+Artifact/run-plan discrepancies are stated in the affected reports. They include the `shakeout-1` rounding and critic summaries; `overnight-3` peak/range summaries; the separate grounding-probe values being unlike `abl-gnd25` rows 0–14; `pure-1`’s minimum MAE; `pure-2`’s non-identical repeated trajectory; and unstated aggregation windows for `conv-rho1`, `lam-ret-939`, and `factored-939`.
