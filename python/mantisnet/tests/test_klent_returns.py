@@ -139,3 +139,14 @@ def test_validation():
         lambda_returns(np.array([1.0, -1.0]), [0.0, 1.5], 0.9, 1.0)
     with pytest.raises(ValueError, match="v_hats"):
         lambda_returns(np.array([1.0, -1.0]), [0.0, np.nan], 0.9, 1.0)
+
+
+def test_the_refusal_names_the_entry_and_which_condition_failed():
+    """The two failures need different responses — a non-finite value means the
+    network or the operator produced one, a small excursion means the fp32
+    summation slack was underestimated — so the message must separate them."""
+    signs = signs_from_moves_remaining([1, 1, 2])
+    with pytest.raises(ValueError, match=r"v_hats\[1\] = nan.*1 non-finite"):
+        lambda_returns(signs, [0.0, np.nan, 0.5], 0.939, 0.99)
+    with pytest.raises(ValueError, match=r"v_hats\[2\] = 1\.5.*0 non-finite"):
+        lambda_returns(signs, [0.0, 0.0, 1.5], 0.939, 0.99)
