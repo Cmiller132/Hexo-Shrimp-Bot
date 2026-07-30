@@ -110,6 +110,22 @@ def test_hand_computed_intermediate_lambda():
     assert np.allclose(g, [0.0, -0.2, -0.7, 1.0])
 
 
+def test_fp32_summation_slack_is_accepted_and_a_real_excursion_is_not():
+    """The acting v̂ is an fp32 sum over a position's legal cells, so a
+    saturated critic hands the recursion values a few ulps outside [-1, 1].
+    That is arithmetic, not corruption, and the returns stay inside the same
+    slack; an excursion a real error would produce is still refused."""
+    signs = signs_from_moves_remaining([1, 1, 2])
+    ulps = np.nextafter(np.float32(1.0), np.float32(2.0)) - np.float32(1.0)
+    just_over = 1.0 + 100 * float(ulps)  # ~1.2e-5, the measured magnitude
+    g = lambda_returns(signs, [0.0, -just_over, just_over], 0.939, 0.99)
+    assert np.abs(g).max() <= 1.0 + 1e-4
+    assert np.abs(g).max() > 1.0 - 1e-2  # the slack propagated, not clipped away
+
+    with pytest.raises(ValueError, match="v_hats"):
+        lambda_returns(signs, [0.0, 0.0, 1.01], 0.939, 0.99)
+
+
 def test_validation():
     with pytest.raises(ValueError, match="lam_ret"):
         lambda_returns(np.array([1.0]), [0.0], 1.5, 1.0)
