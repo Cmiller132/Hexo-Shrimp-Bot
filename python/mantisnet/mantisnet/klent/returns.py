@@ -30,6 +30,28 @@ import numpy as np
 _RANGE_SLACK = 1e-4
 
 
+def _refuse_unbounded(x: np.ndarray, name: str) -> None:
+    """Refuse a non-finite or out-of-range array, naming the entry that failed.
+
+    Which condition failed and on which value is the whole diagnostic content of
+    this refusal: a non-finite entry means the network or the operator produced
+    one, while an entry a little outside the interval means the fp32 summation
+    slack was underestimated. A message that cannot tell them apart sends the
+    reader to the wrong place.
+    """
+    finite = np.isfinite(x)
+    excess = np.where(finite, np.abs(x) - 1.0, np.inf)
+    if finite.all() and excess.max() <= _RANGE_SLACK:
+        return
+    worst = int(np.argmax(excess))
+    raise ValueError(
+        f"{name} must be finite and within [-1, 1]: {name}[{worst}] = {float(x[worst])!r} "
+        f"of {x.size} entries, {int((~finite).sum())} non-finite and "
+        f"{int((excess[finite] > _RANGE_SLACK).sum())} outside the interval by more "
+        f"than the {_RANGE_SLACK} fp32 summation slack"
+    )
+
+
 def signs_from_moves_remaining(moves_remaining) -> np.ndarray:
     """``+1`` where the mover keeps the turn (moves_remaining == 2), else ``-1``."""
     mr = np.asarray(moves_remaining, dtype=np.int64)
@@ -54,8 +76,7 @@ def lambda_returns(signs: np.ndarray, v_hats, lam_ret: float, gamma: float) -> n
     v = np.asarray(v_hats, dtype=np.float64)
     if v.shape != np.shape(signs) or v.ndim != 1 or len(v) == 0:
         raise ValueError("signs and v_hats must be equal-length, nonempty 1-d arrays")
-    if not (np.isfinite(v).all() and np.abs(v).max() <= 1.0 + _RANGE_SLACK):
-        raise ValueError("v_hats must be finite and within [-1, 1]")
+    _refuse_unbounded(v, "v_hats")
     g = np.empty_like(v)
     g[-1] = 1.0
     for t in range(len(v) - 2, -1, -1):
@@ -63,6 +84,5 @@ def lambda_returns(signs: np.ndarray, v_hats, lam_ret: float, gamma: float) -> n
     # Bounded inputs and gamma <= 1 bound G by construction, to the same fp32
     # slack the inputs carry; leaving that interval means the recursion or its
     # inputs changed incompatibly.
-    if np.abs(g).max() > 1.0 + _RANGE_SLACK:
-        raise ValueError("lambda-return left [-1, 1]; recursion inputs are corrupt")
+    _refuse_unbounded(g, "the lambda-return")
     return g
