@@ -451,6 +451,131 @@ Manager-measured setup, verbatim: “Critic ranking-stability probe (64 conteste
 
 Measured reading: contested-position Q rankings are stable across 3–4 iterations (comparable to the policy head's own stability), and measured σ(Q) in contested positions is 0.02–0.03 against operator temperature τ+λ = 0.11.
 
+### `brm-939`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-30, 01:50–03:41 UTC |
+| Init/fork | `runs/grafts/ckpt151-brm.pt`, the function-preserving graft of `runs/conv-disc-lam01/checkpoint_000151.pt`; seed 21 |
+| Delta from reference | The bipolar return-mass critic: two logits per legal cell, $u^{\pm}=\sigma(z^{\pm})$, $Q=u^{+}-u^{-}$, trained with taken-action $(Q-G)^2$ plus $\tfrac{\eta}{2}$ times the soft-target binary cross-entropies of $z^{+}$ against $\max(G,0)$ and $z^{-}$ against $\max(-G,0)$, $\eta=0.25$. Otherwise the reference recipe; 50 iterations. Branch `brm-critic`. |
+| Question | Whether storing positive and negative return mass, rather than a marginal sign times a marginal magnitude, matches the scalar critic's evaluation |
+| Pre-stated abort signature | Evaluation at or below 0.625 at iteration 25, or acting $H/\log\lvert A\rvert$ leaving $[0.12,0.36]$ on a monotone trend |
+| Disposition | Completed 50 iterations; abort signature not observed |
+
+| Completed iteration | Score | Wilson 95% | Elo 95% | Seat scores | Capped |
+| ---: | ---: | --- | --- | --- | ---: |
+| 25 | 56/64 = 0.875 | 0.772252–0.935278 | 338.039 [212.122, 463.957] | 31/25 | 0 |
+| 50 | 56/64 = 0.875 | 0.772252–0.935278 | 338.039 [212.122, 463.957] | 29/27 | 0 |
+
+Both rows contain 64 games and zero forfeits.
+
+| Iteration range | Measurements |
+| --- | --- |
+| 0 → first five → last five | H 0.20344 → 0.19872 → 0.23129, full range 0.19297–0.23799; q-loss 0.10175 → 0.09601 → 0.07289, minimum 0.06863; mean won length 55.74 → 59.74 → 78.97, maximum 83.56 |
+| Acting KL | First five 0.00775, last five 0.00576, minimum 0.00397, maximum 0.07339 at iteration 32 |
+| `mass_loss`, the unweighted binary-cross-entropy pair | 0.64005 at iteration 14 → 0.57394 at iteration 49 |
+| Ply buckets, iterations 45–49 | Undecided H 0.2069 and top-1 0.6265 over 1,370,610 plies; decided H 0.3694 and top-1 0.5414 over 248,929 plies |
+| Cost | 1.83 h of iteration time over 50 iterations |
+
+The acting-KL maximum at iteration 32 is an excursion of one iteration, 8.3 times the scalar reference's 50-iteration maximum of 0.00884, coincident with that run's highest q-loss after iteration 0 (0.09991), its highest `mass_loss` (0.67389), and a fall in mean won length from 77.11 to 52.90. It decayed over four iterations (0.07339 → 0.02292 → 0.01830 → 0.00986 → 0.00803). A manager hypothesis that unbounded binary-cross-entropy logit growth drove it is contradicted by the head measurements below. No cause is established.
+
+`checkpoint_000023.pt` exists because a manager placed the `CHECKPOINT` sentinel at that boundary for the head probe; it is not a scheduled artifact.
+
+### `duel-939`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-30, 03:49–07:35 UTC |
+| Init/fork | `runs/grafts/ckpt151-duel.pt`, the order-preserving graft of the same checkpoint; seed 21 |
+| Delta from reference | The dueling critic: $Q=\tanh\big(v(S)+A(S,a)-\sum_b\mathrm{sg}[\pi_\theta(b\mid S)]A(S,b)\big)$, with $A$ the existing legal-cell decoder score and $v$ a new per-position readout over the global token. Loss, coefficients, and metric keys unchanged; 50 iterations. Branch `dueling-critic`. |
+| Question | Whether moving the position's value level into a per-position readout, leaving the legal-cell decoder to score advantages, improves evaluation |
+| Pre-stated abort signature | As `brm-939` |
+| Disposition | Completed 50 iterations; abort signature not observed |
+
+| Completed iteration | Score | Wilson 95% | Elo 95% | Seat scores | Capped |
+| ---: | ---: | --- | --- | --- | ---: |
+| 25 | 52/64 = 0.8125 | 0.700254–0.889355 | 254.729 [147.401, 362.057] | 26/26 | 0 |
+| 50 | 53/64 = 0.828125 | 0.717949–0.901175 | 273.216 [162.108, 384.324] | 29/24 | 0 |
+
+| Iteration range | Measurements |
+| --- | --- |
+| Iteration 0 | Acting KL 0.10440 and `v_hat_mae` 1.02507, against 0.00868 and 0.79204 for `brm-939` at the same iteration. Decided-bucket KL over iterations 0–4 was 0.2052, against 0.0078 and 0.0058 for the other two arms. |
+| 0 → first five → last five | H 0.16494 → 0.16833 → 0.29613, maximum 0.30520; q-loss 0.06269 → 0.07617 → 0.06315, minimum 0.06133; mean won length 55.32 → 60.61 → 91.27, maximum 96.59 |
+| Recovery of the reset level | `v_hat_mae` 1.02507 → 0.91385 (first five) → 0.85992 (last five); acting KL 0.10440 → 0.00447 |
+| Ply buckets, iterations 45–49 | Undecided H 0.2891 and top-1 0.5349; decided H 0.3310 and top-1 0.5600 |
+| Cost | 3.75 h of iteration time over 50 iterations; samples per second 2514 (first five) → 781 (last five) |
+
+This arm recorded the lowest q-loss of the four configurations, 0.06133, and the lowest evaluation total. Its acting entropy passed the scalar reference's 50-iteration maximum of 0.25374 at iteration 15 and ended at 0.30520, and its mean won length ended about 20 plies above the reference's range.
+
+### `tail-939`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-30, 07:46 UTC onward |
+| Init/fork | `runs/grafts/ckpt151-tail.pt`, the exactly identity graft of the same checkpoint; seed 21 |
+| Delta from reference | The private critic tail: a pre-norm residual FFN over the window rows and the global token, read only by the action-value head, so the two cell heads no longer share the incidence aggregation. `--cell-budget 500000 --collect-cell-budget 1600000`, memory only. Otherwise the reference recipe. Branch `critic-tail`. |
+| Question | Whether critic-private trunk-side features improve evaluation |
+| Pre-stated abort signature | As `brm-939` |
+| Disposition | Completed 50 iterations; continued in place toward 150 |
+
+| Completed iteration | Score | Wilson 95% | Elo 95% | Seat scores | Provenance |
+| ---: | ---: | --- | --- | --- | --- |
+| 25 | 53/64 = 0.828125 | 0.717949–0.901175 | 273.216 [162.108, 384.324] | 29/24 | `eval_matches` |
+| 50 | 57/64 = 0.890625 | — | — | — | metrics only; the continuation's replay removed the database row |
+
+| Iteration range | Measurements |
+| --- | --- |
+| 0 → first five → last five of 0–49 | H 0.20327 → 0.20316 → 0.24850, maximum 0.26224; q-loss 0.09997 → 0.09192 → 0.07586, minimum 0.07277; mean won length 55.82 → 62.01 → 75.24 |
+| Acting KL, 0–49 | Maximum 0.00886, last five 0.00571; no excursion |
+| Ply buckets, iterations 45–49 | Undecided H 0.2320 and top-1 0.6057; decided H 0.3377 and top-1 0.5682 |
+| Cost | 1.73 h over iterations 0–49; iteration time 176.77 s over the last five against 190.29 s for `brm-939`, and samples per second 1770 against 1721 |
+
+The second incidence pass is not measurable as a doubling of cost at these budgets: this arm's iteration time and throughput over the same window are within 8% of a single-pass arm's.
+
+### The three arms against the scalar reference
+
+The window is iterations 0–49 from `conv-disc-lam01/checkpoint_000151.pt` at the reference recipe with seed 21. `lam-ret-939` iterations 0–49 are that fork under the scalar critic, so its rows are the control.
+
+| Configuration | Iteration 25 | Iteration 50 | Wins of 128 | Minimum q-loss | Final H | Won length, last five |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `lam-ret-939` (scalar) | 0.8125 | 0.875 | 108 | 0.07501 | 0.23716 | 70.9 |
+| `brm-939` | 0.875 | 0.875 | 112 | 0.06863 | 0.23129 | 78.97 |
+| `tail-939` | 0.828125 | 0.890625 | 110 | 0.07277 | 0.24850 | 75.24 |
+| `duel-939` | 0.8125 | 0.828125 | 105 | 0.06133 | 0.29613 | 91.27 |
+
+Each evaluation is 64 games; one standard error on a single match is about four games, and about three on the 128-game totals. These evaluations therefore do not separate the four configurations. The two arms that lowered q-loss most, `duel-939` and `brm-939`, do not order the same way on evaluation.
+
+| Configuration | Undecided H | Undecided top-1 | Decided H | Decided top-1 |
+| --- | ---: | ---: | ---: | ---: |
+| `lam-ret-939` | 0.2312 | 0.6035 | 0.3123 | 0.5922 |
+| `brm-939` | 0.2069 | 0.6265 | 0.3694 | 0.5414 |
+| `tail-939` | 0.2320 | 0.6057 | 0.3377 | 0.5682 |
+| `duel-939` | 0.2891 | 0.5349 | 0.3310 | 0.5600 |
+
+Iterations 45–49, decided at $\lvert\hat v\rvert\ge0.5$. The undecided bucket holds about five times the ply mass of the decided one in every run.
+
+### Graft manifests
+
+Each arm's conversion of `conv-disc-lam01/checkpoint_000151.pt` wrote a manifest beside its checkpoint in `runs/grafts/`, measured on that arm's own seeded probe set at $\tau=0.1$, $\lambda=0.01$.
+
+| Arm | Stated property | Measured |
+| --- | --- | --- |
+| `brm` | Action values and $\pi'$ are the parent's, since $\sigma(2z)-\sigma(-2z)=\tanh z$ | max $\lvert\Delta Q\rvert$ 1.1920929e-07, mean 2.6443e-08; mean $D_{\mathrm{KL}}(\pi'_{\text{new}}\Vert\pi'_{\text{parent}})$ 1.844e-14, maximum 1.610e-13; median top-16 σ(Q) 0.065138791 against the parent's 0.065138798 |
+| `duel` | Every position's ordering of its legal cells is the parent's; the level is reset | 135,939,358 comparable pairs, 0 discordant, rank agreement 1.0; 185 shared parameters carried bitwise; $v(S)=0$ exactly. max $\lvert\Delta Q\rvert$ 1.4836, mean 0.1596; median removed level −0.006225; median top-16 σ(Q) 0.069721 → 0.072019; mean improved-policy KL 0.001490, maximum 0.024504 |
+| `tail` | Every parent tensor is the source file's bit for bit and the tail is the identity | max $\lvert\Delta Q\rvert$ 0.0, mean 0.0; readout input max $\lvert\Delta\rvert$ 0.0; KL 0.0 mean and maximum; 185 shared tensors unchanged under one SHA-256; median top-16 σ(Q) 0.063669 unchanged |
+
+Manager-measured on a shared 96-position set drawn from checkpoint 151's own self-play and replayed against every model, at τ+λ = 0.110:
+
+| Model | Contested σ(Q) top-16 | Decided σ(Q) | Mean $\lvert Q\rvert$ | fp32 ties in top-16 |
+| --- | ---: | ---: | ---: | ---: |
+| `conv-disc-lam01` ckpt151 | 0.0623 | 0.0526 | 0.8540 | 0.0 |
+| `lam-ret-939` ckpt50 | 0.0582 | 0.0383 | 0.8731 | 0.5 |
+| `brm-939` ckpt23 | 0.0575 | 0.0286 | 0.7226 | 0.0 |
+| `brm-939` ckpt50 | 0.0464 | 0.0324 | 0.7184 | 0.0 |
+| `ckpt151-duel.pt` at the graft | 0.2216 | 0.1700 | 0.8854 | 0.0 |
+
+The bipolar head's own quantities over the same set: $u^{+}+u^{-}$, its estimate of $\mathbb E\lvert G\rvert$, moved from exactly 1.0 everywhere at the graft to 0.275 over the policy's top-16 in contested positions and 0.955 in decided ones, against $(\gamma\lambda_{\mathrm{ret}})^k=0.9296^k$. $\lvert z^{+}+z^{-}\rvert$ moved 0.00 → 3.61 → 4.30 and $\operatorname{corr}(z^{+},z^{-})$ −1.000 → −0.960 → −0.903, so the two logits are not each other's negation after training. No probe cell at any checkpoint had both sigmoids saturated, and none reached $\lvert Q\rvert=1$.
+
 ## Engineering experiments
 
 ### Fused Triton block attention
@@ -598,6 +723,26 @@ Offline `overnight-3` checkpoint curve, depth-1 SealBot at 0.1 s/move using the 
 
 At the later scalar-reference endpoint, `lam-ret-939` measured 56/64 = 0.875, Wilson CI 0.772252–0.935278, Elo 338.039 [212.122, 463.957].
 
+### Segmented reduction under `torch.compile`
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-30 |
+| Setup | `segment_sum` as `index_add_` over a row-to-segment index, inside the compiled `trunk` + `cell_heads` pass. Reached only by a configuration that puts a ragged reduction in that pass: the `dueling-critic` critic centers its advantage with a policy-weighted segment sum. |
+| Measurement | Inductor's lowering drops the bounds mask on its atomic once it can prove the destination has a single row, so a single-position batch also sums padding lanes. Independently reproduced at 0.911 instead of 1.0 for a single-segment softmax at N = 7 on CUDA. |
+| Disposition | On `dueling-critic`, `segment_sum` and the segment maximum became `torch.segment_reduce` over the CSR offsets, and the compiled-heads test gained a one-position batch. Equivalence of the two forms was checked over ragged shapes including one-position and all-singleton segments: exact in float64, and at fp32 reassociation level on CUDA where `index_add_` is itself order-dependent. |
+| Exposure elsewhere | None measured on the other configurations: `policy_loss` and `improved_policy` call these helpers outside the compiled region, and no other configuration puts one inside it. |
+
+### The improvement operator's expectations at fp32
+
+| Field | Record |
+| --- | --- |
+| Date | 2026-07-30 |
+| Setup | $\hat v=\sum_a\pi'(a)Q(a)$ evaluated in fp32 over a position's legal cells, with the $\lambda$-return's range check refusing $\lvert\hat v\rvert$ outside $[-1,1]$. |
+| Measurement | The bound holds in real arithmetic and not in fp32: an fp32 segment softmax sums to one only to a few ulps, and where every legal move shares one saturated value — a lost endgame, every cell at exactly $Q=-1$ — nothing cancels that error. Measured over 287,140 acting plies of one collection: 3,909 plies outside the interval, p99.9 excursion 9.7e-06, maximum 2.97e-05. A 159-ply position at approximately three thousand legal cells produced 1.09e-04. Mixed-sign positions do not show it: at 400-ply random playouts with 88% of cells saturated, $\lvert\hat v\rvert$ never left the interval. |
+| Disposition | `v_hat`, `kl`, and the entropy behind `norm_entropy` divide by their segment's summed $\pi'$, which is what an expectation under a normalized distribution means; the bound then holds to a few ulps at any segment width. Retained on every configuration. The range check keeps a 1e-4 slack. |
+| Detection history | The check first refused a legitimate corpus at `brm-939` iteration 0 under an exact bound, then again at `tail-939` iteration 56 under the 1e-4 slack. Its message named neither the value nor which of its two conditions failed, and two manager hypotheses — a non-finite value from bf16 or `torch.compile`, and a slack too small for the sample size — were measured and contradicted before the third measurement located the cause. Both refusals now name the entry, its value, and the count of each condition, and every optimizer step is followed by a fused finiteness check over the parameters. |
+
 ## Provenance
 
 | Source | Use in this record |
@@ -608,6 +753,8 @@ At the later scalar-reference endpoint, `lam-ret-939` measured 56/64 = 0.875, Wi
 | `config.json`, `invocations.jsonl`, `status.json`, adjacent logs/errors | Forks, exact flags, branch boundaries, dates, completion state, and stop-sentinel evidence |
 | `KLENT_RUN_PLAN.md` §§2–4a | Historical claims and experiment criteria not encoded in the run artifacts. Such measurements are labeled **(run plan, not re-derived)**. |
 | Manager measurements dated 2026-07-29 | `factored-939-s2` report, ply-bucket decomposition, and critic ranking-stability probe |
+| Manager measurements dated 2026-07-30 | The three arms' shared 96-position critic probe, the bipolar head's logit and mass quantities, the fp32 expectation excursion counts, and the segmented-reduction reproduction |
+| `runs/grafts/ckpt151-{brm,duel,tail}.json` | Each arm's graft transform, probe, and preservation measurements, written by the conversion itself |
 | `python/mantisnet/README.md`, “Performance” and “Deliberately absent” | Engineering benchmark receipts and retained/removed implementation dispositions |
 
 Every evaluation score was compared with `eval_matches` when the run retained a database row. No score mismatch was found. Resume cleanup left metrics-only evaluations at `pure-2` iteration 200 (0.84375), `conv-disc-lam01` iteration 50 (0.703125), and `factored-939` iteration 50 (0.8125); those rows consequently have no retained database CI or Elo.
