@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 hexo-engine = { path = "../../crates/hexo-engine" }
 hexo-model-mantisnet = { path = "../../crates/models/mantisnet" }
+hexo-runner = { path = "../../crates/hexo-runner" }
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py312"] }
 numpy = "0.26"
 

@@ -44,7 +44,11 @@ Module constants:
 - `RULES_VERSION`;
 - `ACTION_ORDER_VERSION`;
 - `LEGAL_RADIUS`;
-- `MODEL_REPR_VERSION`.
+- `MODEL_REPR_VERSION`;
+- `PROTOCOL_VERSION`, re-exported from `hexo_runner`. A host orchestrator opens
+  every seat with the three versions of `CONTAINER_SPEC.md` §3.1's handshake;
+  two of them are the engine's, and this is the third, so a Python orchestrator
+  never keeps its own copy of that number.
 
 The extension uses `abi3-py312`, so its binary contract targets CPython 3.12
 and later on the same platform.
