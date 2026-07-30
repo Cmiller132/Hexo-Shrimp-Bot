@@ -32,7 +32,7 @@ The public `encoder` module provides:
 - `build`, `build_batch`, and `build_batch_prefixes`;
 - `collate`;
 - `WireError`;
-- `NUM_PATTERNS`.
+- `NUM_PATTERNS` and `DEC_CLASSES`.
 
 `MantisPackage::from_config` accepts:
 

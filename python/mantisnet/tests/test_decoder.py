@@ -1,11 +1,13 @@
 """Shared decoder layout, folded head matrix, and kernel contracts.
 
 The oracle transcribes the §6 decoder formula directly: project window rows,
-add slot-class embeddings, sum each cell's entries, and overwrite background
+add joint-class embeddings, sum each cell's entries, and overwrite background
 cells from the bucket table. The implementation aggregates before projection.
 """
 
 from __future__ import annotations
+
+import copy
 
 import pytest
 import torch
@@ -21,6 +23,8 @@ from mantisnet.decoder import (
     aggregate,
     head_matrix,
 )
+
+from .conftest import JOINT_ORBITS
 
 _CUDA = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the decoder aggregation kernel requires CUDA"
@@ -106,6 +110,68 @@ def test_slack_columns_never_contribute(positions, model):
     )
     used = model.cfg.h + CLASS_SLOTS + decoder_impl.BG_SLOTS
     assert rows[:, used:].abs().sum() == 0
+
+
+@torch.no_grad()
+def test_the_joint_class_separates_cells_the_slot_class_could_not(positions, model):
+    """Two legal moves that a slot-class decoder cannot rank differently.
+
+    A cell's decoder row is its window rows summed plus its class counts, so two
+    cells with the same window multiset and the same counts get one row — and
+    therefore one logit and one action value, whatever the weights. Under
+    ``(canonical mask, slot class)`` that happens for real move pairs: mirrored
+    slots of a non-palindromic window share a class, so extending a stone by
+    contact and extending it across a gap are the same input. The joint class
+    keys the pair jointly and separates them.
+
+    The pair here is found in the shared position set rather than hand-built, so
+    the test asserts the aliasing is reachable in play, not only in principle.
+    """
+    slot_class = {rank: min(slot, 5 - slot) for rank, (_mask, slot) in enumerate(JOINT_ORBITS)}
+    found = []
+    for pos in positions:
+        batch = _batch([pos])
+        old: dict[int, list] = {}
+        new: dict[int, list] = {}
+        for cell, window, cls in zip(batch.dec_cell, batch.dec_window, batch.dec_class):
+            old.setdefault(int(cell), []).append((int(window), slot_class[int(cls)]))
+            new.setdefault(int(cell), []).append((int(window), int(cls)))
+        by_old: dict[tuple, list[int]] = {}
+        for cell, entries in old.items():
+            by_old.setdefault(tuple(sorted(entries)), []).append(cell)
+        for cells in by_old.values():
+            for a, b in zip(cells, cells[1:]):
+                if sorted(new[a]) != sorted(new[b]):
+                    found.append((pos, batch, a, b))
+                    break
+            if found:
+                break
+        if found:
+            break
+    assert found, "no aliased move pair in the shared positions: nothing to separate"
+
+    pos, batch, a, b = found[0]
+    rows = aggregate(
+        _windows(batch, model.cfg.h), batch.dec_window, batch.dec_class,
+        batch.dec_cell, batch.bg_cell, batch.bg_bucket, batch.cell_pos.shape[0],
+    )
+    # The window halves agree — the pair shares its live windows — and the class
+    # counts are what now differ.
+    torch.testing.assert_close(rows[a, : model.cfg.h], rows[b, : model.cfg.h])
+    assert not torch.equal(rows[a, model.cfg.h :], rows[b, model.cfg.h :])
+
+    # And so the heads can score them apart, which under the slot class they
+    # could not: identical rows give identical outputs whatever the weights. A
+    # fresh model has the zero readouts of §10 and scores every cell zero, so
+    # the demonstration needs a readout that reads — any trained one does.
+    scored = copy.deepcopy(model)
+    generator = torch.Generator().manual_seed(11)
+    for out in (scored.mlp_p.out, scored.mlp_q.out):
+        out.weight.copy_(torch.randn(out.weight.shape, generator=generator) * 0.1)
+    _s, w, g = scored.trunk(batch)
+    policy, q = scored.cell_heads(w, g, batch)
+    assert policy[a] != policy[b]
+    assert q[a] != q[b]
 
 
 @torch.no_grad()

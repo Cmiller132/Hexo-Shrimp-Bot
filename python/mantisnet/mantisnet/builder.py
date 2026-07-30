@@ -10,6 +10,9 @@ Index conventions this module fixes (each is part of the representation):
 - Window feature: ``colour * NUM_PATTERNS + pattern_rank``, colour ``0`` = own,
   ``1`` = opponent, rank = position of the canonical occupancy mask in the
   sorted list of the ``NUM_PATTERNS`` canonical 6-bit patterns of 1–5 bits.
+- Decoder class: the rank of the ``(occupancy mask, candidate slot)`` reversal
+  orbit in ascending ``(mask, slot)`` order, one of ``DEC_CLASSES``. Stone
+  incidence keeps the coarser reversal-invariant slot class (§4.3).
 - Attention distance bucket: hex distance ``d >= 1`` maps to ``d - 1`` clamped
   to ``D_MAX - 1``; ``SELF`` is ``D_MAX``; ``TOKEN`` is ``D_MAX + 1`` and wins
   over ``SELF`` on the token–token pair.
@@ -61,6 +64,44 @@ PATTERN_STONES = np.array([bin(int(m)).count("1") for m in _CANONICAL])
 # Slot class of slot s in 0..5: min(s, 5 - s) — end / near-end / centre (§4.3).
 _SLOT_CLASS = np.minimum(np.arange(WINDOW_LEN), WINDOW_LEN - 1 - np.arange(WINDOW_LEN))
 
+
+def _decoder_classes() -> np.ndarray:
+    """The (64, 6) table of decoder classes, by window mask and candidate slot.
+
+    A reflection reverses a window's slot order, so it sends the pair
+    ``(mask, slot)`` to ``(reverse6(mask), 5 - slot)`` — *jointly*. The orbits of
+    that involution are therefore the finest reversal-invariant description of
+    where a candidate sits among a window's stones (§4.3), and the class is the
+    orbit's rank in ascending ``(mask, slot)`` order.
+
+    Entries that are not a live window with an empty candidate slot are ``-1``:
+    the empty and full masks, and any slot that already holds a stone. A legal
+    cell is empty by construction, so ``-1`` reaching ``dec_class`` is a builder
+    fault and is refused rather than embedded.
+    """
+    table = np.full((64, WINDOW_LEN), -1, dtype=np.int64)
+    nxt = 0
+    for mask in range(1, 63):
+        rev = int(_reverse6(np.array(mask))[()])
+        for slot in range(WINDOW_LEN):
+            if (mask >> slot) & 1:
+                continue
+            # Ascending order visits each orbit's representative first, so its
+            # rank is assigned there and its partner reads it back.
+            if (mask, slot) <= (rev, WINDOW_LEN - 1 - slot):
+                table[mask, slot] = nxt
+                nxt += 1
+            else:
+                table[mask, slot] = table[rev, WINDOW_LEN - 1 - slot]
+    return table
+
+
+_DEC_CLASS = _decoder_classes()
+
+# 93: the 186 (nonempty-nonfull mask, empty slot) pairs fold to 186 / 2 orbits —
+# the involution has no fixed point, since no slot equals its own mirror.
+DEC_CLASSES = int(_DEC_CLASS.max()) + 1
+
 # Coordinate packing: q, r fit i16, so 21 bits of headroom per component is
 # collision-free. Window identity packs the axis into the low two bits.
 _QSHIFT = 1 << 21
@@ -90,7 +131,7 @@ class PositionGraph:
     n_legal: int
     dec_cell: np.ndarray  # (e_d,) int64: legal-cell index
     dec_window: np.ndarray  # (e_d,) int64: live window through it
-    dec_class: np.ndarray  # (e_d,) int64: the cell's slot class there
+    dec_class: np.ndarray  # (e_d,) int64: the (mask, slot) class there, < DEC_CLASSES
     bg_cell: np.ndarray  # (n_bg,) int64: cells in no live window
     bg_bucket: np.ndarray  # (n_bg,) int64 in 0..7: nearest-stone bucket
     moves_remaining: int  # 1 or 2
@@ -216,8 +257,18 @@ def build(
     c_hit = (live_key[wpos_clip] == c_key) if len(live_key) else np.zeros(len(c_key), bool)
     flat = np.nonzero(c_hit)[0]
     dec_cell = flat // (3 * WINDOW_LEN)
-    dec_class = _SLOT_CLASS[flat % WINDOW_LEN]
     dec_window = wpos_clip[flat]
+    # The class is joint in the window's occupancy and the candidate's own slot
+    # (§4.3), so it needs the window's raw mask in slot order — `pattern`, not
+    # the canonicalized rank the window embedding carries.
+    dec_class = _DEC_CLASS[pattern[dec_window], flat % WINDOW_LEN]
+    if dec_class.size and dec_class.min() < 0:
+        bad = int(np.argmin(dec_class))
+        raise ValueError(
+            f"decoder entry {bad} pairs window mask "
+            f"{int(pattern[dec_window[bad]]):06b} with slot "
+            f"{int(flat[bad] % WINDOW_LEN)}, which that window already occupies"
+        )
 
     covered = np.zeros(n_legal, dtype=bool)
     covered[dec_cell] = True
@@ -298,7 +349,7 @@ class Batch:
     cell_pos: torch.Tensor  # (N_c,) long: position of each cell
     dec_cell: torch.Tensor  # (E_d,) long, global cell index
     dec_window: torch.Tensor  # (E_d,) long, global window index
-    dec_class: torch.Tensor  # (E_d,) long
+    dec_class: torch.Tensor  # (E_d,) long, < DEC_CLASSES
     bg_cell: torch.Tensor  # (N_bg,) long, global cell index
     bg_bucket: torch.Tensor  # (N_bg,) long
 

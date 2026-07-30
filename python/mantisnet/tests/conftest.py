@@ -62,6 +62,32 @@ def d6_transforms():
     return telemetry.D6_TRANSFORMS
 
 
+def reverse6(mask: int) -> int:
+    """Bit-reverse a 6-bit mask, by string reversal rather than by shifts."""
+    return int(f"{mask:06b}"[::-1], 2)
+
+
+# The decoder's joint classes (§4.3), derived independently of the builder's
+# table: the orbits of ``(mask, slot)`` under a joint reversal, ranked by sorting
+# the representatives rather than by the builder's ascending scan. Same contract,
+# different derivation — including of the ranking convention the Rust encoder
+# shares, which is why this is an oracle and not a restatement.
+JOINT_ORBITS = sorted(
+    {
+        min((mask, slot), (reverse6(mask), 5 - slot))
+        for mask in range(1, 63)
+        for slot in range(6)
+        if not (mask >> slot) & 1
+    }
+)
+_JOINT_RANK = {pair: rank for rank, pair in enumerate(JOINT_ORBITS)}
+
+
+def joint_class(occupancy: int, slot: int) -> int:
+    """The decoder class of a window occupancy and a candidate's slot in it."""
+    return _JOINT_RANK[min((occupancy, slot), (reverse6(occupancy), 5 - slot))]
+
+
 def oracle_live_windows(pos: hexo_py.Position) -> dict[tuple[int, int, int], tuple[int, int]]:
     """Live windows by the engine's own walk: identity (axis, start_q, start_r)
     to (colour relative to the mover, occupancy mask).

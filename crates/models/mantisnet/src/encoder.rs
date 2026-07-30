@@ -60,6 +60,53 @@ const fn slot_class(k: usize) -> i64 {
     (if k < 3 { k } else { 5 - k }) as i64
 }
 
+/// Number of joint window-occupancy/candidate-slot classes the decoder reads.
+///
+/// A reflection reverses a window's slot order, so it sends the pair
+/// `(mask, slot)` to `(reverse6(mask), 5 - slot)` jointly, and the orbits of that
+/// involution are the finest reversal-invariant description of the pair. The 186
+/// pairs of a nonempty, nonfull mask with an empty slot fold to 93 orbits: the
+/// involution has no fixed point, because no slot is its own mirror.
+pub const DEC_CLASSES: i64 = 93;
+
+/// Decoder class of each `(mask, slot)` pair, indexed `mask * 6 + slot`.
+///
+/// `-1` where the pair is not one a live window and an empty candidate can form:
+/// the empty and full masks, and any slot the window already occupies. The class
+/// is the orbit's rank in ascending `(mask, slot)` order, which is how the Python
+/// builder ranks it.
+const DEC_CLASS: [i8; 64 * 6] = {
+    let mut table = [-1i8; 64 * 6];
+    let mut next = 0i8;
+    let mut m = 1usize;
+    while m < 63 {
+        let mut rev = 0usize;
+        let mut k = 0;
+        while k < 6 {
+            rev |= ((m >> k) & 1) << (5 - k);
+            k += 1;
+        }
+        let mut s = 0usize;
+        while s < 6 {
+            if (m >> s) & 1 == 0 {
+                // Ascending order reaches each orbit's representative first, so
+                // its rank is assigned there and its partner reads it back. The
+                // partner's slot is empty whenever this one's is, since bit
+                // `5 - s` of `rev` is bit `s` of `m`.
+                if m < rev || (m == rev && s <= 5 - s) {
+                    table[m * 6 + s] = next;
+                    next += 1;
+                } else {
+                    table[m * 6 + s] = table[rev * 6 + (5 - s)];
+                }
+            }
+            s += 1;
+        }
+        m += 1;
+    }
+    table
+};
+
 fn pack(c: engine::HexCoord) -> i64 {
     c.q as i64 * QSHIFT + c.r as i64
 }
@@ -434,7 +481,7 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
     validate_indices(&dec_cell, counts.legal, "dec_cell")?;
     validate_indices(&dec_window, counts.windows, "dec_window")?;
     for (index, &value) in dec_class.iter().enumerate() {
-        if !(0..=2).contains(&value) {
+        if !(0..DEC_CLASSES).contains(&value) {
             return Err(invalid_feature("dec_class", index, value));
         }
     }
@@ -606,9 +653,20 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
             }
             let key = pack(wr.window.start) * 4 + wr.window.axis.index() as i64;
             if let Ok(w) = live_keys.binary_search(&key) {
+                // The class is joint in the window's occupancy and the
+                // candidate's own slot, so it reads the raw mask in slot order
+                // rather than the canonicalized rank the window feature carries.
+                let occ = live_occ[w] as usize;
+                let slot = i % 6;
+                let class = DEC_CLASS[occ * 6 + slot];
+                assert!(
+                    class >= 0,
+                    "legal cell {cell:?} sits at slot {slot} of a window whose \
+                     occupancy {occ:06b} already fills it"
+                );
                 dec_cell.push(j as i64);
                 dec_window.push(w as i64);
-                dec_class.push(slot_class(i % 6));
+                dec_class.push(class as i64);
                 covered = true;
             }
         }
@@ -679,7 +737,7 @@ pub struct RawBatch {
     pub dec_cell: Vec<i64>,
     /// Global live-window index for each decoder incidence.
     pub dec_window: Vec<i64>,
-    /// Reversal-invariant slot class for each decoder incidence.
+    /// Reversal-invariant joint occupancy/slot class for each decoder incidence.
     pub dec_class: Vec<i64>,
     /// Global legal-cell indices routed through the background decoder.
     pub bg_cell: Vec<i64>,
@@ -972,5 +1030,38 @@ mod tests {
                 .to_string()
                 .contains("stone_own[0] has invalid feature 2")
         );
+    }
+
+    #[test]
+    fn wire_decoder_bounds_the_joint_decoder_class() {
+        let position = replay(&[(0, 0)]);
+        let graph = build(&position).expect("a one-stone position builds");
+        let counts = WireCounts::from_graph(&graph);
+        // dec_class follows stone_own, stone_qr, window_feat, the three incidence
+        // arrays, dec_cell, and dec_window.
+        let offset = WIRE_HEADER_LEN
+            + 8 * counts.stones
+            + 8 * counts.stones
+            + 8 * counts.windows
+            + 8 * 3 * counts.incidences
+            + 8 * 2 * counts.decoder;
+
+        let build_max = graph
+            .dec_class
+            .iter()
+            .copied()
+            .max()
+            .expect("entries exist");
+        assert!((0..DEC_CLASSES).contains(&build_max));
+        for out_of_range in [DEC_CLASSES, -1] {
+            let mut bytes = encoded(&position);
+            bytes[offset..offset + 8].copy_from_slice(&out_of_range.to_le_bytes());
+            assert!(
+                decode_batch(std::iter::once(bytes.as_slice()))
+                    .expect_err("the class table has 93 rows and no more")
+                    .to_string()
+                    .contains(&format!("dec_class[0] has invalid feature {out_of_range}"))
+            );
+        }
     }
 }

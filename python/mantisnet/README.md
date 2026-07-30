@@ -21,7 +21,7 @@ The top-level `mantisnet` package exports:
 | `collate_positions`, `collate_prefixes` | Shared Rust encoder path |
 | `policy_loss`, `value_loss`, `value_target` | Training losses and targets |
 | `param_groups` | Decay/no-decay optimizer groups |
-| `MODEL_REPR_VERSION`, `NUM_PATTERNS` | Representation constants |
+| `MODEL_REPR_VERSION`, `NUM_PATTERNS`, `DEC_CLASSES` | Representation constants |
 
 Core modules:
 

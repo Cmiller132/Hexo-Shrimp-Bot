@@ -1,7 +1,7 @@
 """The incidence pass both cell heads read.
 
 MODEL_SPEC §6's policy decoder and appendix B's action-value decoder walk the
-same table: a legal cell's live windows, the slot class the cell holds in each,
+same table: a legal cell's live windows, the joint class the cell holds in each,
 and — for a cell lying in no live window — its nearest-stone bucket. Only their
 parameters differ. Their per-cell decoder input is
 
@@ -16,10 +16,14 @@ then serves both heads instead of two.
 ``aggregate`` returns the coefficients of ``h``, one row per cell:
 
     [0, H)            Σ_e w[dec_window[e]]
-    [H, H+3)          how many entries carried each slot class
-    [H+3, H+11)       one-hot of the background bucket, background cells only
-    [H+11, H+16)      zero — the row is rounded to a multiple of 16 so the head
-                      GEMM keeps a tensor-core-friendly K
+    [H, H+93)         how many entries carried each joint class
+    [H+93, H+101)     one-hot of the background bucket, background cells only
+    [H+101, H+128)    zero — the row is rounded to a power of two, which the
+                      kernel's block arange takes and the head GEMM likes
+
+The class block is 93 wide and a cell has at most 18 entries, so it is sparse by
+construction; it is stored dense because that is what lets ``head_matrix`` fold
+the class table into one GEMM.
 
 ``head_matrix`` folds a head's projection, embedding tables, and first MLP
 layer into the matrix that reads an aggregate row. Neither function owns
@@ -43,7 +47,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .builder import NEAREST_BUCKETS
+from .builder import DEC_CLASSES, NEAREST_BUCKETS
 
 try:
     import triton
@@ -53,18 +57,21 @@ except ImportError:
     tl = None
 
 
-CLASS_SLOTS = 3  # slot classes: end, near-end, centre (MODEL_SPEC §4.3)
+CLASS_SLOTS = DEC_CLASSES  # joint (mask, slot) decoder classes (MODEL_SPEC §4.3)
 BG_SLOTS = NEAREST_BUCKETS
-# Rounded up from the 11 coefficients in use. K stays a multiple of 16 for the
-# head GEMM, and the slack columns are stored as zero so they contribute
+# Rounded up from the 101 coefficients in use, to a power of two: that is what
+# the kernel's block arange takes, and it keeps the head GEMM's K
+# tensor-core friendly. The slack columns are stored as zero so they contribute
 # nothing whatever the head matrix holds there.
-COEF_WIDTH = 16
+COEF_WIDTH = 128
 
 if CLASS_SLOTS + BG_SLOTS > COEF_WIDTH:
     raise RuntimeError(
         f"{CLASS_SLOTS} class + {BG_SLOTS} background coefficients exceed the "
         f"{COEF_WIDTH}-wide block"
     )
+if COEF_WIDTH & (COEF_WIDTH - 1):
+    raise RuntimeError(f"COEF_WIDTH must be a power of two, got {COEF_WIDTH}")
 
 # One program and one warp process each cell. Fixed geometry keeps symbolic
 # shape changes out of Triton's tuning cache.

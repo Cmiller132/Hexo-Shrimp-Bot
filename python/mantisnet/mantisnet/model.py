@@ -22,7 +22,7 @@ from torch import Tensor, nn
 
 from . import decoder
 from .attention import fused_attention
-from .builder import NEAREST_BUCKETS, NUM_PATTERNS, Batch
+from .builder import DEC_CLASSES, NEAREST_BUCKETS, NUM_PATTERNS, Batch
 
 
 @dataclass(frozen=True)
@@ -197,14 +197,14 @@ class MantisNet(nn.Module):
         # §6 policy decoder. MLP_P([h_a; g]) as a _PairMlp, so the g half of
         # its first layer runs per position, not per legal cell.
         self.p = nn.Linear(h, h, bias=False)
-        self.e_pw = nn.Embedding(3, h)
+        self.e_pw = nn.Embedding(DEC_CLASSES, h)
         self.e_bg = nn.Embedding(NEAREST_BUCKETS, h)
         self.mlp_p = _PairMlp(h, cfg.policy_hidden, 1)
 
         # Appendix B action-value decoder: the same shape as §6 with its own
         # parameters everywhere, one raw Q per legal cell. KLENT's head.
         self.q = nn.Linear(h, h, bias=False)
-        self.e_qw = nn.Embedding(3, h)
+        self.e_qw = nn.Embedding(DEC_CLASSES, h)
         self.e_qbg = nn.Embedding(NEAREST_BUCKETS, h)
         self.mlp_q = _PairMlp(h, cfg.policy_hidden, 1)
 

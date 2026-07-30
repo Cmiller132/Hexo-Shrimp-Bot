@@ -59,10 +59,10 @@ group D6, so the whole model is D6-invariant by construction (§8).
 | `DROPOUT` | dropout probability (trunk sub-blocks) | 0.0 |
 
 Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
-slot classes = 3 (§4.3), `moves_remaining ∈ {1, 2}`.
+slot classes = 3 and `DEC_CLASSES = 93` (§4.3), `moves_remaining ∈ {1, 2}`.
 
-The default configuration has 1,249,699 parameters: 1,063,648 in the four
-trunk blocks and 186,051 across input/final parameters and the three heads.
+The default configuration has 1,272,739 parameters: 1,063,648 in the four
+trunk blocks and 209,091 across input/final parameters and the three heads.
 
 ---
 
@@ -142,12 +142,44 @@ makes the attention pathway symmetry-safe.
 For a legal cell, the hex distance to the nearest stone, clamped to the
 legality radius (8): a table of 8 embeddings of width `H`.
 
-### 4.3 Slot classes
+### 4.3 Slot and joint classes
 
-A cell occupies slot `s ∈ 0..5` of a window it belongs to. Under reversal
-`s ↔ 5 − s`, so the model uses the reversal-invariant **slot class**
-`min(s, 5 − s) ∈ {0, 1, 2}` (end / near-end / centre). Slot-class embedding
-tables of width `H` appear in each place a stone-or-cell↔window pairing is
+A stone or cell occupies slot `s ∈ 0..5` of a window it belongs to. A
+reflection reverses slot order, `s ↔ 5 − s`, so no encoding of a slot may
+distinguish the two. There are two invariants of a pairing, and the model
+uses each where it is the right one.
+
+**Slot class** — `min(s, 5 − s) ∈ {0, 1, 2}` (end / near-end / centre). Used
+for the stone↔window incidence of §5.1 and §5.2, where the pairing's other
+half is a stone the window's own occupancy pattern already accounts for.
+
+**Joint class** — for the legal-cell decoder of §6, the slot class discards
+what the decoder most needs. The reflection acts on the pair
+`(occupancy mask, candidate slot)` *jointly*, sending it to
+`(reverse6(mask), 5 − s)`, so the orbits of that involution are the finest
+reversal-invariant description of where a candidate sits among a window's
+stones. The decoder class is the orbit's rank in ascending `(mask, slot)`
+order, one of
+
+```
+DEC_CLASSES = 93
+```
+
+— the 186 pairs of a nonempty, nonfull mask with an empty slot, folded in
+half: the involution has no fixed point, because no slot is its own mirror.
+
+Keying the two halves separately, as `(canonical mask, slot class)`, is
+coarser and realizes only 75 classes. The 18 it merges are exactly the pairs
+of mirrored slots of a non-palindromic mask — for a lone stone at slot 0, a
+candidate at slot 1 makes a contiguous pair and one at slot 4 a split pair,
+and both are `(000001, near-end)`. Since a cell's decoder input is its window
+rows summed plus its class counts, two cells with the same live windows and
+the same counts get one row and therefore one logit and one action value
+whatever the weights: the merge is an action alias, not an approximation.
+Over uniformly-random playouts, 79% of decoder entries lie in a merged class
+and 57% of positions contain at least one aliased pair of legal moves.
+
+Class embedding tables of width `H` appear in each place a pairing is
 encoded; each site owns its own table.
 
 ---
@@ -214,12 +246,14 @@ For each legal cell `a`:
 - **Window path** (cell lies in ≥ 1 live window):
 
   ```
-  h_a    = Σ_{w ∋ a, live}  ( P · W_w  +  E_pw[class(a, w)] )     # ≤ 18 terms
+  h_a    = Σ_{w ∋ a, live}  ( P · W_w  +  E_pw[joint(a, w)] )     # ≤ 18 terms
   logit  = MLP_P( [ h_a ; g ] )                    # 2H → P_H → 1, ReLU
   ```
 
-  The builder emits, per legal cell, its list of (window index, slot class)
-  pairs; the decoder is a gather-sum, never a search.
+  `joint(a, w)` is §4.3's joint class of `w`'s occupancy mask and `a`'s slot
+  in it, so `E_pw` has `DEC_CLASSES` rows. The builder emits, per legal cell,
+  its list of (window index, joint class) pairs; the decoder is a gather-sum,
+  never a search.
 
 - **Background path** (cell lies in no live window):
 
@@ -273,6 +307,7 @@ is a D6 invariant:
 | stone colour (own/opp) | colours don't move under board symmetry |
 | window occupancy pattern | canonicalized under reversal (§3.2) |
 | slot classes | reversal-invariant by definition (§4.3) |
+| decoder joint classes | orbits of a reversal acting on both halves (§4.3) |
 | hex-distance buckets | hex distance is D6-invariant |
 | nearest-stone buckets | ditto |
 | `moves_remaining` | not geometric |
@@ -298,7 +333,7 @@ positions (indices are per-position by construction); attention is masked
 block-diagonal per position. The builder emits, per position: the stone
 table, the window table (colour + canonical pattern), the stone↔window
 incidence list with slot classes, the legal-cell decoder table
-(per-cell window/slot-class lists or background bucket, in engine order),
+(per-cell window/joint-class lists or background bucket, in engine order),
 and `moves_remaining`. All index tensors are precomputed by the builder;
 the forward contains no data-dependent index discovery.
 
@@ -341,9 +376,10 @@ Two version constants govern compatibility:
   checkpoint, as the policy indexes legal moves by position.
 - `MODEL_REPR_VERSION` (model-owned): covers the builder and every feature
   encoding in §3–§4 (window liveness rule, pattern canonicalization, slot
-  classes, bucket tables, incidence layout). Any change to these bumps it
-  and invalidates checkpoints. Formats are not backward compatible; there
-  is one builder and one schema per version.
+  and joint classes, bucket tables, incidence layout). Any change to these
+  bumps it and invalidates checkpoints. Formats are not backward compatible;
+  there is one builder and one schema per version. Version 2 is the joint
+  decoder class of §4.3; version 1 keyed the decoder by slot class alone.
 
 ---
 
@@ -367,6 +403,12 @@ Two version constants govern compatibility:
 7. If a second forward implementation ever exists, committed random-weight
    parity fixtures with pinned tolerances and provenance-gated
    real-checkpoint fixtures, failing loudly when weights are absent.
+8. **Decoder classes:** the 93 classes are exactly the orbits of the joint
+   reversal — invariant on each orbit, distinct across orbits — with the
+   ranking convention derived independently of the builder's table, since the
+   Rust encoder must agree on it. Separation is asserted where it matters: a
+   pair of legal moves that `(canonical mask, slot class)` gives one decoder
+   row, given two.
 
 ---
 
@@ -401,7 +443,7 @@ explicit allowlist, not silent prefix matching).
 ## Appendix B — action-value head (the KLENT interface)
 
 The action-value head has the §6 decoder shape and emits one scalar per legal
-cell in engine legal-move order. It owns a window projection, slot-class
+cell in engine legal-move order. It owns a window projection, joint-class
 table, background-bucket table, and MLP distinct from the policy decoder's
 parameters. The policy and action-value heads may share the parameter-free
 pass over the decoder incidence table.

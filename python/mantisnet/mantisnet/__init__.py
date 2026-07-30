@@ -7,6 +7,7 @@ container package owns improved evaluation and sessions.
 """
 
 from .builder import (
+    DEC_CLASSES,
     MODEL_REPR_VERSION,
     NUM_PATTERNS,
     Batch,
@@ -21,6 +22,7 @@ from .losses import param_groups, policy_loss, value_loss, value_target
 from .model import MantisConfig, MantisNet, ModelOutput
 
 __all__ = [
+    "DEC_CLASSES",
     "MODEL_REPR_VERSION",
     "NUM_PATTERNS",
     "Batch",

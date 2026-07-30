@@ -576,6 +576,36 @@ Manager-measured on a shared 96-position set drawn from checkpoint 151's own sel
 
 The bipolar head's own quantities over the same set: $u^{+}+u^{-}$, its estimate of $\mathbb E\lvert G\rvert$, moved from exactly 1.0 everywhere at the graft to 0.275 over the policy's top-16 in contested positions and 0.955 in decided ones, against $(\gamma\lambda_{\mathrm{ret}})^k=0.9296^k$. $\lvert z^{+}+z^{-}\rvert$ moved 0.00 → 3.61 → 4.30 and $\operatorname{corr}(z^{+},z^{-})$ −1.000 → −0.960 → −0.903, so the two logits are not each other's negation after training. No probe cell at any checkpoint had both sigmoids saturated, and none reached $\lvert Q\rvert=1$.
 
+### `joint-939`
+
+| Field | Record |
+| --- | --- |
+| Date | Built 2026-07-30; not yet launched |
+| Init/fork | `runs/grafts/ckpt151-joint.pt`, the exact function-preserving graft of `conv-disc-lam01/checkpoint_000151.pt`; seed 21 |
+| Delta from reference | The decoder's class is joint in the window's occupancy mask and the candidate cell's own slot, folded by a reversal acting on both halves — 93 classes where the slot class alone gave 3 (MODEL_SPEC §4.3). Both cell heads' class tables grow to 93 rows, +23,040 parameters; the stone incidence keeps the slot class. `MODEL_REPR_VERSION` 1 → 2. `--cell-budget 450000 --collect-cell-budget 1350000`, memory only: the aggregate row widens from $H+16$ to $H+128$, so the budgets come down by that same 1.78 to hold decoder memory at the reference's level. Otherwise the reference recipe. Branch `joint-slot-decoder`. |
+| Question | Whether removing the decoder's action aliases improves evaluation, and which head uses the separation |
+| Pre-stated abort signature | As `brm-939`: evaluation at or below 0.625 at iteration 25, or H outside [0.12, 0.36] on a monotone trend |
+| Disposition | Built, verified, and grafted; awaiting the GPU |
+
+What the old key merged, measured over 2,800 positions from uniformly-random legal playouts before the change:
+
+| Quantity | Measurement |
+| --- | ---: |
+| `(mask, slot)` pairs a live window and an empty candidate can form | 186 |
+| Their orbits under the joint reversal | 93 |
+| Classes `(canonical mask, slot class)` realizes | 75, merging 18 orbit pairs |
+| Decoder entries lying in a merged class | 6,092,396 of 7,723,536 = 78.9% |
+| Pairs of legal moves sharing one decoder row, hence one logit and one $Q$ | 4,321, every one separated by the joint key |
+| Positions holding at least one such pair | 1,605 of 2,800 = 57% |
+
+The merged classes are exactly the mirrored slots of a non-palindromic mask, so all 18 involve masks of one to three stones — the common case. An instance: a window holding one stone at slot 0, with one legal cell at slot 1 and another at slot 4, neither in any other live window. Under the slot class those two cells' decoder rows are equal, so no weights can rank a contiguous extension above a split one. The aliasing is exact, not approximate.
+
+| Graft | Stated property | Measured |
+| --- | --- | --- |
+| `joint` | Each of the 93 rows is bit for bit the slot-class row it replaces, so the grafted model is the parent as a function | MODEL_SPEC §6's decode over the grafted tables and joint classes is bitwise equal to the parent's over its own tables and slot classes, both heads; 183 shared tensors unchanged under one SHA-256; 186 expanded rows checked; median top-16 σ(Q) 0.0636686347424984 on both sides. The folded path's deltas are fp32 reassociation from the wider head GEMM: max $\lvert\Delta Q\rvert$ 6.557e-07, max $\lvert\Delta\text{logit}\rvert$ 1.526e-05, max improved-policy KL 2.994e-06 — against 1.5e-06, 1.6e-06, and 1.8e-06 for one unmodified model decoded both ways. |
+
+Adam's moments for the two tables are replicated by the same rows as their weights, so each new row inherits the ratio its parent row had rather than taking one bias-corrected cold step.
+
 ## Engineering experiments
 
 ### Fused Triton block attention

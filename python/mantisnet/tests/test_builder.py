@@ -11,9 +11,33 @@ import numpy as np
 import pytest
 
 from mantisnet import NUM_PATTERNS, collate, from_position
-from mantisnet.builder import _CANON, _PATTERN_RANK, _SLOT_CLASS, AXES
+from mantisnet.builder import DEC_CLASSES, _CANON, _PATTERN_RANK, _SLOT_CLASS, AXES
 
-from .conftest import oracle_live_windows
+from .conftest import JOINT_ORBITS, joint_class, oracle_live_windows, reverse6
+
+
+def test_ninety_three_joint_decoder_classes():
+    # The 186 (nonempty-nonfull mask, empty slot) pairs fold to 186 / 2 = 93
+    # orbits: no slot is its own mirror, so the involution has no fixed point.
+    assert DEC_CLASSES == len(JOINT_ORBITS) == 93
+    pairs = [(m, s) for m in range(1, 63) for s in range(6) if not (m >> s) & 1]
+    assert len(pairs) == 186
+    # Exactly reversal-invariant, and no coarser: the two members of an orbit
+    # share a class, and members of different orbits never do.
+    assert all(joint_class(m, s) == joint_class(reverse6(m), 5 - s) for m, s in pairs)
+    assert len({joint_class(m, s) for m, s in pairs}) == 93
+    # Strictly finer than the slot class it replaces, at 18 of the 93: a
+    # (canonical mask, slot class) key merges the two ways a candidate can sit
+    # at mirrored slots of a non-palindromic window — an adjacent extension and
+    # a split one get one embedding under it and two under this.
+    merged = {}
+    for m, s in pairs:
+        merged.setdefault(
+            (min(m, reverse6(m)), int(_SLOT_CLASS[s])), set()
+        ).add(joint_class(m, s))
+    assert sum(len(v) - 1 for v in merged.values()) == 18
+    assert all(len(v) <= 2 for v in merged.values())
+    assert joint_class(0b000001, 1) != joint_class(0b000001, 4)
 
 
 def test_thirty_four_canonical_patterns():
@@ -84,7 +108,9 @@ def test_decoder_table_ordering_and_coverage(positions):
                 for k in range(6):
                     wid = (axis, q - k * int(vec[0]), r - k * int(vec[1]))
                     if wid in live:
-                        expected.add((wid, int(_SLOT_CLASS[k])))
+                        # The class pairs the window's occupancy — the oracle's
+                        # own, from the engine's walk — with this cell's slot.
+                        expected.add((wid, joint_class(oracle[wid][1], k)))
             assert rows_by_cell.get(j, set()) == expected, f"decoder row {j} at {(q, r)}"
             if not expected:
                 dists = [
