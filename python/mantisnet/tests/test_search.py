@@ -171,3 +171,70 @@ def test_halving_schedule_receipts():
     assert _halving_schedule(16, 16) == [(16, 1)]
     assert _halving_schedule(32, 8) == [(8, 1), (4, 2), (2, 8)]
     assert _halving_schedule(32, 16) == [(16, 1), (8, 2)]
+
+
+def _spread(choose, position, seeds):
+    """The distinct moves ``choose`` returns for one position over ``seeds``."""
+    return {choose([position], np.random.default_rng(s))[0] for s in seeds}
+
+
+def test_unit_temperature_is_the_unscaled_draw():
+    # The cross-language Gumbel fixtures are generated through this chooser, so
+    # the default has to be the old behaviour exactly and not merely closely.
+    positions = [
+        hexo_py.Position.replay([(0, 0)]),
+        hexo_py.Position.replay([(0, 0), (1, 2), (-2, 1)]),
+    ]
+    default = gumbel_choose(heuristic_evaluate, 0.1, 0.03, 32)
+    explicit = gumbel_choose(heuristic_evaluate, 0.1, 0.03, 32, temperature=1.0)
+    assert default(positions, np.random.default_rng(55)) == explicit(
+        positions, np.random.default_rng(55)
+    )
+
+
+def test_zero_temperature_is_deterministic_across_seeds():
+    position = hexo_py.Position.replay([(0, 0), (1, 2), (-2, 1)])
+    cold = gumbel_choose(heuristic_evaluate, 0.1, 0.03, 32, temperature=0.0)
+    assert len(_spread(cold, position, range(12))) == 1
+
+
+def test_temperature_widens_the_move_distribution():
+    position = hexo_py.Position.replay([(0, 0), (1, 2), (-2, 1)])
+    seeds = range(24)
+    cold = _spread(gumbel_choose(heuristic_evaluate, 0.1, 0.03, 32, temperature=0.0), position, seeds)
+    warm = _spread(gumbel_choose(heuristic_evaluate, 0.1, 0.03, 32, temperature=1.0), position, seeds)
+    hot = _spread(gumbel_choose(heuristic_evaluate, 0.1, 0.03, 32, temperature=4.0), position, seeds)
+    # Monotone rather than a threshold on any one count: the point of the knob
+    # is that it orders these, not that it hits a particular spread.
+    assert len(cold) == 1 < len(warm) <= len(hot)
+
+
+def test_the_rng_stream_does_not_depend_on_temperature():
+    # The Gumbel is drawn and then scaled, so two temperatures consume the same
+    # draws and a chooser swap cannot silently shift a shared generator.
+    position = hexo_py.Position.replay([(0, 0), (1, 2)])
+    streams = []
+    for temperature in (0.0, 0.25, 1.0):
+        rng = np.random.default_rng(30)
+        gumbel_choose(
+            heuristic_evaluate, 0.1, 0.03, 32, temperature=temperature
+        )([position], rng)
+        streams.append(rng.integers(2**63))
+    assert len(set(streams)) == 1
+
+
+def test_a_temperature_without_a_budget_is_refused():
+    # sims == 0 draws no Gumbel, so honouring the request is impossible and
+    # ignoring it would hand back a deterministic chooser to a caller who asked
+    # for a stochastic one.
+    for kwargs in (
+        {"sims": 0, "temperature": 0.5},
+        {"sims": 32, "temperature": -0.1},
+        {"sims": 32, "temperature": float("nan")},
+        {"sims": 32, "temperature": float("inf")},
+    ):
+        try:
+            gumbel_choose(heuristic_evaluate, 0.1, 0.03, **kwargs)
+        except ValueError:
+            continue
+        raise AssertionError(f"gumbel_choose accepted {kwargs}")

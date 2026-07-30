@@ -250,6 +250,7 @@ def head_to_head(
     device: str = "cpu",
     seed: int = 0,
     opening_range: tuple[int, int] = (2, 6),
+    temperature: float = 1.0,
 ) -> dict:
     """Play A against B over ``pairs`` seat-swapped pairs and summarise them.
 
@@ -257,6 +258,12 @@ def head_to_head(
     ``sims > 0`` and ``None`` when it is zero, where the operator is never
     consulted — the manifest then records that no operating point was used
     instead of naming one that was not.
+
+    ``temperature`` is the root Gumbel scale of :func:`gumbel_choose`, applied
+    to both seats because an asymmetric one would measure the difference
+    between two search settings as though it were a difference between two
+    models. It is recorded with the result: a score at one temperature says
+    nothing about a score at another.
 
     Returns the statistics of :func:`paired_statistics`, an audit record per
     checkpoint, one row per pair, and the match's own parameters — enough for
@@ -296,6 +303,7 @@ def head_to_head(
             tau=tau,
             lam=lam,
             sims=sims,
+            temperature=temperature,
         )
         for path in (path_a, path_b)
     ]
@@ -328,6 +336,7 @@ def head_to_head(
             "sims": sims,
             "tau": tau,
             "lam": lam,
+            "temperature": temperature,
             "opening_range": list(opening_range),
             "ply_cap": ply_cap,
             "device": device,
@@ -363,6 +372,7 @@ def _fmt(result: dict) -> str:
             f"elo {_number(result['elo'], '+.0f')} "
             f"({_number(result['elo_lo'], '+.0f')}.."
             f"{_number(result['elo_hi'], '+.0f')}, from the paired SE) "
+            f"| sims {result['match']['sims']} T {result['match']['temperature']:g} "
             f"| {result['match']['seconds']:.0f}s",
         )
     )
@@ -402,6 +412,13 @@ def main(argv=None) -> None:
     )
     parser.add_argument("--tau", type=float, help="reverse-KL weight, required with --sims")
     parser.add_argument("--lam", type=float, help="entropy weight, required with --sims")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=1.0,
+        help="root Gumbel scale for both seats; 0 is deterministic, 1 is Gumbel "
+        "MuZero's (default: 1.0)",
+    )
     args = parser.parse_args(argv)
 
     # At sims = 0 the operator is never consulted and the coefficients stay
@@ -431,6 +448,7 @@ def main(argv=None) -> None:
         device=args.device,
         seed=args.seed,
         opening_range=tuple(args.opening_range),
+        temperature=args.temperature,
     )
     # Write then rename, so an interrupt cannot leave a truncated result behind.
     tmp = args.out.with_suffix(".tmp")

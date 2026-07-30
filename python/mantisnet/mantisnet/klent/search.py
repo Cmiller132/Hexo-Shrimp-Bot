@@ -24,7 +24,8 @@ from ..builder import collate_positions
 from .improve import improved_policy
 
 # Gumbel MuZero's root value transform. Keep these together: changing either
-# changes the relative scale of root prior/noise and searched line value.
+# changes the relative scale of root prior/noise and searched line value, as
+# ``gumbel_choose``'s ``temperature`` does from the noise side.
 C_VISIT = 50
 C_SCALE = 1.0
 
@@ -88,7 +89,14 @@ def _terminal_value(position, root_player: int) -> float:
     return 1.0 if position.winner == root_player else -1.0
 
 
-def gumbel_choose(evaluate, tau: float, lam: float, sims: int, rng=None):
+def gumbel_choose(
+    evaluate,
+    tau: float,
+    lam: float,
+    sims: int,
+    rng=None,
+    temperature: float = 1.0,
+):
     """Build a batched Gumbel root-sampling and sequential-halving chooser.
 
     ``evaluate(batch)`` returns flat CPU ``(policy_logits, q_values)`` tensors
@@ -98,9 +106,33 @@ def gumbel_choose(evaluate, tau: float, lam: float, sims: int, rng=None):
 
     ``rng`` is accepted for construction symmetry with other chooser
     factories, but the chooser contract's call-time generator is authoritative.
+
+    ``temperature`` scales the root Gumbel vector, which is a temperature in
+    the exact sense: Gumbel is a scale family, so ``T * Gumbel(0, 1)`` is
+    ``Gumbel(0, T)``, and ranking by ``logit + Gumbel(0, T)`` draws the root
+    order from ``softmax(logits / T)``. ``T = 1`` is Gumbel MuZero's and is
+    bit-for-bit the unscaled draw. ``T = 0`` leaves the search deterministic:
+    candidates are the top-*m* logits and the scores carry no noise term. Small
+    positive ``T`` therefore decorrelates repeated games between one pair of
+    models without moving play far from the greedy line.
+
+    The scale is relative to two other quantities and not only to the logits —
+    ``C_VISIT`` and ``C_SCALE`` weigh the searched value against this noise, so
+    ``T`` changes how much a searched line must be worth to overturn the prior
+    order. Matches played at different ``T`` are different measurements.
     """
     if sims < 0:
         raise ValueError(f"sims must be >= 0, got {sims}")
+    if not math.isfinite(temperature) or temperature < 0.0:
+        raise ValueError(f"temperature must be finite and >= 0, got {temperature}")
+    if sims == 0 and temperature != 1.0:
+        # Zero-budget argmax draws nothing, so there is no Gumbel to scale.
+        # Silently ignoring the request would hand back a deterministic chooser
+        # to a caller who asked for a stochastic one.
+        raise ValueError(
+            f"temperature={temperature} needs sims > 0; sims == 0 is argmax and "
+            "draws no Gumbel to scale"
+        )
 
     def choose(positions, call_rng):
         if not positions:
@@ -151,7 +183,9 @@ def gumbel_choose(evaluate, tau: float, lam: float, sims: int, rng=None):
                 rank = int(root_logits[lo:hi].argmax())
                 searches.append((rank, None))
                 continue
-            gumbels = root_rngs[k].gumbel(size=legal_count)
+            # Always drawn, then scaled, so the RNG stream stays a function of
+            # the seeds alone and T = 1 is the unscaled draw exactly.
+            gumbels = root_rngs[k].gumbel(size=legal_count) * temperature
             sampled = gumbels + logits
             order = np.argsort(-sampled, kind="stable")[:candidate_count]
             lines = []

@@ -258,12 +258,31 @@ def test_the_manifest_identifies_both_checkpoints_and_the_match(checkpoints):
         "sims": 0,
         "tau": 0.1,
         "lam": 0.03,
+        "temperature": 1.0,
         "opening_range": [2, 6],
         "ply_cap": 24,
         "device": "cpu",
         "seed": 5,
         "seconds": result["match"]["seconds"],
     }
+
+
+def test_the_match_records_its_temperature_and_refuses_one_it_cannot_apply(
+    checkpoints,
+):
+    # A score at one temperature says nothing about a score at another, so the
+    # manifest carries it whether or not the match was searched. At sims == 0
+    # there is no Gumbel to scale, and a request to scale it is an error rather
+    # than a silently deterministic match.
+    searched = _match(*checkpoints, pairs=1, sims=2, temperature=0.25)
+    assert searched["match"]["temperature"] == 0.25
+
+    try:
+        _match(*checkpoints, pairs=1, sims=0, temperature=0.25)
+    except ValueError as error:
+        assert "sims > 0" in str(error)
+    else:
+        raise AssertionError("a temperature without a budget was accepted")
 
 
 def test_the_cli_writes_strict_json_and_needs_coefficients_to_search(

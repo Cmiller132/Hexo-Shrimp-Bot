@@ -170,6 +170,11 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
   reports no Elo interval and warns instead.
 - A head-to-head at `--sims 0` never consults `--tau`/`--lam` and records them
   as absent; a searched one requires both.
+- `--temperature` scales the root Gumbel for both seats, which is exactly
+  drawing the root order from `softmax(logits / T)`. `0` searches
+  deterministically and `1` is the unscaled draw. It is recorded in the
+  manifest, because two temperatures are two measurements, and it is refused at
+  `--sims 0`, where no Gumbel is drawn to scale.
 - A head-to-head refuses two checkpoints that differ in rules, action order, or
   Torch version, and names `klent.graft` as the bridge for a representation
   difference.
