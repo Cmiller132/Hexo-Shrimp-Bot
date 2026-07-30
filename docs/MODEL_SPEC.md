@@ -31,9 +31,10 @@ inputs, and no nodes for empty cells.
   is computed on demand from the live windows passing through it (or from a
   background path when there are none). Trunk cost therefore scales with
   stones and live windows, not with the legal halo.
-- The **action-value** head is an independently parameterized decoder with the
-  same routing as policy. It emits one tanh-bounded scalar per legal cell
-  (appendix B).
+- The **action-value** head is dueling: an independently parameterized decoder
+  with the same routing as policy scores a per-action advantage, and a readout
+  over the global token scores a per-position baseline. It emits one
+  tanh-bounded scalar per legal cell (appendix B).
 - The **value** head reads the board through multi-query attention over the
   window embeddings and outputs a binned distribution over `[−1, 1]`,
   decoded to a scalar in-forward.
@@ -54,15 +55,15 @@ group D6, so the whole model is D6-invariant by construction (§8).
 | `D_MAX` | hex-distance clamp for the attention bias table | 12 |
 | `Q` | learned value-readout queries | 4 |
 | `K` | value bins | 65 |
-| `P_H` | policy and action-value decoder MLP hidden width | 128 |
+| `P_H` | policy, action-value, and critic-baseline MLP hidden width | 128 |
 | `V_H` | value MLP hidden width | 128 |
 | `DROPOUT` | dropout probability (trunk sub-blocks) | 0.0 |
 
 Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
 slot classes = 3 (§4.3), `moves_remaining ∈ {1, 2}`.
 
-The default configuration has 1,249,699 parameters: 1,063,648 in the four
-trunk blocks and 186,051 across input/final parameters and the three heads.
+The default configuration has 1,266,340 parameters: 1,063,648 in the four
+trunk blocks and 202,692 across input/final parameters and the three heads.
 
 ---
 
@@ -403,21 +404,42 @@ explicit allowlist, not silent prefix matching).
 The action-value head has the §6 decoder shape and emits one scalar per legal
 cell in engine legal-move order. It owns a window projection, slot-class
 table, background-bucket table, and MLP distinct from the policy decoder's
-parameters. The policy and action-value heads may share the parameter-free
-pass over the decoder incidence table.
+parameters, plus one readout over the global token. The policy and action-value
+heads may share the parameter-free pass over the decoder incidence table.
 
-For each legal cell `a`, the head uses the same window/background routing as
-§6:
+The head is **dueling**: the decoder scores a per-action advantage, the token
+readout scores a per-position baseline, and the action value is their sum with
+the advantage centered on the current policy. For each legal cell `a`, using
+the same window/background routing as §6:
 
 ```
 h_a     = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[class(a, w)] )
-q_raw   = MLP_Q( [ h_a ; g ] )                    # 2H → P_H → 1, ReLU
-Q(s, a) = tanh(q_raw)
+A(s, a) = MLP_Q( [ h_a ; g ] )                    # 2H → P_H → 1, ReLU
+v(s)    = MLP_QB( g )                             #  H → P_H → 1, ReLU
+Q(s, a) = tanh( v(s) + A(s, a) − Σ_b sg[ π_θ(b|s) ] · A(s, b) )
 ```
 
-For a background cell, `h_a = E_qbg[nearest-stone bucket(a)]`. The head applies
-`tanh`, so each action value lies in `(−1, 1)`. The KLENT operator and loss cast
-these values to fp32 before arithmetic.
+For a background cell, `h_a = E_qbg[nearest-stone bucket(a)]`.
+
+`π_θ = softmax` of the §6 logits over the same position's legal set, from the
+same forward, and `sg[·]` is a stop-gradient: the centering weight is a
+constant of the step. It is the raw policy and never `π′`, which is a function
+of `Q` and would define `Q` by a fixed point. Gradients reach `A` through both
+of its terms and `v` through its own; none reaches the policy through this
+head.
+
+Subtracting the policy's own expectation of `A` leaves the decoder scoring only
+how an action compares with the position's other plausible actions and puts the
+level — how won the position is — in `v`, read off the global token once per
+position. The subtracted term is constant within a position, so `Q` is there a
+strictly increasing function of `A`: the decomposition changes what each part
+must represent, not the ordering a given `A` induces.
+
+The head applies `tanh`, so each action value lies in `(−1, 1)`. The centering
+sum, the composition, and the `tanh` are computed in fp32 whatever precision
+autocast chose for the head's GEMMs, so an action value means the same thing
+under bf16 autocast. The KLENT operator and loss cast these values to fp32
+before arithmetic.
 
 The KLENT operator and training contract are specified in
 [`KLENT_FOR_HEXO.md`](KLENT_FOR_HEXO.md). The improvement step consumes the
@@ -429,12 +451,14 @@ v̂(s)    = E_{a~π′}[Q(s,a)]
 ```
 
 Training selects the taken action and minimizes its squared error
-`(Q(s,a_taken) − G)²` against the sample's λ-return `G`. Policy
+`(Q(s,a_taken) − G)²` against the sample's λ-return `G`. There is no separate
+loss on `v(s)`; it is trained through the taken action's `Q` alone. Policy
 cross-entropy is unchanged.
 
-**Both the policy decoder's and action-value decoder's MLP output layers
-initialize to zero**, overriding §10's framework default for those two
-layers. Initial policy logits and action values are therefore exactly zero.
+**The policy decoder's, the action-value decoder's, and the baseline readout's
+MLP output layers all initialize to zero**, overriding §10's framework default
+for those three layers. A zero advantage centers to zero and a zero baseline
+adds nothing, so initial policy logits and action values are exactly zero.
 
 This head reads the trunk output and adds no inputs, so it does not change
 `MODEL_REPR_VERSION`. The §7 state-value head is neither called nor trained

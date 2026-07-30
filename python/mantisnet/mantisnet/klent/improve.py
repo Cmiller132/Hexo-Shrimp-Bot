@@ -42,14 +42,14 @@ def improved_policy(
     p = offsets.shape[0] - 1
     seg = segment_ids(offsets)
 
-    log_pi = segment_log_softmax(policy_logits.float(), offsets)
+    log_pi = segment_log_softmax(policy_logits.float(), offsets, seg)
     q = q_values.float()
-    log_improved = segment_log_softmax((q + tau * log_pi) / (tau + lam), offsets)
+    log_improved = segment_log_softmax((q + tau * log_pi) / (tau + lam), offsets, seg)
     probs = log_improved.exp()
 
-    v_hat = segment_sum(probs * q, seg, p)
-    kl = segment_sum(probs * (log_improved - log_pi), seg, p)
-    entropy = segment_sum(-probs * log_improved, seg, p)
+    v_hat = segment_sum(probs * q, offsets)
+    kl = segment_sum(probs * (log_improved - log_pi), offsets)
+    entropy = segment_sum(-probs * log_improved, offsets)
     counts = (offsets[1:] - offsets[:-1]).float()
     norm_entropy = torch.where(counts > 1, entropy / counts.clamp(min=2).log(), entropy.new_zeros(p))
     return ImprovedPolicy(probs=probs, v_hat=v_hat, kl=kl, norm_entropy=norm_entropy)

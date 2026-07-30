@@ -5,7 +5,8 @@
 `python/mantisnet` requires Python 3.12 or later and contains the MantisNet
 Torch model, independent graph-builder oracle, losses, Hexo KLENT training loop,
 telemetry store, benchmarks, and control-deck backend. The training path uses a policy head and one
-`tanh`-bounded scalar action value per legal cell. Algorithm obligations are in
+`tanh`-bounded scalar action value per legal cell, composed from a per-position
+baseline and a policy-centered advantage. Algorithm obligations are in
 `docs/KLENT_FOR_HEXO.md`; measured experiment outcomes are in
 `docs/ABLATIONS.md`.
 
@@ -28,7 +29,7 @@ Core modules:
 | Module | Contract |
 | --- | --- |
 | `builder` | Graph construction, Rust batch conversion, and collation |
-| `model` | Stone/window trunk, policy decoder, action-value decoder, value head |
+| `model` | Stone/window trunk, policy decoder, dueling action-value head, value head |
 | `attention` | Fused attention operation plus reference path |
 | `decoder` | Shared legal-cell incidence aggregation |
 | `segments` | Ragged segment reductions |
@@ -37,6 +38,7 @@ Core modules:
 | `klent.selfplay` | Persistent-slot collection and samples |
 | `klent.train` | Network evaluation, packing, collection, and fit |
 | `klent.run` | Checkpointed iteration driver and CLI |
+| `klent.graft` | Scalar-critic checkpoint conversion, measured and enforced |
 | `klent.telemetry` | SQLite writes, queries, and CLI |
 | `klent.search` | Gumbel line search used by Python evaluation |
 | `deck.app` | FastAPI routes and SPA serving |
@@ -123,10 +125,12 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 - Policy and action-value decoders share incidence aggregation but own separate
   projections, embeddings, and output MLPs.
 - Action values are scalar and bounded to `(-1, 1)` by `tanh`.
-- The policy and action-value output layers initialize to zero.
+- An action value is a per-position baseline plus the decoder's advantage,
+  centered on the detached raw policy of the same forward.
+- The policy, advantage, and critic-baseline output layers initialize to zero.
 - KLENT improvement consumes raw policy logits and scalar action values.
 - The KLENT fit objective trains policy cross-entropy and the taken action's
-  squared return error.
+  squared return error; the critic baseline has no loss of its own.
 - KLENT fitting does not train or read the distributional state-value head.
 - Stored training states are move prefixes and are rebuilt through `hexo_py`.
 - Capped self-play episodes are excluded from the fitting buffer.
@@ -137,6 +141,10 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
   NumPy RNG state.
 - A fresh run refuses a nonempty output directory.
 - `--resume` requires a checkpoint and is exclusive with `--init-from`.
+- A pre-dueling scalar-critic checkpoint enters only through
+  `python -m mantisnet.klent.graft`, which requires `--tau`, `--lam`, and
+  `--manifest`, and writes nothing unless it preserved the parent's ordering of
+  `Q`, carried every shared parameter bitwise, and composed appendix B on them.
 - `config.json` records current run fields; `invocations.jsonl` records every invocation and resume.
 - `metrics.jsonl` is append-only; replay after resume can repeat an iteration number.
 - `telemetry.db` is schema-versioned and stores run, iteration, game, ply,

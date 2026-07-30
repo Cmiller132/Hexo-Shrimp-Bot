@@ -6,8 +6,11 @@ evaluator in ``tests/heuristic.py``.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import hexo_py
 import numpy as np
+import pytest
 import torch
 
 from mantisnet import MantisConfig, MantisNet
@@ -19,7 +22,7 @@ from mantisnet.klent import (
     play_match,
 )
 from mantisnet.klent.evaluate import argmax_choose
-from mantisnet.klent.train import _pack, fit, network_evaluate
+from mantisnet.klent.train import _pack, _rebuild, fit, network_evaluate
 
 from .heuristic import heuristic_choose, heuristic_evaluate
 
@@ -181,13 +184,58 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
     # so the step count is bounded by, not equal to, ceil(n / batch_size).
     assert 1 <= metrics["fit_steps"] <= (len(samples) + 63) // 64
 
-    value_only = {"value_queries", "ln_value", "mlp_v"}
-    for name, p in model.named_parameters():
-        head = name.split(".")[0]
-        if head in value_only:
-            assert p.grad is None, f"value head parameter {name} was trained"
-        else:
-            assert p.grad is not None, f"{name} received no gradient"
+    # The §7 state-value head is the whole of what KLENT leaves alone, named
+    # parameter by parameter. The critic's per-position baseline is trained,
+    # through the taken action's Q and nothing else.
+    value_head = {
+        "value_queries",
+        "ln_value.weight",
+        "ln_value.bias",
+        "mlp_v.0.weight",
+        "mlp_v.0.bias",
+        "mlp_v.2.weight",
+        "mlp_v.2.bias",
+    }
+    untrained = {name for name, p in model.named_parameters() if p.grad is None}
+    assert untrained == value_head
+    baseline = {name for name, _p in model.named_parameters() if name.startswith("mlp_qbase.")}
+    assert len(baseline) == 4 and not baseline & untrained
+
+
+def test_q_loss_is_the_taken_actions_squared_return_error():
+    """The metric the critic arms are compared on, and the only critic term in
+    the objective: the taken action's ``(Q - G)²`` and nothing else."""
+    rng = np.random.default_rng(22)
+    episodes, _ = _collect(heuristic_evaluate, 2, 200, 0.1, 0.03, rng)
+    source = [s for e in episodes for s in episode_samples(e, 0.883, 1.0)]
+    assert len(source) >= 3
+    returns = (-0.25, 0.0, 0.75)
+    samples = [replace(s, g=g) for s, g in zip(source[:3], returns)]
+
+    model = _tiny_model()
+    torch.manual_seed(23)
+    for out in (model.mlp_q.out, model.mlp_qbase[-1]):
+        torch.nn.init.normal_(out.weight)
+        torch.nn.init.normal_(out.bias)
+    batch = _rebuild(samples)
+    with torch.no_grad():
+        _s, w, token = model.trunk(batch)
+        _policy, q = model.cell_heads(w, token, batch)
+        ranks = torch.tensor([s.rank for s in samples])
+        taken = q.index_select(0, batch.legal_offsets[:-1] + ranks)
+        expected = (taken - torch.tensor(returns)).square().mean()
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    metrics = fit(
+        model,
+        samples,
+        optimizer,
+        KlentConfig(batch_size=len(samples)),
+        np.random.default_rng(24),
+    )
+    assert metrics["q_loss"] == pytest.approx(float(expected), abs=1e-6)
+    # The dueling composition adds no loss term, so it adds no metric key.
+    assert set(metrics) == {"policy_loss", "q_loss", "fit_steps"}
 
 
 def test_collect_and_fit_end_to_end():

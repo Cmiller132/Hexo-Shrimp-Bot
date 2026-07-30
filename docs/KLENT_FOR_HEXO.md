@@ -118,6 +118,12 @@ The operator refuses `tau < 0`, `lam < 0`, and `tau + lam <= 0`. Shape, device, 
 
 The consumed model contract is the trunk and legal-cell decoder in [MODEL_SPEC.md](MODEL_SPEC.md): `cell_heads` returns one raw policy logit and one scalar $Q\in(-1,1)$, produced by `tanh`, for every legal cell in engine order. KLENT calls no state-value readout and applies no loss to it.
 
+The critic is dueling (MODEL_SPEC appendix B). Per position it reads a baseline $v(S)$ off the global token and a per-action advantage $A(S,a)$ off the legal-cell decoder, and composes
+
+$$Q(S,a)=\tanh\!\left(v(S)+A(S,a)-\sum_b \operatorname{sg}[\pi_\theta(b\mid S)]\,A(S,b)\right),$$
+
+with the centering weight the raw policy of the same forward, stop-gradiented. The decomposition is internal to the critic: $Q$ is one bounded scalar per legal cell as before, so the operator of §2, the acting seam of §4.1, and search consume it unchanged.
+
 For a fitting batch of positions,
 
 $$L =
@@ -127,7 +133,7 @@ $$L =
   +(Q_\theta(S_i,A_i)-G_i)^2
 \right].$$
 
-The policy cross-entropy covers the full legal set. The critic loss selects only the stored action rank. The two terms have unit weight.
+The policy cross-entropy covers the full legal set. The critic loss selects only the stored action rank. The two terms have unit weight. The critic's decomposition adds no third term and no coefficient: $v$ and $A$ are both trained by the taken action's squared error alone, so $v$ is fitted only where a return was collected and $A$ receives gradient both directly and through the centering sum.
 
 | Check | Owner | Exact behavior |
 |---|---|---|
@@ -237,6 +243,19 @@ Telemetry stores per-ply $\hat v$, KL, normalized entropy, top probability, and 
 - Checkpoints require exact equality of `MODEL_REPR_VERSION`, `RULES_VERSION`, `ACTION_ORDER_VERSION`, and Torch version. Model loading constructs default `MantisConfig`; incompatible shapes fail strict state-dict loading.
 - `telemetry.db` independently refuses a schema-version mismatch.
 
+A checkpoint written before the dueling critic carries no baseline readout and therefore does not load. `mantisnet.klent.graft` is the one-shot conversion:
+
+```sh
+python -m mantisnet.klent.graft OLD.pt NEW.pt --tau T --lam L --manifest OUT.json
+```
+
+- It adds keys only. The parent's critic decoder becomes $A$ verbatim, with its Adam moments and step carried unchanged; the baseline readout arrives at this build's initialization, seeded by a constant the manifest records, with zero moments and a zeroed step. Adam state is remapped by parameter name, since inserting a readout shifts the saved positions after it.
+- **It preserves order and resets the level.** At the graft $v(S)=0$, so $Q_{\text{new}}=\tanh(A-\mathbb E_{\pi_\theta}[A])$ against the parent's $Q=\tanh(A)$. The values move — the level the parent carried inside $A$ is removed and $v$ must learn it back — while every position's ranking of its legal cells is unchanged, both maps being monotone in $A$ within a position.
+- $\tau$ and $\lambda$ are required, because the manifest measures $\pi'$ and those measurements have no meaning without the operating point they were taken at.
+- The manifest records the arm, source, iteration, versions, seeds, probe size, transform, and what moved: $|Q_{\text{new}}-Q_{\text{parent}}|$, the removed level, the spread of $Q$ over the policy's leading cells before and after, and $D_{\mathrm{KL}}(\pi'_{\text{new}}\Vert\pi'_{\text{parent}})$. It measures the parent's action values by applying the parent's readout tensors to the grafted model's own captured activation, since this build does not contain the parent's code.
+- The ordering is enforced, not merely reported: a single discordant pair, or an ordering collapsed to constant, fails the conversion and writes neither file.
+- So is the premise which makes that ordering a statement about the parent, since $\tanh$ of a per-position constant shift is monotone whatever the shift is: every shared parameter is checked bitwise against the parent before the probe runs, and the composition — $v(S)=0$ and one level per position, the raw policy's expectation of the advantage — is re-derived from the formula and compared with the head's own output. The manifest reports both. Every refusal — a malformed checkpoint, a missing Adam entry, a version mismatch, a non-scalar parent readout, any further architecture difference, an identical source and destination — is an error rather than a repair.
+
 ## 8. Per-iteration metrics
 
 Acting means cover every position evaluated during the collection call, including capped episodes and unfinished slots. Outcome-conditioned statistics cover only naturally terminated episodes returned by the call.
@@ -288,7 +307,7 @@ Acting means cover every position evaluated during the collection call, includin
 
 ### 9.6 Output initialization
 
-**Paper:** Policy and action-value networks start from random initialization. **Here:** The policy and scalar-Q output layers initialize exactly to zero. **Grounds:** The remaining model parameters retain their configured initialization. **Measured outcomes:** See [ABLATIONS.md § `abl-zeroq-lam01`](ABLATIONS.md#abl-zeroq-lam01).
+**Paper:** Policy and action-value networks start from random initialization. **Here:** The policy, advantage, and critic-baseline output layers initialize exactly to zero. **Grounds:** The remaining model parameters retain their configured initialization. **Measured outcomes:** See [ABLATIONS.md § `abl-zeroq-lam01`](ABLATIONS.md#abl-zeroq-lam01).
 
 ### 9.7 Capped episodes
 
@@ -322,6 +341,10 @@ Acting means cover every position evaluated during the collection call, includin
 
 **Paper:** Experiments use a fixed-action ResNetV2 with policy and action-value heads and no state-value head for KLENT. **Here:** KLENT consumes MantisNet's ragged legal-cell policy/scalar-Q decoders; its model container has a state-value head that KLENT neither calls nor trains. **Grounds:** Hexo's board and legal-action count are variable. **Measured outcomes:** See [ABLATIONS.md § Shared decoder aggregation](ABLATIONS.md#shared-decoder-aggregation-and-triton-segment-reduction) and [§ Critic ranking-stability probe](ABLATIONS.md#critic-ranking-stability-probe).
 
+### 9.15 Critic parameterization
+
+**Paper:** One action-value network emits $Q(s,a)$ per action directly. **Here:** The scalar $Q$ is composed from a per-position baseline read off the global token and a per-action advantage centered on the raw policy, under one unchanged squared-error objective. **Grounds:** The legal-cell decoder then scores only the differences between a position's plausible actions, while the level that is common to them is read once per position. **Measured outcomes:** See [ABLATIONS.md § Training runs](ABLATIONS.md#training-runs).
+
 ## 10. Reference configuration
 
 The current repository reference recipe is:
@@ -332,7 +355,7 @@ The current repository reference recipe is:
 | $\lambda$ | `0.01` |
 | $\tau$ | `0.1` |
 | $\lambda_{\mathrm{ret}}$ | `0.939` |
-| Critic | scalar tanh Q |
+| Critic | dueling scalar tanh Q |
 
 These are configuration facts recorded in [ABLATIONS.md](ABLATIONS.md), which also records their selection.
 

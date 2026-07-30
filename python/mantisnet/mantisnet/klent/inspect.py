@@ -14,7 +14,7 @@ from pathlib import Path
 import torch
 
 from ..builder import collate_prefixes
-from ..segments import segment_log_softmax
+from ..segments import segment_ids, segment_log_softmax
 from .improve import improved_policy
 from .run import load_model
 
@@ -61,7 +61,7 @@ def inspect_position(
         logits, q_values = model.cell_heads(w, g, batch)
         logits, q_values = logits.float().cpu(), q_values.float().cpu()
     offsets = batch.legal_offsets.cpu()
-    log_pi = segment_log_softmax(logits, offsets)
+    log_pi = segment_log_softmax(logits, offsets, segment_ids(offsets))
     imp = improved_policy(logits, q_values, offsets, tau, lam)
 
     legal = position.legal_moves()

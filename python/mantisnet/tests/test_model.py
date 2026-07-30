@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from mantisnet import MantisConfig, MantisNet, collate, from_position
+from mantisnet.segments import segment_ids
 
 
 @torch.no_grad()
@@ -36,6 +37,9 @@ def test_output_contracts(model, positions):
     assert out.policy_logits.shape == (sum(g.n_legal for g in graphs),)
     assert out.q_values.shape == out.policy_logits.shape
     assert torch.isfinite(out.q_values).all()
+    # Appendix B bounds the critic: π′ exponentiates Q/(τ+λ), so an unbounded
+    # action value could sharpen the improvement step without limit.
+    assert torch.all((out.q_values > -1) & (out.q_values < 1))
     assert batch.legal_offsets.tolist() == [0] + list(
         torch.tensor([g.n_legal for g in graphs]).cumsum(0).tolist()
     )
@@ -45,6 +49,27 @@ def test_output_contracts(model, positions):
     # The scalar is the distribution's decode — the same value every consumer sees.
     assert torch.allclose(out.value, out.value_dist @ model.bin_centers, atol=1e-6)
     assert torch.isfinite(out.policy_logits).all()
+
+
+@torch.no_grad()
+def test_zero_init_gives_exactly_zero_logits_and_action_values(positions):
+    """Appendix B's initialization contract. The dueling critic composes three
+    readouts, and all three start at zero: a zero advantage centers to zero and
+    a zero baseline adds nothing, so Q is exactly zero — not approximately, and
+    not merely equal across a position's cells."""
+    torch.manual_seed(2)
+    net = MantisNet(MantisConfig()).eval()
+    out = net(collate([from_position(p) for p in positions]))
+    assert torch.count_nonzero(out.policy_logits) == 0
+    assert torch.count_nonzero(out.q_values) == 0
+
+
+def test_cell_pos_is_the_legal_offsets_segment_index(positions):
+    """The critic's centering reduces over ``cell_pos`` because the builder
+    already computed it; everything else ragged reduces over
+    ``segment_ids(legal_offsets)``. Nothing else asserts they are one index."""
+    batch = collate([from_position(p) for p in positions])
+    assert torch.equal(batch.cell_pos, segment_ids(batch.legal_offsets))
 
 
 def test_dropout_config_runs_and_eval_is_deterministic(positions):
@@ -70,6 +95,10 @@ def test_cuda_bf16_smoke(model, positions):
         with torch.autocast("cuda", dtype=torch.bfloat16):
             out = net(batch)
         assert torch.isfinite(out.policy_logits).all()
+        # The critic composes and bounds in fp32 whatever autocast chose for
+        # the head GEMMs, so Q means the same thing under either.
+        assert out.q_values.dtype == torch.float32
+        assert torch.all((out.q_values > -1) & (out.q_values < 1))
         assert torch.isfinite(out.value).all()
         assert out.value_dist.dtype == torch.float32
         assert torch.allclose(

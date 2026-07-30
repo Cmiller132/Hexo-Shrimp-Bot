@@ -7,6 +7,8 @@ cells from the bucket table. The implementation aggregates before projection.
 
 from __future__ import annotations
 
+import copy
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -110,19 +112,44 @@ def test_slack_columns_never_contribute(positions, model):
 
 @torch.no_grad()
 def test_cell_heads_match_the_spec_decode(positions, model):
-    batch = _batch(positions)
-    _s, w, g = model.trunk(batch)
-    policy, q = model.cell_heads(w, g, batch)
+    """§6's logit and appendix B's dueling action value, both transcribed.
 
-    for scores, tail, proj, e_class, e_bg, mlp in (
-        (policy, lambda x: x, model.p, model.e_pw, model.e_bg, model.mlp_p),
-        (q, torch.tanh, model.q, model.e_qw, model.e_qbg, model.mlp_q),
-    ):
+    Every readout of the fixture model is zero-initialized, which makes the
+    critic's composition hold for any centering weight at all; the perturbed
+    copy is what pins it. The scale keeps the advantage off tanh's saturated
+    tail, where a difference of large numbers would compare nothing. The
+    centering is a per-position Python loop here, not the segment helpers the
+    head uses.
+    """
+    net = copy.deepcopy(model)
+    torch.manual_seed(4)
+    for out in (net.mlp_p.out, net.mlp_q.out, net.mlp_qbase[-1]):
+        torch.nn.init.normal_(out.weight, std=0.1)
+        torch.nn.init.normal_(out.bias, std=0.1)
+
+    batch = _batch(positions)
+    _s, w, g = net.trunk(batch)
+    policy, q = net.cell_heads(w, g, batch)
+
+    def decode(proj, e_class, e_bg, mlp):
         h = _spec_decoder_input(w, batch, proj.weight, e_class.weight, e_bg.weight)
-        spec = mlp.out(
+        return mlp.out(
             F.relu(mlp.lin_a(h) + mlp.lin_b(g).index_select(0, batch.cell_pos))
         ).squeeze(-1)
-        torch.testing.assert_close(scores, tail(spec), rtol=1e-4, atol=1e-4)
+
+    logits = decode(net.p, net.e_pw, net.e_bg, net.mlp_p)
+    torch.testing.assert_close(policy, logits, rtol=1e-4, atol=1e-4)
+
+    advantage = decode(net.q, net.e_qw, net.e_qbg, net.mlp_q)
+    baseline = net.mlp_qbase(g).squeeze(-1)
+    bounds = batch.legal_offsets.tolist()
+    expected = []
+    for i in range(batch.n_pos):
+        low, high = bounds[i], bounds[i + 1]
+        pi = logits[low:high].softmax(0)
+        a = advantage[low:high]
+        expected.append(torch.tanh(baseline[i] + a - (pi * a).sum()))
+    torch.testing.assert_close(q, torch.cat(expected), rtol=1e-4, atol=1e-4)
 
 
 @torch.no_grad()
@@ -131,6 +158,62 @@ def test_policy_head_matches_the_pair(positions, model):
     _s, w, g = model.trunk(batch)
     policy, _q = model.cell_heads(w, g, batch)
     assert torch.equal(model.policy_head(w, g, batch), policy)
+
+
+def test_the_critic_error_never_reaches_the_policy_decoder(positions, model):
+    """Appendix B's ``sg[·]`` on the centering weight, as a gradient contract.
+
+    The critic centers on π_θ from its own forward, so the policy decoder is
+    upstream of Q. Detached, it is not upstream of the *gradient*: the taken
+    action's ``(Q - G)²`` trains the advantage, the baseline and the trunk, and
+    reaches no parameter the policy logit alone owns. That is what keeps π
+    meaning the policy its own cross-entropy trained, and it is the only thing
+    here that changes if the stop-gradient goes.
+    """
+    net = copy.deepcopy(model)
+    torch.manual_seed(6)
+    for out in (net.mlp_p.out, net.mlp_q.out, net.mlp_qbase[-1]):
+        torch.nn.init.normal_(out.weight, std=0.1)
+        torch.nn.init.normal_(out.bias, std=0.1)
+
+    batch = _batch(positions)
+    assert batch.bg_cell.numel(), "the background tables are inert without a background cell"
+
+    def grads_of(loss):
+        net.zero_grad(set_to_none=True)
+        logits, q = net.cell_heads(*net.trunk(batch)[1:], batch)
+        loss(logits, q).backward()
+        return {name: p.grad for name, p in net.named_parameters() if p.grad is not None}
+
+    # The objective's critic term: one taken action per position, against targets
+    # spread over the range so no position's contribution cancels another's.
+    taken = batch.legal_offsets[:-1]
+    returns = torch.linspace(-0.9, 0.9, taken.shape[0])
+    critic = grads_of(lambda _logits, q: (q.index_select(0, taken) - returns).square().mean())
+    policy = grads_of(lambda logits, _q: logits.sum())
+
+    # The §6 decoder, parameter by parameter: nothing else produces the logit,
+    # and the logit is the whole of what the critic reads them through.
+    policy_only = {
+        "p.weight",
+        "e_pw.weight",
+        "e_bg.weight",
+        "mlp_p.lin_a.weight",
+        "mlp_p.lin_a.bias",
+        "mlp_p.lin_b.weight",
+        "mlp_p.out.weight",
+        "mlp_p.out.bias",
+    }
+    assert policy_only.isdisjoint(critic)
+    # Every one of them is reachable from the logit, so the line above is a
+    # stop-gradient and not a dead path.
+    assert policy_only <= set(policy)
+    assert all(torch.count_nonzero(policy[name]) > 0 for name in policy_only)
+    # What the critic's error does train: both of the advantage's terms, the
+    # baseline, and the shared trunk.
+    for name in ("q.weight", "mlp_q.lin_a.weight", "mlp_q.out.weight",
+                 "mlp_qbase.0.weight", "mlp_qbase.2.weight", "ln_out.weight"):
+        assert name in critic and torch.count_nonzero(critic[name]) > 0, name
 
 
 def test_aggregation_gradient_flows_only_to_the_windows(positions):
@@ -204,8 +287,11 @@ def test_compiled_dynamic_heads_match_eager(positions, model):
     )
     try:
         # Several shapes through one dynamic graph: the aggregation stays in it
-        # only if its fake kernel tracks the symbolic cell count.
-        for count in (2, 5, len(positions)):
+        # only if its fake kernel tracks the symbolic cell count. One position
+        # is the case worth naming — the critic's centering reduces every legal
+        # cell into a single row there, which is where a scatter lowering that
+        # drops its bounds mask would quietly sum padding lanes too.
+        for count in (1, 2, 5, len(positions)):
             batch = _batch(positions[:count]).to("cuda")
             eager = model.cell_heads(*model.trunk(batch)[1:], batch)
             got = compiled(model, batch)

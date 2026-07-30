@@ -23,6 +23,7 @@ from torch import Tensor, nn
 from . import decoder
 from .attention import fused_attention
 from .builder import NEAREST_BUCKETS, NUM_PATTERNS, Batch
+from .segments import segment_log_softmax, segment_sum
 
 
 @dataclass(frozen=True)
@@ -202,11 +203,13 @@ class MantisNet(nn.Module):
         self.mlp_p = _PairMlp(h, cfg.policy_hidden, 1)
 
         # Appendix B action-value decoder: the same shape as §6 with its own
-        # parameters everywhere, one raw Q per legal cell. KLENT's head.
+        # parameters everywhere, one raw advantage per legal cell, plus the
+        # per-position baseline read off the token. KLENT's head.
         self.q = nn.Linear(h, h, bias=False)
         self.e_qw = nn.Embedding(3, h)
         self.e_qbg = nn.Embedding(NEAREST_BUCKETS, h)
         self.mlp_q = _PairMlp(h, cfg.policy_hidden, 1)
+        self.mlp_qbase = _mlp(h, cfg.policy_hidden, 1)
 
         # §7 value head.
         self.value_queries = nn.Parameter(torch.empty(cfg.value_queries, h))
@@ -226,11 +229,13 @@ class MantisNet(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
         nn.init.normal_(self.token_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
-        # Both decoder outputs start at zero, so initial policy logits and Q
-        # values are constant across legal cells.
-        for head in (self.mlp_p, self.mlp_q):
-            nn.init.zeros_(head.out.weight)
-            nn.init.zeros_(head.out.bias)
+        # Every readout the cell heads compose starts at zero, so initial
+        # policy logits are constant across legal cells and initial action
+        # values are exactly zero: a zero advantage centers to zero and a zero
+        # baseline adds nothing.
+        for out in (self.mlp_p.out, self.mlp_q.out, self.mlp_qbase[-1]):
+            nn.init.zeros_(out.weight)
+            nn.init.zeros_(out.bias)
 
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""
@@ -292,20 +297,41 @@ class MantisNet(nn.Module):
         """Return §6 policy logits and appendix-B scalar action values.
 
         Both heads use the same parameter-free incidence aggregation and own
-        separate decoder parameters. Action values are bounded by tanh.
+        separate decoder parameters. The critic is dueling: the legal-cell
+        decoder scores an advantage ``A``, a readout over the global token
+        scores a per-position baseline ``v``, and
+
+            Q(s, a) = tanh( v(s) + A(s, a) - Σ_b π_θ(b|s) A(s, b) )
+
+        so the decoder carries only how an action compares with the position's
+        other plausible actions while the level — how won the position is —
+        lives in ``v``.
+
+        The centering weight is π_θ from this same forward, detached. It is not
+        π′, which is a function of Q and would make Q its own fixed point; and
+        it is detached because the policy is trained by its cross-entropy
+        alone, never by the critic's error. Gradients reach ``A`` through both
+        of its terms and ``v`` through its own.
+
+        Composition and the tanh run in fp32, so bf16 autocast cannot change
+        what an action value means. The centering broadcasts back over
+        ``batch.cell_pos``, the builder's per-cell position index — the segment
+        index of ``batch.legal_offsets`` (§9), already computed, so the forward
+        still discovers no index of its own.
         """
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
         rows = self._decoder_rows(w, batch, g_p.dtype)
-        return (
-            self._cell_scores(
-                rows, g_p, batch, self.p, self.e_pw, self.e_bg, self.mlp_p
-            ),
-            torch.tanh(
-                self._cell_scores(
-                    rows, g_q, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q
-                )
-            ),
+        logits = self._cell_scores(
+            rows, g_p, batch, self.p, self.e_pw, self.e_bg, self.mlp_p
         )
+        advantage = self._cell_scores(
+            rows, g_q, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q
+        ).float()
+        offsets, cells = batch.legal_offsets, batch.cell_pos
+        pi = segment_log_softmax(logits.detach().float(), offsets, cells).exp()
+        level = segment_sum(pi * advantage, offsets)
+        baseline = self.mlp_qbase(g).float().squeeze(-1)
+        return logits, torch.tanh(advantage + (baseline - level).index_select(0, cells))
 
     def value_head(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """§7: (value, value_dist, value_logits). Multi-query attention

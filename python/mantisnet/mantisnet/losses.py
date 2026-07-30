@@ -49,7 +49,7 @@ def policy_loss(logits: Tensor, offsets: Tensor, target: Tensor) -> Tensor:
 
     target = target.float()
     # Accumulating in f64 keeps fp32 rounding below the normalization tolerance.
-    sums = segment_sum(target.double(), seg, p)
+    sums = segment_sum(target.double(), offsets)
     if not torch.allclose(sums, torch.ones_like(sums), atol=1e-4):
         dev = (sums - 1.0).abs()
         worst = int(dev.argmax())
@@ -61,8 +61,8 @@ def policy_loss(logits: Tensor, offsets: Tensor, target: Tensor) -> Tensor:
             f"{int(target.isnan().sum())} NaN / {int(target.isinf().sum())} Inf entries"
         )
 
-    log_probs = segment_log_softmax(logits.float(), offsets)
-    return segment_sum(-(target * log_probs), seg, p).mean()
+    log_probs = segment_log_softmax(logits.float(), offsets, seg)
+    return segment_sum(-(target * log_probs), offsets).mean()
 
 
 def param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
