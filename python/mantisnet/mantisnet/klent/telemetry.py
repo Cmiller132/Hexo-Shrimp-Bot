@@ -128,10 +128,10 @@ CREATE TABLE opponents (
 CREATE TABLE eval_matches (
     match_id   INTEGER PRIMARY KEY,
     created    TEXT NOT NULL,
-    source     TEXT NOT NULL,   -- 'driver' (in-loop) | 'cli' (offline sweep)
+    source     TEXT NOT NULL,   -- 'driver' (in-loop) | 'cli' (offline sweep) | 'deck'
     opponent   INTEGER NOT NULL REFERENCES opponents(opponent_id),
-    iteration  INTEGER,         -- driver: iterations completed; cli: from the checkpoint name
-    checkpoint TEXT,            -- cli only; the driver measures live weights
+    iteration  INTEGER,         -- driver: iterations completed; else the checkpoint name's
+    checkpoint TEXT,            -- cli and deck only; the driver measures live weights
     games      INTEGER NOT NULL,
     score      REAL NOT NULL,
     win_rate   REAL NOT NULL,
