@@ -32,7 +32,7 @@ from pathlib import Path
 import numpy as np
 
 # Covers every table, column, and packing below; mismatches are refused on open.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 DB_NAME = "telemetry.db"
 
@@ -58,9 +58,9 @@ _ITERATION_METRICS = (
     ("q_loss", "REAL"),
     ("fit_steps", "INTEGER"),
     ("seconds", "REAL"),
-    ("eval_score", "REAL"),
-    ("eval_capped", "INTEGER"),
-    ("eval_games", "INTEGER"),
+    # An iteration evaluates against every configured opponent, so its score is
+    # not one number. Each match is its own attributed ``eval_matches`` row,
+    # keyed by this iteration; only the wall time around them all is scalar.
     ("eval_seconds", "REAL"),
 )
 
@@ -128,10 +128,10 @@ CREATE TABLE opponents (
 CREATE TABLE eval_matches (
     match_id   INTEGER PRIMARY KEY,
     created    TEXT NOT NULL,
-    source     TEXT NOT NULL,   -- 'driver' (in-loop) | 'cli' (offline sweep)
+    source     TEXT NOT NULL,   -- 'driver' (in-loop) | 'cli' (offline sweep) | 'deck'
     opponent   INTEGER NOT NULL REFERENCES opponents(opponent_id),
-    iteration  INTEGER,         -- driver: iterations completed; cli: from the checkpoint name
-    checkpoint TEXT,            -- cli only; the driver measures live weights
+    iteration  INTEGER,         -- driver: iterations completed; else the checkpoint name's
+    checkpoint TEXT,            -- cli and deck only; the driver measures live weights
     games      INTEGER NOT NULL,
     score      REAL NOT NULL,
     win_rate   REAL NOT NULL,
@@ -664,11 +664,13 @@ def _ply_rows(ids, episodes):
 
 
 def convert_v1(run_dir) -> None:
-    """Convert an inactive schema-v1 database to schema v2.
+    """Convert an inactive schema-v1 database to the current schema.
 
     The conversion builds a fresh database, quantizes ply scalars, sets
-    v2-only match columns to NULL, swaps the files, and retains the v1 file as
-    ``telemetry.db.v1.bak``. The caller must ensure no process is writing it.
+    match columns v1 did not have to NULL, drops v1's per-iteration evaluation
+    projection — which its ``eval_matches`` rows already carry — swaps the
+    files, and retains the v1 file as ``telemetry.db.v1.bak``. The caller must
+    ensure no process is writing it.
     """
     path = db_path(run_dir)
     if not path.exists():
@@ -681,14 +683,23 @@ def convert_v1(run_dir) -> None:
     if found != 1:
         raise ValueError(f"convert regenerates v1 databases only; {path} is v{found}")
 
-    fresh_path = path.with_suffix(".v2.tmp")
+    fresh_path = path.with_suffix(".convert.tmp")
     fresh_path.unlink(missing_ok=True)
-    conn = _connect(fresh_path)  # builds the v2 schema
+    conn = _connect(fresh_path)  # builds the current schema
     try:
         conn.execute("ATTACH DATABASE ? AS v1", (str(path),))
+        # Every current iterations column is a v1 column, so naming them both
+        # sides carries the shared ones and drops the rest.
+        carried = ", ".join(
+            row["name"]
+            for row in conn.execute("PRAGMA main.table_info(iterations)")
+        )
         with conn:
             conn.execute("INSERT INTO runs SELECT * FROM v1.runs")
-            conn.execute("INSERT INTO iterations SELECT * FROM v1.iterations")
+            conn.execute(
+                f"INSERT INTO iterations ({carried})"
+                f" SELECT {carried} FROM v1.iterations"
+            )
             conn.execute("INSERT INTO opponents SELECT * FROM v1.opponents")
             conn.execute(
                 "INSERT INTO eval_matches (created, source, opponent, iteration,"
@@ -716,7 +727,7 @@ def convert_v1(run_dir) -> None:
     backup = path.with_suffix(".db.v1.bak")
     path.replace(backup)
     fresh_path.replace(path)
-    print(f"{path}: regenerated as schema v2; v1 original at {backup}")
+    print(f"{path}: regenerated as schema v{SCHEMA_VERSION}; v1 original at {backup}")
 
 
 def _rows(conn, sql: str, params=()) -> list[dict]:

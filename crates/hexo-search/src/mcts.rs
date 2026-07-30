@@ -5,7 +5,7 @@ use crate::seam::Evaluation;
 use crate::select::{Child, SearchOutcome, SelectFromSearch};
 use crate::session::{DecisionSession, LeafId, SessionStatus};
 use hexo_engine::{Action, Player, Position, Search};
-use hexo_runner::{Decision, Game};
+use hexo_runner::Decision;
 use std::num::{NonZeroU32, NonZeroUsize};
 
 /// The shape of one tree search.
@@ -478,18 +478,13 @@ impl MctsSession {
 }
 
 impl DecisionSession for MctsSession {
-    fn begin(&mut self, game: &Game) {
+    fn begin(&mut self, position: &Position) {
         assert!(
-            game.result().is_none(),
-            "MctsSession::begin on a game that finished as {:?}; a driver only asks a live game's \
+            !position.is_terminal(),
+            "MctsSession::begin on a terminal position; a driver only asks a live position's \
              mover",
-            game.result(),
         );
-        self.root.clone_from(game.position());
-        debug_assert!(
-            !self.root.is_terminal(),
-            "a live game's position is never terminal",
-        );
+        self.root.clone_from(position);
         self.walker.restart(self.root.current_player());
         self.summary.clear();
         self.begun = true;
@@ -590,7 +585,7 @@ impl DecisionSession for MctsSession {
 mod tests {
     use super::*;
     use hexo_engine::{Action, HexCoord};
-    use hexo_runner::{GameSpec, Reply, Step as GameStep};
+    use hexo_runner::{Game, GameSpec, Reply, Step as GameStep};
 
     /// A selector that always plays the most-visited child.
     struct MaxVisits;
@@ -634,7 +629,7 @@ mod tests {
 
     /// Drive one decision with uniform priors and value zero.
     fn run(session: &mut MctsSession, game: &Game) -> Decision {
-        session.begin(game);
+        session.begin(game.position());
         let mut leaves: Vec<(LeafId, usize)> = Vec::new();
         loop {
             leaves.clear();
@@ -663,7 +658,7 @@ mod tests {
         let edges = session.walker.tree.edges.capacity();
         assert!(nodes > 0 && edges > 0);
 
-        session.begin(&game);
+        session.begin(game.position());
         assert_eq!(session.walker.tree.nodes.len(), 1, "only the root survives");
         assert!(session.walker.tree.edges.is_empty());
         assert_eq!(session.walker.tree.nodes.capacity(), nodes);
@@ -704,7 +699,7 @@ mod tests {
         let mut session = MctsSession::new(config(4, 1), Box::new(MaxVisits), 1);
         let mut seen = Vec::new();
         for _ in 0..3 {
-            session.begin(&game);
+            session.begin(game.position());
             loop {
                 let mut round = Vec::new();
                 let status = session.pump(&mut |leaf, position| {

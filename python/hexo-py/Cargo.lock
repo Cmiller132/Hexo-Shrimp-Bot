@@ -78,6 +78,7 @@ version = "0.1.0"
 dependencies = [
  "hexo-engine",
  "hexo-model-mantisnet",
+ "hexo-runner",
  "numpy",
  "pyo3",
 ]

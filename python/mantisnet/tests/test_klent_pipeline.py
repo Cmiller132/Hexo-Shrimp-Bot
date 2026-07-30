@@ -19,13 +19,15 @@ from mantisnet.klent import (
     play_match,
 )
 from mantisnet.klent.evaluate import argmax_choose
+from mantisnet.klent.opponents import shared_openings
 from mantisnet.klent.train import _pack, fit, network_evaluate
+from mantisnet.model import CRITIC_LOGITS
 
 from .heuristic import heuristic_choose, heuristic_evaluate
 
 
-def _tiny_model():
-    torch.manual_seed(5)
+def _tiny_model(seed: int = 5):
+    torch.manual_seed(seed)
     return MantisNet(
         MantisConfig(
             h=32, blocks=1, heads=2, value_queries=2, value_bins=5,
@@ -176,7 +178,9 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
     cfg = KlentConfig(batch_size=64)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     metrics = fit(model, samples, optimizer, cfg, rng)
-    assert np.isfinite(metrics["policy_loss"]) and np.isfinite(metrics["q_loss"])
+    for key in ("policy_loss", "q_loss", "mass_loss"):
+        assert np.isfinite(metrics[key]), key
+    assert metrics["mass_loss"] > 0  # two cross-entropies against soft targets
     # Groups close at >= batch_size samples and may overshoot by one chunk,
     # so the step count is bounded by, not equal to, ceil(n / batch_size).
     assert 1 <= metrics["fit_steps"] <= (len(samples) + 63) // 64
@@ -188,6 +192,11 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
             assert p.grad is None, f"value head parameter {name} was trained"
         else:
             assert p.grad is not None, f"{name} received no gradient"
+    # Both critic readout rows train: the squared error moves the composed Q
+    # and each cross-entropy moves its own mass.
+    rows = model.mlp_q.out.weight.grad.abs().sum(dim=1)
+    assert rows.shape == (CRITIC_LOGITS,)
+    assert (rows > 0).all(), "a return mass received no gradient"
 
 
 def test_collect_and_fit_end_to_end():
@@ -209,26 +218,66 @@ def test_collect_and_fit_end_to_end():
 
 
 def test_network_evaluate_matches_forward():
+    """The acting seam composes what the full forward reports. The critic
+    readout is perturbed off zero first, or both sides would be zero and the
+    composition would go untested."""
     model = _tiny_model().eval()
     from mantisnet import collate, from_position
 
+    with torch.no_grad():
+        model.mlp_q.out.weight.normal_(std=0.5)
+        model.mlp_q.out.bias.normal_(std=0.5)
     pos = hexo_py.Position.replay([(0, 0), (1, 1), (2, 0)])
     batch = collate([from_position(pos)])
     logits, q = network_evaluate(model, KlentConfig())(batch)
     with torch.no_grad():
         out = model(batch)
+    assert q.abs().max() > 0
     assert torch.allclose(logits, out.policy_logits, atol=1e-6)
     assert torch.allclose(q, out.q_values, atol=1e-6)
 
 
 def test_play_match_is_seat_balanced_and_scores_caps_as_half():
     rng = np.random.default_rng(13)
-    result = play_match(heuristic_choose, heuristic_choose, games=4, ply_cap=300, rng=rng)
+    result, rows = play_match(
+        heuristic_choose, heuristic_choose, shared_openings(rng, 2), 300, rng
+    )
     assert result["games"] == 4
     assert 0.0 <= result["score_a"] <= 4.0
     assert result["capped"] * 0.5 <= result["score_a"] <= 4 - result["capped"] * 0.5
+    assert result["score_a_as_p0"] + result["score_a_as_p1"] == result["score_a"]
+    assert [row["seat"] for row in rows] == [0, 1, 0, 1]
 
     model = _tiny_model().eval()
-    quick = play_match(argmax_choose(model), heuristic_choose, games=2, ply_cap=30, rng=rng)
+    quick, _rows = play_match(
+        argmax_choose(model), heuristic_choose, shared_openings(rng, 1), 30, rng
+    )
     assert quick["games"] == 2
     assert 0.0 <= quick["score_a"] <= 2.0
+
+
+def _distinguishable_model(seed: int):
+    """A tiny model whose policy is not constant: the output layers initialize to
+    zero, so two fresh models both argmax to legal rank 0 and play one line."""
+    model = _tiny_model(seed).eval()
+    with torch.no_grad():
+        for param in model.parameters():
+            param.add_(torch.randn_like(param) * 0.1)
+    return model
+
+
+def test_play_match_plays_a_distinct_game_per_schedule_entry():
+    """The schedule's openings are the whole source of a match's diversity: two
+    deterministic choosers from one start play one game however often they are
+    asked to. Both choosers here ignore the generator, so every distinction below
+    is the schedule's."""
+    schedule = shared_openings(np.random.default_rng(4), 4)
+    _summary, rows = play_match(
+        argmax_choose(_distinguishable_model(5)),
+        argmax_choose(_distinguishable_model(9)),
+        schedule,
+        60,
+        np.random.default_rng(0),
+    )
+    assert len({tuple(row["opening"]) for row in rows}) == 4
+    assert len({tuple(row["moves"]) for row in rows}) == 8

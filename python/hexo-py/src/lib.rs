@@ -263,5 +263,11 @@ fn hexo_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ACTION_ORDER_VERSION", engine::ACTION_ORDER_VERSION)?;
     m.add("LEGAL_RADIUS", engine::LEGAL_RADIUS)?;
     m.add("MODEL_REPR_VERSION", MODEL_REPR_VERSION)?;
+    // A host orchestrator opens every seat with the three versions of
+    // `CONTAINER_SPEC.md` §3.1's handshake. Two of them are the engine's and
+    // already here; the third is the runner's, and a Python orchestrator
+    // holding its own copy of that number is the drift this re-export exists
+    // to prevent.
+    m.add("PROTOCOL_VERSION", hexo_runner::PROTOCOL_VERSION)?;
     Ok(())
 }

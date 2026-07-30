@@ -5,7 +5,7 @@ use crate::seam::Evaluation;
 use crate::select::SelectFromPolicy;
 use crate::session::{DecisionSession, LeafId, SessionStatus};
 use hexo_engine::Position;
-use hexo_runner::{Decision, Game};
+use hexo_runner::Decision;
 
 /// Where a [`PolicySession`] is in its one-question cycle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,14 +50,13 @@ impl PolicySession {
 }
 
 impl DecisionSession for PolicySession {
-    fn begin(&mut self, game: &Game) {
+    fn begin(&mut self, position: &Position) {
         assert!(
-            game.result().is_none(),
-            "PolicySession::begin on a game that finished as {:?}; a driver only asks a live \
-             game's mover",
-            game.result(),
+            !position.is_terminal(),
+            "PolicySession::begin on a terminal position; a driver only asks a live position's \
+             mover",
         );
-        self.root.clone_from(game.position());
+        self.root.clone_from(position);
         self.state = State::Wanted;
         self.decision = None;
     }

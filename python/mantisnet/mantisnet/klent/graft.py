@@ -1,44 +1,31 @@
-"""Graft the joint-class decoder onto a checkpoint trained with slot classes.
+"""Apply the joint-class decoder and bipolar return-mass grafts together.
 
-MODEL_SPEC §4.3's decoder class keys a window's occupancy and the candidate's own
-slot jointly, where it used to key the reversal-invariant slot class alone. The
-two cell heads' class tables therefore grow from 3 rows to ``DEC_CLASSES``, and
-the conversion fills each new row with the parent row its class replaces: every
-joint class has one slot class — the two members of a reversal orbit are mirrored
-slots, and mirrored slots share a slot class — so the expansion is a row
-replication and nothing else. Each entry of the decoder incidence then contributes
-the embedding it contributed before, and the grafted model is the parent as a
-function.
+The parent has three-row slot-class tables in both cell heads and a one-row
+scalar critic readout followed by ``tanh``. This build has 93-row joint-class
+tables and a two-row critic composed as ``sigmoid(z_pos) - sigmoid(z_neg)``.
+The transforms are disjoint:
 
-Preservation is exact, and is checked without a tolerance three ways: every parent
-tensor the transform does not touch is compared bit for bit against the source
-file; each expanded row is compared bit for bit against the parent row it claims
-to replicate; and MODEL_SPEC §6's decode, transcribed here rather than taken from
-the model, is compared bit for bit between the parent's 3-row tables under its
-slot classes and the grafted tables under the builder's joint classes. The third
-is end-to-end over both heads and the background path, and catches an expansion
-written by one index and read by another — a swapped table, a transposed one, an
-off-by-one on one side only.
+* each joint-class row copies the slot-class row it replaces; and
+* ``(W, b)`` becomes ``(2W, 2b)`` and ``(-2W, -2b)``, because
+  ``sigmoid(2z) - sigmoid(-2z) = tanh(z)``.
 
-What none of the three can catch is a row map that is consistently wrong, since it
-would be applied to both sides: that ``min(slot, 5 - slot)`` is the parent row of
-each joint class rests on ``parent_row_of_class`` refusing a class whose two
-mirrored slots disagree, and on the test oracle deriving the same map from the
-engine's own window walk.
+The conversion applies both in one state-dict pass and remaps each parameter's
+Adam moments exactly as its transform requires. There is no single-arm mode.
 
-What is not exact is the model's own arithmetic. The class coefficient block widens
-from 3 columns to 93, so the head GEMM's K grows and its sum is reassociated; the
-folded path is therefore compared against the spec decode under an fp32 bound,
-which one unmodified model already needs against itself.
+The joint detector compares every untouched tensor with a second read of the
+source file, checks every replicated row bit for bit, and transcribes
+MODEL_SPEC §6 independently to compare the parent slot decode with the expanded
+joint decode bit for bit. The BRM detector runs the complete grafted model and
+the parent checkpoint in its own architecture on a separate fixed probe, then
+enforces ``MAX_ABS_DQ`` and ``MAX_MEAN_KL`` at the supplied ``--tau``/``--lam``.
+A failed check writes neither output.
 
-A conversion that fails any of this writes neither checkpoint nor manifest.
+``MODEL_REPR_VERSION`` moves here because the joint decoder changes the model
+representation. Run from ``python/mantisnet``:
 
-This is also where ``MODEL_REPR_VERSION`` moves: the representation changed, so
-the parent's own version is refused everywhere else and rewritten here alone.
+    python -m mantisnet.klent.graft OLD.pt NEW.pt --tau T --lam L
 
-Run from ``python/mantisnet``:
-
-    python -m mantisnet.klent.graft OLD.pt NEW.pt --tau T --lam L --manifest OUT.json
+The evidence sidecar is derived from ``NEW.pt`` as ``NEW.json``.
 """
 
 from __future__ import annotations
@@ -56,22 +43,33 @@ import hexo_py
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
 
-from ..builder import DEC_CLASSES, WINDOW_LEN, Batch, _DEC_CLASS, collate, from_position
+from ..builder import (
+    DEC_CLASSES,
+    WINDOW_LEN,
+    Batch,
+    _DEC_CLASS,
+    collate,
+    collate_prefixes,
+    from_position,
+)
 from ..model import MantisConfig, MantisNet
 from ..segments import segment_ids, segment_sum
 from .improve import improved_policy
 from .run import _versions
 
-ARM = "joint-slot-decoder"
+ARM = "joint-brm"
 
-# What the transform owns: the two decoder class tables, and nothing else.
 _EXPANDED_KEYS = ("e_pw.weight", "e_qw.weight")
+_READOUT_KEYS = ("mlp_q.out.weight", "mlp_q.out.bias")
+_TRANSFORMED_KEYS = frozenset((*_EXPANDED_KEYS, *_READOUT_KEYS))
+READOUT_GAIN = 2.0
 TRANSFORM = (
-    "expand e_pw and e_qw from 3 slot-class rows to 93 joint-class rows, each a "
-    "copy of the slot-class row its class replaces; every other parent tensor "
-    "copied unchanged"
+    "expand e_pw and e_qw from 3 slot-class rows to 93 joint-class rows by "
+    "parent-row replication; set the scalar critic readout to W_pos = 2 W_s, "
+    "b_pos = 2 b_s, W_neg = -2 W_s, b_neg = -2 b_s; copy every other parent "
+    "tensor unchanged"
 )
 
 # The representation the parent was built under. The conversion is the one place
@@ -81,13 +79,18 @@ PARENT_REPR_VERSION = 1
 # The parent's class count, from before the joint key.
 PARENT_CLASSES = 3
 
-# The probe set: seeded uniformly-random legal playouts, cut over the ply range
-# where a Hexo position has a contested critic and a wide legal set.
-PROBE_SEED = 5_112_303
+# The joint decoder's independent spec-decode probe.
+JOINT_PROBE_SEED = 5_112_303
+JOINT_PROBE_POSITIONS = 64
+JOINT_PROBE_PLIES = (20, 60)
+JOINT_PROBE_TOP_K = 16
+
+# The BRM arm's fixed parent-vs-grafted probe, retained from that arm.
+PROBE_SEED = 314_159
 PROBE_POSITIONS = 64
 PROBE_PLIES = (20, 60)
-# The plausible set per position, over which the critic's spread is reported.
 PROBE_TOP_K = 16
+_PROBE_ATTEMPTS = 100
 
 # The bounds on the model's own folded arithmetic. Preservation itself is exact
 # and checked without a tolerance (``spec_decode_bitwise_equal``); these cover the
@@ -100,12 +103,26 @@ Q_TOLERANCE = 1e-5
 POLICY_TOLERANCE = 1e-4  # raw logits, which are not squashed into [-1, 1]
 KL_TOLERANCE = 1e-5
 
+# The BRM arm's stated preservation bounds. These are fixed evidence gates, not
+# tuning parameters.
+MAX_ABS_DQ = 1e-5
+MAX_MEAN_KL = 1e-6
+PRESERVATION = (
+    "the composed joint-class and bipolar-return-mass model agrees with the "
+    "slot-class scalar-tanh parent on every probe cell's action value and on "
+    "the improved policy, because replicated decoder rows preserve each "
+    "incidence contribution and sigmoid(2z) - sigmoid(-2z) = tanh(z)"
+)
+
 # The parent's cell-head tensors, by state-dict key: window projection, class
 # table, background-bucket table, and the MLP's prefix.
 _POLICY_HEAD = ("p.weight", "e_pw.weight", "e_bg.weight", "mlp_p")
 _CRITIC_HEAD = ("q.weight", "e_qw.weight", "e_qbg.weight", "mlp_q")
 
-_CHECKPOINT_KEYS = frozenset({"model", "optimizer", "iteration", "rng_state", "versions"})
+_CHECKPOINT_KEYS = frozenset(
+    {"model", "optimizer", "iteration", "rng_state", "versions"}
+)
+_ADAM_FIELDS = ("step", "exp_avg", "exp_avg_sq")
 
 
 def parent_row_of_class() -> np.ndarray:
@@ -143,9 +160,25 @@ def _expand(table: Tensor) -> Tensor:
     """A parent class table as its joint-class replication."""
     if tuple(table.shape[1:]) == () or table.shape[0] != PARENT_CLASSES:
         raise ValueError(
-            f"parent class table must have {PARENT_CLASSES} rows, got {tuple(table.shape)}"
+            f"parent class table must have {PARENT_CLASSES} rows, got "
+            f"{tuple(table.shape)}"
         )
     return table.index_select(0, torch.from_numpy(_PARENT_ROW))
+
+
+def _signed_rows(row: Tensor) -> Tensor:
+    """The bipolar readout's positive and negative rows from one scalar row."""
+    return torch.cat([READOUT_GAIN * row, -READOUT_GAIN * row], dim=0)
+
+
+def _converted_state(old_model: dict[str, Any]) -> dict[str, Any]:
+    """Apply both disjoint parameter transforms in one state-dict pass."""
+    converted = dict(old_model)
+    for key in _EXPANDED_KEYS:
+        converted[key] = _expand(old_model[key])
+    for key in _READOUT_KEYS:
+        converted[key] = _signed_rows(old_model[key])
+    return converted
 
 
 def _architecture_mismatches(old: dict[str, Any], current: dict[str, Any]) -> list[str]:
@@ -159,6 +192,69 @@ def _architecture_mismatches(old: dict[str, Any], current: dict[str, Any]) -> li
         elif old_value.shape != current_value.shape:
             mismatches.append(key)
     return sorted(mismatches)
+
+
+def _check_checkpoint(checkpoint: Any) -> dict[str, Any]:
+    """Validate the complete parent envelope and return its required versions."""
+    if not isinstance(checkpoint, dict) or set(checkpoint) != _CHECKPOINT_KEYS:
+        got = (
+            sorted(checkpoint)
+            if isinstance(checkpoint, dict)
+            else type(checkpoint).__name__
+        )
+        raise ValueError(
+            f"checkpoint must hold exactly {sorted(_CHECKPOINT_KEYS)}, got {got}"
+        )
+    if not isinstance(checkpoint["model"], dict):
+        raise ValueError("checkpoint's model entry must be a state dict")
+    if not isinstance(checkpoint["iteration"], int):
+        raise ValueError("checkpoint's iteration must be an int")
+    if not isinstance(checkpoint["rng_state"], dict):
+        raise ValueError("checkpoint's rng_state must be a bit-generator state")
+    parent_versions = {**_versions(), "MODEL_REPR_VERSION": PARENT_REPR_VERSION}
+    if checkpoint["versions"] != parent_versions:
+        raise ValueError(
+            f"checkpoint versions {checkpoint['versions']} != the parent build "
+            f"{parent_versions}"
+        )
+    return parent_versions
+
+
+def _check_parent_shapes(old_model: dict[str, Any], current: dict[str, Any]) -> None:
+    """Refuse anything except the precise slot-table/scalar-readout parent."""
+    for key in _EXPANDED_KEYS:
+        want = (PARENT_CLASSES, current[key].shape[1])
+        value = old_model[key]
+        if not isinstance(value, Tensor) or tuple(value.shape) != want:
+            got = (
+                tuple(value.shape)
+                if isinstance(value, Tensor)
+                else type(value).__name__
+            )
+            raise ValueError(f"parent {key} must have shape {want}, got {got}")
+
+    hidden = current[_READOUT_KEYS[0]].shape[1]
+    expected = {_READOUT_KEYS[0]: (1, hidden), _READOUT_KEYS[1]: (1,)}
+    wrong = [
+        key
+        for key in _READOUT_KEYS
+        if not isinstance(old_model[key], Tensor)
+        or tuple(old_model[key].shape) != expected[key]
+    ]
+    if wrong:
+        shapes = []
+        for key in wrong:
+            value = old_model[key]
+            shape = (
+                tuple(value.shape)
+                if isinstance(value, Tensor)
+                else type(value).__name__
+            )
+            shapes.append(f"{key}: {shape}")
+        raise ValueError(
+            f"the parent critic readout must be one row {expected}; got "
+            f"{', '.join(shapes)}"
+        )
 
 
 def _shared_digest(state: dict[str, Any], names: list[str]) -> str:
@@ -175,24 +271,20 @@ def _shared_digest(state: dict[str, Any], names: list[str]) -> str:
     return digest.hexdigest()
 
 
-def _adam_state(
-    parent: dict[str, Any], names: list[str], shapes: dict[str, tuple]
+def _remap_adam(
+    saved: Any, old_model: dict[str, Any], names: list[str]
 ) -> dict[str, Any]:
-    """The parent's Adam state remapped onto the new parameter list, by name.
+    """Remap both transforms' Adam moments onto this build's parameter list.
 
-    The parent's numeric ids index its own ``named_parameters()`` order, which is
-    why the caller pins that order first. The transform neither adds nor removes
-    a parameter, so every entry is carried; the two expanded tables' moments are
-    replicated by the same rows as their weights.
-
-    Replicated rather than zeroed, because Adam's update is a ratio of the two
-    moments: a row that inherits both steps as its parent row would have, while a
-    zeroed row would take one full-size bias-corrected step first. The conversion
-    is meant to be continuous in the optimizer as well as in the function.
+    Joint-table moments replicate by the same parent-row map as their weights.
+    For a bipolar row scaled by ``s = ±2``, the first moment scales by ``s`` and
+    the second moment is duplicated unchanged. Adam's ratio then makes the
+    first post-graft update ``s`` times the parent's, preserving the readout's
+    relation in function space.
     """
-    if not isinstance(parent, dict) or not isinstance(parent.get("state"), dict):
+    if not isinstance(saved, dict) or not isinstance(saved.get("state"), dict):
         raise ValueError("checkpoint must contain an Adam optimizer state dict")
-    groups = parent.get("param_groups")
+    groups = saved.get("param_groups")
     if (
         not isinstance(groups, list)
         or len(groups) != 1
@@ -203,29 +295,32 @@ def _adam_state(
             "optimizer must have exactly one param_group holding a params list"
         )
     saved_ids = groups[0]["params"]
-    if len(saved_ids) != len(names):
+    if len(saved_ids) != len(names) or len(set(saved_ids)) != len(saved_ids):
         raise ValueError(
             "optimizer parameter count does not match the checkpoint's parameters: "
-            f"{len(saved_ids)} != {len(names)}"
+            f"{len(saved_ids)} distinct ids for {len(names)} parameters"
         )
 
     state: dict[int, dict] = {}
     for index, (name, param_id) in enumerate(zip(names, saved_ids)):
-        entry = parent["state"].get(param_id)
+        entry = saved["state"].get(param_id)
         if entry is None:
-            # Adam's state dict is sparse: a parameter it never stepped has no
-            # entry at all, which is how the state-value head KLENT does not
-            # train appears in every checkpoint this repo writes. Absence is the
-            # parent's own statement that the parameter is unstepped, so it is
-            # carried as absence rather than zero-filled.
+            if name in _READOUT_KEYS:
+                raise ValueError(
+                    f"the optimizer has no Adam state for {name}, the readout "
+                    "this transform rescales"
+                )
+            # Adam state is sparse; absence is the parent's record that this
+            # parameter has never stepped and is carried as absence.
             continue
         if not isinstance(entry, dict):
             raise ValueError(f"optimizer state for {name} is not a state dict")
-        missing = [f for f in ("step", "exp_avg", "exp_avg_sq") if f not in entry]
+        missing = [field for field in _ADAM_FIELDS if field not in entry]
         if missing:
-            raise ValueError(f"optimizer state for {name} is missing: {', '.join(missing)}")
-        expanded = name in _EXPANDED_KEYS
-        want = (PARENT_CLASSES,) + shapes[name][1:] if expanded else shapes[name]
+            raise ValueError(
+                f"optimizer state for {name} is missing: {', '.join(missing)}"
+            )
+        want = tuple(old_model[name].shape)
         for field in ("exp_avg", "exp_avg_sq"):
             moment = entry[field]
             if not isinstance(moment, Tensor) or tuple(moment.shape) != want:
@@ -234,9 +329,20 @@ def _adam_state(
                     f"shape {want}"
                 )
         entry = copy.deepcopy(entry)
-        if expanded:
+        if name in _EXPANDED_KEYS:
             for field in ("exp_avg", "exp_avg_sq"):
                 entry[field] = _expand(entry[field])
+        elif name in _READOUT_KEYS:
+            extra = set(entry) - set(_ADAM_FIELDS)
+            if extra:
+                raise ValueError(
+                    f"optimizer state for {name} carries {sorted(extra)}, which "
+                    "cannot be mapped onto two rows"
+                )
+            entry["exp_avg"] = _signed_rows(entry["exp_avg"])
+            entry["exp_avg_sq"] = torch.cat(
+                [entry["exp_avg_sq"], entry["exp_avg_sq"]], dim=0
+            )
         state[index] = entry
     if not state:
         raise ValueError("the parent's optimizer stepped no parameter at all")
@@ -244,17 +350,18 @@ def _adam_state(
     return {"state": state, "param_groups": [group]}
 
 
-def _probe_positions() -> list:
-    """The probe set: ``PROBE_POSITIONS`` non-terminal positions from seeded
+def _joint_probe_positions() -> list:
+    """The joint probe: non-terminal positions from seeded
     uniformly-random legal playouts, prefix lengths spread evenly over
-    ``PROBE_PLIES``. A playout that ends the game is retried under a further
-    derived seed, so the set is a function of ``PROBE_SEED`` alone."""
-    low, high = PROBE_PLIES
+    ``JOINT_PROBE_PLIES``. A terminal playout is retried under a derived seed."""
+    low, high = JOINT_PROBE_PLIES
     positions = []
-    for index in range(PROBE_POSITIONS):
-        plies = low + round(index * (high - low) / (PROBE_POSITIONS - 1))
+    for index in range(JOINT_PROBE_POSITIONS):
+        plies = low + round(index * (high - low) / (JOINT_PROBE_POSITIONS - 1))
         for attempt in range(100):
-            rng = random.Random(PROBE_SEED + 1_000_003 * index + 1_009 * attempt)
+            rng = random.Random(
+                JOINT_PROBE_SEED + 1_000_003 * index + 1_009 * attempt
+            )
             position = hexo_py.Position()
             for _ in range(plies):
                 position.advance(*rng.choice(position.legal_moves()))
@@ -262,8 +369,34 @@ def _probe_positions() -> list:
                 positions.append(position)
                 break
         else:
-            raise RuntimeError(f"no non-terminal {plies}-ply probe playout in 100 seeds")
+            raise RuntimeError(
+                f"no non-terminal {plies}-ply probe playout in 100 seeds"
+            )
     return positions
+
+
+def _probe_prefixes() -> list[list[tuple[int, int]]]:
+    """The BRM arm's deterministic nonterminal move-prefix probe."""
+    rng = np.random.default_rng(PROBE_SEED)
+    low, high = PROBE_PLIES
+    prefixes: list[list[tuple[int, int]]] = []
+    for index in range(PROBE_POSITIONS):
+        plies = low + round(index * (high - low) / (PROBE_POSITIONS - 1))
+        for _attempt in range(_PROBE_ATTEMPTS):
+            position, moves = hexo_py.Position(), []
+            for _ in range(plies):
+                legal = position.legal_moves()
+                move = legal[int(rng.integers(len(legal)))]
+                position.advance(*move)
+                moves.append(move)
+            if not position.is_terminal:
+                break
+        else:
+            raise RuntimeError(
+                f"no nonterminal {plies}-ply playout in {_PROBE_ATTEMPTS} draws"
+            )
+        prefixes.append(moves)
+    return prefixes
 
 
 def _spec_scores(
@@ -313,40 +446,48 @@ def _segment_kl(new: Tensor, parent: Tensor, offsets: Tensor) -> Tensor:
     return segment_sum(term, segment_ids(offsets), offsets.shape[0] - 1)
 
 
-def _q_spread(policy: Tensor, q: Tensor, offsets: Tensor) -> float:
-    """Median over positions of σ(Q) across the policy's top-``PROBE_TOP_K``
+def _q_spread(policy: Tensor, q: Tensor, offsets: Tensor, top_k: int) -> float:
+    """Median over positions of σ(Q) across the policy's top-``top_k``
     legal cells — the spread the improvement operator actually exponentiates."""
     spreads = []
     for lo, hi in zip(offsets[:-1].tolist(), offsets[1:].tolist()):
-        top = policy[lo:hi].topk(min(PROBE_TOP_K, hi - lo)).indices
+        top = policy[lo:hi].topk(min(top_k, hi - lo)).indices
         spreads.append(float(q[lo:hi].index_select(0, top).std()))
     return statistics.median(spreads)
 
 
-def _measure(model: MantisNet, parent_model: dict[str, Any], tau: float, lam: float) -> dict:
-    """The grafted model against the parent's own decode on the probe set."""
-    batch = collate([from_position(p) for p in _probe_positions()])
-
-    child_model = model.state_dict()
+def _measure_joint(
+    model: MantisNet, parent_model: dict[str, Any], tau: float, lam: float
+) -> dict:
+    """Run the joint arm's exact spec-decode and folded-arithmetic checks."""
+    batch = collate([from_position(p) for p in _joint_probe_positions()])
     slot_class = torch.from_numpy(_PARENT_ROW).index_select(0, batch.dec_class)
+    # This intermediate state exists only for the independent joint detector:
+    # expanded tables, but the parent's scalar readout. It isolates the class
+    # transform from the disjoint BRM transform without creating an artifact.
+    joint_state = dict(parent_model)
+    for key in _EXPANDED_KEYS:
+        joint_state[key] = _expand(parent_model[key])
+
     with torch.no_grad():
         _s, w, g = model.trunk(batch)
         policy_new, q_new = model.cell_heads(w, g, batch)
-        # The trunk is shared: the transform touches neither its parameters nor
-        # its inputs, so both sides read these rows and the comparison isolates
-        # the decoder.
-        policy_parent = _spec_scores(w, g, batch, parent_model, _POLICY_HEAD, slot_class)
-        q_parent = torch.tanh(
-            _spec_scores(w, g, batch, parent_model, _CRITIC_HEAD, slot_class)
+        policy_parent = _spec_scores(
+            w, g, batch, parent_model, _POLICY_HEAD, slot_class
         )
-        # The same formula over the grafted tables and the joint classes. This is
-        # the exact half of preservation: equal bit for bit, or the expansion put
-        # a row somewhere the decoder does not read it.
-        policy_child = _spec_scores(w, g, batch, child_model, _POLICY_HEAD, batch.dec_class)
-        q_child = torch.tanh(
-            _spec_scores(w, g, batch, child_model, _CRITIC_HEAD, batch.dec_class)
+        q_parent_score = _spec_scores(
+            w, g, batch, parent_model, _CRITIC_HEAD, slot_class
         )
-        exact = torch.equal(policy_child, policy_parent) and torch.equal(q_child, q_parent)
+        q_parent = torch.tanh(q_parent_score)
+        policy_joint = _spec_scores(
+            w, g, batch, joint_state, _POLICY_HEAD, batch.dec_class
+        )
+        q_joint_score = _spec_scores(
+            w, g, batch, joint_state, _CRITIC_HEAD, batch.dec_class
+        )
+        exact = torch.equal(policy_joint, policy_parent) and torch.equal(
+            q_joint_score, q_parent_score
+        )
 
     offsets = batch.legal_offsets
     kl = _segment_kl(
@@ -357,105 +498,153 @@ def _measure(model: MantisNet, parent_model: dict[str, Any], tau: float, lam: fl
     q_delta = (q_new - q_parent).abs()
     policy_delta = (policy_new - policy_parent).abs()
     return {
-        "probe": {
-            "seed": PROBE_SEED,
+        "joint_probe": {
+            "seed": JOINT_PROBE_SEED,
             "positions": batch.n_pos,
-            "plies": list(PROBE_PLIES),
+            "plies": list(JOINT_PROBE_PLIES),
             "legal_cells": batch.n_cells,
             "decoder_entries": int(batch.dec_class.shape[0]),
             "classes_exercised": int(batch.dec_class.unique().numel()),
-            "top_k": PROBE_TOP_K,
+            "top_k": JOINT_PROBE_TOP_K,
         },
-        "tau": tau,
-        "lam": lam,
         "spec_decode_bitwise_equal": bool(exact),
         "q_max_abs_delta": float(q_delta.max()),
         "q_mean_abs_delta": float(q_delta.mean()),
         "policy_max_abs_delta": float(policy_delta.max()),
         "policy_mean_abs_delta": float(policy_delta.mean()),
-        "q_spread_median_parent": _q_spread(policy_parent, q_parent, offsets),
-        "q_spread_median_new": _q_spread(policy_new, q_new, offsets),
+        "q_spread_median_parent": _q_spread(
+            policy_parent, q_parent, offsets, JOINT_PROBE_TOP_K
+        ),
+        "q_spread_median_new": _q_spread(
+            policy_new, q_new, offsets, JOINT_PROBE_TOP_K
+        ),
         "kl_mean": float(kl.mean()),
         "kl_max": float(kl.max()),
     }
 
 
-def graft(
-    old_path: Path, new_path: Path, tau: float, lam: float, manifest_path: Path
-) -> dict:
-    """Convert ``old_path``, measure the conversion, and write both files.
+def _parent_model(old_model: dict[str, Any], cfg: MantisConfig) -> MantisNet:
+    """Strict-load the parent slot-table/scalar-readout architecture."""
+    parent = MantisNet(cfg)
+    parent.e_pw = nn.Embedding(PARENT_CLASSES, cfg.h)
+    parent.e_qw = nn.Embedding(PARENT_CLASSES, cfg.h)
+    parent.mlp_q.out = nn.Linear(parent.mlp_q.out.in_features, 1)
+    parent.load_state_dict(old_model)
+    parent.eval()
+    return parent
 
-    Returns the manifest. Nothing is written unless the preservation property
-    holds: every parent tensor bit for bit, every expanded row its parent row bit
-    for bit, and the probe's bounds.
-    """
-    old_path, new_path, manifest_path = Path(old_path), Path(new_path), Path(manifest_path)
-    if old_path.resolve() == new_path.resolve():
-        raise ValueError("OLD.pt and NEW.pt must be different paths")
+
+def _measure(
+    model: MantisNet, parent: MantisNet, tau: float, lam: float
+) -> dict:
+    """Run the BRM arm's complete parent-vs-composed-model probe."""
+    prefixes = _probe_prefixes()
+    batch = collate_prefixes(prefixes, [len(moves) for moves in prefixes])
+    parent_state = parent.state_dict()
+    slot_class = torch.from_numpy(_PARENT_ROW).index_select(0, batch.dec_class)
+
+    with torch.no_grad():
+        _s, w, g = model.trunk(batch)
+        policy_new, q_new = model.cell_heads(w, g, batch)
+        # A separate parent trunk forward prevents a mangled shared tensor from
+        # disappearing behind shared activations. Its old decoder is evaluated
+        # by the independent MODEL_SPEC §6 transcription because this build's
+        # folded coefficient layout is necessarily the 93-class child layout.
+        _s, parent_w, parent_g = parent.trunk(batch)
+        policy_parent = _spec_scores(
+            parent_w, parent_g, batch, parent_state, _POLICY_HEAD, slot_class
+        )
+        q_parent = torch.tanh(
+            _spec_scores(
+                parent_w, parent_g, batch, parent_state, _CRITIC_HEAD, slot_class
+            )
+        )
+
+    offsets = batch.legal_offsets
+    delta = (q_new - q_parent).abs()
+    pi_new = improved_policy(policy_new.double(), q_new.double(), offsets, tau, lam)
+    pi_parent = improved_policy(
+        policy_parent.double(), q_parent.double(), offsets, tau, lam
+    )
+    probs = pi_new.probs
+    terms = torch.where(
+        probs > 0,
+        probs * (probs.log() - pi_parent.probs.log()),
+        probs.new_zeros(()),
+    )
+    kl = segment_sum(terms, segment_ids(offsets), batch.n_pos)
+
+    return {
+        "probe_seed": PROBE_SEED,
+        "probe_positions": int(batch.n_pos),
+        "probe_legal_cells": int(offsets[-1]),
+        "probe_plies": [len(moves) for moves in prefixes],
+        "max_abs_dq": float(delta.max()),
+        "mean_abs_dq": float(delta.mean()),
+        "top_k": PROBE_TOP_K,
+        "top_k_q_std_median_parent": _q_spread(
+            policy_parent, q_parent, offsets, PROBE_TOP_K
+        ),
+        "top_k_q_std_median_grafted": _q_spread(
+            policy_new, q_new, offsets, PROBE_TOP_K
+        ),
+        "mean_improved_kl": float(kl.mean()),
+        "max_improved_kl": float(kl.max()),
+    }
+
+
+def graft(
+    old_path: Path | str,
+    new_path: Path | str,
+    tau: float,
+    lam: float,
+    manifest_path: Path | str | None = None,
+) -> dict:
+    """Apply both transforms, run both batteries, then write one checkpoint."""
+    old_path, new_path = Path(old_path), Path(new_path)
+    manifest_path = (
+        Path(manifest_path)
+        if manifest_path is not None
+        else new_path.with_suffix(".json")
+    )
+    resolved = [old_path.resolve(), new_path.resolve(), manifest_path.resolve()]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError(
+            "OLD.pt, NEW.pt, and the evidence sidecar must be different paths"
+        )
 
     checkpoint = torch.load(old_path, map_location="cpu", weights_only=False)
-    if not isinstance(checkpoint, dict) or set(checkpoint) != _CHECKPOINT_KEYS:
-        raise ValueError(
-            f"checkpoint must hold exactly {sorted(_CHECKPOINT_KEYS)}, got "
-            f"{sorted(checkpoint) if isinstance(checkpoint, dict) else type(checkpoint).__name__}"
-        )
+    parent_versions = _check_checkpoint(checkpoint)
     parent_model = checkpoint["model"]
-    if not isinstance(parent_model, dict):
-        raise ValueError("checkpoint's model entry must be a state dict")
-    # The parent is a build of the representation this conversion converts from,
-    # and differs from the running build in exactly that field.
-    parent_versions = {**_versions(), "MODEL_REPR_VERSION": PARENT_REPR_VERSION}
-    if checkpoint["versions"] != parent_versions:
-        raise ValueError(
-            f"checkpoint versions {checkpoint['versions']} != the parent build "
-            f"{parent_versions}"
-        )
 
-    model = MantisNet(MantisConfig())
+    cfg = MantisConfig()
+    model = MantisNet(cfg)
     current = model.state_dict()
-    expanded = set(_EXPANDED_KEYS)
-    # The architecture comparison is the whole gate on what else the parent may
-    # be: it refuses a missing or extra key and any shape this build does not
-    # have, so the only difference it tolerates is the two class tables.
     mismatches = _architecture_mismatches(parent_model, current)
-    if set(mismatches) != expanded:
+    if set(mismatches) != _TRANSFORMED_KEYS:
         raise ValueError(
-            "parent model must differ from this build only at the decoder class "
-            f"tables ({', '.join(_EXPANDED_KEYS)}); mismatched keys: "
+            "parent model must differ from this build only at the two decoder "
+            "class tables and scalar critic readout; mismatched keys: "
             f"{', '.join(mismatches) if mismatches else '<none>'}"
         )
-    for key in _EXPANDED_KEYS:
-        want = (PARENT_CLASSES, current[key].shape[1])
-        if tuple(parent_model[key].shape) != want:
-            raise ValueError(
-                f"parent {key} must have shape {want}, got {tuple(parent_model[key].shape)}"
-            )
+    _check_parent_shapes(parent_model, current)
 
-    new_names = [name for name, _p in model.named_parameters()]
-    shared_names = [name for name in new_names if name not in expanded]
+    names = [name for name, _parameter in model.named_parameters()]
+    shared_names = [name for name in names if name not in _TRANSFORMED_KEYS]
     # The parent's Adam ids are positions in its own parameter order, and this is
     # the only record of that order, so it is pinned rather than assumed.
-    if list(parent_model) != new_names:
+    if list(parent_model) != names:
         raise ValueError(
             "parent state dict is not in this build's parameter order, so its "
             "optimizer ids cannot be named"
         )
 
+    converted_model = _converted_state(parent_model)
     converted = {
-        "model": {
-            name: (
-                _expand(parent_model[name]) if name in expanded else parent_model[name]
-            )
-            for name in new_names
-        },
-        "optimizer": _adam_state(
-            checkpoint["optimizer"],
-            new_names,
-            {name: tuple(current[name].shape) for name in new_names},
-        ),
+        "model": {name: converted_model[name] for name in names},
+        "optimizer": _remap_adam(checkpoint["optimizer"], parent_model, names),
         "iteration": checkpoint["iteration"],
         "rng_state": copy.deepcopy(checkpoint["rng_state"]),
-        # The representation moved, and this is where it moves.
         "versions": _versions(),
     }
 
@@ -490,7 +679,9 @@ def graft(
         f"{name}[{cls}]"
         for name in _EXPANDED_KEYS
         for cls in range(DEC_CLASSES)
-        if not torch.equal(grafted_model[name][cls], source_model[name][_PARENT_ROW[cls]])
+        if not torch.equal(
+            grafted_model[name][cls], source_model[name][_PARENT_ROW[cls]]
+        )
     ]
     if misplaced:
         raise ValueError(
@@ -498,6 +689,8 @@ def graft(
             f"{', '.join(misplaced[:8])}; nothing written"
         )
 
+    joint_measurement = _measure_joint(model, parent_model, tau, lam)
+    brm_measurement = _measure(model, _parent_model(parent_model, cfg), tau, lam)
     manifest = {
         "arm": ARM,
         "source": str(old_path),
@@ -506,45 +699,58 @@ def graft(
         "versions": converted["versions"],
         "transform": TRANSFORM,
         "expanded_keys": list(_EXPANDED_KEYS),
+        "readout_keys": list(_READOUT_KEYS),
         "classes": DEC_CLASSES,
         "parent_classes": PARENT_CLASSES,
         "class_to_parent_row": _PARENT_ROW.tolist(),
-        **_measure(model, parent_model, tau, lam),
+        "tau": tau,
+        "lam": lam,
+        **joint_measurement,
+        **brm_measurement,
     }
+    joint_holds = (
+        manifest["spec_decode_bitwise_equal"]
+        and manifest["q_max_abs_delta"] <= Q_TOLERANCE
+        and manifest["policy_max_abs_delta"] <= POLICY_TOLERANCE
+        and manifest["kl_max"] <= KL_TOLERANCE
+    )
+    brm_holds = (
+        manifest["max_abs_dq"] <= MAX_ABS_DQ
+        and abs(manifest["mean_improved_kl"]) <= MAX_MEAN_KL
+    )
     manifest["preservation"] = {
-        "property": (
-            "every untouched parent tensor is the source file's bit for bit, each "
-            "of the 93 joint-class rows is bit for bit the slot-class row it "
-            "replaces, and the spec decode over the grafted tables and joint "
-            "classes is bit for bit the parent's over its own tables and slot "
-            "classes, so the grafted model is the parent as a function"
-        ),
+        "property": PRESERVATION,
         "shared_tensors_unchanged": len(shared_names),
         "shared_tensor_sha256": _shared_digest(converted["model"], shared_names),
         "expanded_rows_checked": len(_EXPANDED_KEYS) * DEC_CLASSES,
-        "arithmetic": (
-            "the class coefficient block widens from 3 to 93, so the head GEMM's "
-            "sum is reassociated; the deltas below are that fp32 slack, which one "
-            "unmodified model already shows between its folded and spec decodes"
-        ),
-        "q_max_abs_delta_tolerance": Q_TOLERANCE,
-        "policy_max_abs_delta_tolerance": POLICY_TOLERANCE,
-        "kl_max_tolerance": KL_TOLERANCE,
-        "holds": (
-            manifest["spec_decode_bitwise_equal"]
-            and manifest["q_max_abs_delta"] <= Q_TOLERANCE
-            and manifest["policy_max_abs_delta"] <= POLICY_TOLERANCE
-            and manifest["kl_max"] <= KL_TOLERANCE
-        ),
+        "spec_decode_bitwise_equal": manifest["spec_decode_bitwise_equal"],
+        "joint_q_max_abs_delta": manifest["q_max_abs_delta"],
+        "joint_q_max_abs_delta_tolerance": Q_TOLERANCE,
+        "joint_policy_max_abs_delta": manifest["policy_max_abs_delta"],
+        "joint_policy_max_abs_delta_tolerance": POLICY_TOLERANCE,
+        "joint_kl_max": manifest["kl_max"],
+        "joint_kl_max_tolerance": KL_TOLERANCE,
+        "max_abs_dq": manifest["max_abs_dq"],
+        "max_abs_dq_tolerance": MAX_ABS_DQ,
+        "mean_improved_kl": manifest["mean_improved_kl"],
+        "mean_improved_kl_tolerance": MAX_MEAN_KL,
+        "holds": joint_holds and brm_holds,
     }
-    if not manifest["preservation"]["holds"]:
+    if not joint_holds:
         raise ValueError(
-            "the graft did not preserve the parent's decode: spec decode bitwise "
-            f"equal = {manifest['spec_decode_bitwise_equal']}, max "
-            f"|Q_new - Q_parent| = {manifest['q_max_abs_delta']:.3e} (bound "
-            f"{Q_TOLERANCE:.0e}), max |logit_new - logit_parent| = "
-            f"{manifest['policy_max_abs_delta']:.3e} (bound {POLICY_TOLERANCE:.0e}), "
-            f"max KL = {manifest['kl_max']:.3e} (bound {KL_TOLERANCE:.0e}); "
+            "the joint decoder checks failed: spec decode bitwise equal = "
+            f"{manifest['spec_decode_bitwise_equal']}, max |Q_new - Q_parent| = "
+            f"{manifest['q_max_abs_delta']:.3e} (bound {Q_TOLERANCE:.0e}), max "
+            f"|logit_new - logit_parent| = {manifest['policy_max_abs_delta']:.3e} "
+            f"(bound {POLICY_TOLERANCE:.0e}), max KL = {manifest['kl_max']:.3e} "
+            f"(bound {KL_TOLERANCE:.0e}); nothing written"
+        )
+    if not brm_holds:
+        raise ValueError(
+            "the BRM graft is not function preserving on the probe set: max "
+            f"|Q_new - Q_parent| = {manifest['max_abs_dq']:.3e} (tolerance "
+            f"{MAX_ABS_DQ:.0e}), mean KL(pi'_new || pi'_parent) = "
+            f"{manifest['mean_improved_kl']:.3e} (tolerance {MAX_MEAN_KL:.0e}); "
             "nothing written"
         )
 
@@ -557,7 +763,7 @@ def graft(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="graft the joint-class decoder onto a slot-class checkpoint"
+        description="apply the joint-class decoder and BRM critic graft together"
     )
     parser.add_argument("old", type=Path, metavar="OLD.pt")
     parser.add_argument("new", type=Path, metavar="NEW.pt")
@@ -565,12 +771,9 @@ def main(argv: list[str] | None = None) -> None:
     # did not name it would not say what it measured.
     parser.add_argument("--tau", type=float, required=True, help="reverse-KL weight")
     parser.add_argument("--lam", type=float, required=True, help="entropy weight")
-    parser.add_argument(
-        "--manifest", type=Path, required=True, metavar="OUT.json",
-        help="where the conversion's measurements are written",
-    )
     args = parser.parse_args(argv)
-    graft(args.old, args.new, args.tau, args.lam, args.manifest)
+    manifest = graft(args.old, args.new, args.tau, args.lam)
+    print(json.dumps(manifest["preservation"], indent=2), flush=True)
 
 
 if __name__ == "__main__":

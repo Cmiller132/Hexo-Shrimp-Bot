@@ -1,9 +1,8 @@
-"""The joint-class graft: the row map, preservation, the Adam remap, refusals.
+"""The composed joint-class and bipolar-return-mass graft.
 
-The synthetic parent is this build's state dict with the two decoder class tables
-cut back to 3 slot-class rows, one Adam step of moments behind it, and nonzero
-cell readouts — the zero readouts of §10 would make every score zero and preserve
-nothing.
+The synthetic parent has both old shapes: three slot-class rows per decoder and
+one scalar-tanh critic row. Tests cover each tensor transform, their composed
+function, both Adam remaps, both independent check batteries, and refusals.
 
 The row map is checked against ``conftest``'s own orbit derivation rather than the
 builder's table, and preservation is checked by transcribing §6 over the parent's
@@ -16,6 +15,7 @@ from __future__ import annotations
 import copy
 import json
 
+import hexo_py
 import numpy as np
 import pytest
 import torch
@@ -25,10 +25,17 @@ from mantisnet import MantisConfig, MantisNet, collate, from_position
 from mantisnet.builder import DEC_CLASSES
 from mantisnet.klent import graft as graft_module
 from mantisnet.klent.graft import (
+    MAX_ABS_DQ,
+    MAX_MEAN_KL,
     PARENT_CLASSES,
     PARENT_REPR_VERSION,
+    PROBE_PLIES,
+    PROBE_POSITIONS,
+    PROBE_TOP_K,
     _EXPANDED_KEYS,
     _PARENT_ROW,
+    _READOUT_KEYS,
+    _probe_prefixes,
     graft,
     main,
 )
@@ -45,7 +52,7 @@ def _parent_versions() -> dict:
 
 
 def _parent_checkpoint(unstepped: str | None = "value_queries") -> dict:
-    """A checkpoint of the slot-class build: 3-row class tables throughout.
+    """A slot-class/scalar-tanh checkpoint with one Adam step behind it.
 
     ``unstepped`` names a parameter the optimizer never stepped, which is how the
     state-value head KLENT does not train appears in every real checkpoint.
@@ -82,12 +89,20 @@ def _parent_checkpoint(unstepped: str | None = "value_queries") -> dict:
         model_state[key] = torch.randn(PARENT_CLASSES, h, generator=generator) * 0.02
         for field in ("exp_avg", "exp_avg_sq"):
             entries[key][field] = entries[key][field][:PARENT_CLASSES].clone()
+    for key in _READOUT_KEYS:
+        model_state[key] = model_state[key][:1].clone()
+        for field in ("exp_avg", "exp_avg_sq"):
+            entries[key][field] = entries[key][field][:1].clone()
 
     rng = np.random.default_rng(31)
     return {
         "model": model_state,
         "optimizer": {
-            "state": {index: entries[name] for index, name in enumerate(names) if name in entries},
+            "state": {
+                index: entries[name]
+                for index, name in enumerate(names)
+                if name in entries
+            },
             "param_groups": [
                 {**state["param_groups"][0], "params": list(range(len(names)))}
             ],
@@ -132,12 +147,18 @@ def test_graft_preserves_the_parent_decode(tmp_path, positions):
     # bit for bit on both sides. The bounded deltas below it are the folded head
     # GEMM's reassociation, which is not the graft's.
     assert manifest["spec_decode_bitwise_equal"] is True
-    assert new.exists() and json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
+    assert new.exists()
+    assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest
     assert manifest["source_iteration"] == _ITERATION
     # The conversion is where the representation version moves, and the only
     # place: the parent's is refused by every loader, the child's is this build's.
     assert manifest["parent_versions"]["MODEL_REPR_VERSION"] == PARENT_REPR_VERSION
     assert manifest["versions"] == _versions()
+    assert manifest["probe_positions"] == PROBE_POSITIONS
+    assert manifest["probe_legal_cells"] > PROBE_POSITIONS * PROBE_TOP_K
+    assert (min(manifest["probe_plies"]), max(manifest["probe_plies"])) == PROBE_PLIES
+    assert 0 <= manifest["mean_abs_dq"] <= manifest["max_abs_dq"] <= MAX_ABS_DQ
+    assert abs(manifest["mean_improved_kl"]) <= MAX_MEAN_KL
 
     model = MantisNet(MantisConfig())
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -174,8 +195,13 @@ def test_graft_preserves_the_parent_decode(tmp_path, positions):
         assert grafted[key].shape == (DEC_CLASSES, model.cfg.h)
         for cls in range(DEC_CLASSES):
             assert torch.equal(grafted[key][cls], parent[key][_PARENT_ROW[cls]])
+    for key in _READOUT_KEYS:
+        assert torch.equal(
+            grafted[key],
+            torch.cat([2 * parent[key], -2 * parent[key]], dim=0),
+        )
     for key, tensor in grafted.items():
-        if key not in _EXPANDED_KEYS:
+        if key not in (*_EXPANDED_KEYS, *_READOUT_KEYS):
             assert torch.equal(tensor, parent[key]), key
 
 
@@ -203,19 +229,30 @@ def test_adam_moments_follow_their_rows_and_absence_is_carried(tmp_path):
                     assert torch.equal(
                         entry[field][cls], parent_state[name][field][_PARENT_ROW[cls]]
                     )
+            elif name in _READOUT_KEYS:
+                if field == "exp_avg":
+                    expected = torch.cat(
+                        [2 * parent_state[name][field], -2 * parent_state[name][field]]
+                    )
+                else:
+                    expected = torch.cat(
+                        [parent_state[name][field], parent_state[name][field]]
+                    )
+                assert torch.equal(entry[field], expected)
             else:
                 assert torch.equal(entry[field], parent_state[name][field])
         assert entry["step"] == parent_state[name]["step"]
 
 
 def test_the_cli_writes_the_same_manifest(tmp_path):
-    old, new, manifest_path = _write_parent(tmp_path)
-    main([str(old), str(new), "--tau", str(TAU), "--lam", str(LAM),
-          "--manifest", str(manifest_path)])
+    old, new, _manifest_path = _write_parent(tmp_path)
+    manifest_path = new.with_suffix(".json")
+    main([str(old), str(new), "--tau", str(TAU), "--lam", str(LAM)])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["arm"] == "joint-slot-decoder"
+    assert manifest["arm"] == "joint-brm"
     assert manifest["classes"] == DEC_CLASSES == 93
     assert manifest["class_to_parent_row"] == _PARENT_ROW.tolist()
+    assert manifest["preservation"]["holds"]
 
 
 def test_a_parent_of_this_representation_is_refused(tmp_path):
@@ -243,7 +280,7 @@ def test_an_unexpected_architecture_difference_is_refused(tmp_path):
     checkpoint = _parent_checkpoint()
     checkpoint["model"]["mlp_q.out.weight"] = torch.zeros(1, 7)
     old, new, manifest_path = _write_parent(tmp_path, checkpoint)
-    with pytest.raises(ValueError, match="mismatched keys: .*mlp_q.out.weight"):
+    with pytest.raises(ValueError, match="critic readout must be one row"):
         graft(old, new, TAU, LAM, manifest_path)
     assert not new.exists() and not manifest_path.exists()
 
@@ -289,7 +326,7 @@ def test_a_misplaced_expansion_row_is_caught(tmp_path, monkeypatch):
 def test_a_failed_bound_writes_nothing(tmp_path, monkeypatch):
     old, new, manifest_path = _write_parent(tmp_path)
     monkeypatch.setattr(graft_module, "Q_TOLERANCE", -1.0)
-    with pytest.raises(ValueError, match="did not preserve the parent's decode"):
+    with pytest.raises(ValueError, match="joint decoder checks failed"):
         graft(old, new, TAU, LAM, manifest_path)
     assert not new.exists() and not manifest_path.exists()
 
@@ -298,3 +335,58 @@ def test_one_path_for_both_is_refused(tmp_path):
     old, _new, manifest_path = _write_parent(tmp_path)
     with pytest.raises(ValueError, match="must be different paths"):
         graft(old, old, TAU, LAM, manifest_path)
+
+
+def test_brm_probe_is_deterministic_and_nonterminal():
+    prefixes = _probe_prefixes()
+    assert len(prefixes) == PROBE_POSITIONS
+    lengths = [len(moves) for moves in prefixes]
+    assert lengths == sorted(lengths)
+    assert (lengths[0], lengths[-1]) == PROBE_PLIES
+    assert _probe_prefixes() == prefixes
+    for moves in prefixes[::8]:
+        assert not hexo_py.Position.replay(moves).is_terminal
+
+
+def test_a_wrong_brm_gain_is_caught(tmp_path, monkeypatch):
+    """Gain one composes to tanh(z / 2), so the BRM battery must refuse it."""
+    old, new, manifest_path = _write_parent(tmp_path)
+    monkeypatch.setattr(graft_module, "READOUT_GAIN", 1.0)
+    with pytest.raises(ValueError, match="checks failed|not function preserving"):
+        graft(old, new, TAU, LAM, manifest_path)
+    assert not new.exists() and not manifest_path.exists()
+
+
+def test_a_mangled_shared_tensor_is_caught(tmp_path, monkeypatch):
+    """The separate parent forward makes the BRM probe cover shared tensors."""
+    victim = "blocks.0.ffn.0.weight"
+    convert = graft_module._converted_state
+
+    def mangle(old_model):
+        state = convert(old_model)
+        state[victim] = state[victim] * 1.05
+        return state
+
+    old, new, manifest_path = _write_parent(tmp_path)
+    monkeypatch.setattr(graft_module, "_converted_state", mangle)
+    with pytest.raises(ValueError, match="untouched parent tensor"):
+        graft(old, new, TAU, LAM, manifest_path)
+    assert not new.exists() and not manifest_path.exists()
+
+
+def test_missing_brm_adam_state_is_refused(tmp_path):
+    checkpoint = _parent_checkpoint()
+    names = list(checkpoint["model"])
+    index = names.index(_READOUT_KEYS[0])
+    del checkpoint["optimizer"]["state"][index]
+    old, new, manifest_path = _write_parent(tmp_path, checkpoint)
+    with pytest.raises(ValueError, match="no Adam state for"):
+        graft(old, new, TAU, LAM, manifest_path)
+    assert not new.exists() and not manifest_path.exists()
+
+
+def test_cli_requires_the_operating_point(tmp_path):
+    paths = [str(tmp_path / "old.pt"), str(tmp_path / "new.pt")]
+    for argv in (paths, paths + ["--tau", str(TAU)], paths + ["--lam", str(LAM)]):
+        with pytest.raises(SystemExit):
+            main(argv)

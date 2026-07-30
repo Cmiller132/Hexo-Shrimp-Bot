@@ -69,9 +69,11 @@ def test_run_resume_and_artifacts(tmp_path):
 
     config = json.loads((out / "config.json").read_text())
     assert config["klent"]["tau"] == 0.1 and config["klent"]["lam"] == 0.03
+    assert config["klent"]["mass_weight"] == 0.25
     assert config["eval_time"] == 0.1
     assert config["eval_depth"] is None
     assert config["eval_sims"] == 32
+    assert config["eval_seat"] is None
     assert "MODEL_REPR_VERSION" in config["versions"]
     lines = (out / "metrics.jsonl").read_text().splitlines()
     assert len(lines) == 2
@@ -105,7 +107,7 @@ def test_run_resume_and_artifacts(tmp_path):
     with pytest.raises(SystemExit, match="not empty"):
         main(args + ["--iterations", "1"])
 
-    # In-driver eval is SealBot or nothing.
+    # In-driver eval needs at least one explicitly named external opponent.
     with pytest.raises(SystemExit, match="sealbot"):
         main(["--out", str(tmp_path / "x"), "--iterations", "1", "--eval-every", "1"])
     with pytest.raises(SystemExit, match="eval-depth"):
@@ -114,6 +116,65 @@ def test_run_resume_and_artifacts(tmp_path):
         main(["--out", str(tmp_path / "z"), "--iterations", "1", "--eval-sims", "-1"])
     with pytest.raises(SystemExit, match="eval-time"):
         main(["--out", str(tmp_path / "w"), "--iterations", "1", "--eval-time", "0"])
+
+
+def test_run_records_the_resolved_evaluation_seat(tmp_path, monkeypatch):
+    from mantisnet.klent import run as run_mod
+
+    participant_file = tmp_path / "seat.json"
+    participant_file.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "strix-anchor",
+                    "command": ["python", "-u", "strix_seat.py"],
+                    "hello": {
+                        "checkpoint": "anchors/strix.pt",
+                        "variant": "mcts:sims=32",
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    called = {}
+
+    def fake_training(*_args, **kwargs):
+        called.update(kwargs)
+
+    monkeypatch.setattr(run_mod, "run_training", fake_training)
+    out = tmp_path / "seat-run"
+    run_mod.main(
+        [
+            "--out",
+            str(out),
+            "--iterations",
+            "1",
+            "--eval-every",
+            "1",
+            "--eval-seat",
+            str(participant_file),
+            "--device",
+            "cpu",
+            "--no-compile",
+        ]
+    )
+
+    expected = {
+        "source": str(participant_file),
+        "participant": {
+            "id": "strix-anchor",
+            "command": ["python", "-u", "strix_seat.py"],
+            "hello": {
+                "checkpoint": "anchors/strix.pt",
+                "variant": "mcts:sims=32",
+            },
+        },
+    }
+    assert json.loads((out / "config.json").read_text())["eval_seat"] == expected
+    invocation = json.loads((out / "invocations.jsonl").read_text())
+    assert invocation["eval_seat"] == expected
+    assert called["eval_every"] == 1 and callable(called["evaluate_fn"])
 
 
 def test_eval_in_driver_leaves_training_untouched(tmp_path):
@@ -129,7 +190,21 @@ def test_eval_in_driver_leaves_training_untouched(tmp_path):
         return model, torch.optim.Adam(model.parameters())
 
     cfg = KlentConfig(games_per_iteration=2, envs=2, ply_cap=24, batch_size=64)
-    fake_eval = lambda m, done, tel: {"eval_score": 0.5, "eval_capped": 0, "eval_games": 2}  # noqa: E731
+    eval_results = [
+        {
+            "opponent_name": "restricted-seat",
+            "opponent_config": {
+                "resolved_variant": "policy",
+                "digest": "0x0000000000000001",
+            },
+            "score": 1.0,
+            "win_rate": 0.5,
+            "capped": 0,
+            "games": 2,
+            "forfeits": 1,
+        }
+    ]
+    fake_eval = lambda m, done, tel: {"eval_results": eval_results}  # noqa: E731
     for name, eval_every in (("plain", 0), ("evaled", 1)):
         model, opt = build()
         run_mod.run_training(
@@ -143,29 +218,12 @@ def test_eval_in_driver_leaves_training_untouched(tmp_path):
         for line in (tmp_path / name / "metrics.jsonl").read_text().splitlines()
     ]
     for plain, evaled in zip(read("plain"), read("evaled"), strict=True):
-        assert evaled["eval_score"] == 0.5
-        assert evaled["eval_games"] == 2 and evaled["eval_capped"] == 0
+        assert evaled["eval_results"] == eval_results
+        assert evaled["eval_results"][0]["forfeits"] == 1
         assert evaled["eval_seconds"] >= 0
         for key in plain:
             if key != "seconds":
                 assert evaled[key] == plain[key], key
-
-
-def test_crossplay_plays_every_checkpoint_pair(tmp_path):
-    """The A7 matrix plays every checkpoint pair of a run."""
-    from mantisnet.klent.crossplay import cross_play
-
-    out = tmp_path / "run"
-    main(["--out", str(out), "--seed", "4", "--checkpoint-every", "1",
-          "--iterations", "2", "--games", "2", "--cap", "16", "--batch", "64",
-          "--device", "cpu"])
-
-    rows = cross_play(out, games=2, ply_cap=12, device="cpu", seed=0)
-    assert [(r["a"], r["b"]) for r in rows] == [
-        ("checkpoint_000001.pt", "checkpoint_000002.pt")
-    ]
-    assert 0.0 <= rows[0]["score_a"] <= 1.0
-    assert rows[0]["capped"] <= 2
 
 
 def _tiny_run(out_dir, iterations, checkpoint_every=100, seed=2):

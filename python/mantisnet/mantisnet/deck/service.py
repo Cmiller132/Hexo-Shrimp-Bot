@@ -23,7 +23,7 @@ from ..builder import collate_prefixes
 from ..klent import telemetry
 from ..klent.inspect import inspect_position
 from ..klent.run import _versions
-from ..model import MantisConfig, MantisNet
+from ..model import CRITIC_LOGITS, MantisConfig, MantisNet
 
 _RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
 
@@ -296,10 +296,11 @@ def _config_from_checkpoint(raw: dict) -> MantisConfig:
     state = raw["model"]
     # Metadata remains browsable even when a checkpoint head shape is unsupported.
     critic_width = state["mlp_q.out.weight"].shape[0]
-    if critic_width != 1:
+    if critic_width != CRITIC_LOGITS:
         raise ValueError(
-            f"unsupported \x66actored critic checkpoint (head width {critic_width}); "
-            "this build only loads scalar tanh critic checkpoints"
+            f"unsupported critic readout width {critic_width}; this build loads "
+            f"the {CRITIC_LOGITS}-row return-mass critic, and a narrower "
+            "readout must be converted by mantisnet.klent.graft"
         )
     if "model_config" in raw:
         return MantisConfig(**raw["model_config"])

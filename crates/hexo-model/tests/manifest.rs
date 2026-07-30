@@ -179,7 +179,7 @@ fn a_manifest_missing_a_field_is_refused_rather_than_defaulted() {
     let error = read_back(
         dir.path(),
         r#"{"package":"mock","package_version":3,"encoder_version":7,
-            "rules_version":1,"action_order_version":1,"protocol_version":1,
+            "rules_version":1,"action_order_version":1,"protocol_version":2,
             "probe_hash":"0x0123456789abcdef"}"#,
     )
     .expect_err("the epoch is missing");

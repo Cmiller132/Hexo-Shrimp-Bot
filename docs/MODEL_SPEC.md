@@ -32,8 +32,8 @@ inputs, and no nodes for empty cells.
   background path when there are none). Trunk cost therefore scales with
   stones and live windows, not with the legal halo.
 - The **action-value** head is an independently parameterized decoder with the
-  same routing as policy. It emits one tanh-bounded scalar per legal cell
-  (appendix B).
+  same routing as policy. It emits two return-mass logits per legal cell,
+  composed into one action value in `(−1, 1)` (appendix B).
 - The **value** head reads the board through multi-query attention over the
   window embeddings and outputs a binned distribution over `[−1, 1]`,
   decoded to a scalar in-forward.
@@ -61,8 +61,8 @@ group D6, so the whole model is D6-invariant by construction (§8).
 Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
 slot classes = 3 and `DEC_CLASSES = 93` (§4.3), `moves_remaining ∈ {1, 2}`.
 
-The default configuration has 1,272,739 parameters: 1,063,648 in the four
-trunk blocks and 209,091 across input/final parameters and the three heads.
+The default configuration has 1,272,868 parameters: 1,063,648 in the four
+trunk blocks and 209,220 across input/final parameters and the three heads.
 
 ---
 
@@ -352,9 +352,10 @@ the forward contains no data-dependent index discovery.
   embedding `N(0, 0.02)`.
 - Optimizer grouping: parameters with `ndim ≤ 1`, all embedding tables,
   and the attention-bias tables are excluded from weight decay.
-- Outputs: raw policy logits; tanh-bounded scalar action values; the state-value
-  bin distribution and its scalar decode. The model applies no policy softmax
-  and does not clamp the decoded state value.
+- Outputs: raw policy logits; action values composed in fp32 from the critic's
+  two return-mass logits; the state-value bin distribution and its scalar
+  decode. The model applies no policy softmax and does not clamp the decoded
+  state value.
 
 ---
 
@@ -442,8 +443,8 @@ explicit allowlist, not silent prefix matching).
 
 ## Appendix B — action-value head (the KLENT interface)
 
-The action-value head has the §6 decoder shape and emits one scalar per legal
-cell in engine legal-move order. It owns a window projection, joint-class
+The action-value head has the §6 decoder shape and emits one action value per
+legal cell in engine legal-move order. It owns a window projection, joint-class
 table, background-bucket table, and MLP distinct from the policy decoder's
 parameters. The policy and action-value heads may share the parameter-free
 pass over the decoder incidence table.
@@ -452,14 +453,21 @@ For each legal cell `a`, the head uses the same window/background routing as
 §6:
 
 ```
-h_a     = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[class(a, w)] )
-q_raw   = MLP_Q( [ h_a ; g ] )                    # 2H → P_H → 1, ReLU
-Q(s, a) = tanh(q_raw)
+h_a             = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[class(a, w)] )
+[z_pos, z_neg]  = MLP_Q( [ h_a ; g ] )            # 2H → P_H → 2, ReLU
+u_pos           = σ(z_pos),  u_neg = σ(z_neg)
+Q(s, a)         = u_pos − u_neg
 ```
 
-For a background cell, `h_a = E_qbg[nearest-stone bucket(a)]`. The head applies
-`tanh`, so each action value lies in `(−1, 1)`. The KLENT operator and loss cast
-these values to fp32 before arithmetic.
+For a background cell, `h_a = E_qbg[nearest-stone bucket(a)]`. The two logits
+decode to the **positive** and the **negative return mass** of the action:
+`u_pos + u_neg` is the head's estimate of `E[|G|]`, and their difference is the
+action value. Both masses lie in `(0, 1)`, so `Q ∈ (−1, 1)` and each mass moves
+`Q` directly. The composition is fp32, as is every loss term over these values.
+
+The raw pair is part of the interface: fitting reads `[z_pos, z_neg]` and
+composes the taken action's `Q` from the same numbers, so one decoder pass
+serves both. Every acting consumer sees only the composed value.
 
 The KLENT operator and training contract are specified in
 [`KLENT_FOR_HEXO.md`](KLENT_FOR_HEXO.md). The improvement step consumes the
@@ -470,13 +478,13 @@ policy logits and action values without an additional gain:
 v̂(s)    = E_{a~π′}[Q(s,a)]
 ```
 
-Training selects the taken action and minimizes its squared error
-`(Q(s,a_taken) − G)²` against the sample's λ-return `G`. Policy
-cross-entropy is unchanged.
+Training selects the taken action and fits both the composed value and the two
+masses; `KLENT_FOR_HEXO.md` §3 owns that loss.
 
 **Both the policy decoder's and action-value decoder's MLP output layers
 initialize to zero**, overriding §10's framework default for those two
-layers. Initial policy logits and action values are therefore exactly zero.
+layers. Initial policy logits are therefore exactly zero, and so are the
+initial action values: `z_pos = z_neg = 0` gives `u_pos = u_neg = 1/2`.
 
 This head reads the trunk output and adds no inputs, so it does not change
 `MODEL_REPR_VERSION`. The §7 state-value head is neither called nor trained

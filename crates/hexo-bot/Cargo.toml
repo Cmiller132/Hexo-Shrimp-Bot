@@ -1,6 +1,6 @@
 [package]
 name = "hexo-bot"
-description = "The one binary: the training loop that drives batched self-play, fitting, checkpoints, and evaluation from a single long-lived process."
+description = "The native container binary for checkpoints, batched training, matches, and seat serving."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -21,6 +21,7 @@ hexo-records.workspace = true
 hexo-model.workspace = true
 hexo-model-mock.workspace = true
 hexo-model-mantisnet.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 pyo3.workspace = true
 ctrlc.workspace = true

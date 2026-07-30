@@ -40,6 +40,22 @@ pub enum BotError {
         /// What the filesystem said.
         source: std::io::Error,
     },
+    /// Stdin or stdout broke while serving the seat protocol.
+    Transport {
+        /// Which read, write, or flush failed.
+        operation: &'static str,
+        /// What the stream reported.
+        source: std::io::Error,
+    },
+    /// A connection-terminal seat-protocol refusal.
+    ///
+    /// The refusal object has already been flushed to stdout. This error makes
+    /// the child exit nonzero and repeats the diagnostic on stderr, which the
+    /// protocol explicitly keeps out of its parsed transport.
+    SeatProtocol {
+        /// The terminal cause in operator-facing words.
+        problem: String,
+    },
     /// A JSON document this crate wrote could not be read back as JSON.
     Json {
         /// The document.
@@ -124,6 +140,13 @@ impl BotError {
             problem: problem.into(),
         }
     }
+
+    /// A connection-terminal protocol failure after its refusal was written.
+    pub(crate) fn seat_protocol(problem: impl Into<String>) -> Self {
+        Self::SeatProtocol {
+            problem: problem.into(),
+        }
+    }
 }
 
 impl From<hexo_model::PackageError> for BotError {
@@ -150,6 +173,8 @@ impl core::fmt::Display for BotError {
             Self::Package(source) => write!(f, "{source}"),
             Self::Record(source) => write!(f, "{source}"),
             Self::Io { path, source } => write!(f, "{}: {source}", path.display()),
+            Self::Transport { operation, source } => write!(f, "{operation}: {source}"),
+            Self::SeatProtocol { problem } => write!(f, "seat protocol: {problem}"),
             Self::Json { path, source } => write!(f, "{}: {source}", path.display()),
             Self::RunManifest { path, problem } => write!(f, "{}: {problem}", path.display()),
             Self::RunExists { path } => write!(
@@ -196,6 +221,7 @@ impl std::error::Error for BotError {
             Self::Package(source) | Self::UnloadableCheckpoint { source, .. } => Some(source),
             Self::Record(source) => Some(source),
             Self::Io { source, .. } => Some(source),
+            Self::Transport { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
             Self::Signal(source) => Some(source),
             _ => None,

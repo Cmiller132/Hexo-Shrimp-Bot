@@ -56,6 +56,11 @@ fn run() -> Result<Outcome, BotError> {
             println!("{}", played.report.to_json());
             Ok(played.outcome)
         }
+        Command::Serve(config) => {
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            hexo_bot::serve(&config, &registry, stdin.lock(), stdout.lock())
+        }
     }
 }
 

@@ -1,11 +1,9 @@
 //! The command line and the configuration each subcommand parses into.
 //!
-//! `docs/CONTAINER_SPEC.md` §3 ships only the subcommands that work. `serve` and
-//! `play` are not here, not even as stubs that print "not implemented": both are
-//! entirely wire protocol, there is no wire protocol, and a stub would publish a
-//! command line before the thing behind it is designed — the flags it guessed
-//! would become the constraint the real implementation has to argue its way out
-//! of.
+//! `docs/CONTAINER_SPEC.md` §3 ships only the subcommands that work. `serve` is
+//! available because §3.1 now pins its native protocol. `play` remains absent:
+//! §15 has not named its foreign harness, so there is still no edge protocol an
+//! adapter could correctly parse.
 //!
 //! Nothing is defaulted that decides how a run behaves. The defaults that do
 //! exist — batch size, ply cap, the flush window, the worker count — are
@@ -33,6 +31,8 @@ usage:
   hexo-bot match --games <n> --seat <spec> --seat <spec>
                  [--batch <n>] [--threads <n>] [--batch-wait-ms <n>]
                  [--ply-cap <n>] [--report <path>]
+
+  hexo-bot serve --package <name> [--package-config <string>]
 
   a seat spec is `;`-separated: package=<name>;checkpoint=<dir>[;config=<string>][;variant=<name>]";
 
@@ -71,6 +71,8 @@ pub enum Command {
     Train(TrainConfig),
     /// One head-to-head between two seats over fixed weights.
     Match(MatchConfig),
+    /// One long-lived native seat connection over stdin/stdout.
+    Serve(ServeConfig),
 }
 
 impl Command {
@@ -81,6 +83,7 @@ impl Command {
             Self::Init(config) => &config.stop,
             Self::Train(config) => &config.stop,
             Self::Match(config) => &config.stop,
+            Self::Serve(config) => &config.stop,
         }
     }
 }
@@ -165,6 +168,21 @@ pub struct MatchConfig {
     pub stop: Arc<AtomicBool>,
 }
 
+/// Everything `serve` was told before its `hello` handshake.
+///
+/// The package is process configuration because the registry selects code.
+/// The checkpoint and package-owned session variant arrive in `hello`, so the
+/// process may start before the orchestrator resolves those match inputs.
+#[derive(Debug)]
+pub struct ServeConfig {
+    /// Registry name of the package filling every slot on this connection.
+    pub package: String,
+    /// Package configuration handed over verbatim.
+    pub package_config: String,
+    /// Set when the process receives its stop signal.
+    pub stop: Arc<AtomicBool>,
+}
+
 /// One competitor in a `match`: which package, which weights, which search.
 ///
 /// `;`-separated rather than `,`-separated because a package configuration
@@ -201,7 +219,7 @@ where
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
     let Some((subcommand, rest)) = args.split_first() else {
         return Err(BotError::usage(format!(
-            "no subcommand; this binary has `init`, `train`, and `match`.\n{USAGE}"
+            "no subcommand; this binary has `init`, `train`, `match`, and `serve`.\n{USAGE}"
         )));
     };
     let mut flags = Flags::split(rest)?;
@@ -209,10 +227,11 @@ where
         "init" => Ok(Command::Init(init(&mut flags)?)),
         "train" => Ok(Command::Train(train(&mut flags)?)),
         "match" => Ok(Command::Match(matches(&mut flags)?)),
+        "serve" => Ok(Command::Serve(serve(&mut flags)?)),
         other => Err(BotError::usage(format!(
-            "unknown subcommand {other:?}; this binary has `init`, `train`, and `match`. `serve` and \
-             `play` are not built: they are entirely wire protocol, and there is no wire \
-             protocol yet (docs/CONTAINER_SPEC.md §3).\n{USAGE}"
+            "unknown subcommand {other:?}; this binary has `init`, `train`, `match`, and `serve`. \
+             `play` is not built because docs/CONTAINER_SPEC.md §15 has not named the foreign \
+             harness whose protocol it would adapt.\n{USAGE}"
         ))),
     }
 }
@@ -287,6 +306,17 @@ fn matches(flags: &mut Flags) -> Result<MatchConfig, BotError> {
         stop: Arc::new(AtomicBool::new(false)),
     };
     flags.finish("match")?;
+    Ok(config)
+}
+
+/// Read `serve`'s process-level flags.
+fn serve(flags: &mut Flags) -> Result<ServeConfig, BotError> {
+    let config = ServeConfig {
+        package: flags.required("--package")?,
+        package_config: flags.optional("--package-config")?.unwrap_or_default(),
+        stop: Arc::new(AtomicBool::new(false)),
+    };
+    flags.finish("serve")?;
     Ok(config)
 }
 

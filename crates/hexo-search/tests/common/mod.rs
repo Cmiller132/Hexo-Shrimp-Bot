@@ -288,7 +288,7 @@ pub fn decide(
     game: &Game,
     evaluator: &mut dyn Evaluator,
 ) -> Run {
-    session.begin(game);
+    session.begin(game.position());
     let mut batch = EncodedBatch::new();
     let mut leaves = Vec::new();
     let mut answers = Vec::new();

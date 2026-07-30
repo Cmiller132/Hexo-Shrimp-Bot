@@ -10,9 +10,10 @@ version identifiers, and the count of completed iterations.
 
 ``STOP`` requests a checkpoint and clean exit at the next iteration boundary.
 ``CHECKPOINT`` requests a checkpoint at that boundary without stopping.
-``--eval-every N`` records a seat-balanced SealBot match every ``N`` completed
-iterations. Evaluation uses Gumbel line search when ``--eval-sims`` is positive
-and raw-policy argmax when it is zero; its RNG is separate from training.
+``--eval-every N`` records one seat-balanced match per configured external
+opponent every ``N`` completed iterations. Evaluation uses Gumbel line search
+when ``--eval-sims`` is positive and raw-policy argmax when it is zero; its RNG
+is separate from training.
 
 Run from python/mantisnet:
 
@@ -56,6 +57,19 @@ def _versions() -> dict:
         "RULES_VERSION": hexo_py.RULES_VERSION,
         "ACTION_ORDER_VERSION": hexo_py.ACTION_ORDER_VERSION,
         "torch": torch.__version__,
+    }
+
+
+def _participant_config(participant) -> dict | None:
+    if participant is None:
+        return None
+    return {
+        "id": participant.id,
+        "command": list(participant.command),
+        "hello": {
+            "checkpoint": participant.checkpoint,
+            "variant": participant.variant,
+        },
     }
 
 
@@ -277,11 +291,15 @@ def run_training(
                 f"buffer {metrics['buffer_samples']} | "
                 f"H/log|A| {metrics['acting_norm_entropy']:.3f}"
             )
-            if "eval_score" in metrics:
-                line += (
-                    f" | eval {metrics['eval_score']:.3f}"
-                    f" ({metrics['eval_capped']}/{metrics['eval_games']} capped)"
-                )
+            if metrics.get("eval_results"):
+                rendered = []
+                for result in metrics["eval_results"]:
+                    rendered.append(
+                        f"{result['opponent_name']} {result['win_rate']:.3f} "
+                        f"({result['capped']}/{result['games']} capped, "
+                        f"{result['forfeits']} forfeits)"
+                    )
+                line += " | eval " + "; ".join(rendered)
             print(line, flush=True)
 
             starved = starved + 1 if metrics["buffer_samples"] < cfg.games_per_iteration else 0
@@ -328,6 +346,10 @@ def main(argv=None) -> None:
     ap.add_argument("--cap", type=int, default=512)
     ap.add_argument("--tau", type=float, default=KlentConfig.tau)
     ap.add_argument("--lam", type=float, default=KlentConfig.lam)
+    ap.add_argument(
+        "--mass-weight", type=float, default=KlentConfig.mass_weight,
+        help="eta: weight on the critic's return-mass cross-entropies",
+    )
     ap.add_argument("--lam-ret", type=float, default=KlentConfig.lam_ret)
     ap.add_argument(
         "--gamma", type=float, default=KlentConfig.gamma,
@@ -357,12 +379,24 @@ def main(argv=None) -> None:
     ap.add_argument("--checkpoint-every", type=int, default=25)
     ap.add_argument(
         "--eval-every", type=int, default=0,
-        help="SealBot match every N iterations (0 = off; needs --sealbot)",
+        help=(
+            "external-opponent matches every N iterations "
+            "(0 = off; needs --sealbot and/or --eval-seat)"
+        ),
     )
     ap.add_argument("--eval-games", type=int, default=64)
     ap.add_argument(
         "--sealbot", type=Path, default=None,
         help="SealBot checkout root, the external eval opponent",
+    )
+    ap.add_argument(
+        "--eval-seat",
+        type=Path,
+        default=None,
+        help=(
+            "one-entry participant JSON naming a native subprocess "
+            "evaluation seat"
+        ),
     )
     ap.add_argument(
         "--eval-depth", type=int, default=None,
@@ -390,8 +424,12 @@ def main(argv=None) -> None:
     ap.add_argument("--resume", action="store_true", help="continue from the run dir's latest checkpoint")
     args = ap.parse_args(argv)
 
-    if args.eval_every > 0 and args.sealbot is None:
-        raise SystemExit("--eval-every > 0 needs --sealbot")
+    if (
+        args.eval_every > 0
+        and args.sealbot is None
+        and args.eval_seat is None
+    ):
+        raise SystemExit("--eval-every > 0 needs --sealbot and/or --eval-seat")
     if args.eval_depth is not None and args.eval_depth < 1:
         raise SystemExit("--eval-depth must be >= 1")
     if args.eval_time <= 0:
@@ -401,9 +439,24 @@ def main(argv=None) -> None:
     if args.resume and args.init_from is not None:
         raise SystemExit("--resume and --init-from are exclusive")
 
+    seat_participant = None
+    if args.eval_seat is not None:
+        from .seat import load_participants
+
+        try:
+            participants = load_participants(args.eval_seat, minimum=1)
+        except (OSError, TypeError, ValueError) as error:
+            raise SystemExit(f"--eval-seat: {error}") from error
+        if len(participants) != 1:
+            raise SystemExit(
+                "--eval-seat must contain exactly one participant entry"
+            )
+        seat_participant = participants[0]
+
     cfg = KlentConfig(
         tau=args.tau,
         lam=args.lam,
+        mass_weight=args.mass_weight,
         lam_ret=args.lam_ret,
         gamma=args.gamma,
         ply_cap=args.cap,
@@ -457,6 +510,12 @@ def main(argv=None) -> None:
         "eval_time": args.eval_time,
         "eval_sims": args.eval_sims,
         "sealbot": str(args.sealbot) if args.sealbot else None,
+        "eval_seat": {
+            "source": str(args.eval_seat),
+            "participant": _participant_config(seat_participant),
+        }
+        if args.eval_seat
+        else None,
         "seed": args.seed,
         "init_from": str(args.init_from) if args.init_from else None,
         "versions": _versions(),
@@ -474,6 +533,12 @@ def main(argv=None) -> None:
         "eval_time": args.eval_time,
         "eval_sims": args.eval_sims,
         "sealbot": str(args.sealbot) if args.sealbot else None,
+        "eval_seat": {
+            "source": str(args.eval_seat),
+            "participant": _participant_config(seat_participant),
+        }
+        if args.eval_seat
+        else None,
         "starve_limit": args.starve_limit,
         "init_from": str(args.init_from) if args.init_from else None,
         "seed": args.seed,
@@ -485,7 +550,11 @@ def main(argv=None) -> None:
 
     evaluate_fn = None
     if args.eval_every > 0:
-        from .opponents import SealBotOpponent, opponent_match
+        from .opponents import (
+            SealBotOpponent,
+            SeatOpponent,
+            opponent_match,
+        )
         from .search import gumbel_choose
         from .sealbot import record_match
         from .train import network_evaluate
@@ -499,27 +568,48 @@ def main(argv=None) -> None:
                 lam=cfg.lam,
                 sims=args.eval_sims,
             )
-            opponent = SealBotOpponent(
-                args.sealbot,
-                time_limit=args.eval_time,
-                max_depth=args.eval_depth,
-            )
-            result, per_game = opponent_match(
-                choose,
-                opponent,
-                args.eval_games,
-                cfg.ply_cap,
-                np.random.default_rng([args.seed, done]),
-            )
-            record_match(
-                telemetry, result, per_game,
-                source="driver", iteration=done,
-            )
-            return {
-                "eval_score": result["win_rate"],
-                "eval_capped": result["capped"],
-                "eval_games": result["games"],
-            }
+            opponents = []
+            if args.sealbot is not None:
+                opponents.append(
+                    SealBotOpponent(
+                        args.sealbot,
+                        time_limit=args.eval_time,
+                        max_depth=args.eval_depth,
+                    )
+                )
+            if seat_participant is not None:
+                opponents.append(SeatOpponent(seat_participant))
+
+            results = []
+            for opponent in opponents:
+                result, per_game = opponent_match(
+                    choose,
+                    opponent,
+                    args.eval_games,
+                    cfg.ply_cap,
+                    # Every anchor sees the same opening schedule and model
+                    # RNG stream; adding one cannot perturb another.
+                    np.random.default_rng([args.seed, done]),
+                )
+                record_match(
+                    telemetry,
+                    result,
+                    per_game,
+                    source="driver",
+                    iteration=done,
+                )
+                results.append(
+                    {
+                        "opponent_name": result["opponent_name"],
+                        "opponent_config": result["opponent_config"],
+                        "score": result["score"],
+                        "win_rate": result["win_rate"],
+                        "capped": result["capped"],
+                        "games": result["games"],
+                        "forfeits": result["forfeits"],
+                    }
+                )
+            return {"eval_results": results}
 
     run_training(
         model,

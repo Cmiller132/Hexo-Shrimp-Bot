@@ -67,6 +67,36 @@ def test_single_action_segment_is_a_point_mass():
     assert abs(imp.kl.item()) < 1e-7
 
 
+def test_float64_inputs_keep_float64_precision():
+    """A float64 caller is computed in float64, not rounded to fp32.
+
+    The graft's preservation gate measures a KL between two improved policies
+    that differ by ~1e-7 in Q against a 1e-6 tolerance; an fp32 π′ makes that
+    measurement rounding noise the size of the tolerance itself.
+    """
+    logits, q, offsets = _random_ragged(4, [3, 40, 9])
+    tau, lam = 0.1, 0.01
+    imp = improved_policy(logits.double(), q.double(), offsets, tau, lam)
+
+    assert imp.probs.dtype == torch.float64
+    assert imp.v_hat.dtype == torch.float64
+    assert imp.kl.dtype == torch.float64
+    assert imp.norm_entropy.dtype == torch.float64
+    for i in range(len(offsets) - 1):
+        a, b = offsets[i], offsets[i + 1]
+        log_pi = logits[a:b].double().log_softmax(0)
+        ref = ((q[a:b].double() + tau * log_pi) / (tau + lam)).softmax(0)
+        # Six orders under what an fp32 π′ manages on these inputs, so an
+        # operator that computed in fp32 and cast the result up fails here.
+        assert float((imp.probs[a:b] - ref).abs().max()) <= 1e-14
+        assert float((imp.v_hat[i] - (ref * q[a:b].double()).sum()).abs()) <= 1e-14
+
+    # Acting logits arrive in bf16 under autocast; those still promote to fp32,
+    # which is the precision every π′ diagnostic is stored and compared at.
+    coarse = improved_policy(logits.bfloat16(), q.bfloat16(), offsets, tau, lam)
+    assert coarse.probs.dtype == torch.float32
+
+
 def test_refuses_a_degenerate_temperature():
     with pytest.raises(ValueError, match="tau"):
         improved_policy(torch.zeros(2), torch.zeros(2), torch.tensor([0, 2]), 0.0, 0.0)

@@ -149,6 +149,43 @@ fn sessions_and_evaluators_require_proved_weights() {
 }
 
 #[test]
+fn gumbel_variant_temperature_crosses_the_public_package_surface() {
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+    let source = scratch.path().join("training.pt");
+    std::fs::write(&source, [11]).expect("fake training weights");
+    let checkpoint = scratch.path().join("checkpoint");
+    package(&source_config(&source))
+        .init(&checkpoint)
+        .expect("checkpoint sealed");
+    let mut loaded = package("tau=0.1,lambda=0.03");
+    loaded.load(&checkpoint).expect("checkpoint loaded");
+
+    for variant in [
+        "gumbel:sims=2,m=1",
+        "gumbel:sims=2,m=1,temp=0",
+        "gumbel:temp=0.25,m=1,sims=2",
+    ] {
+        assert!(
+            loaded.variant_session(variant).is_ok(),
+            "{variant:?} should construct a session",
+        );
+    }
+
+    for variant in [
+        "gumbel:sims=2,m=1,temp=-1",
+        "gumbel:sims=2,m=1,temp=NaN",
+        "gumbel:sims=2,m=1,temp=inf",
+    ] {
+        let error = match loaded.variant_session(variant) {
+            Err(error) => error,
+            Ok(_) => panic!("{variant:?} unexpectedly constructed a session"),
+        };
+        assert!(matches!(error, PackageError::InvalidConfig { .. }));
+        assert!(error.to_string().contains("temp"), "{variant:?}: {error}");
+    }
+}
+
+#[test]
 fn fit_declines_without_touching_shards_or_output() {
     let scratch = tempfile::tempdir().expect("a scratch directory");
     let output = scratch.path().join("next");

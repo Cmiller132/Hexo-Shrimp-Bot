@@ -19,7 +19,8 @@ The crate root re-exports:
 | `error` | `SubmitError` |
 
 `PROTOCOL_VERSION` versions the runner-level request, reply, and result
-semantics used by manifests and record shards.
+semantics plus the native seat message set in `docs/CONTAINER_SPEC.md` §3.1.
+It is used by manifests, record shards, and the seat handshake.
 
 A driver follows this state machine:
 

@@ -330,6 +330,7 @@ dependencies = [
  "hexo-runner",
  "hexo-search",
  "pyo3",
+ "serde",
  "serde_json",
  "tempfile",
 ]

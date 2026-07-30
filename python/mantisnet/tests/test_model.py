@@ -6,6 +6,22 @@ import pytest
 import torch
 
 from mantisnet import MantisConfig, MantisNet, collate, from_position
+from mantisnet.model import CRITIC_LOGITS
+
+
+def _critic_model() -> MantisNet:
+    """A small model whose critic readout is not a fresh init's zero rows."""
+    torch.manual_seed(2)
+    net = MantisNet(
+        MantisConfig(
+            h=32, blocks=1, heads=2, value_queries=2, value_bins=5,
+            policy_hidden=32, value_hidden=32,
+        )
+    )
+    with torch.no_grad():
+        net.mlp_q.out.weight.normal_(std=0.5)
+        net.mlp_q.out.bias.normal_(std=0.5)
+    return net.eval()
 
 
 @torch.no_grad()
@@ -45,6 +61,40 @@ def test_output_contracts(model, positions):
     # The scalar is the distribution's decode — the same value every consumer sees.
     assert torch.allclose(out.value, out.value_dist @ model.bin_centers, atol=1e-6)
     assert torch.isfinite(out.policy_logits).all()
+
+
+@torch.no_grad()
+def test_action_values_are_the_two_return_masses_composed(positions):
+    """Appendix B's composition, written out against the raw readout rows."""
+    net = _critic_model()
+    batch = collate([from_position(p) for p in positions])
+    _s, w, g = net.trunk(batch)
+    policy_logits, q = net.cell_heads(w, g, batch)
+    raw_policy, critic_logits = net.cell_head_logits(w, g, batch)
+
+    assert torch.equal(raw_policy, policy_logits)
+    assert critic_logits.shape == (q.shape[0], CRITIC_LOGITS)
+    # The reference is in double, so the tolerance is fp32 rounding of the
+    # composition, not slack in the formula.
+    u_pos = torch.sigmoid(critic_logits[:, 0].double())
+    u_neg = torch.sigmoid(critic_logits[:, 1].double())
+    torch.testing.assert_close(q.double(), u_pos - u_neg, rtol=0, atol=1e-6)
+    # Both masses are in (0, 1), so their difference is a bounded action value
+    # whatever the logits, and this readout is far from the zero one.
+    assert q.abs().max() < 1.0
+    assert q.abs().max() > 0.1
+    assert q.dtype == torch.float32
+
+
+@torch.no_grad()
+def test_fresh_init_policy_logits_and_action_values_are_exactly_zero(positions):
+    """The appendix-B init override: both decoder readouts start at zero, so
+    both mass logits vanish and every action value is exactly zero."""
+    torch.manual_seed(0)
+    net = MantisNet(MantisConfig()).eval()
+    out = net(collate([from_position(p) for p in positions]))
+    assert torch.count_nonzero(out.policy_logits) == 0
+    assert torch.count_nonzero(out.q_values) == 0
 
 
 def test_dropout_config_runs_and_eval_is_deterministic(positions):
