@@ -4,6 +4,8 @@ This file is the technical record of the retained KLENT training runs and engine
 
 The comparison reference used below is: \(\gamma=0.99\), \(\lambda=0.01\), \(\tau=0.1\), \(\lambda_{\mathrm{ret}}=0.939\), and a scalar tanh critic; 4096 completed games per iteration, 1024 environments, ply cap 512, and learning rate \(10^{-3}\). Unless a run configuration says otherwise, in-driver evaluations are 64 seat-balanced games against uncapped SealBot at 0.1 s/move, using the 32-simulation Gumbel line search.
 
+Runs whose last artifact predates 2026-07-29 — everything up to and including `pure-2`, plus the two `.aborted-guard` directories — live under `runs/archive/<name>/`. The move is the whole of the archiving: nothing is deleted, every artifact this record cites is still readable at that path, and the deck lists only direct children of `runs/` that hold a `config.json`, so an archived run stops appearing without being removed.
+
 Training metric iteration numbers are the zero-based values stored in `metrics.jsonl` and `iterations`. `eval_matches.iteration` is the completed-iteration count, so an evaluation on metrics row 24 is stored as evaluation 25. Legacy results are labeled “metrics row”; database results are labeled “@”. `H` means `acting_norm_entropy`, or the corresponding quantized per-ply `norm_entropy` after division by 10000. “Decided” means \(|\hat v| \ge 0.5\).
 
 ## Training runs
