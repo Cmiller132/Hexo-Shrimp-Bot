@@ -436,3 +436,30 @@ def test_the_improved_policy_criterion_sees_what_the_action_values_cannot():
     )
     assert measured["max_abs_dq"] <= MAX_ABS_DQ
     assert abs(measured["mean_improved_kl"]) > MAX_MEAN_KL
+
+
+def test_graft_carries_an_unstepped_parameter_as_unstepped(tmp_path):
+    """Adam's state dict is sparse. KLENT never steps the state-value head, so
+    no checkpoint this repo writes holds moments for it, and the conversion
+    carries that absence instead of refusing the file or inventing moments."""
+    old, ids, positions = _parent_checkpoint()
+    unstepped = [
+        name
+        for name in positions
+        if name.startswith(("value_queries", "ln_value", "mlp_v"))
+    ]
+    assert len(unstepped) == 7, unstepped
+    for name in unstepped:
+        del old["optimizer"]["state"][ids[positions[name]]]
+
+    old_path, new_path = tmp_path / "old.pt", tmp_path / "new.pt"
+    torch.save(old, old_path)
+    graft(old_path, new_path, tau=_TAU, lam=_LAM, manifest_path=tmp_path / "graft.json")
+
+    converted = torch.load(new_path, map_location="cpu", weights_only=False)
+    names = list(converted["model"])
+    state = converted["optimizer"]["state"]
+    assert {names[index] for index in state} == set(names) - set(unstepped)
+    load_checkpoint(new_path, MantisNet(MantisConfig()), torch.optim.Adam(
+        MantisNet(MantisConfig()).parameters()
+    ))

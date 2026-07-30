@@ -194,8 +194,20 @@ def _remap_adam(saved: Any, old_model: dict, names: list[str]) -> dict:
     state: dict[int, dict] = {}
     for position, (name, param_id) in enumerate(zip(names, ids)):
         entry = saved["state"].get(param_id)
+        if entry is None:
+            # Adam's state dict is sparse: a parameter it never stepped has no
+            # entry at all, which is how the state-value head KLENT does not
+            # train appears in every checkpoint this repo writes. Absence is
+            # the parent's own statement that the parameter is unstepped, so it
+            # is carried as absence rather than filled in.
+            if name in _READOUT_KEYS:
+                raise ValueError(
+                    f"the optimizer has no Adam state for {name}, the readout "
+                    "this transform rescales"
+                )
+            continue
         if not isinstance(entry, dict):
-            raise ValueError(f"the optimizer has no Adam state for {name}")
+            raise ValueError(f"the optimizer state for {name} is not a state dict")
         missing = [field for field in _ADAM_FIELDS if field not in entry]
         if missing:
             raise ValueError(
