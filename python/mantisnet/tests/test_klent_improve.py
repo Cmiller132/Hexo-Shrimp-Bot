@@ -100,3 +100,23 @@ def test_float64_inputs_keep_float64_precision():
 def test_refuses_a_degenerate_temperature():
     with pytest.raises(ValueError, match="tau"):
         improved_policy(torch.zeros(2), torch.zeros(2), torch.tensor([0, 2]), 0.0, 0.0)
+
+
+def test_expectations_stay_inside_the_q_range_when_every_action_is_lost():
+    """A lost endgame has every legal move at exactly Q = -1, so the fp32
+    softmax's mass error reaches E[Q] with nothing to cancel it. The operator
+    divides by the segment's own mass, so |v_hat| cannot leave |Q|'s range at
+    any width — the width is what made this a live failure at 3000 cells."""
+    for n in (1, 2, 1000, 3000):
+        offsets = torch.tensor([0, n])
+        q = -torch.ones(n)
+        logits = torch.randn(n) * 3.0  # a real policy, so pi' is not uniform
+        out = improved_policy(logits, q, offsets, 0.1, 0.01)
+        assert abs(float(out.v_hat[0])) <= 1.0, (n, float(out.v_hat[0]))
+        assert float(out.kl[0]) >= -1e-6 and float(out.norm_entropy[0]) >= -1e-6
+
+    # And the ordinary case is unchanged: a uniform policy with two-valued Q
+    # still averages to the plain mean.
+    offsets = torch.tensor([0, 4])
+    out = improved_policy(torch.zeros(4), torch.tensor([1.0, 1.0, -1.0, -1.0]), offsets, 1e9, 1e9)
+    assert abs(float(out.v_hat[0])) < 1e-5
