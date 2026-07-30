@@ -86,9 +86,10 @@ of adjudicating.
 protocol is designed for this system's needs and translated into; a foreign
 protocol's assumptions never reach `hexo-runner`.
 
-`train` is implemented. `serve` and `play` are specified in §3.1 and not yet
-implemented; the binary MUST NOT expose either subcommand until its protocol is
-implemented against that section.
+`train` and `serve` are implemented. `serve` exposes exactly the native seat
+protocol in §3.1 and `crates/hexo-bot/README.md`. `play` remains unimplemented
+and the binary MUST NOT expose that subcommand until §15 names the foreign
+harness protocol its edge adapter must implement.
 
 `match` plays two seats — each named by package, checkpoint, package config, and
 session variant — over the same driver used by `train`, and prints a JSON
@@ -306,8 +307,10 @@ MantisNet's worker encoder and the
 samples the improved policy π′; its evaluation session uses the shared
 `GumbelSession` at 32 simulations and 16 root candidates. Its exact variant
 grammar is `policy`, `mcts:visits=..,inflight=..,cpuct=..`, and
-`gumbel:sims=..,m=..`. Its nine diagnostic bytes carry a version, v̂, and π′
-entropy for the acted self-play position.
+`gumbel:sims=..,m=..[,temp=..]`. Gumbel `temp` is a finite, nonnegative
+floating-point root-noise scale, defaults to `1.0`, makes `0.0` deterministic,
+and leaves the cross-language draw unscaled at `1.0`. Its nine diagnostic bytes
+carry a version, v̂, and π′ entropy for the acted self-play position.
 
 ---
 

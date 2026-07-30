@@ -5,7 +5,7 @@
 #![allow(dead_code)]
 
 use hexo_bot::registry::PackageRegistry;
-use hexo_bot::{Command, InitConfig, MatchConfig, TrainConfig};
+use hexo_bot::{Command, InitConfig, MatchConfig, ServeConfig, TrainConfig};
 use hexo_model::{ModelPackage, PackageError};
 use hexo_model_mock::MockPackage;
 use serde_json::Value;
@@ -17,6 +17,7 @@ pub fn train_config(args: &[&str]) -> TrainConfig {
         Ok(Command::Train(config)) => config,
         Ok(Command::Init(_)) => panic!("these flags parsed as checkpoint init"),
         Ok(Command::Match(_)) => panic!("these flags parsed as a match"),
+        Ok(Command::Serve(_)) => panic!("these flags parsed as a seat server"),
         Err(error) => panic!("these flags do not parse: {error}"),
     }
 }
@@ -27,6 +28,7 @@ pub fn init_config(args: &[&str]) -> InitConfig {
         Ok(Command::Init(config)) => config,
         Ok(Command::Train(_)) => panic!("these flags parsed as a train run"),
         Ok(Command::Match(_)) => panic!("these flags parsed as a match"),
+        Ok(Command::Serve(_)) => panic!("these flags parsed as a seat server"),
         Err(error) => panic!("these flags do not parse: {error}"),
     }
 }
@@ -37,6 +39,18 @@ pub fn match_config(args: &[&str]) -> MatchConfig {
         Ok(Command::Match(config)) => config,
         Ok(Command::Init(_)) => panic!("these flags parsed as checkpoint init"),
         Ok(Command::Train(_)) => panic!("these flags parsed as a train run"),
+        Ok(Command::Serve(_)) => panic!("these flags parsed as a seat server"),
+        Err(error) => panic!("these flags do not parse: {error}"),
+    }
+}
+
+/// Parse a `serve` command line, or say which command it became.
+pub fn serve_config(args: &[&str]) -> ServeConfig {
+    match hexo_bot::parse(args.iter().copied()) {
+        Ok(Command::Serve(config)) => config,
+        Ok(Command::Init(_)) => panic!("these flags parsed as checkpoint init"),
+        Ok(Command::Train(_)) => panic!("these flags parsed as a train run"),
+        Ok(Command::Match(_)) => panic!("these flags parsed as a match"),
         Err(error) => panic!("these flags do not parse: {error}"),
     }
 }

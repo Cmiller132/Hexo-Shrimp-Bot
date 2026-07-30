@@ -23,14 +23,14 @@ The crate root re-exports:
 | `SessionStatus` | `AwaitingEvals` or `Decided` |
 | `PolicySession` | One root evaluation per decision |
 | `MctsConfig`, `MctsSession` | PUCT tree with bounded visits and in-flight leaves |
-| `GumbelConfig`, `GumbelSession`, `GumbelTrace` | Sequential-halving line search |
+| `GumbelConfig`, `GumbelSession`, `GumbelTrace` | Sequential-halving line search, including root Gumbel temperature |
 | `Child`, `SearchOutcome` | Completed root-search view |
 | `SelectFromPolicy`, `SelectFromSearch` | Package-owned decision policies |
 | `SplitMix64` | Session sampling stream |
 
 The nonblocking drive contract is:
 
-1. Call `begin(&game)` on a live game.
+1. Call `begin(&position)` on a live `Position`.
 2. Call `pump`, encoding each `(LeafId, &Position)` in its callback.
 3. Batch encoded items and call one `Evaluator::evaluate`.
 4. Deliver each answer with `resume`.
@@ -42,6 +42,15 @@ The nonblocking drive contract is:
 
 `Evaluation.priors[i]` corresponds to `Position::nth_legal(i)`.
 `Evaluation.value` is from the current player at the evaluated leaf.
+
+`GumbelConfig::temperature` is the finite, nonnegative scale applied to every
+root Gumbel draw before it is added to the root log prior. For positive
+temperature, ranking `log_prior + temperature * gumbel` draws the root order
+from `softmax(log_prior / temperature)`. `0.0` removes root noise and makes
+the prior order deterministic, while `1.0` leaves every draw unscaled. The
+implementation draws first and scales second, so changing temperature does not
+change the RNG stream and the committed cross-language fixtures remain
+bit-identical at `1.0`.
 
 ## Run / test
 
@@ -72,7 +81,7 @@ cargo xtask verify
 
 - `crates/hexo-engine` supplies position reads, canonical action order, and
   reversible `Search`.
-- `crates/hexo-runner` supplies the `Game` input and complete `Decision` output.
+- `crates/hexo-runner` supplies the complete `Decision` output.
 - `crates/hexo-model` binds package-owned encoders, evaluators, and sessions.
 - `crates/models/mock` and `crates/models/mantisnet` provide concrete
   selectors and evaluators.
@@ -83,7 +92,10 @@ cargo xtask verify
 ## Invariants & gotchas
 
 - `DecisionSession` is `Send`, object-safe, and nonblocking.
-- A session owns its search-position copy and never mutates the runner's game.
+- `begin` accepts a `Position`, so a seat can search its mirror without owning
+  or constructing a runner `Game`.
+- A session owns its search-position copy and never mutates the caller's
+  position.
 - The position passed to `pump` exists only for the callback duration; encode it
   before returning.
 - `LeafId` values are never reused within a session.
@@ -102,6 +114,8 @@ cargo xtask verify
 - Virtual loss remains attached to an in-flight path until its answer resumes.
 - Gumbel search counts line-deepening simulations; its root evaluation is
   outside the simulation budget.
+- `GumbelConfig::temperature` must be finite and nonnegative; zero is
+  deterministic and one preserves the unscaled Python/Rust fixture.
 - Gumbel candidate and survivor ties preserve canonical root order.
 - Selectors author the action and optional diagnostics; sessions do not supply
   a default selection policy.

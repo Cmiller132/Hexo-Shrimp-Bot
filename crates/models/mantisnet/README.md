@@ -49,8 +49,15 @@ Session variant names are:
 ```text
 policy
 mcts:visits=N,inflight=N,cpuct=F
-gumbel:sims=N,m=N
+gumbel:sims=N,m=N[,temp=F]
 ```
+
+Variant parameters may appear in any order, each at most once. `sims` and `m`
+are required positive integers. `temp` is optional and defaults to `1.0`; it
+must be a finite, nonnegative `f64`. It scales the root Gumbel vector before
+the vector is added to root log priors, so positive `T` samples the root order
+from `softmax(logits / T)`, `T = 0` is deterministic, and `T = 1` is the
+unscaled Python-compatible draw.
 
 The forward result contains one policy logit and one scalar action value per
 legal cell, ragged by `RawBatch::legal_offsets`. The evaluator applies the
@@ -115,6 +122,8 @@ Python training entry point to operate on checkpoints.
 - Fixed evaluation uses `GumbelSession` with 32 simulations and 16 candidates.
 - Named variants use evaluation selection and do not record self-play
   diagnostics.
+- A named Gumbel variant defaults `temp` to `1.0` and refuses negative or
+  non-finite values.
 - A sealed checkpoint contains `weights.pt` and `manifest.json`.
 - Manifest package metadata contains the configured `tau` and `lambda`.
 - Load validates metadata, versions, and the evaluator probe before publishing

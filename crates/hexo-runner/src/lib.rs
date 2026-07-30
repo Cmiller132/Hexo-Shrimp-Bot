@@ -27,5 +27,5 @@ pub use error::SubmitError;
 pub use game::{FailurePolicy, Game, GameSpec, PlyRecord, Step, Transition};
 pub use outcome::{DrawReason, MatchResult, NoContest, WinReason};
 
-/// Version of the runner's decision and result model.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Version of the runner decision/result model and native seat message set.
+pub const PROTOCOL_VERSION: u32 = 2;

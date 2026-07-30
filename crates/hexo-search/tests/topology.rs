@@ -89,7 +89,7 @@ fn every_game_of_a_mixed_sweep_finishes_through_one_shared_batch() {
                 else {
                     continue;
                 };
-                lane.seats[seat.index()].begin(&lane.game);
+                lane.seats[seat.index()].begin(lane.game.position());
                 lane.open = Some((seat.index(), generation));
             }
             live += 1;

@@ -64,12 +64,24 @@ fn init_requires_only_package_and_checkpoint_and_preserves_package_config() {
 }
 
 #[test]
-fn an_unknown_subcommand_says_why_serve_and_play_are_not_among_them() {
-    let message = refused(&["serve", "--seat", "x"]);
-    assert!(message.contains("serve"), "{message}");
+fn serve_is_available_but_play_still_names_its_missing_foreign_harness() {
+    let Ok(Command::Serve(config)) = hexo_bot::parse([
+        "serve",
+        "--package",
+        "mock",
+        "--package-config",
+        "search=policy",
+    ]) else {
+        panic!("the native seat protocol is implemented");
+    };
+    assert_eq!(config.package, "mock");
+    assert_eq!(config.package_config, "search=policy");
+
+    let message = refused(&["play"]);
+    assert!(message.contains("play"), "{message}");
     assert!(
-        message.contains("wire protocol"),
-        "the refusal says what is missing rather than only that it is: {message}",
+        message.contains("foreign harness"),
+        "the refusal says which edge protocol is still unnamed: {message}",
     );
 }
 

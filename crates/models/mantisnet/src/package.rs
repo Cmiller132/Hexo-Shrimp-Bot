@@ -126,10 +126,12 @@ impl MantisPackage {
             Search::Gumbel {
                 simulations,
                 candidates,
+                temperature,
             } => Box::new(GumbelSession::new(
                 GumbelConfig {
                     simulations,
                     candidates,
+                    temperature,
                 },
                 seed,
             )),
@@ -229,6 +231,7 @@ impl ModelPackage for MantisPackage {
             Search::Gumbel {
                 simulations: EVAL_SIMULATIONS,
                 candidates: EVAL_CANDIDATES,
+                temperature: 1.0,
             },
             false,
         )

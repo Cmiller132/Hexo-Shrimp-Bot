@@ -25,7 +25,7 @@ fn a_decision_costs_exactly_one_evaluation() {
 fn the_session_is_decided_after_one_resume() {
     let game = game_after(&WIN_IN_ONE, GameSpec::default());
     let mut session = PolicySession::new(Box::new(HighestPrior), 1);
-    session.begin(&game);
+    session.begin(game.position());
 
     let mut leaf = None;
     let status = session.pump(&mut |id, position| {
@@ -71,7 +71,7 @@ fn the_selector_reads_the_canonical_order_it_was_promised() {
     priors[winning] = 1.0;
 
     let mut session = PolicySession::new(Box::new(HighestPrior), 1);
-    session.begin(&game);
+    session.begin(game.position());
     let mut leaf = None;
     session.pump(&mut |id, _position| leaf = Some(id));
     session.resume(
@@ -103,7 +103,7 @@ fn the_decision_attests_the_position_and_carries_the_seats_bytes() {
 fn resuming_with_the_wrong_number_of_priors_panics() {
     let game = game_after(&WIN_IN_ONE, GameSpec::default());
     let mut session = PolicySession::new(Box::new(HighestPrior), 1);
-    session.begin(&game);
+    session.begin(game.position());
     let mut leaf = None;
     session.pump(&mut |id, _position| leaf = Some(id));
     session.resume(
@@ -122,11 +122,11 @@ fn resuming_before_the_root_was_asked_about_panics() {
     let mut donor = PolicySession::new(Box::new(HighestPrior), 1);
     let mut session = PolicySession::new(Box::new(HighestPrior), 2);
 
-    donor.begin(&game);
+    donor.begin(game.position());
     let mut leaf = None;
     donor.pump(&mut |id, _position| leaf = Some(id));
 
-    session.begin(&game);
+    session.begin(game.position());
     session.resume(
         leaf.expect("the donor asked"),
         uniform_evaluation(game.position().legal_count()),
@@ -141,13 +141,13 @@ fn pumping_before_begin_panics() {
 }
 
 #[test]
-#[should_panic(expected = "a game that finished")]
-fn beginning_on_a_finished_game_panics() {
+#[should_panic(expected = "a terminal position")]
+fn beginning_on_a_terminal_position_panics() {
     let mut moves = WIN_IN_ONE.to_vec();
     moves.push((WIN_IN_ONE_CELL.q, WIN_IN_ONE_CELL.r));
     let game = game_after(&moves, GameSpec::default());
     let mut session = PolicySession::new(Box::new(HighestPrior), 1);
-    session.begin(&game);
+    session.begin(game.position());
 }
 
 #[test]

@@ -75,14 +75,10 @@ fn run_case(case: Case) {
     let mut game = game_after(&case.position_prefix);
     let root = game.position().clone();
     let mut session = GumbelSession::with_gumbels(
-        GumbelConfig {
-            simulations: NonZeroU32::new(case.config.sims)
-                .expect("fixture simulations are positive"),
-            candidates: NonZeroUsize::new(case.config.m).expect("fixture candidates are positive"),
-        },
+        search_config(case.config.sims, case.config.m, 1.0),
         case.root_gumbel_noise,
     );
-    session.begin(&game);
+    session.begin(game.position());
 
     for call in &case.scripted_calls {
         assert_eq!(
@@ -213,6 +209,96 @@ fn run_case(case: Case) {
     };
     game.submit(generation, Reply::Place(decision))
         .expect("the chosen fixture move is legal");
+}
+
+#[test]
+fn zero_temperature_ignores_root_noise() {
+    let game = game_after(&[[0, 0]]);
+    let legal_count = game.position().legal_count();
+    let mut priors = vec![0.0; legal_count];
+    priors[2] = 0.7;
+    priors[5] = 0.3;
+    let mut noise = vec![100.0; legal_count];
+    noise[2] = -100.0;
+    let mut session = GumbelSession::with_gumbels(search_config(4, 2, 0.0), noise);
+
+    session.begin(game.position());
+    let mut root_leaf = None;
+    assert_eq!(
+        session.pump(&mut |leaf, _position| root_leaf = Some(leaf)),
+        SessionStatus::AwaitingEvals { in_flight: 1 },
+    );
+    session.resume(
+        root_leaf.expect("the root evaluation receipt"),
+        Evaluation {
+            priors: priors.into(),
+            value: 0.0,
+        },
+    );
+    finish_uniform(&mut session);
+
+    assert_eq!(
+        session
+            .last_trace()
+            .expect("the completed search has a trace")
+            .candidate_root_ranks(),
+        [2, 5],
+        "T=0 ranks by root opinion even when the raw Gumbels prefer every other action",
+    );
+    let decision = session
+        .take_decision()
+        .expect("the deterministic search authored a decision");
+    assert_eq!(
+        game.position().legal_rank(decision.action),
+        Some(2),
+        "with equal searched values, zero temperature keeps the highest-prior root action",
+    );
+}
+
+#[test]
+fn invalid_temperatures_are_refused_at_construction() {
+    for temperature in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let result =
+            std::panic::catch_unwind(|| GumbelSession::new(search_config(2, 1, temperature), 7));
+        assert!(
+            result.is_err(),
+            "temperature {temperature} unexpectedly constructed a session",
+        );
+    }
+}
+
+fn search_config(simulations: u32, candidates: usize, temperature: f64) -> GumbelConfig {
+    GumbelConfig {
+        simulations: NonZeroU32::new(simulations).expect("test simulations are positive"),
+        candidates: NonZeroUsize::new(candidates).expect("test candidates are positive"),
+        temperature,
+    }
+}
+
+fn finish_uniform(session: &mut GumbelSession) {
+    loop {
+        let mut leaves = Vec::new();
+        match session.pump(&mut |leaf, position| {
+            leaves.push((leaf, position.legal_count()));
+        }) {
+            SessionStatus::Decided => {
+                assert!(leaves.is_empty());
+                return;
+            }
+            SessionStatus::AwaitingEvals { in_flight } => {
+                assert_eq!(in_flight, leaves.len());
+            }
+        }
+        for (leaf, legal_count) in leaves {
+            session.resume(
+                leaf,
+                Evaluation {
+                    priors: vec![1.0 / legal_count as f32; legal_count].into(),
+                    value: 0.0,
+                },
+            );
+        }
+    }
 }
 
 fn replay(prefix: &[[i16; 2]]) -> Position {

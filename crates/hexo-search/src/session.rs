@@ -2,7 +2,7 @@
 
 use crate::seam::Evaluation;
 use hexo_engine::Position;
-use hexo_runner::{Decision, Game};
+use hexo_runner::Decision;
 
 /// Session-scoped handle for one requested leaf evaluation.
 ///
@@ -41,15 +41,15 @@ pub enum SessionStatus {
 /// then `take_decision`. The driver controls session interleaving and evaluator
 /// batch size.
 pub trait DecisionSession: Send {
-    /// Reset onto `game`'s current position and discard any previous search.
+    /// Reset onto `position` and discard any previous search.
     ///
-    /// The session copies the game's position and does not retain mutable access
-    /// to canonical game state.
+    /// The session copies the position and does not retain access to the
+    /// caller's mirror or canonical state.
     ///
     /// # Panics
     ///
-    /// If `game` has already finished.
-    fn begin(&mut self, game: &Game);
+    /// If `position` is terminal.
+    fn begin(&mut self, position: &Position);
 
     /// Run until the decision is ready, the in-flight cap is reached, or the
     /// visit budget is fully dispatched.

@@ -13,7 +13,7 @@ use crate::rng::SplitMix64;
 use crate::seam::Evaluation;
 use crate::session::{DecisionSession, LeafId, SessionStatus};
 use hexo_engine::{Player, Position};
-use hexo_runner::{Decision, Game};
+use hexo_runner::Decision;
 use std::collections::{BTreeMap, VecDeque};
 use std::num::{NonZeroU32, NonZeroUsize};
 
@@ -23,13 +23,18 @@ const UNIT_SCALE: f64 = 1.0 / 9_007_199_254_740_992.0;
 
 /// The explicit search shape for a [`GumbelSession`].
 ///
-/// There is no `Default`; both fields are required.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// There is no `Default`; every field is required.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GumbelConfig {
     /// Total equal-deepening allocations below the root.
     pub simulations: NonZeroU32,
     /// Maximum number of Gumbel-top root candidates.
     pub candidates: NonZeroUsize,
+    /// Scale applied to every root Gumbel draw.
+    ///
+    /// Must be finite and non-negative. Zero removes root noise while retaining
+    /// the searched line-value comparison; one leaves the draws unscaled.
+    pub temperature: f64,
 }
 
 /// A completed search's canonical root-rank trace.
@@ -114,6 +119,10 @@ pub struct GumbelSession {
 impl GumbelSession {
     /// Construct a session whose Gumbels come from its seeded [`SplitMix64`]
     /// stream.
+    ///
+    /// # Panics
+    ///
+    /// If `config.temperature` is not finite and non-negative.
     #[must_use]
     pub fn new(config: GumbelConfig, seed: u64) -> Self {
         Self::build(config, seed, None)
@@ -126,12 +135,22 @@ impl GumbelSession {
     /// positive budget below two consumes none because it falls back directly
     /// to prior argmax. Running out, or supplying a non-finite value, panics
     /// instead of silently switching to another random stream.
+    ///
+    /// # Panics
+    ///
+    /// If `config.temperature` is not finite and non-negative.
     #[must_use]
     pub fn with_gumbels(config: GumbelConfig, gumbels: impl IntoIterator<Item = f64>) -> Self {
         Self::build(config, 0, Some(gumbels.into_iter().collect()))
     }
 
     fn build(config: GumbelConfig, seed: u64, injected: Option<VecDeque<f64>>) -> Self {
+        assert!(
+            config.temperature.is_finite() && config.temperature >= 0.0,
+            "GumbelConfig::temperature is {}; the root-noise scale must be finite and \
+             non-negative",
+            config.temperature,
+        );
         Self {
             config,
             rng: SplitMix64::new(seed),
@@ -221,7 +240,9 @@ impl GumbelSession {
 
         let mut scored = Vec::with_capacity(legal_count);
         for (root_rank, &prior) in evaluation.priors.iter().enumerate() {
-            let gumbel = self.next_gumbel();
+            // Draw first and scale second so temperature never changes the RNG
+            // stream, and T=1 retains the raw draw bit-for-bit.
+            let gumbel = self.next_gumbel() * self.config.temperature;
             let log_prior = if prior == 0.0 {
                 f64::NEG_INFINITY
             } else {
@@ -391,14 +412,13 @@ impl GumbelSession {
 }
 
 impl DecisionSession for GumbelSession {
-    fn begin(&mut self, game: &Game) {
+    fn begin(&mut self, position: &Position) {
         assert!(
-            game.result().is_none(),
-            "GumbelSession::begin on a game that finished as {:?}; a driver only asks a live \
-             game's mover",
-            game.result(),
+            !position.is_terminal(),
+            "GumbelSession::begin on a terminal position; a driver only asks a live position's \
+             mover",
         );
-        self.root.clone_from(game.position());
+        self.root.clone_from(position);
         self.root_player = self.root.current_player();
         self.state = State::WantedRoot;
         self.decision = None;
@@ -536,7 +556,7 @@ fn halving_schedule(simulations: usize, candidates: usize) -> Vec<(usize, usize)
 mod tests {
     use super::*;
     use hexo_engine::{Action, HexCoord};
-    use hexo_runner::{GameSpec, Reply, Step};
+    use hexo_runner::{Game, GameSpec, Reply, Step};
 
     fn game_after(moves: &[(i16, i16)]) -> Game {
         let mut game = Game::new(GameSpec::default());
@@ -556,6 +576,7 @@ mod tests {
         GumbelConfig {
             simulations: NonZeroU32::new(simulations).expect("test budget is positive"),
             candidates: NonZeroUsize::new(candidates).expect("test width is positive"),
+            temperature: 1.0,
         }
     }
 
@@ -595,7 +616,7 @@ mod tests {
     }
 
     fn root(session: &mut GumbelSession, game: &Game, priors: Vec<f32>) {
-        session.begin(game);
+        session.begin(game.position());
         let leaves = pump_leaves(session);
         assert_eq!(leaves.len(), 1);
         session.resume(
@@ -777,9 +798,9 @@ mod tests {
     fn a_stale_leaf_from_an_abandoned_begin_is_refused() {
         let game = game_after(&[(0, 0)]);
         let mut session = GumbelSession::new(config(2, 1), 7);
-        session.begin(&game);
+        session.begin(game.position());
         let stale = pump_leaves(&mut session)[0].0;
-        session.begin(&game);
+        session.begin(game.position());
         let fresh = pump_leaves(&mut session)[0].0;
         assert_ne!(stale, fresh);
         session.resume(stale, uniform(game.position().legal_count(), 0.0));
@@ -790,7 +811,7 @@ mod tests {
     fn a_root_answer_with_the_wrong_action_count_is_refused() {
         let game = game_after(&[(0, 0)]);
         let mut session = GumbelSession::new(config(2, 1), 7);
-        session.begin(&game);
+        session.begin(game.position());
         let root_leaf = pump_leaves(&mut session)[0].0;
         session.resume(root_leaf, uniform(2, 0.0));
     }

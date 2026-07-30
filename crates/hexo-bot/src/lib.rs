@@ -7,8 +7,8 @@
 //!
 //! # Public operations
 //!
-//! [`init_checkpoint`], [`train`], and [`play_match`] are the whole surface.
-//! The wire-protocol `serve` and `play` operations named by §3 are not exposed.
+//! [`init_checkpoint`], [`train`], [`play_match`], and [`serve`] are the whole
+//! surface. `play` remains forbidden until §15 names its foreign harness.
 //!
 //! # The shape of a run
 //!
@@ -33,12 +33,16 @@ mod init;
 mod matches;
 mod metrics;
 mod run;
+mod serve;
 mod train;
 
-pub use cli::{Command, InitConfig, MatchConfig, SeatSpec, TrainConfig, USAGE, parse, seat};
+pub use cli::{
+    Command, InitConfig, MatchConfig, SeatSpec, ServeConfig, TrainConfig, USAGE, parse, seat,
+};
 pub use error::BotError;
 pub use init::init_checkpoint;
 pub use matches::{MatchReport, MatchRun, SeatReport, play_match};
+pub use serve::serve;
 pub use train::train;
 
 /// How a subcommand ended, when it did not fail.

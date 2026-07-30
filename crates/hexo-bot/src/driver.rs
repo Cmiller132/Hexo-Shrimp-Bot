@@ -341,7 +341,7 @@ impl Lane {
 /// get the same stream. Two seats sharing an RNG would correlate their choices,
 /// which is the failure `hexo-player` and this crate both refuse to allow by
 /// construction.
-fn entropy_seed(lane: usize, serial: u64, seat: usize) -> u64 {
+pub(crate) fn entropy_seed(lane: usize, serial: u64, seat: usize) -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |since| since.as_nanos() as u64);
@@ -643,7 +643,7 @@ fn advance(
                 Step::NeedDecision {
                     seat, generation, ..
                 } => {
-                    lane.sessions[seat.index()].begin(&lane.game);
+                    lane.sessions[seat.index()].begin(lane.game.position());
                     let open = (seat.index(), generation);
                     lane.open = Some(open);
                     open

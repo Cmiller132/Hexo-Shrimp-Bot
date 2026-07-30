@@ -185,7 +185,7 @@ fn the_root_is_asked_about_exactly_once_per_decision() {
 fn resuming_with_the_wrong_number_of_priors_panics() {
     let game = game_after(&WIN_IN_ONE, GameSpec::default());
     let mut session = MctsSession::new(config(4, 2), Box::new(MaxVisits), 3);
-    session.begin(&game);
+    session.begin(game.position());
     let mut leaf = None;
     session.pump(&mut |id, _position| leaf = Some(id));
     session.resume(
@@ -202,7 +202,7 @@ fn resuming_with_the_wrong_number_of_priors_panics() {
 fn resuming_with_an_out_of_range_value_panics() {
     let game = game_after(&WIN_IN_ONE, GameSpec::default());
     let mut session = MctsSession::new(config(4, 2), Box::new(MaxVisits), 3);
-    session.begin(&game);
+    session.begin(game.position());
     let mut leaf = None;
     session.pump(&mut |id, _position| leaf = Some(id));
     let n = game.position().legal_count();
@@ -220,7 +220,7 @@ fn resuming_with_an_out_of_range_value_panics() {
 fn answering_the_same_leaf_twice_panics() {
     let game = game_after(&WIN_IN_ONE, GameSpec::default());
     let mut session = MctsSession::new(config(4, 2), Box::new(MaxVisits), 3);
-    session.begin(&game);
+    session.begin(game.position());
     let mut leaf = None;
     session.pump(&mut |id, _position| leaf = Some(id));
     let leaf = leaf.expect("the root");
@@ -235,27 +235,27 @@ fn an_answer_for_a_decision_the_session_has_left_panics() {
     let game = game_after(&WIN_IN_ONE, GameSpec::default());
     let mut session = MctsSession::new(config(4, 2), Box::new(MaxVisits), 3);
 
-    session.begin(&game);
+    session.begin(game.position());
     let mut stale = None;
     session.pump(&mut |id, _position| stale = Some(id));
     let stale = stale.expect("the root of the first decision");
 
     // Starting a new decision invalidates leaves from the prior tree.
-    session.begin(&game);
+    session.begin(game.position());
     session.pump(&mut |_id, _position| {});
     session.resume(stale, uniform_evaluation(game.position().legal_count()));
 }
 
 #[test]
-#[should_panic(expected = "a game that finished")]
-fn beginning_on_a_finished_game_panics() {
+#[should_panic(expected = "a terminal position")]
+fn beginning_on_a_terminal_position_panics() {
     let mut moves = WIN_IN_ONE.to_vec();
     moves.push((WIN_IN_ONE_CELL.q, WIN_IN_ONE_CELL.r));
     let game = game_after(&moves, GameSpec::default());
     assert!(game.result().is_some());
 
     let mut session = MctsSession::new(config(4, 2), Box::new(MaxVisits), 1);
-    session.begin(&game);
+    session.begin(game.position());
 }
 
 #[test]
@@ -304,7 +304,7 @@ fn a_decision_is_taken_once_and_taking_it_resets_nothing() {
         "nothing has been searched"
     );
 
-    session.begin(&game);
+    session.begin(game.position());
     assert!(session.take_decision().is_none(), "the search has not run");
 
     // `decide` takes the decision itself, so a second take must come back empty.
@@ -383,7 +383,7 @@ fn a_driver_can_hold_a_session_behind_the_trait() {
 fn an_emitted_leaf_is_the_position_at_the_leaf_and_not_the_root() {
     let game = game_after(&WIN_IN_ONE, GameSpec::default());
     let mut session = MctsSession::new(config(8, 1), Box::new(MaxVisits), 1);
-    session.begin(&game);
+    session.begin(game.position());
 
     let mut seen: Vec<(u64, u32)> = Vec::new();
     let mut leaves: Vec<(LeafId, usize)> = Vec::new();

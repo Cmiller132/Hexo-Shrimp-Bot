@@ -56,7 +56,7 @@ pub fn play(
         };
 
         let session = &mut seats[seat.index()];
-        session.begin(&game);
+        session.begin(game.position());
         loop {
             batch.clear();
             leaves.clear();

@@ -69,7 +69,7 @@
 //!         break game.result().expect("a finished game has a result");
 //!     };
 //!     let session = &mut seats[seat.index()];
-//!     session.begin(&game);
+//!     session.begin(game.position());
 //!     loop {
 //!         batch.clear();
 //!         leaves.clear();

@@ -32,6 +32,8 @@ pub(crate) enum Search {
         simulations: NonZeroU32,
         /// Maximum number of root candidates.
         candidates: NonZeroUsize,
+        /// Root Gumbel scale. Zero is deterministic and one is unscaled.
+        temperature: f64,
     },
 }
 
@@ -191,6 +193,7 @@ fn parse_mcts(parameters: &str) -> Result<Search, VariantFailure> {
 fn parse_gumbel(parameters: &str) -> Result<Search, VariantFailure> {
     let mut simulations = None;
     let mut candidates = None;
+    let mut temperature = None;
 
     for field in parameters.split(',') {
         let (key, value) = variant_pair("gumbel", field)?;
@@ -203,9 +206,13 @@ fn parse_gumbel(parameters: &str) -> Result<Search, VariantFailure> {
                 reject_variant_repeat(candidates.is_some(), "gumbel", key)?;
                 candidates = Some(nonzero_usize("gumbel", key, value)?);
             }
+            "temp" => {
+                reject_variant_repeat(temperature.is_some(), "gumbel", key)?;
+                temperature = Some(non_negative_variant_f64("gumbel", key, value)?);
+            }
             _ => {
                 return Err(VariantFailure::BadParameters(format!(
-                    "unknown `gumbel` parameter {key:?}; expected `sims` or `m`"
+                    "unknown `gumbel` parameter {key:?}; expected `sims`, `m`, or `temp`"
                 )));
             }
         }
@@ -214,6 +221,7 @@ fn parse_gumbel(parameters: &str) -> Result<Search, VariantFailure> {
     Ok(Search::Gumbel {
         simulations: simulations.ok_or_else(|| missing_variant("gumbel", "sims"))?,
         candidates: candidates.ok_or_else(|| missing_variant("gumbel", "m"))?,
+        temperature: temperature.unwrap_or(1.0),
     })
 }
 
@@ -271,6 +279,20 @@ fn non_negative_float(context: &str, key: &str, value: &str) -> Result<f32, Pack
 
 fn non_negative_variant_float(shape: &str, key: &str, value: &str) -> Result<f32, VariantFailure> {
     let parsed = value.parse::<f32>().map_err(|_| {
+        VariantFailure::BadParameters(format!(
+            "`{shape}` parameter {key:?} is {value:?}, not a floating-point number"
+        ))
+    })?;
+    if !parsed.is_finite() || parsed < 0.0 {
+        return Err(VariantFailure::BadParameters(format!(
+            "`{shape}` parameter {key:?} is {value:?}; it must be finite and non-negative"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn non_negative_variant_f64(shape: &str, key: &str, value: &str) -> Result<f64, VariantFailure> {
+    let parsed = value.parse::<f64>().map_err(|_| {
         VariantFailure::BadParameters(format!(
             "`{shape}` parameter {key:?} is {value:?}, not a floating-point number"
         ))
@@ -431,11 +453,20 @@ mod tests {
             })
         );
         assert_eq!(
-            parse_variant("gumbel:m=8,sims=32").expect("gumbel"),
+            parse_variant("gumbel:temp=0.25,m=8,sims=32").expect("gumbel"),
             Search::Gumbel {
                 simulations: NonZeroU32::new(32).expect("nonzero"),
                 candidates: NonZeroUsize::new(8).expect("nonzero"),
+                temperature: 0.25,
             }
+        );
+        assert_eq!(
+            parse_variant("gumbel:m=8,sims=32").expect("default temperature"),
+            Search::Gumbel {
+                simulations: NonZeroU32::new(32).expect("nonzero"),
+                candidates: NonZeroUsize::new(8).expect("nonzero"),
+                temperature: 1.0,
+            },
         );
     }
 
@@ -483,6 +514,7 @@ mod tests {
             "mcts:visits=1,inflight=1,cpuct=1,cpuct=2",
             "gumbel:sims=1,sims=2,m=1",
             "gumbel:sims=1,m=1,m=2",
+            "gumbel:sims=1,m=1,temp=1,temp=2",
         ] {
             assert!(variant_problem(input).contains("stated twice"), "{input:?}");
         }
@@ -518,6 +550,27 @@ mod tests {
         ] {
             assert!(variant_problem(input).contains("cpuct"), "{input:?}");
         }
+    }
+
+    #[test]
+    fn gumbel_temperature_is_finite_and_non_negative() {
+        for input in [
+            "gumbel:sims=2,m=1,temp=no",
+            "gumbel:sims=2,m=1,temp=-1",
+            "gumbel:sims=2,m=1,temp=NaN",
+            "gumbel:sims=2,m=1,temp=inf",
+            "gumbel:sims=2,m=1,temp=-inf",
+        ] {
+            assert!(variant_problem(input).contains("temp"), "{input:?}");
+        }
+        assert_eq!(
+            parse_variant("gumbel:sims=2,m=1,temp=0").expect("zero is deterministic"),
+            Search::Gumbel {
+                simulations: NonZeroU32::new(2).expect("nonzero"),
+                candidates: NonZeroUsize::new(1).expect("nonzero"),
+                temperature: 0.0,
+            },
+        );
     }
 
     #[test]
