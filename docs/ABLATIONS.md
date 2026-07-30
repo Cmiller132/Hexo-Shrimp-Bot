@@ -542,8 +542,9 @@ The window is iterations 0–49 from `conv-disc-lam01/checkpoint_000151.pt` at t
 | `brm-939` | 0.875 | 0.875 | 112 | 0.06863 | 0.23129 | 78.97 |
 | `tail-939` | 0.828125 | 0.890625 | 110 | 0.07277 | 0.24850 | 75.24 |
 | `duel-939` | 0.8125 | 0.828125 | 105 | 0.06133 | 0.29613 | 91.27 |
+| `joint-939` | 0.78125 | 0.765625 | 99 | 0.06877 | 0.24413 | 74.42 |
 
-Each evaluation is 64 games; one standard error on a single match is about four games, and about three on the 128-game totals. These evaluations therefore do not separate the four configurations. The two arms that lowered q-loss most, `duel-939` and `brm-939`, do not order the same way on evaluation.
+Each evaluation is 64 games. At the observed rates one standard error on a 128-game total is about four games, so a difference between two arms carries about 5.8. Every arm is within 1.6 of those standard errors of the control — `brm` at 0.7, `tail` at 0.3, `duel` at 0.5, `joint` at 1.6 — so this evaluation separates none of the five configurations, and no ordering may be read from it. The two arms that lowered q-loss most, `duel-939` and `brm-939`, do not order the same way on evaluation. The paired head-to-head below is the instrument that does separate them.
 
 | Configuration | Undecided H | Undecided top-1 | Decided H | Decided top-1 |
 | --- | ---: | ---: | ---: | ---: |
@@ -553,6 +554,27 @@ Each evaluation is 64 games; one standard error on a single match is about four 
 | `duel-939` | 0.2891 | 0.5349 | 0.3310 | 0.5600 |
 
 Iterations 45–49, decided at $\lvert\hat v\rvert\ge0.5$. The undecided bucket holds about five times the ply mass of the decided one in every run.
+
+### Paired head-to-head against the control
+
+Each arm's iteration-50 checkpoint against `lam-ret-939`'s iteration-50 checkpoint, converted into that arm's architecture by that arm's own graft. 64 shared openings of 2–6 plies, each played from both seats, so 128 games; both seats search at 32 simulations with $\tau=0.1$, $\lambda=0.01$; ply cap 512, seed 21. The pair is the unit: $d=(\text{A's wins in the pair})-1\in\{-1,0,+1\}$, and the reported interval comes from $\operatorname{sd}(d)/\sqrt{K}$ rather than from the marginal score.
+
+| Arm | Score of 128 | Wilson | Pairs A / split / B | Sign test | Elo | Mean plies |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `joint-939` | 84.0 = 65.6% | 57.0–73.3% | 26 / 32 / 6 | 0.0005 | **+112** (+55, +177) | 72.8 |
+| `tail-939` | 73.0 = 57.0% | 48.4–65.3% | 19 / 35 / 10 | 0.136 | +49 (−8, +109) | 74.7 |
+| `brm-939` | 49.0 = 38.3% | 30.3–46.9% | 10 / 29 / 25 | 0.0167 | **−83** (−150, −21) | 74.6 |
+| `duel-939` | 128.0 = 100% | 97.1–100% | 64 / 0 / 0 | — | not reported | 20.4 |
+
+No game reached the ply cap in any match.
+
+This instrument separates what the anchored evaluation could not. `joint-939` beats the control and `brm-939` loses to it, both beyond the sign test's 0.05, while their anchored totals sit 1.6 and 0.7 standard errors from the control's — that is, the anchored evaluation has no opinion about either, so the two measurements do not conflict. `brm-939` is the load-bearing case for reading these at all: an artifact that flattered whichever arm was newer would have flattered it too, and it measures negative.
+
+What the matches measure is strength against one same-lineage sibling, not strength in general. Both models in every pairing descend from `conv-disc-lam01/checkpoint_000151.pt` and differ by 50 iterations under one changed term.
+
+`duel-939`'s result is not a strength measurement and is excluded. Its graft is the one conversion that is order-preserving rather than function-preserving, so its opponent is the control with its value level removed rather than the control. Its games ended in 20.4 plies against 72.8–74.7 for the other three, and all 64 pairs returned the same $d$, leaving the paired variance unestimable; the harness reported no Elo interval and no standard-error ratio for it.
+
+Pairing on shared openings and seats gained little over independent games: the ratio of unpaired to paired standard error was 1.055, 1.059, and 0.976 for `joint`, `tail`, and `brm`, against 1.24 in simulation. At $d$'s observed dispersion the pairing removes almost no variance, so the design's value here is the sign test over decisive pairs rather than a narrower interval.
 
 ### Graft manifests
 
@@ -580,21 +602,25 @@ The bipolar head's own quantities over the same set: $u^{+}+u^{-}$, its estimate
 
 | Field | Record |
 | --- | --- |
-| Date | Built 2026-07-30; not yet launched |
+| Date | 2026-07-30, 08:25–10:49 EDT |
 | Init/fork | `runs/grafts/ckpt151-joint.pt`, the exact function-preserving graft of `conv-disc-lam01/checkpoint_000151.pt`; seed 21 |
 | Delta from reference | The decoder's class is joint in the window's occupancy mask and the candidate cell's own slot, folded by a reversal acting on both halves — 93 classes where the slot class alone gave 3 (MODEL_SPEC §4.3). Both cell heads' class tables grow to 93 rows, +23,040 parameters; the stone incidence keeps the slot class. `MODEL_REPR_VERSION` 1 → 2. `--cell-budget 450000 --collect-cell-budget 1350000`, memory only: the aggregate row widens from $H+16$ to $H+128$, so the budgets come down by that same 1.78 to hold decoder memory at the reference's level. Otherwise the reference recipe. Branch `joint-slot-decoder`. |
 | Question | Whether removing the decoder's action aliases improves evaluation, and which head uses the separation |
 | Pre-stated abort signature | As `brm-939`: evaluation at or below 0.625 at iteration 25, or H outside [0.12, 0.36] on a monotone trend |
-| Disposition | Launched 2026-07-30 12:25 UTC, from `tail-939`'s stop at iteration 84 |
+| Disposition | Ran iterations 0–49 and stopped at its configured limit. No abort signature fired: evaluation was 0.78125 at 25 against a floor of 0.625, and H stayed in [0.12, 0.36]. |
 
 Pre-registered before iteration 0, against `lam-ret-939` iterations 0–49 as the control:
 
-| Quantity | Control | Predicted |
-| --- | ---: | --- |
-| Wins of 128 over the two evaluations | 108 | 104–116 — not separable at this evaluation budget |
-| Minimum q-loss | 0.07501 | 0.068–0.073 |
-| Undecided-bucket top-1 | 0.6035 | 0.61–0.63 |
-| Iteration time | — | +5% to +15% from the wider head GEMM |
+| Quantity | Control | Predicted | Measured |
+| --- | ---: | --- | ---: |
+| Wins of 128 over the two evaluations | 108 | 104–116 — not separable at this evaluation budget | 99 |
+| Minimum q-loss | 0.07501 | 0.068–0.073 | 0.06877 |
+| Undecided-bucket top-1 | 0.6035 | 0.61–0.63 | — |
+| Iteration time | — | +5% to +15% from the wider head GEMM | — |
+
+The anchored evaluation fell below the predicted band, by 1.6 standard errors of the difference. The prediction's own stated basis was that this evaluation cannot separate the arms, and it does not: the interval is consistent with no change. It is the only arm whose two evaluations declined across the window, 0.78125 to 0.765625, where the other four rose or held.
+
+Against the same control, the paired head-to-head below measures `joint-939` as the strongest of the four arms at 128 games, which the anchored evaluation neither shows nor contradicts.
 
 The reasoning, so a wrong prediction is diagnostic rather than merely wrong: adjacency is already
 recoverable from window multiplicity, which the aliasing does not touch. A candidate adjacent to a
