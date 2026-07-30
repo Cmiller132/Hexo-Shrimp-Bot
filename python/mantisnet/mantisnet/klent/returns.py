@@ -21,6 +21,14 @@ from __future__ import annotations
 
 import numpy as np
 
+# |v̂| ≤ max_a |Q(a)| ≤ 1 holds in real arithmetic, but v̂ is an fp32 sum over a
+# position's legal cells: a saturated critic puts many of them at exactly ±1,
+# and an fp32 segment softmax sums to one only to a few ulps, so a legitimate
+# v̂ can land just outside the interval — measured at 1.7e-5 over a corpus of
+# 8.7M cells. The slack keeps the range checks below detectors of inputs that
+# are actually wrong rather than of fp32 summation.
+_RANGE_SLACK = 1e-4
+
 
 def signs_from_moves_remaining(moves_remaining) -> np.ndarray:
     """``+1`` where the mover keeps the turn (moves_remaining == 2), else ``-1``."""
@@ -46,14 +54,15 @@ def lambda_returns(signs: np.ndarray, v_hats, lam_ret: float, gamma: float) -> n
     v = np.asarray(v_hats, dtype=np.float64)
     if v.shape != np.shape(signs) or v.ndim != 1 or len(v) == 0:
         raise ValueError("signs and v_hats must be equal-length, nonempty 1-d arrays")
-    if not (np.isfinite(v).all() and np.abs(v).max() <= 1.0):
+    if not (np.isfinite(v).all() and np.abs(v).max() <= 1.0 + _RANGE_SLACK):
         raise ValueError("v_hats must be finite and within [-1, 1]")
     g = np.empty_like(v)
     g[-1] = 1.0
     for t in range(len(v) - 2, -1, -1):
         g[t] = signs[t] * gamma * ((1.0 - lam_ret) * v[t + 1] + lam_ret * g[t + 1])
-    # Bounded inputs and gamma <= 1 bound G by construction; leaving the
-    # interval means the recursion or its inputs changed incompatibly.
-    if np.abs(g).max() > 1.0:
+    # Bounded inputs and gamma <= 1 bound G by construction, to the same fp32
+    # slack the inputs carry; leaving that interval means the recursion or its
+    # inputs changed incompatibly.
+    if np.abs(g).max() > 1.0 + _RANGE_SLACK:
         raise ValueError("lambda-return left [-1, 1]; recursion inputs are corrupt")
     return g
