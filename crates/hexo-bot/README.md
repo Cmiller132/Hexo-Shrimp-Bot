@@ -237,6 +237,15 @@ session's attestation as `got`. Hash comparisons use `HASH` strings.
 | Slot lifecycle | `duplicate_slot`, `slot_already_open`, `unknown_slot` |
 | Mirror input | `opening_line`, `incremental_line`, `zobrist_mismatch`, `terminal_position`, `wrong_side` |
 | Session construction or authorship | `variant`, `attestation_mismatch` |
+| A declared restriction with nothing left to propose | `restriction_exhausted` |
+
+Every code above except `restriction_exhausted` reports a fault. That one
+reports an ordinary outcome of a sound match: a seat that declared a
+restriction (§3.1) has run out of actions its declaration allows while the
+position still has legal ones. The orchestrator adjudicates that game against
+the seat and continues, where a fault fails the pairing — which is why the two
+cannot share a code. `hexo-bot` declares no restriction and so never emits it;
+it is part of the contract because a foreign seat speaking this protocol will.
 
 For an existing slot, duplicate use, reopening while open, an invalid
 incremental line, a zobrist mismatch, a terminal mirror, a wrong side to move,

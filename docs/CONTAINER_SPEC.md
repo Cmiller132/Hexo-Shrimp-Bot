@@ -198,6 +198,14 @@ report a restricted player as a peer. The orchestrator MUST NOT narrow the game
 to match a restriction, and a seat MUST NOT propose an action its declaration
 excludes.
 
+A restriction can leave a seat with nothing to propose while the position still
+has legal actions. That seat MUST refuse the slot under a cause of its own,
+distinct from every cause that reports a fault, and the orchestrator MUST
+adjudicate the game — a seat that cannot move loses it — rather than failing the
+pairing. The distinction is the point: exhausting a declared handicap is an
+ordinary outcome of a sound match, and reporting it under a fault's cause would
+make a routine loss indistinguishable from a broken seat.
+
 **The variant carries move selection, including temperature.** Sampling,
 temperature, and greediness are the package's (§5), so they reach a seat as its
 variant string and never as a protocol field. The protocol transports that
