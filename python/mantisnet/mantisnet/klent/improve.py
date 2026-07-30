@@ -47,9 +47,17 @@ def improved_policy(
     log_improved = segment_log_softmax((q + tau * log_pi) / (tau + lam), offsets, seg)
     probs = log_improved.exp()
 
-    v_hat = segment_sum(probs * q, offsets)
-    kl = segment_sum(probs * (log_improved - log_pi), offsets)
-    entropy = segment_sum(-probs * log_improved, offsets)
+    # Every expectation divides by the segment's own probability mass. π′ sums
+    # to one by definition, but an fp32 segment softmax sums to one only to a
+    # few ulps, and that error is not small where it matters: a lost endgame
+    # position has every legal move at exactly Q = -1, so nothing cancels and
+    # E[Q] inherits the whole of it. Measured at 1.1e-4 outside [-1, 1] on a
+    # 159-ply episode, which is what the λ-return's range check refuses.
+    # Dividing restores |E[Q]| <= max|Q| to a few ulps at any segment width.
+    mass = segment_sum(probs, offsets)
+    v_hat = segment_sum(probs * q, offsets) / mass
+    kl = segment_sum(probs * (log_improved - log_pi), offsets) / mass
+    entropy = segment_sum(-probs * log_improved, offsets) / mass
     counts = (offsets[1:] - offsets[:-1]).float()
     norm_entropy = torch.where(counts > 1, entropy / counts.clamp(min=2).log(), entropy.new_zeros(p))
     return ImprovedPolicy(probs=probs, v_hat=v_hat, kl=kl, norm_entropy=norm_entropy)
