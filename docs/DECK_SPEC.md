@@ -18,7 +18,8 @@ from a backend response or persisted deck state.
   `strength_curve`, `crossplay_matrix`, `summary`) are the substrate; the
   API wraps them, it does not re-derive SQL that exists there. The single
   exception is match recording (below), which goes through the existing
-  `sealbot.record_match` writer path with a `busy_timeout`.
+  writer path with a `busy_timeout` — `sealbot.record_match` for a SealBot
+  match, `telemetry.write_eval_match` for a checkpoint one.
 - **The training loop remains independent.** The deck consumes the
   run driver's artifacts — `telemetry.db`, `metrics.jsonl`, `config.json`,
   `invocations.jsonl`, checkpoints, and `status.json` —
@@ -132,10 +133,13 @@ The FastAPI app and its non-HTTP services implement these seams:
   — post human moves, get bot replies, query `inspect_position` for the
   current prefix for the overlays and candidate list. Illegal placements
   are a 400 with the reason, enforced by the engine, not the client.
-- **Matches.** `POST /api/matches` runs a seat-balanced set in a background
+- **Matches.** `POST /api/matches` runs a seat-paired set in a background
   thread: checkpoint vs checkpoint (`evaluate.play_match`) or checkpoint vs
   SealBot (`sealbot.sealbot_match`), progress over SSE, result recorded to
-  the checkpoint's run `telemetry.db` via `record_match(source="deck")`.
+  the checkpoint's run `telemetry.db` as `source='deck'` — through
+  `record_match` for a SealBot match, `write_eval_match` for a checkpoint one.
+  Both kinds play `games / 2` shared random openings from both seats, so a
+  request's game count is its count of distinct games.
   One match job at a time, same 409 rule as runs.
 - **`runs/deck.db`** — the deck's own SQLite (WAL, schema-versioned and
   refused on mismatch like telemetry, no migrations): game tags and review

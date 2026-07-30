@@ -1,8 +1,12 @@
 """Evaluate every checkpoint pair in a run; see ``KLENT_FOR_HEXO.md`` §6.3.
 
-Crossplay is raw-policy argmax against argmax, seat balanced when ``games`` is
-even, with capped games scored ½. Each invocation replaces ``crossplay.json``
-and the telemetry crossplay table with one result per unordered pair.
+Crossplay is raw-policy argmax against argmax over ``games // 2`` shared
+random openings, each played from both seats, with capped games scored ½. Each
+invocation replaces ``crossplay.json`` and the telemetry crossplay table with
+one result per unordered pair.
+
+Both choosers are deterministic, so the openings are the whole source of the
+match's diversity: without them every game of a pairing would be the same game.
 
     uv run python -m mantisnet.klent.crossplay --run runs/<name> --games 64
 """
@@ -18,6 +22,7 @@ import numpy as np
 import torch
 
 from .evaluate import argmax_choose, play_match
+from .opponents import shared_openings
 from .run import load_model
 from .telemetry import open_telemetry
 
@@ -27,9 +32,12 @@ def cross_play(
 ) -> list[dict]:
     """Evaluate each unordered checkpoint pair once.
 
-    Pair RNG derives from ``(seed, index_a, index_b)``. Rows name checkpoints
-    separately; ``crossplay.json`` formats those names as ``"a vs b"`` keys.
+    Pair RNG derives from ``(seed, index_a, index_b)`` and draws that pairing's
+    openings. Rows name checkpoints separately; ``crossplay.json`` formats those
+    names as ``"a vs b"`` keys.
     """
+    if games < 2 or games % 2:
+        raise ValueError(f"games must be even and >= 2 (paired seats): {games}")
     paths = sorted(run_dir.glob("checkpoint_*.pt"))
     if len(paths) < 2:
         raise SystemExit(f"cross-play needs at least two checkpoints under {run_dir}")
@@ -39,7 +47,8 @@ def cross_play(
     rows = []
     for a, b in itertools.combinations(names, 2):
         rng = np.random.default_rng([seed, names.index(a), names.index(b)])
-        result = play_match(choosers[a], choosers[b], games, ply_cap, rng)
+        schedule = shared_openings(rng, games // 2)
+        result, _per_game = play_match(choosers[a], choosers[b], schedule, ply_cap, rng)
         rows.append(
             {
                 "a": a,

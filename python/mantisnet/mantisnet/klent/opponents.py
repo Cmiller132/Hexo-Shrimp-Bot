@@ -196,28 +196,45 @@ class SealBotOpponent:
         )
 
 
-def _openings(rng: np.random.Generator, n: int, cut_range: tuple[int, int]):
-    """Uniform-random, non-terminal prefixes shared by each seat pair."""
+def shared_openings(
+    rng: np.random.Generator, pairs: int, cut_range: tuple[int, int] = (2, 6)
+) -> list[tuple[list[tuple[int, int]], int]]:
+    """The seat-paired game schedule every match loop plays.
+
+    ``pairs`` uniform-random prefixes, each played twice, returned as
+    ``2 * pairs`` ``(opening, seat)`` games in pair-major order: games ``2i``
+    and ``2i + 1`` are pair ``i`` — one shared prefix with the seats swapped —
+    so opening difficulty and seat advantage cancel inside the pair instead of
+    separating two games. ``seat`` is the seat the first chooser takes.
+
+    Openings are non-terminal by the ``cut_range`` bound rather than by a
+    check: at ten placements the leading player owns five stones, so no
+    six-in-a-row is reachable.
+    """
     import hexo_py
 
+    if pairs < 1:
+        raise ValueError(f"pairs must be >= 1, got {pairs}")
     lo, hi = cut_range
     if not 1 <= lo <= hi <= 10:
         raise ValueError(
             f"opening range must satisfy 1 <= lo <= hi <= 10: {cut_range}"
         )
-    openings = []
-    for target in rng.integers(lo, hi + 1, size=n):
+    schedule = []
+    for target in rng.integers(lo, hi + 1, size=pairs):
         position = hexo_py.Position()
         moves = []
         for _ in range(int(target)):
             move = position.nth_legal(int(rng.integers(position.legal_count)))
             position.advance(*move)
             moves.append(move)
-        openings.append(moves)
-    return openings
+        schedule.append((moves, 0))
+        schedule.append((moves, 1))
+    return schedule
 
 
-def _wilson(score: float, n: int, z: float = 1.96):
+def wilson(score: float, n: int, z: float = 1.96):
+    """The Wilson interval, as rates, around a **total** score over ``n`` games."""
     p = score / n
     denom = 1 + z * z / n
     centre = (p + z * z / (2 * n)) / denom
@@ -225,7 +242,8 @@ def _wilson(score: float, n: int, z: float = 1.96):
     return max(0.0, centre - spread), min(1.0, centre + spread)
 
 
-def _elo(score: float) -> float:
+def elo(score: float) -> float:
+    """Elo points from a score **rate** in ``[0, 1]``; ``±inf`` at the extremes."""
     if score <= 0.0:
         return -math.inf
     if score >= 1.0:
@@ -248,16 +266,14 @@ def opponent_match(
     import hexo_py
 
     opponent_choose = opponent.make_chooser(ply_cap)
-    openings = _openings(rng, games // 2, opening_range)
     states = []
-    for game_idx in range(games):
-        opening = openings[game_idx // 2]
+    for opening, seat in shared_openings(rng, games // 2, opening_range):
         position = hexo_py.Position.replay([tuple(move) for move in opening])
         state = {
             "pos": position,
             "moves": [tuple(move) for move in opening],
             "opening_len": len(opening),
-            "seat": game_idx % 2,
+            "seat": seat,
             "capped": False,
             "forfeit": False,
             "opponent_meta": {},
@@ -378,7 +394,7 @@ def opponent_match(
             }
         )
 
-    ci_lo, ci_hi = _wilson(score, games)
+    ci_lo, ci_hi = wilson(score, games)
     summary = {
         "score": score,
         "games": games,
@@ -386,9 +402,9 @@ def opponent_match(
         "win_rate": score / games,
         "ci_lo": ci_lo,
         "ci_hi": ci_hi,
-        "elo": _elo(score / games),
-        "elo_lo": _elo(ci_lo),
-        "elo_hi": _elo(ci_hi),
+        "elo": elo(score / games),
+        "elo_lo": elo(ci_lo),
+        "elo_hi": elo(ci_hi),
         "score_as_p0": per_seat[0],
         "score_as_p1": per_seat[1],
         "forfeits": forfeits,

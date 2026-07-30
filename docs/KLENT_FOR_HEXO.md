@@ -208,13 +208,23 @@ Search is evaluation-only: collection and fitting do not import it. `gumbel_choo
 
 SealBot is the anchored external opponent. Its recorded identity is `sealbot` plus variant, per-turn time limit, and optional depth limit; the checkout commit and build identity are not version-pinned.
 
-In-driver matches require an even game count of at least two. Each seat pair shares one uniform-random nonterminal opening of two through six placements. Caps score one half. A second consecutive unplayable SealBot proposal after one retry is a forfeit scored as a model win.
+Every match, in-driver or offline, plays one seat-paired schedule: `games / 2` uniform-random openings, each replayed from both seats, so a match requires an even game count of at least two. An opening is one to ten placements, two through six by default; the bound is what makes an opening nonterminal, because at ten placements the leading player owns five stones. The ply cap counts the opening's placements. Caps score one half. A second consecutive unplayable SealBot proposal after one retry is a forfeit scored as a model win.
 
 The in-driver evaluation generator is derived from `(run seed, completed iteration)` and never from the training generator. Enabling evaluation therefore does not consume training RNG state.
 
 ### 6.3 Checkpoint crossplay
 
-Crossplay evaluates every unordered pair of sorted run checkpoints once, using raw-policy argmax for both. Pair RNG derives from `(seed, index_a, index_b)`, games start empty, caps score one half, and seats are balanced when `games` is even. `crossplay.json` and the telemetry crossplay table are replaced wholesale by each invocation.
+Crossplay evaluates every unordered pair of sorted run checkpoints once, using raw-policy argmax for both. Pair RNG derives from `(seed, index_a, index_b)` and draws that pairing's openings; caps score one half. Both choosers are deterministic, so the openings are the whole source of a pairing's diversity and the game count is the count of distinct games. `crossplay.json` and the telemetry crossplay table are replaced wholesale by each invocation.
+
+### 6.4 Paired head-to-head
+
+A head-to-head compares two checkpoints from any two run directories directly, and is the resolution instrument: two independent anchored scores of sixty-four games cannot separate less than about eight percentage points, while the pairing below reports a standard error next to the unpaired one it replaces.
+
+`pairs` openings are each played twice with the seats swapped, both models searching at the same `sims`, and a pair is one unit — it shares its opening and its whole generator, derived from `(seed, pair index)`, and is reproducible alone. Per pair, `d` is A's wins minus one and lies in `{-1, 0, +1}`; a one-one split is the seat-advantage component the pairing removes. The result states A's score with its marginal Wilson interval, the win/split/loss pair counts, the paired and unpaired standard errors of the same estimand, an exact two-sided binomial sign test over the decisive pairs, Elo with an interval from the paired standard error, the seat split, and the capped count.
+
+A cap is not a decision: a capped pair is counted apart from the win/split/loss counts, excluded from the sign test, and named in the result's warnings. Elo bounds that reach a zero or unit score are unbounded and are recorded as absent rather than as infinities. Pairs that all carry one `d` — the shape an all-splits match takes — have no spread to estimate, so such a match has no standard-error ratio and no Elo interval either, and names that degeneracy in its warnings. A ply cap must exceed the longest opening, or neither model would move.
+
+The two checkpoints must agree on `RULES_VERSION`, `ACTION_ORDER_VERSION`, and the Torch version, for which no conversion exists, and on `MODEL_REPR_VERSION`, for which `klent.graft` is the bridge. The output names both checkpoints' SHA-256, versions, and iteration, and the seed, sims, coefficients, pairs, opening range, ply cap, and device the match ran under; an unsearched match records absent coefficients, because it never consults them.
 
 ## 7. Run directory contract
 

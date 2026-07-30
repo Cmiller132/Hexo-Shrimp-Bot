@@ -1,14 +1,19 @@
-"""Policy-argmax chooser and checkpoint cross-play.
+"""Policy-argmax chooser and the two-chooser match loop.
 
-``argmax_choose`` implements the zero-search policy choice. Evaluation
-matches with search use ``search.gumbel_choose`` and
-``opponents.opponent_match``; ``play_match`` implements the
-checkpoint-vs-checkpoint loop.
-Seats alternate because the game is asymmetric even though the encoding is
-not, and a capped game scores a half-win for each side.
+``argmax_choose`` implements the zero-search policy choice and consumes no
+randomness. ``play_match`` runs any two batched choosers against each other
+over a seat-paired schedule from ``opponents.shared_openings``; evaluation
+against an external opponent uses ``opponents.opponent_match`` instead, because
+that one carries the per-game lifecycle hooks a second rules state needs.
+
+Diversity comes from the schedule's openings, never from the choosers: two
+deterministic choosers from one starting position play one game however many
+times they are asked to. A capped game scores a half-win for each side.
 """
 
 from __future__ import annotations
+
+import time
 
 import torch
 
@@ -35,46 +40,86 @@ def argmax_choose(model, device: str = "cpu"):
     return choose
 
 
-def play_match(
-    choose_a,
-    choose_b,
-    games: int,
-    ply_cap: int,
-    rng,
-) -> dict:
-    """``games`` lockstep games with A taking P0 in the even-indexed ones.
+def play_match(choose_a, choose_b, schedule, ply_cap: int, rng):
+    """One lockstep game per ``(opening, seat)`` entry of ``schedule``.
 
-    Each outer step advances every live game one ply: the games whose mover
-    is A form one batched chooser call, B's the other. Returns A's score
-    (win 1, cap ½), the capped count, and the game count.
+    ``schedule`` is ``opponents.shared_openings``' output: A takes ``seat`` and
+    B the other, and the two games of a seat pair replay one shared prefix. Each
+    outer step advances every live game one ply — the games whose mover is A form
+    one batched chooser call, B's games the other — and every chooser call
+    receives ``rng``.
+
+    ``ply_cap`` counts the opening's placements, as ``opponent_match``'s cap
+    does, so the same cap means the same total game length in both loops.
+
+    Returns A's summary and one row per game, in schedule order.
     """
     import hexo_py
 
-    positions = [hexo_py.Position() for _ in range(games)]
-    score_a, capped = 0.0, 0
-    plies = [0] * games
-    live = list(range(games))
+    if not schedule:
+        raise ValueError("play_match needs at least one game")
+    games = len(schedule)
+    positions = [
+        hexo_py.Position.replay([tuple(move) for move in opening])
+        for opening, _seat in schedule
+    ]
+    seats = [seat for _opening, seat in schedule]
+    moves = [[tuple(move) for move in opening] for opening, _seat in schedule]
+    capped = [False] * games
+    started = time.monotonic()
+
+    def settle(indices):
+        still = []
+        for k in indices:
+            if positions[k].is_terminal:
+                continue
+            if len(moves[k]) >= ply_cap:
+                capped[k] = True
+                continue
+            still.append(k)
+        return still
+
+    live = settle(list(range(games)))
     while live:
         groups: dict = {0: [], 1: []}  # chooser A's games, chooser B's games
         for k in live:
-            a_is_mover = (positions[k].current_player == 0) == (k % 2 == 0)
-            groups[0 if a_is_mover else 1].append(k)
+            groups[0 if positions[k].current_player == seats[k] else 1].append(k)
         for chooser, group in ((choose_a, groups[0]), (choose_b, groups[1])):
             if not group:
                 continue
-            for k, move in zip(group, chooser([positions[k] for k in group], rng)):
+            chosen = chooser([positions[k] for k in group], rng)
+            for k, move in zip(group, chosen, strict=True):
+                move = (int(move[0]), int(move[1]))
                 positions[k].advance(*move)
-                plies[k] += 1
-        still = []
-        for k in live:
-            pos = positions[k]
-            if pos.is_terminal:
-                a_seat = 0 if k % 2 == 0 else 1
-                score_a += 1.0 if pos.winner == a_seat else 0.0
-            elif plies[k] >= ply_cap:
-                capped += 1
-                score_a += 0.5
-            else:
-                still.append(k)
-        live = still
-    return {"score_a": score_a, "games": games, "capped": capped}
+                moves[k].append(move)
+        live = settle(live)
+
+    score_a, per_seat, plies = 0.0, [0.0, 0.0], 0
+    rows = []
+    for k in range(games):
+        game_score = (
+            0.5 if capped[k] else float(positions[k].winner == seats[k])
+        )
+        score_a += game_score
+        per_seat[seats[k]] += game_score
+        plies += len(moves[k])
+        rows.append(
+            {
+                "seat": seats[k],
+                "winner": None if capped[k] else positions[k].winner,
+                "capped": capped[k],
+                "score_a": game_score,
+                "opening": [tuple(move) for move in schedule[k][0]],
+                "moves": moves[k],
+            }
+        )
+    summary = {
+        "score_a": score_a,
+        "games": games,
+        "capped": sum(capped),
+        "score_a_as_p0": per_seat[0],
+        "score_a_as_p1": per_seat[1],
+        "avg_plies": plies / games,
+        "seconds": time.monotonic() - started,
+    }
+    return summary, rows
