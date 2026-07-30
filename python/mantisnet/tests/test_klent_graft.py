@@ -352,9 +352,11 @@ _REFUSALS = {
         lambda c: c["optimizer"]["param_groups"][0]["params"].pop(),
         "optimizer parameter count does not match",
     ),
-    "missing Adam entry": (
-        lambda c: c["optimizer"]["state"].pop(3),
-        "optimizer has no Adam state for window_table.weight",
+    "malformed Adam entry": (
+        # An absent entry is a parameter Adam never stepped, which is
+        # legitimate; an entry that is not a state dict is a malformed file.
+        lambda c: c["optimizer"]["state"].__setitem__(3, 0.0),
+        "optimizer state for window_table.weight is not a state dict",
     ),
     "missing Adam moment": (
         lambda c: c["optimizer"]["state"][3].pop("exp_avg_sq"),
@@ -400,3 +402,31 @@ def test_cli_requires_the_operating_point_and_the_manifest(argv):
     with pytest.raises(SystemExit) as exit_info:
         main(argv)
     assert exit_info.value.code == 2
+
+
+def test_graft_carries_an_unstepped_parameter_as_unstepped(tmp_path):
+    """Adam's state dict is sparse. KLENT never steps the state-value head, so
+    no checkpoint this repo writes holds moments for it, and the conversion
+    carries that absence instead of refusing the file or inventing moments."""
+    parent = _parent_checkpoint()
+    parent_names = list(parent["model"])
+    unstepped = [
+        name
+        for name in parent_names
+        if name.startswith(("value_queries", "ln_value", "mlp_v"))
+    ]
+    assert len(unstepped) == 7, unstepped
+    for name in unstepped:
+        del parent["optimizer"]["state"][parent_names.index(name)]
+
+    old, new = tmp_path / "old.pt", tmp_path / "new.pt"
+    torch.save(parent, old)
+    graft(old, new, TAU, LAM, tmp_path / "manifest.json")
+
+    converted = torch.load(new, map_location="cpu", weights_only=False)
+    names = list(converted["model"])
+    state = converted["optimizer"]["state"]
+    assert {names[index] for index in state} == set(names) - set(unstepped)
+    load_checkpoint(new, MantisNet(MantisConfig()), torch.optim.Adam(
+        MantisNet(MantisConfig()).parameters()
+    ))

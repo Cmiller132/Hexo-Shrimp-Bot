@@ -152,10 +152,19 @@ def _adam_state(
         )
 
     entries: dict[str, dict] = {}
+    unstepped: set[str] = set()
     for name, param_id in zip(parent_names, saved_ids):
         entry = parent["state"].get(param_id)
+        if entry is None:
+            # Adam's state dict is sparse: a parameter it never stepped has no
+            # entry at all, which is how the state-value head KLENT does not
+            # train appears in every checkpoint this repo writes. Absence is
+            # the parent's own statement that the parameter is unstepped, so it
+            # is carried as absence rather than zero-filled.
+            unstepped.add(name)
+            continue
         if not isinstance(entry, dict):
-            raise ValueError(f"optimizer has no Adam state for {name}")
+            raise ValueError(f"optimizer state for {name} is not a state dict")
         missing = [f for f in ("step", "exp_avg", "exp_avg_sq") if f not in entry]
         if missing:
             raise ValueError(f"optimizer state for {name} is missing: {', '.join(missing)}")
@@ -168,9 +177,11 @@ def _adam_state(
                 )
         entries[name] = entry
 
-    zero_step = _zero_step(entries[parent_names[0]]["step"])
+    zero_step = _zero_step(next(iter(entries.values()))["step"])
     state: dict[int, dict] = {}
     for index, name in enumerate(new_names):
+        if name in unstepped:
+            continue
         if name in entries:
             state[index] = copy.deepcopy(entries[name])
         else:
