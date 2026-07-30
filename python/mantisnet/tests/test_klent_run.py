@@ -151,23 +151,6 @@ def test_eval_in_driver_leaves_training_untouched(tmp_path):
                 assert evaled[key] == plain[key], key
 
 
-def test_crossplay_plays_every_checkpoint_pair(tmp_path):
-    """The A7 matrix plays every checkpoint pair of a run."""
-    from mantisnet.klent.crossplay import cross_play
-
-    out = tmp_path / "run"
-    main(["--out", str(out), "--seed", "4", "--checkpoint-every", "1",
-          "--iterations", "2", "--games", "2", "--cap", "16", "--batch", "64",
-          "--device", "cpu"])
-
-    rows = cross_play(out, games=2, ply_cap=12, device="cpu", seed=0)
-    assert [(r["a"], r["b"]) for r in rows] == [
-        ("checkpoint_000001.pt", "checkpoint_000002.pt")
-    ]
-    assert 0.0 <= rows[0]["score_a"] <= 1.0
-    assert rows[0]["capped"] <= 2
-
-
 def _tiny_run(out_dir, iterations, checkpoint_every=100, seed=2):
     from mantisnet import MantisConfig, MantisNet
     from mantisnet.klent import run as run_mod

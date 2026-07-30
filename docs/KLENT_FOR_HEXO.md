@@ -204,19 +204,37 @@ Search is evaluation-only: collection and fitting do not import it. `gumbel_choo
 
 ### 6.2 Anchored opponent and RNG
 
-SealBot is the anchored external opponent. Its recorded identity is `sealbot` plus variant, per-turn time limit, and optional depth limit; the checkout commit and build identity are not version-pinned.
+SealBot is the anchored external opponent for in-driver evaluation. Its recorded identity is `sealbot` plus variant, per-turn time limit, and optional depth limit; the checkout commit and build identity are not version-pinned.
 
-Every match, in-driver or offline, plays one seat-paired schedule: `games / 2` uniform-random openings, each replayed from both seats, so a match requires an even game count of at least two. An opening is one to ten placements, two through six by default; the bound is what makes an opening nonterminal, because at ten placements the leading player owns five stones. The ply cap counts the opening's placements. Caps score one half. A second consecutive unplayable SealBot proposal after one retry is a forfeit scored as a model win.
+In-driver evaluation, paired head-to-head, and each crossplay pairing use one seat-paired schedule: uniform-random openings are each replayed from both seats. An opening is one to ten placements, two through six by default; the bound is what makes an opening nonterminal, because at ten placements the leading player owns five stones. The ply cap counts the opening's placements and must exceed the longest opening. Caps score one half. An illegal proposal or an exhausted declared seat restriction is a forfeit, not a cap; other seat faults abort crossplay, while the SealBot adapter alone retries one unplayable proposal before forfeiting.
 
 The in-driver evaluation generator is derived from `(run seed, completed iteration)` and never from the training generator. Enabling evaluation therefore does not consume training RNG state.
 
-### 6.3 Checkpoint crossplay
+### 6.3 Seat crossplay
 
-Crossplay evaluates every unordered pair of sorted run checkpoints once, using raw-policy argmax for both. Pair RNG derives from `(seed, index_a, index_b)` and draws that pairing's openings; caps score one half. Both choosers are deterministic, so the openings are the whole source of a pairing's diversity and the game count is the count of distinct games. `crossplay.json` and the telemetry crossplay table are replaced wholesale by each invocation.
+`mantisnet.klent.crossplay` is the host referee outside `hexo-bot` required by `CONTAINER_SPEC.md` §14. A participant list gives each stable referee ID, an argv launch command, and the checkpoint and variant for its §3.1 `hello`; it never imports participant code. The same command repeated with different checkpoint references expresses a within-run checkpoint sweep. There is no run-directory scanner or in-process crossplay path.
+
+The referee launches one subprocess per participant and holds every authoritative `hexo_py.Position`. It owns opening generation, seat swapping, the placement-count ply cap, legality, and outcomes; a seat receives neither an opponent identity nor a result. It opens both participants' mirrors from the complete shared prefix, sends only accepted-placement deltas thereafter, checks every pre-action zobrist attestation, submits the returned action to its authoritative position, and closes both live slots when the game ends. A seat's own returned action remains in the next delta because the seat does not apply it to its mirror.
+
+All games in all pairings run concurrently. In each scheduling round the referee groups every game waiting on a participant into exactly one `decide`, sends those participant-wide batches before reading their responses, and requires one ordered decision per requested slot. A slot-local `restriction_exhausted` refusal from a seat that declared a welcome restriction commits none of that batch's mirror deltas: the named slot loses its game, the complete refusal is recorded verbatim, and the unaffected slots are sent together again in the next round with the same deltas. The retired slot is not closed. An illegal action likewise loses and records its raw `ActionId` and Python engine `MoveError` text. Any other slot-local fault, a connection-scoped refusal, malformed response, wrong attestation, or dead child aborts the tournament and names the participant; none is silently scored.
+
+Every `hello` takes `PROTOCOL_VERSION`, `RULES_VERSION`, and `ACTION_ORDER_VERSION` from the loaded `hexo_py`, never configuration. A compliant disagreeing seat refuses the connection. Each `welcome` is validated independently, including that its resolved variant equals its own request, but two seats need not agree on name, package version, optional encoder version, variant, digest, or restriction. A restriction is copied into every pairing and game result in which the participant appears and never narrows the referee's legal game.
+
+Each unordered pairing plays `pairs` shared openings from both seats and is summarized by the same `paired_statistics` used in §6.4. The standalone manifest contains the exact launches, hellos and welcomes, every game's complete adjudication, every paired summary, and a symmetric row-perspective matrix. It is strict JSON written through a sibling temporary file and atomically replaces the requested `--out`; seat crossplay does not write run telemetry. The opening seed derives each pairing's prefixes from `(seed, participant index A, participant index B)`, but §3.1 carries no participant seed, so it is not a whole-match reproducibility guarantee.
+
+Bradley–Terry ratings fit the full matrix with one or more referee IDs fixed at explicit natural-log-odds anchors. For aggregate score \(w_{ab}\) over \(n_{ab}\) games,
+
+\[
+\Pr(a \mathbin{>} b)=\sigma(\beta_a-\beta_b),\qquad
+\ell=\sum_{a<b} w_{ab}\log \sigma(\beta_a-\beta_b)
+ +(n_{ab}-w_{ab})\log \sigma(\beta_b-\beta_a).
+\]
+
+A cap contributes one half to each side. Newton maximization uses the unregularized observed-information graph Laplacian; a free rating's standard error is the square root of the corresponding inverse-information diagonal, conditional on the fixed anchors. No pseudocount, ridge, clipping, or pseudoinverse turns separation into a finite estimate. The result explicitly names disconnected components, leaves an unanchored component absent, and uses directed outcome reachability to leave an all-win, all-loss, or more general separated rating and its standard error absent rather than reporting a large sentinel. Fixed anchors retain their nominated value and have conditional standard error zero.
 
 ### 6.4 Paired head-to-head
 
-A head-to-head compares two checkpoints from any two run directories directly, and is the resolution instrument: two independent anchored scores of sixty-four games cannot separate less than about eight percentage points, while the pairing below reports a standard error next to the unpaired one it replaces.
+A head-to-head compares two checkpoints from any two run directories directly, and is the resolution instrument: two independent anchored scores of sixty-four games cannot separate less than about eight percentage points, while the pairing below reports a standard error next to the unpaired one it replaces. Crossplay reuses its `paired_statistics` calculation for each seat-swapped participant pairing, but not this in-process checkpoint-loading path.
 
 `pairs` openings are each played twice with the seats swapped, both models searching at the same `sims`, and a pair is one unit — it shares its opening and its whole generator, derived from `(seed, pair index)`, and is reproducible alone. Per pair, `d` is A's wins minus one and lies in `{-1, 0, +1}`; a one-one split is the seat-advantage component the pairing removes. The result states A's score with its marginal Wilson interval, the win/split/loss pair counts, the paired and unpaired standard errors of the same estimand, an exact two-sided binomial sign test over the decisive pairs, Elo with an interval from the paired standard error, the seat split, and the capped count.
 
@@ -224,7 +242,7 @@ A cap is not a decision: a capped pair is counted apart from the win/split/loss 
 
 `temperature` scales the root Gumbel vector, and because Gumbel is a scale family this is a temperature exactly: ranking by `logit + Gumbel(0, T)` draws the root order from `softmax(logits / T)`. `T = 1` is the unscaled draw and `T = 0` searches deterministically, leaving the openings as the only source of a pairing's diversity. It applies to both seats — an asymmetric one would report the difference between two search settings as a difference between two models — and it is refused at `sims = 0`, where argmax draws no Gumbel to scale. `T` weighs against `C_VISIT` and `C_SCALE` as well as against the logits, so it also sets how much a searched line must be worth to overturn the prior order; matches at different `T` are different measurements.
 
-The two checkpoints must agree on `RULES_VERSION`, `ACTION_ORDER_VERSION`, and the Torch version, for which no conversion exists, and on `MODEL_REPR_VERSION`, for which `klent.graft` is the bridge. The output names both checkpoints' SHA-256, versions, and iteration, and the seed, sims, coefficients, temperature, pairs, opening range, ply cap, and device the match ran under; an unsearched match records absent coefficients, because it never consults them.
+The two head-to-head checkpoints must agree on `RULES_VERSION`, `ACTION_ORDER_VERSION`, and the Torch version, for which no conversion exists, and on `MODEL_REPR_VERSION`, for which `klent.graft` is the bridge. The output names both checkpoints' SHA-256, versions, and iteration, and the seed, sims, coefficients, temperature, pairs, opening range, ply cap, and device the match ran under; an unsearched match records absent coefficients, because it never consults them. These are head-to-head compatibility rules, not crossplay welcome-equality rules.
 
 ## 7. Run directory contract
 
@@ -236,7 +254,7 @@ A fresh CLI run requires an absent or empty `--out`. A nonempty directory requir
 | `invocations.jsonl` | Appends every resolved invocation, including start iteration, `starve_limit`, changed resume settings, KLENT configuration, and versions. |
 | `metrics.jsonl` | Appends and flushes one strict-JSON row per executed iteration; NaN statistics become `null`. Resume does not prune a tail beyond the restored checkpoint, so superseded or duplicate iteration numbers may remain. |
 | `status.json` | Atomically replaced heartbeat with exactly `updated`, `iteration`, `collect`, `fit`, and `eval`; idle lanes are `null`. A clean, STOP, or starvation return clears the lanes. |
-| `telemetry.db` | Schema-versioned WAL database. Each iteration's row, games, plies, and hardware aggregates commit in one transaction; evaluation and crossplay are also stored. Resume removes driver/self-play rows at and beyond the restored iteration before replay. |
+| `telemetry.db` | Schema-versioned WAL database. Each iteration's row, games, plies, and hardware aggregates commit in one transaction; in-driver evaluation is also stored. Resume removes driver/self-play rows at and beyond the restored iteration before replay. Seat crossplay writes its standalone manifest instead. |
 | `checkpoint_NNNNNN.pt` | Atomic write containing model, optimizer, completed-iteration count, main NumPy RNG state, and versions. `NNNNNN` is the completed count. |
 | `CHECKPOINT` | At the next iteration commit, forces a checkpoint, is consumed, and training continues. |
 | `STOP` | After the current iteration, forces a checkpoint, is consumed, and returns normally; a starvation return takes precedence. |

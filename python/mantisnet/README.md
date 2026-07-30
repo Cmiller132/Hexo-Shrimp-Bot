@@ -42,6 +42,7 @@ Core modules:
 | `klent.opponents` | Opponent seam, SealBot adapter, `shared_openings`, `wilson`, `elo` |
 | `klent.evaluate` | Policy argmax and the two-chooser lockstep match loop |
 | `klent.headtohead` | Paired cross-run checkpoint-vs-checkpoint match and CLI |
+| `klent.crossplay` | Round-robin referee for independent §3.1 subprocess seats |
 | `deck.app` | FastAPI routes and SPA serving |
 | `deck.service` | Run registry, inference cache, and play sessions |
 | `deck.state` | Deck-owned reviews, probes, presets, and match jobs |
@@ -107,6 +108,51 @@ uv run python -m mantisnet.klent.headtohead \
   --out h2h.json
 ```
 
+Run a seat-protocol round robin from a participant list:
+
+```json
+[
+  {
+    "id": "epoch-1000",
+    "command": ["hexo-bot", "serve", "--package", "mantisnet"],
+    "hello": {
+      "checkpoint": "runs/one/native/checkpoint-1000",
+      "variant": "policy"
+    }
+  },
+  {
+    "id": "foreign-engine",
+    "command": ["python", "-u", "foreign_seat.py"],
+    "hello": {
+      "checkpoint": "weights/foreign.bin",
+      "variant": "search:visits=64"
+    }
+  }
+]
+```
+
+```sh
+uv run python -m mantisnet.klent.crossplay \
+  --participants participants.json \
+  --pairs 32 \
+  --anchor epoch-1000=0 \
+  --cap 512 \
+  --out crossplay.json
+```
+
+Commands are argv arrays and are launched without a shell. Participant IDs are
+referee keys, not seat identities; the seat supplies its name, package version,
+optional encoder version, resolved variant, digest, and optional restriction in
+`welcome`. At least one repeated `--anchor ID=RATING` is required. Ratings and
+anchor values are Bradley–Terry natural log-odds.
+
+The output is one strict, atomically replaced JSON manifest. It records the
+exact `hello` and `welcome` for every participant, every game's opening, seats,
+plies and adjudication, paired statistics for every unordered pairing, a
+row-perspective full matrix, and anchored Bradley–Terry ratings with standard
+errors. Listing the same serve command with each run checkpoint is the
+within-run checkpoint sweep; there is no checkpoint-scanning execution path.
+
 Run the deck backend directly:
 
 ```sh
@@ -152,15 +198,28 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 - `--resume` requires a checkpoint and is exclusive with `--init-from`.
 - `config.json` records current run fields; `invocations.jsonl` records every invocation and resume.
 - `metrics.jsonl` is append-only; replay after resume can repeat an iteration number.
-- `telemetry.db` is schema-versioned and stores run, iteration, game, ply,
-  evaluation, and cross-play data.
+- `telemetry.db` is schema-versioned and stores training and in-driver
+  evaluation data. Seat crossplay writes its standalone result manifest, not
+  run telemetry.
 - `status.json` is the deck heartbeat and phase-progress surface.
 - `STOP` requests shutdown after the current iteration and a durable checkpoint.
 - `CHECKPOINT` requests a checkpoint at the next commit point.
-- Every match plays `games / 2` shared random openings from both seats; the ply
-  cap counts the opening's placements, and a capped game scores one half.
-- Both crossplay choosers are deterministic, so the openings are the whole
-  source of a pairing's diversity.
+- Every evaluation, head-to-head, or crossplay pairing uses shared random
+  openings from both seats. The ply cap counts the opening's placements, and a
+  capped game scores one half.
+- The crossplay referee imports no participant. It holds every authoritative
+  `hexo_py.Position` and sends one `decide` per participant per scheduling round
+  containing all games then waiting on that seat.
+- Crossplay sends the three version constants exported by `hexo_py` to every
+  seat independently. It does not require participants' welcome identity,
+  encoder, variant, digest, or restriction to agree.
+- A slot-local `restriction_exhausted` refusal from a seat that declared a
+  welcome restriction, or an illegal action, forfeits that game with its
+  complete cause preserved. Any other slot-local fault, a connection refusal,
+  malformed response, or dead subprocess aborts the tournament rather than
+  becoming a score.
+- The crossplay seed fixes referee openings only. §3.1 carries no participant
+  RNG seed, so a repeated seed is not a whole-tournament reproducibility claim.
 - A head-to-head pair shares its opening and its generator, derived from
   `(seed, pair index)`, and is reproducible on its own; the same seed gives the
   same result.
