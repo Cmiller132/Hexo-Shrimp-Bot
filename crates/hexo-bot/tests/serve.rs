@@ -110,11 +110,13 @@ fn a_successful_handshake_loads_the_checkpoint_and_reports_its_identity() {
         output[0],
         json!({
             "type": "welcome",
-            "package": manifest.package,
-            "package_version": manifest.package_version,
+            "name": manifest.package,
+            "version": manifest.package_version,
             "encoder_version": manifest.encoder_version,
             "resolved_variant": "policy",
-            "probe_hash": hash(manifest.probe_hash),
+            "digest": hash(manifest.probe_hash),
+            // A package proposes every legal action, so it declares no
+            // restriction and the optional field is absent entirely.
         }),
     );
     assert_ok(&output[1], "bye");

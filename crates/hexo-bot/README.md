@@ -99,8 +99,9 @@ hello =
    "action_order_version":U32,"checkpoint":STRING,"variant":STRING}
 
 welcome =
-  {"type":"welcome","package":STRING,"package_version":U32,
-   "encoder_version":U32,"resolved_variant":STRING,"probe_hash":HASH}
+  {"type":"welcome","name":STRING,"version":U32,
+   "encoder_version":U32?,"resolved_variant":STRING,"digest":HASH,
+   "restriction":STRING?}
 
 open =
   {"type":"open","slots":[OPEN_SLOT,...]}
@@ -158,13 +159,21 @@ resolved from the seat process's working directory. `variant` is a nonempty
 package variant string.
 
 The seat loads and proves the checkpoint, constructs the requested variant and
-evaluator, and only then returns `welcome`. `package`, `package_version`, and
-`encoder_version` identify the loaded package; `probe_hash` is the proved
-manifest hash. `resolved_variant` is the exact accepted `hello.variant` string,
-without normalization or substitution. An orchestrator checks the three shared
-versions independently for each seat. It must not require two seats'
-`welcome` values to agree on package, package version, encoder version,
-resolved variant, or probe hash.
+evaluator, and only then returns `welcome`. `name` and `version` identify the
+loaded package and `encoder_version` its encoder; `digest` is the proved
+manifest probe hash. `resolved_variant` is the exact accepted `hello.variant`
+string, without normalization or substitution. An orchestrator checks the three
+shared versions independently for each seat. It must not require two seats'
+`welcome` values to agree on name, version, encoder version, resolved variant,
+or digest.
+
+`welcome` has one shape for every seat, because an orchestrator reads native and
+foreign seats through the same parser. A seat that is not a `hexo-model` package
+— an independent engine reaching this protocol through an adapter of its own —
+omits `encoder_version`, which it does not have, and puts a content digest of
+its own weights in `digest`. `restriction`, absent here, is how such a seat
+declares that it will not propose some legal actions; `hexo-bot` proposes every
+action in the canonical order, so it never sends one.
 
 ### Slot lifecycle and batching
 

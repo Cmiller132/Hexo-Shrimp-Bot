@@ -175,11 +175,14 @@ pub fn serve<R: BufRead, W: Write>(
                 };
 
                 let welcome = Response::Welcome {
-                    package: loaded.name(),
-                    package_version: loaded.package_version(),
-                    encoder_version: loaded.encoder_version(),
+                    name: loaded.name(),
+                    version: loaded.package_version(),
+                    encoder_version: Some(loaded.encoder_version()),
                     resolved_variant: variant.clone(),
-                    probe_hash: hex_u64(manifest.probe_hash),
+                    digest: hex_u64(manifest.probe_hash),
+                    // A package proposes every legal action: the canonical
+                    // ordering (§5) is the whole of its candidate set.
+                    restriction: None,
                 };
                 seat = Some(Seat {
                     package: loaded,
@@ -765,12 +768,20 @@ impl<'de> Deserialize<'de> for WireU64 {
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Response {
+    /// §3.1's seat identity. One shape serves every seat: a `hexo-model`
+    /// package fills `encoder_version` and puts its probe hash (§10.2) in
+    /// `digest`, while an independent engine reaching this protocol through its
+    /// own adapter omits the encoder version and digests its own weights.
+    /// `restriction` is absent for a seat that proposes every legal action.
     Welcome {
-        package: &'static str,
-        package_version: u32,
-        encoder_version: u32,
+        name: &'static str,
+        version: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        encoder_version: Option<u32>,
         resolved_variant: String,
-        probe_hash: String,
+        digest: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        restriction: Option<String>,
     },
     Ok {
         message: &'static str,

@@ -138,7 +138,7 @@ move the §4 crossing to once per position, and is forbidden for that reason.
 | Message | Direction | Carries |
 | --- | --- | --- |
 | `hello` | to seat | `PROTOCOL_VERSION`, `RULES_VERSION`, `ACTION_ORDER_VERSION`, the checkpoint reference, and the requested variant |
-| `welcome` | from seat | package name and version, encoder version, the resolved variant, and the probe hash of the loaded checkpoint |
+| `welcome` | from seat | the seat's name and version, its encoder version where it has one, the resolved variant, a digest of the weights it loaded, and any restriction it plays under |
 | `open` | to seat | new slot ids, each with its opening line and which side this seat plays |
 | `decide` | to seat | per slot: the moves applied since that slot's last message, and the zobrist expected after them |
 | `decided` | from seat | per slot: the chosen action, the session's zobrist attestation, and the package's diagnostics bytes |
@@ -176,6 +176,27 @@ require two seats to agree with each other on package, package version, encoder
 version, or variant: seats differing there is the purpose of a cross-package or
 cross-encoder match, and it is the one asymmetry between this protocol and the
 in-process `match` of §3.
+
+**A seat identifies itself by a digest of what it loaded.** `welcome` carries a
+name, a version, and a digest binding the weights that will play. For a
+`hexo-model` seat that digest is the probe hash of §10.2 and the name is its
+package. A seat that is not a `hexo-model` package — an independent engine
+holding its own network, reaching this protocol through an adapter of its own —
+has no package, encoder version, or probe hash to report, and MUST report a
+content digest of the weights it loaded instead. The field exists to pin which
+weights played; a seat MUST NOT satisfy it with a value that does not change
+when its weights do.
+
+**A seat declares any restriction on the moves it will propose.** A seat that
+will not propose some legal actions — because it searches a narrower candidate
+set than the rules allow, or refuses a class of action — MUST say so at
+`welcome`, and the orchestrator MUST record that declaration with every result
+the seat appears in. This is not a rules disagreement and MUST NOT be treated as
+one: the seat's actions all remain legal, so `RULES_VERSION` still matches and
+play is sound. It is a handicap, and an undeclared handicap makes a rating
+report a restricted player as a peer. The orchestrator MUST NOT narrow the game
+to match a restriction, and a seat MUST NOT propose an action its declaration
+excludes.
 
 **The variant carries move selection, including temperature.** Sampling,
 temperature, and greediness are the package's (§5), so they reach a seat as its
