@@ -105,6 +105,27 @@ def network_evaluate(model, cfg: KlentConfig):
     return evaluate
 
 
+def _refuse_nonfinite_parameters(model, step: int) -> None:
+    """Refuse a weight update that left the finite range, at the step that did it.
+
+    A single non-finite parameter makes every later evaluation non-finite, and
+    the first thing that notices is the return recursion refusing a whole
+    corpus one collection later — which names neither the step nor the tensor.
+    One fused multi-tensor norm and one synchronization per optimizer step buy
+    that name; the per-parameter walk runs only when the check has already
+    failed.
+    """
+    total = torch.stack(torch._foreach_norm(list(model.parameters()))).sum()
+    if torch.isfinite(total):
+        return
+    guilty = [n for n, p in model.named_parameters() if not torch.isfinite(p).all()]
+    raise ValueError(
+        f"optimizer step {step} left {len(guilty)} parameter tensors non-finite: "
+        + ", ".join(guilty[:8])
+        + (" ..." if len(guilty) > 8 else "")
+    )
+
+
 def _rebuild(samples: list[Sample]):
     """Rebuild buffered move prefixes in parallel into one batch.
 
@@ -197,6 +218,7 @@ def fit(
     q_sum = torch.zeros((), device=cfg.device)
     mass_sum = torch.zeros((), device=cfg.device)
     total = 0
+    step = 0
     with ThreadPoolExecutor(max_workers=1) as pool:
         prepped = {k: pool.submit(prep, k) for k in order[:1]}
         consumed = 0
@@ -242,6 +264,8 @@ def fit(
                 if progress is not None:
                     progress(consumed, len(order))
             optimizer.step()
+            step += 1
+            _refuse_nonfinite_parameters(model, step)
             total += group_n
     return {
         "policy_loss": float(policy_sum) / total,

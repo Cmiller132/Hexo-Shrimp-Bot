@@ -52,7 +52,7 @@ The last stored state precedes the winning placement, so its acting mover is the
 - inputs that are empty, non-1-D, or unequal in shape; or
 - `v_hats` entries that are non-finite or outside $[-1,1]$ by more than the fp32 summation slack $10^{-4}$.
 
-The returned array is itself refused if any entry leaves that same widened interval, which bounded inputs make unreachable. The slack is not a tolerance on the mathematics: $\lvert\hat v\rvert\le\max_a\lvert Q(a)\rvert\le1$ exactly, but $\hat v$ is an fp32 sum over a position's legal cells, a saturated critic puts many of them at exactly $\pm1$, and an fp32 segment softmax sums to one only to a few ulps.
+Both refusals name the failing entry, its value, and how many entries were non-finite versus merely outside the interval, because a non-finite value and a small excursion have different causes. The returned array is itself refused if any entry leaves that same widened interval, which bounded inputs make unreachable. The slack is not a tolerance on the mathematics: $\lvert\hat v\rvert\le\max_a\lvert Q(a)\rvert\le1$ exactly, but $\hat v$ is an fp32 sum over a position's legal cells, a saturated critic puts many of them at exactly $\pm1$, and an fp32 segment softmax sums to one only to a few ulps.
 
 It does not separately validate sign values, finiteness, or the range of `v_hats`.
 
@@ -189,6 +189,8 @@ Each forward chunk is packed under three configured limits:
 Collection uses separate pair and cell budgets and a derived position-count pipeline cap. Budget numbers are configuration, not constants of this contract. A single indivisible position that exceeds a pair or cell budget is retained as a singleton; therefore the budgets are hard peak caps only when each individual position fits them.
 
 Fit chunks accumulate sample-weighted gradients until an optimizer group reaches or crosses `batch_size`; a group may exceed it, and the final group may be smaller. The gradient is the mean loss over the whole group. Preparation of the next replayed chunk runs one chunk ahead on a CPU worker.
+
+Every optimizer step is followed by one fused finiteness check over the parameters. A non-finite weight makes every later evaluation non-finite, and without the check the first refusal comes from the return recursion one collection later, naming neither the step nor the tensor; the check refuses at the step, naming both.
 
 ### 5.2 Outer-loop ordering
 
