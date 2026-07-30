@@ -111,8 +111,6 @@ improved_policy(
 | `norm_entropy` | `(P,)` | $H(\pi')/\log|A(S)|$, defined as zero when $|A(S)|=1$. |
 
 Each per-position expectation — `v_hat`, `kl`, and the entropy behind `norm_entropy` — divides by that segment's summed $\pi'$. The mass is one by definition, but an fp32 segment softmax sums to one only to a few ulps, and where every legal move shares one saturated $Q$ nothing cancels that error: it reached $1.1\times10^{-4}$ outside $[-1,1]$ on a 159-ply position, which §1.3's range check refuses. Dividing keeps $\lvert\hat v\rvert\le\max_a\lvert Q(a)\rvert$ at any segment width.
-vert\le\max_a\lvert Q(a)
-vert$ at any segment width.
 
 ### 2.2 Refusal boundary
 
