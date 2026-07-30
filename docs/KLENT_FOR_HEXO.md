@@ -50,9 +50,9 @@ The last stored state precedes the winning placement, so its acting mover is the
 - `lam_ret` outside $[0,1]$;
 - `gamma` outside $(0,1]$;
 - inputs that are empty, non-1-D, or unequal in shape; or
-- `v_hats` entries that are non-finite or outside $[-1,1]$.
+- `v_hats` entries that are non-finite or outside $[-1,1]$ by more than the fp32 summation slack $10^{-4}$.
 
-The returned array is itself refused if any entry leaves $[-1,1]$, which bounded inputs make unreachable.
+The returned array is itself refused if any entry leaves that same widened interval, which bounded inputs make unreachable. The slack is not a tolerance on the mathematics: $\lvert\hat v\rvert\le\max_a\lvert Q(a)\rvert\le1$ exactly, but $\hat v$ is an fp32 sum over a position's legal cells, a saturated critic puts many of them at exactly $\pm1$, and an fp32 segment softmax sums to one only to a few ulps.
 
 It does not separately validate sign values, finiteness, or the range of `v_hats`.
 
