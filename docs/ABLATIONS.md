@@ -585,7 +585,24 @@ The bipolar head's own quantities over the same set: $u^{+}+u^{-}$, its estimate
 | Delta from reference | The decoder's class is joint in the window's occupancy mask and the candidate cell's own slot, folded by a reversal acting on both halves — 93 classes where the slot class alone gave 3 (MODEL_SPEC §4.3). Both cell heads' class tables grow to 93 rows, +23,040 parameters; the stone incidence keeps the slot class. `MODEL_REPR_VERSION` 1 → 2. `--cell-budget 450000 --collect-cell-budget 1350000`, memory only: the aggregate row widens from $H+16$ to $H+128$, so the budgets come down by that same 1.78 to hold decoder memory at the reference's level. Otherwise the reference recipe. Branch `joint-slot-decoder`. |
 | Question | Whether removing the decoder's action aliases improves evaluation, and which head uses the separation |
 | Pre-stated abort signature | As `brm-939`: evaluation at or below 0.625 at iteration 25, or H outside [0.12, 0.36] on a monotone trend |
-| Disposition | Built, verified, and grafted; awaiting the GPU |
+| Disposition | Launched 2026-07-30 12:25 UTC, from `tail-939`'s stop at iteration 84 |
+
+Pre-registered before iteration 0, against `lam-ret-939` iterations 0–49 as the control:
+
+| Quantity | Control | Predicted |
+| --- | ---: | --- |
+| Wins of 128 over the two evaluations | 108 | 104–116 — not separable at this evaluation budget |
+| Minimum q-loss | 0.07501 | 0.068–0.073 |
+| Undecided-bucket top-1 | 0.6035 | 0.61–0.63 |
+| Iteration time | — | +5% to +15% from the wider head GEMM |
+
+The reasoning, so a wrong prediction is diagnostic rather than merely wrong: adjacency is already
+recoverable from window multiplicity, which the aliasing does not touch. A candidate adjacent to a
+lone stone shares five live windows with it; one four cells away shares two. The model therefore
+reconstructs contact from how many windows a cell shares with a stone, and the joint class makes
+that direct rather than newly possible. The exact ties it removes are thin — about 1.5 pairs per
+position, usually between two low-probability halo moves. So the expectation is a real but small
+gain, concentrated in the critic, where per-move contact geometry is what an action value needs.
 
 What the old key merged, measured over 2,800 positions from uniformly-random legal playouts before the change:
 
