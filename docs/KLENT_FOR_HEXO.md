@@ -202,13 +202,15 @@ Search is evaluation-only: collection and fitting do not import it. `gumbel_choo
 - Sequential-halving rounds deepen surviving lines without exceeding `sims` neural expansions per root.
 - Interior actions are improved-policy argmax. Nonterminal leaf values are $\hat v$, signed into the root mover's frame; terminal values are exact $\pm1$.
 
-### 6.2 Anchored opponent and RNG
+### 6.2 Anchored opponents and RNG
 
-SealBot is the anchored external opponent for in-driver evaluation. Its recorded identity is `sealbot` plus variant, per-turn time limit, and optional depth limit; the checkout commit and build identity are not version-pinned.
+The driver accepts SealBot, one independent §3.1 subprocess seat, or both as anchored external opponents. SealBot's recorded identity is `sealbot` plus variant, per-turn time limit, and optional depth limit; the checkout commit and build identity are not version-pinned. `--eval-seat PATH` reads the same strict participant-list format as crossplay but requires exactly one entry, with an explicit referee ID, argv command, checkpoint, and requested variant. The seat's `welcome.name` is its opponent name, and its strength-defining configuration is exactly `welcome.resolved_variant` plus `welcome.digest`.
 
-In-driver evaluation, paired head-to-head, and each crossplay pairing use one seat-paired schedule: uniform-random openings are each replayed from both seats. An opening is one to ten placements, two through six by default; the bound is what makes an opening nonterminal, because at ten placements the leading player owns five stones. The ply cap counts the opening's placements and must exceed the longest opening. Caps score one half. An illegal proposal or an exhausted declared seat restriction is a forfeit, not a cap; other seat faults abort crossplay, while the SealBot adapter alone retries one unplayable proposal before forfeiting.
+The seat opponent starts one subprocess for a match and delays each game's `open` until the model/opponent loop first asks that seat to choose; at that point the authoritative position's `current_player` fixes the seat's side. All newly waiting games are opened in one batch. Each chooser round sends one `decide` containing every waiting slot, its accepted moves since the slot's last committed message, and the resulting zobrist; `after_move` accumulates this delta for both players' moves. A slot-local `restriction_exhausted` refusal is a scored `FORFEIT` only when that seat declared a `welcome.restriction`. Because a refusal answers the whole request, the adapter removes the forfeiting slot and retries all survivors together without advancing their sent cursors. An illegal action is also a forfeit. Every other refusal, a malformed response, a bad attestation, or a dead subprocess raises a participant-naming `SeatError` and aborts the evaluation. For a normally ended or capped game, `finish_game` closes its slot and returns the seat diagnostics as opponent metadata.
 
-The in-driver evaluation generator is derived from `(run seed, completed iteration)` and never from the training generator. Enabling evaluation therefore does not consume training RNG state.
+In-driver evaluation, paired head-to-head, and each crossplay pairing use one seat-paired schedule: uniform-random openings are each replayed from both seats. An opening is one to ten placements, two through six by default; the bound is what makes an opening nonterminal, because at ten placements the leading player owns five stones. The ply cap counts the opening's placements and must exceed the longest opening. Caps score one half. An illegal proposal or an exhausted declared seat restriction is a forfeit, not a cap; other seat faults abort their match, while the SealBot adapter alone retries one unplayable proposal before forfeiting.
+
+The in-driver evaluation generator is derived from `(run seed, completed iteration)` and never from the training generator. Enabling evaluation therefore does not consume training RNG state. `--eval-games` applies separately to every configured opponent, and each match starts from a fresh generator with that same derivation, so adding another anchor neither divides the game budget nor perturbs the other anchor's opening/model-RNG schedule.
 
 ### 6.3 Seat crossplay
 
@@ -250,11 +252,11 @@ A fresh CLI run requires an absent or empty `--out`. A nonempty directory requir
 
 | Artifact | Guarantee |
 |---|---|
-| `config.json` | Replaced on every invocation with the current resolved KLENT/model settings, target iteration, checkpoint/evaluation settings, seed, init source, SealBot path, and versions. It omits `starve_limit`. |
-| `invocations.jsonl` | Appends every resolved invocation, including start iteration, `starve_limit`, changed resume settings, KLENT configuration, and versions. |
+| `config.json` | Replaced on every invocation with the current resolved KLENT/model settings, target iteration, checkpoint/evaluation settings, seed, init source, configured SealBot path and/or evaluation-seat source plus participant entry, and versions. It omits `starve_limit`. |
+| `invocations.jsonl` | Appends every resolved invocation, including start iteration, `starve_limit`, changed resume settings, external-opponent configuration, KLENT configuration, and versions. |
 | `metrics.jsonl` | Appends and flushes one strict-JSON row per executed iteration; NaN statistics become `null`. Resume does not prune a tail beyond the restored checkpoint, so superseded or duplicate iteration numbers may remain. |
 | `status.json` | Atomically replaced heartbeat with exactly `updated`, `iteration`, `collect`, `fit`, and `eval`; idle lanes are `null`. A clean, STOP, or starvation return clears the lanes. |
-| `telemetry.db` | Schema-versioned WAL database. Each iteration's row, games, plies, and hardware aggregates commit in one transaction; in-driver evaluation is also stored. Resume removes driver/self-play rows at and beyond the restored iteration before replay. Seat crossplay writes its standalone manifest instead. |
+| `telemetry.db` | Schema-versioned WAL database. Each iteration's row, games, plies, and hardware aggregates commit in one transaction; every in-driver opponent result is stored as its own attributed match row. Resume removes driver/self-play rows at and beyond the restored iteration before replay. Seat crossplay writes its standalone manifest instead. |
 | `checkpoint_NNNNNN.pt` | Atomic write containing model, optimizer, completed-iteration count, main NumPy RNG state, and versions. `NNNNNN` is the completed count. |
 | `CHECKPOINT` | At the next iteration commit, forces a checkpoint, is consumed, and training continues. |
 | `STOP` | After the current iteration, forces a checkpoint, is consumed, and returns normally; a starvation return takes precedence. |
@@ -292,11 +294,10 @@ Acting means cover every position evaluated during the collection call, includin
 | `q_loss` | Sample-weighted mean taken-action $(Q-G)^2$ over the epoch. |
 | `fit_steps` | Number of optimizer groups stepped. |
 | `seconds` | Driver interval covering the collection wait and fit; evaluation is excluded. |
-| `eval_score` | Evaluation score per game: win or opponent forfeit 1, cap $1/2$, loss 0. |
-| `eval_capped`, `eval_games` | Capped-game count and total games in that evaluation. |
-| `eval_seconds` | Wall time around evaluation and its telemetry recording. |
+| `eval_results` | One entry per configured opponent, each containing `opponent_name`, strength-defining `opponent_config`, total `score`, `win_rate`, `games`, `capped`, and `forfeits`. A model win or opponent forfeit scores 1, a cap \(1/2\), and a loss 0; forfeits remain explicit rather than being folded into losses. |
+| `eval_seconds` | Wall time across all opponent matches and their telemetry recording. |
 
-`policy_loss`, `q_loss`, and `fit_steps` are absent when the buffer is empty. Evaluation fields are absent when no evaluation runs. Empty conditional statistics are serialized as `null`. Telemetry additionally derives samples/second, game and ply counts, and per-iteration hardware means and maxima.
+`policy_loss`, `q_loss`, and `fit_steps` are absent when the buffer is empty. Evaluation fields are absent when no evaluation runs. Empty conditional statistics are serialized as `null`. Telemetry writes one `eval_matches` row per `eval_results` entry and additionally derives samples/second, game and ply counts, and per-iteration hardware means and maxima.
 
 ## 9. Deviations from the paper
 
@@ -350,7 +351,7 @@ Acting means cover every position evaluated during the collection call, includin
 
 ### 9.13 Anchored evaluator and match protocol
 
-**Paper:** Anchored evaluation uses 1,024 games against a fixed pretrained Pgx checkpoint. **Here:** The reference recipe uses 64 seat-paired games from shared random prefixes against external SealBot. **Grounds:** SealBot exposes a separate rules state and alpha-beta chooser through the opponent seam. **Measured outcomes:** See [ABLATIONS.md § SealBot as anchored evaluator](ABLATIONS.md#sealbot-as-anchored-evaluator).
+**Paper:** Anchored evaluation uses 1,024 games against a fixed pretrained Pgx checkpoint. **Here:** The reference recipe uses 64 seat-paired games per configured anchor from shared random prefixes; retained measurements use external SealBot, and the driver can instead or additionally anchor against one independent §3.1 subprocess seat. **Grounds:** The common opponent seam admits SealBot's separate rules state and alpha-beta chooser or a seat whose strength is fixed by its resolved variant and digest. **Measured outcomes:** See [ABLATIONS.md § SealBot as anchored evaluator](ABLATIONS.md#sealbot-as-anchored-evaluator).
 
 ### 9.14 Model substrate
 

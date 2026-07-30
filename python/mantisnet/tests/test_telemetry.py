@@ -375,7 +375,7 @@ def test_convert_regenerates_a_v1_database(tmp_path):
     tel.convert_v1(tmp_path)
     assert (tmp_path / "telemetry.db.v1.bak").exists()
 
-    conn = tel.connect(tmp_path)  # a v2 open proves the version
+    conn = tel.connect(tmp_path)  # a current-schema open proves the version
     game = tel.fetch_game(conn, 0)
     assert game["moves"] == [(0, 0), (1, 0)]
     assert game["plies"][0]["v_hat"] == pytest.approx(0.31418, abs=0.5 / tel._Q)
@@ -405,7 +405,7 @@ def test_convert_regenerates_a_v1_database(tmp_path):
     conn.close()
 
     with pytest.raises(ValueError, match="v1 databases only"):
-        tel.convert_v1(tmp_path)  # already v2
+        tel.convert_v1(tmp_path)  # already the current schema
 
 
 def test_calibration_matches_arithmetic_by_hand(tmp_path):

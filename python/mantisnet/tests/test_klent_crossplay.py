@@ -10,14 +10,9 @@ from pathlib import Path
 import hexo_py
 import pytest
 
-from mantisnet.klent.crossplay import (
-    Participant,
-    SeatError,
-    cross_play,
-    fit_bradley_terry,
-    main,
-)
+from mantisnet.klent.crossplay import cross_play, fit_bradley_terry, main
 from mantisnet.klent.headtohead import paired_statistics
+from mantisnet.klent.seat import Participant, SeatError
 
 
 _SCRIPTED_SEAT = r'''

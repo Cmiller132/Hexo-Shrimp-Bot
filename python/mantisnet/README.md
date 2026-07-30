@@ -39,7 +39,8 @@ Core modules:
 | `klent.run` | Checkpointed iteration driver and CLI |
 | `klent.telemetry` | SQLite writes, queries, and CLI |
 | `klent.search` | Gumbel line search used by Python evaluation |
-| `klent.opponents` | Opponent seam, SealBot adapter, `shared_openings`, `wilson`, `elo` |
+| `klent.opponents` | Opponent seam, SealBot and native-seat adapters, `shared_openings`, `wilson`, `elo` |
+| `klent.seat` | Shared strict §3.1 subprocess client, participant format, wire codec, and response validation |
 | `klent.evaluate` | Policy argmax and the two-chooser lockstep match loop |
 | `klent.headtohead` | Paired cross-run checkpoint-vs-checkpoint match and CLI |
 | `klent.crossplay` | Round-robin referee for independent §3.1 subprocess seats |
@@ -97,6 +98,42 @@ uv run python -m mantisnet.klent.telemetry --run runs/readme-smoke summary
 uv run python bench/bench_forward.py
 uv run python bench/bench_loop.py sweep --device cpu --stones 20 --cohorts 16 --iters 1
 ```
+
+Anchor in-driver evaluation against one native §3.1 seat by putting exactly one
+normal participant entry in `eval-seat.json`:
+
+```json
+[
+  {
+    "id": "foreign-anchor",
+    "command": ["python", "-u", "foreign_seat.py"],
+    "hello": {
+      "checkpoint": "weights/foreign.bin",
+      "variant": "search:visits=64"
+    }
+  }
+]
+```
+
+```sh
+uv run python -m mantisnet.klent.run \
+  --out runs/seat-anchored \
+  --iterations 100 \
+  --games 64 \
+  --envs 64 \
+  --eval-every 25 \
+  --eval-games 64 \
+  --eval-seat eval-seat.json \
+  --sealbot /path/to/SealBot
+```
+
+The participant ID, `command` argv, `hello.checkpoint`, and `hello.variant` are
+all required and are not filled from the environment. A positive
+`--eval-every` requires `--eval-seat`, `--sealbot`, or both. When both are
+present, `--eval-games` applies to each opponent and both receive the same
+opening/model-RNG schedule. Each metrics row stores an attributed
+`eval_results` entry per opponent, and telemetry stores one match row per
+opponent.
 
 Compare two checkpoints from different runs, paired:
 
@@ -199,14 +236,23 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 - `config.json` records current run fields; `invocations.jsonl` records every invocation and resume.
 - `metrics.jsonl` is append-only; replay after resume can repeat an iteration number.
 - `telemetry.db` is schema-versioned and stores training and in-driver
-  evaluation data. Seat crossplay writes its standalone result manifest, not
-  run telemetry.
+  evaluation data, with one match row per configured opponent. Seat crossplay
+  writes its standalone result manifest, not run telemetry.
 - `status.json` is the deck heartbeat and phase-progress surface.
 - `STOP` requests shutdown after the current iteration and a durable checkpoint.
 - `CHECKPOINT` requests a checkpoint at the next commit point.
 - Every evaluation, head-to-head, or crossplay pairing uses shared random
   openings from both seats. The ply cap counts the opening's placements, and a
   capped game scores one half.
+- `klent.crossplay` and `SeatOpponent` share the one strict client in
+  `klent.seat`; neither imports participant code.
+- A `SeatOpponent` batches all newly waiting slots into one lazy `open`; every
+  `decide` request names all slots still waiting in that chooser round. A
+  declared `restriction_exhausted` refusal forfeits its slot and retries the
+  survivors without advancing their move cursors; any other refusal, bad
+  response, attestation failure, or dead child aborts the evaluation.
+- Seat-opponent strength is attributed by the `welcome` resolved variant and
+  digest. Its scored forfeits remain explicit in `eval_results.forfeits`.
 - The crossplay referee imports no participant. It holds every authoritative
   `hexo_py.Position` and sends one `decide` per participant per scheduling round
   containing all games then waiting on that seat.

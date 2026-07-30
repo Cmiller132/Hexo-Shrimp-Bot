@@ -2,7 +2,11 @@
 
 This file is the technical record of the retained KLENT training runs and engineering experiments. It records configurations, measurements, artifact limits, and dispositions. It does not rank runs or prescribe a next experiment.
 
-The comparison reference used below is: \(\gamma=0.99\), \(\lambda=0.01\), \(\tau=0.1\), \(\lambda_{\mathrm{ret}}=0.939\), and a scalar tanh critic; 4096 completed games per iteration, 1024 environments, ply cap 512, and learning rate \(10^{-3}\). Unless a run configuration says otherwise, in-driver evaluations are 64 seat-balanced games against uncapped SealBot at 0.1 s/move, using the 32-simulation Gumbel line search.
+The comparison reference used below is: \(\gamma=0.99\), \(\lambda=0.01\), \(\tau=0.1\), \(\lambda_{\mathrm{ret}}=0.939\), and a scalar tanh critic; 4096 completed games per iteration, 1024 environments, ply cap 512, and learning rate \(10^{-3}\). Unless a run configuration says otherwise, the recorded in-driver evaluations below are 64 seat-balanced games against uncapped SealBot at 0.1 s/move, using the 32-simulation Gumbel line search.
+
+One such evaluation costs 69.6 s on an RTX 4070 Ti, measured on `joint-939/checkpoint_000050.pt` at seed 0 over 64 games averaging 45.3 plies, none capped. Repeating it at zero simulations — raw-policy argmax, 45.6 mean plies — costs 57.2 s, so SealBot's own turn budget sets a floor near 57 s and the 32-simulation line search adds about 12 s above it. The pair is a cost control and not a strength comparison; it locates an evaluation's wall time, which is mostly not in the model.
+
+The current driver can evaluate against SealBot, one independent §3.1 subprocess seat, or both. `--eval-games` is a per-opponent count: when both are configured, each receives the same seat-balanced opening and model-RNG schedule derived from the run seed and completed iteration, rather than splitting the requested games. Metrics and telemetry attribute a separate result to each opponent and its strength-defining configuration.
 
 Runs whose last artifact predates 2026-07-29 — everything up to and including `pure-2`, plus the two `.aborted-guard` directories — live under `runs/archive/<name>/`. The move is the whole of the archiving: nothing is deleted, every artifact this record cites is still readable at that path, and the deck lists only direct children of `runs/` that hold a `config.json`, so an archived run stops appearing without being removed.
 
