@@ -86,9 +86,9 @@ of adjudicating.
 protocol is designed for this system's needs and translated into; a foreign
 protocol's assumptions never reach `hexo-runner`.
 
-`train` is implemented. `serve` and `play` are not implemented because their
-wire protocol is unspecified; the binary MUST NOT expose either subcommand
-until its protocol is specified and implemented.
+`train` is implemented. `serve` and `play` are specified in §3.1 and not yet
+implemented; the binary MUST NOT expose either subcommand until its protocol is
+implemented against that section.
 
 `match` plays two seats — each named by package, checkpoint, package config, and
 session variant — over the same driver used by `train`, and prints a JSON
@@ -105,6 +105,108 @@ MantisNet, package config
 Python `.pt`, loads that copy through the live evaluator, and writes the
 manifest and probe hash that make subsequent loads provable. It constructs no game
 and claims no new authority.
+
+### 3.1 The seat protocol
+
+`serve` speaks this protocol. It is the native one: a foreign protocol is
+translated into it at an adapter, and a foreign protocol's assumptions never
+reach `hexo-runner`.
+
+**Transport.** One JSON object per line, UTF-8, newline-terminated; requests on
+stdin, one response per request on stdout in the order received. Anything on
+stderr is diagnostic and MUST NOT be parsed. There is no framing beyond the
+newline and no length prefix. A seat is a child process and exits when its
+stdin closes, so the same seat runs natively, under `docker run -i`, or over
+any stream that preserves order — the transport is not a deployment choice the
+protocol can observe.
+
+**The seat holds slots; the orchestrator holds games.** A slot is one game in
+progress from this seat's side: a `Position` mirror and a `DecisionSession`.
+The seat never constructs a `Game`, never learns an outcome, never rules on
+legality, and never sees the opposing seat. "Exactly one authority per game" is
+therefore a property of the message set rather than of any implementation —
+there is no message by which a seat could adjudicate.
+
+**Batching is the reason the protocol exists.** `decide` carries every slot
+that needs a move this round and its response carries one decision per slot, so
+a seat pumps those sessions together and hands whole batches of leaves to one
+`Evaluator` call (§7.1). A match of G games then costs one boundary crossing
+per round rather than G. A protocol that asked for one decision at a time would
+move the §4 crossing to once per position, and is forbidden for that reason.
+
+| Message | Direction | Carries |
+| --- | --- | --- |
+| `hello` | to seat | `PROTOCOL_VERSION`, `RULES_VERSION`, `ACTION_ORDER_VERSION`, the checkpoint reference, and the requested variant |
+| `welcome` | from seat | package name and version, encoder version, the resolved variant, and the probe hash of the loaded checkpoint |
+| `open` | to seat | new slot ids, each with its opening line and which side this seat plays |
+| `decide` | to seat | per slot: the moves applied since that slot's last message, and the zobrist expected after them |
+| `decided` | from seat | per slot: the chosen action, the session's zobrist attestation, and the package's diagnostics bytes |
+| `close` | to seat | slot ids to release |
+| `bye` | to seat | shutdown; the seat flushes and exits 0 |
+| `refuse` | from seat | the message it answers, the slot if the cause is one slot's, and the cause |
+
+**The mirror is incremental and checked.** `open` carries a slot's opening line
+once; every later `decide` names only the moves since that slot's last message.
+Because a desynchronized mirror would otherwise produce confident decisions
+about the wrong position, each slot's entry also carries the zobrist that must
+result from applying those moves. A seat computing a different one MUST
+`refuse`, naming both values, and MUST NOT resynchronize from the orchestrator:
+a mirror that can be repaired in place cannot be trusted to have been right
+before.
+
+**The seat authors its decision.** The zobrist attestation and diagnostics
+bytes come from the session that actually searched, and the orchestrator submits
+them verbatim (§7). It MUST NOT substitute either, and MUST refuse an
+attestation disagreeing with its own position.
+
+**An illegal action is adjudicated, not negotiated.** The orchestrator holds
+the `Game`, so a seat returning an illegal action loses by forfeit with the
+`ActionId` and `MoveError` preserved as §11 requires. The seat is not consulted
+and is not told; its slot is closed.
+
+**Refusal is loud and terminal for the slot.** A `refuse` names its cause and
+the orchestrator MUST NOT retry the message. A cause that is not one slot's —
+a version disagreement, a malformed line, an unparseable message — is terminal
+for the connection.
+
+**Handshake.** The orchestrator MUST refuse a seat disagreeing on
+`PROTOCOL_VERSION`, `RULES_VERSION`, or `ACTION_ORDER_VERSION`. It MUST NOT
+require two seats to agree with each other on package, package version, encoder
+version, or variant: seats differing there is the purpose of a cross-package or
+cross-encoder match, and it is the one asymmetry between this protocol and the
+in-process `match` of §3.
+
+**The variant carries move selection, including temperature.** Sampling,
+temperature, and greediness are the package's (§5), so they reach a seat as its
+variant string and never as a protocol field. The protocol transports that
+string and the orchestrator records both seats' resolved variants beside the
+result; results obtained under different variants are different measurements.
+
+**What the protocol does not carry.** No weights, no priors, no values: a
+seat's opinion leaves it as a chosen action and the diagnostics bytes its
+package defines, and nothing else. No seeds — §12 is unchanged, and a match
+over this protocol makes no reproducibility guarantee. No records: only
+self-play writes a shard (§11), and a seat writes none.
+
+**This is not the self-play path.** Self-play runs in one process over the
+§7.1 topology. This protocol MUST NOT be placed between a driver and its own
+seats, and its existence MUST NOT be taken as licence to split self-play into
+communicating processes.
+
+**`play` inverts the ownership.** A foreign harness holds the game and
+`hexo-bot` is one seat in it for one game. Its adapter translates that
+harness's protocol into the same slot-and-decision seam, holds exactly one
+slot, and is bound by every rule above: it constructs no `Game`, authors its
+own decision, and refuses rather than resynchronizes. `serve` is specified for
+implementation first; `play` requires naming a foreign harness, and no adapter
+may be written before that harness's protocol is pinned.
+
+The field names and value encodings of each message belong in
+`crates/hexo-bot/README.md`, as the record format's do in
+`crates/hexo-records/README.md`. This section says only what the container
+requires of them. `PROTOCOL_VERSION` covers this message set: changing a
+message's meaning, fields, or ordering rules bumps it, and a seat and
+orchestrator that disagree on it never exchange a second message.
 
 ---
 
@@ -586,15 +688,17 @@ The container exposes four runtime resource controls.
 
 ## 14. Out of scope
 
-No orchestrator, scheduler, dashboard, or experiment tracker. No model registry
+No orchestrator, scheduler, dashboard, or experiment tracker. The host
+orchestrator that drives §3.1 seats is outside this binary and outside this
+document: `hexo-bot` ships the seat, never the tournament. No model registry
 or promotion logic. No multi-node, no multi-GPU. No inference service separate
 from the process that uses it. No adjudication in seat modes. No hyperparameter
 sweep and no multi-run scheduler: a run is one process and one directory.
 
 ## 15. Unspecified interfaces
 
-- The transport, wire format, and handshake fields for `serve` and `play` are
-  unspecified. Any stdio protocol is limited to external interoperability and
-  MUST NOT become the self-play path.
+- The foreign harness `play` adapts to is unnamed, so its edge translation is
+  unspecified. §3.1 binds that adapter once a harness is chosen; it does not
+  describe one.
 - Reproducible self-play seed ownership is unspecified beyond the session seam
   in §12.
