@@ -574,6 +574,10 @@ What the matches measure is strength against one same-lineage sibling, not stren
 
 `duel-939`'s result is not a strength measurement and is excluded. Its graft is the one conversion that is order-preserving rather than function-preserving, so its opponent is the control with its value level removed rather than the control. Its games ended in 20.4 plies against 72.8–74.7 for the other three, and all 64 pairs returned the same $d$, leaving the paired variance unestimable; the harness reported no Elo interval and no standard-error ratio for it.
 
+No better graft exists, and the dueling decomposition is the reason. The head computes $Q(s,a)=\tanh\big(A(s,a)+b(s)-\sum_{a'}\pi_\theta(a'\mid s)A(s,a')\big)$. Carrying a scalar parent's pre-tanh $z$ into $A$ is exact and is what the graft does; preservation then requires $b(s)=\mathbb{E}_{\pi}[z(s,\cdot)]$. But $b$ is `mlp_qbase(g)`, a readout over the global token alone, while the quantity it would have to equal is a function of the decoder's per-cell outputs and of the policy over them. No assignment of weights to that head produces it, so the graft sets $b=0$ and $Q$ becomes $\tanh(z-\mathbb{E}_\pi[z])$ — the recorded level removal. Separating level from advantage is this arm's whole hypothesis, so the obstruction is the architecture's and not the conversion's.
+
+`duel-939` therefore cannot be measured against any converted control, and needs the genuine scalar control on the other side of the board: two architectures in one match, which one process holding one model cannot do. `CONTAINER_SPEC.md` §3.1 specifies the seat protocol that admits it, and this arm is blocked on that implementation rather than on more evaluation games.
+
 Pairing on shared openings and seats gained little over independent games: the ratio of unpaired to paired standard error was 1.055, 1.059, and 0.976 for `joint`, `tail`, and `brm`, against 1.24 in simulation. At $d$'s observed dispersion the pairing removes almost no variance, so the design's value here is the sign test over decisive pairs rather than a narrower interval.
 
 ### Graft manifests
