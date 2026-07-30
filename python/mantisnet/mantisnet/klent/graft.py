@@ -264,8 +264,15 @@ def _remap_adam(old_path: Path, saved: Any, parent_names: list[str], new_state: 
         if name in added:
             continue
         entry = saved["state"].get(positions[name])
+        if entry is None:
+            # Adam's state dict is sparse: a parameter it never stepped has no
+            # entry at all, which is how the state-value head KLENT does not
+            # train appears in every checkpoint this repo writes. Absence is
+            # the parent's own statement that the parameter is unstepped, so it
+            # is carried as absence rather than filled in.
+            continue
         if not isinstance(entry, dict):
-            raise ValueError(f"{old_path}: optimizer has no Adam state for {name}")
+            raise ValueError(f"{old_path}: optimizer state for {name} is not a state dict")
         if set(entry) != set(_ADAM_FIELDS):
             raise ValueError(
                 f"{old_path}: optimizer state for {name} has fields {sorted(entry)}, "
@@ -280,7 +287,7 @@ def _remap_adam(old_path: Path, saved: Any, parent_names: list[str], new_state: 
                 )
         carried[new_id] = copy.deepcopy(entry)
 
-    step = saved["state"][positions[next(n for n in new_state if n not in added)]]["step"]
+    step = next(iter(carried.values()))["step"]
     for new_id, name in enumerate(new_state):
         if name not in added:
             continue

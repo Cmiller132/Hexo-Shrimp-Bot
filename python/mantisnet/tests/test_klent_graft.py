@@ -350,8 +350,10 @@ def _drop_optimizer(checkpoint):
     del checkpoint["optimizer"]
 
 
-def _drop_one_adam_entry(checkpoint):
-    del checkpoint["optimizer"]["state"][len(checkpoint["model"]) - 1]
+def _replace_an_adam_entry_with_a_scalar(checkpoint):
+    """An absent entry is a parameter Adam never stepped, which is legitimate;
+    an entry that is not a state dict is a malformed file."""
+    checkpoint["optimizer"]["state"][len(checkpoint["model"]) - 1] = 0.0
 
 
 def _widen_readout(checkpoint):
@@ -413,7 +415,7 @@ def _add_amsgrad_state(checkpoint):
         (_reorder, "registration order"),
         (_split_param_groups, "exactly one Adam param group"),
         (_renumber_param_ids, "packed positions"),
-        (_drop_one_adam_entry, "no Adam state for"),
+        (_replace_an_adam_entry_with_a_scalar, "is not a state dict"),
         (_add_amsgrad_state, "expected exactly"),
     ],
 )
@@ -444,3 +446,30 @@ def test_cli_requires_the_operating_point(tmp_path, capsys):
             graft_module.main(argv)
         assert "required" in capsys.readouterr().err
     assert not new.exists() and not manifest_path.exists()
+
+
+def test_graft_carries_an_unstepped_parameter_as_unstepped(tmp_path):
+    """Adam's state dict is sparse. KLENT never steps the state-value head, so
+    no checkpoint this repo writes holds moments for it, and the conversion
+    carries that absence instead of refusing the file or inventing moments."""
+    parent = _parent_checkpoint()
+    parent_names = list(parent["model"])
+    unstepped = [
+        name
+        for name in parent_names
+        if name.startswith(("value_queries", "ln_value", "mlp_v"))
+    ]
+    assert len(unstepped) == 7, unstepped
+    for name in unstepped:
+        del parent["optimizer"]["state"][parent_names.index(name)]
+
+    old, new, manifest_path = _write(tmp_path, parent)
+    graft(old, new, tau=0.1, lam=0.01, manifest_path=manifest_path)
+
+    converted = torch.load(new, map_location="cpu", weights_only=False)
+    names = list(converted["model"])
+    state = converted["optimizer"]["state"]
+    assert {names[index] for index in state} == set(names) - set(unstepped)
+    load_checkpoint(new, MantisNet(MantisConfig()), torch.optim.Adam(
+        MantisNet(MantisConfig()).parameters()
+    ))
