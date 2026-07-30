@@ -41,6 +41,9 @@ Core modules:
 | `klent.graft` | Measured conversion of a pre-critic-tail checkpoint |
 | `klent.telemetry` | SQLite writes, queries, and CLI |
 | `klent.search` | Gumbel line search used by Python evaluation |
+| `klent.opponents` | Opponent seam, SealBot adapter, `shared_openings`, `wilson`, `elo` |
+| `klent.evaluate` | Policy argmax and the two-chooser lockstep match loop |
+| `klent.headtohead` | Paired cross-run checkpoint-vs-checkpoint match and CLI |
 | `deck.app` | FastAPI routes and SPA serving |
 | `deck.service` | Run registry, inference cache, and play sessions |
 | `deck.state` | Deck-owned reviews, probes, presets, and match jobs |
@@ -103,6 +106,16 @@ uv run python bench/bench_forward.py
 uv run python bench/bench_loop.py sweep --device cpu --stones 20 --cohorts 16 --iters 1
 ```
 
+Compare two checkpoints from different runs, paired:
+
+```sh
+uv run python -m mantisnet.klent.headtohead \
+  --a runs/one/checkpoint_001000.pt \
+  --b runs/two/checkpoint_001000.pt \
+  --pairs 64 --sims 32 --tau 0.1 --lam 0.01 \
+  --out h2h.json
+```
+
 Run the deck backend directly:
 
 ```sh
@@ -163,6 +176,23 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 - `status.json` is the deck heartbeat and phase-progress surface.
 - `STOP` requests shutdown after the current iteration and a durable checkpoint.
 - `CHECKPOINT` requests a checkpoint at the next commit point.
+- Every match plays `games / 2` shared random openings from both seats; the ply
+  cap counts the opening's placements, and a capped game scores one half.
+- Both crossplay choosers are deterministic, so the openings are the whole
+  source of a pairing's diversity.
+- A head-to-head pair shares its opening and its generator, derived from
+  `(seed, pair index)`, and is reproducible on its own; the same seed gives the
+  same result.
+- A head-to-head reports the paired standard error beside the unpaired one, an
+  exact sign test over the decisive pairs, and every capped game in `warnings`.
+  Pairs that all carry one `d` have no spread to estimate, so such a match
+  reports no Elo interval and warns instead.
+- A head-to-head at `--sims 0` never consults `--tau`/`--lam` and records them
+  as absent; a searched one requires both.
+- A head-to-head refuses two checkpoints that differ in rules, action order, or
+  Torch version, and names `klent.graft` as the bridge for a representation
+  difference.
+- `wilson` takes a total score and returns rates; `elo` takes a rate.
 - Deck queries open telemetry read-only; deck-owned state is in `runs/deck.db`.
 - The inference cache holds at most its configured checkpoint capacity.
 - CUDA compilation is enabled by the CLI unless `--no-compile` is set.

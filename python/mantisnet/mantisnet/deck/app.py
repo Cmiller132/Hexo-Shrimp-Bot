@@ -8,7 +8,6 @@ import math
 import os
 import shlex
 import threading
-import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
@@ -24,7 +23,7 @@ from ..builder import collate_prefixes
 from ..klent import telemetry
 from ..klent.evaluate import argmax_choose, play_match
 from ..klent.run import _versions
-from ..klent.opponents import _elo, _wilson
+from ..klent.opponents import elo, shared_openings, wilson
 from ..klent.sealbot import record_match, sealbot_match
 from ..model import MantisConfig
 from .service import (
@@ -165,28 +164,27 @@ class MatchRunner:
                 if not request.checkpoint_b:
                     raise ValueError("checkpoint opponent requires checkpoint_b")
                 _path_b, model_b = self.app.state.inference.get(request.checkpoint_b)
-                started = time.monotonic()
-                result = play_match(
+                result, _per_game = play_match(
                     argmax_choose(model_a, self.app.state.inference.device),
                     argmax_choose(model_b, self.app.state.inference.device),
-                    request.games, request.ply_cap, rng,
+                    shared_openings(rng, request.games // 2), request.ply_cap, rng,
                 )
-                ci_lo, ci_hi = _wilson(result["score_a"], result["games"])
+                ci_lo, ci_hi = wilson(result["score_a"], result["games"])
                 result = result | {
                     "score": result["score_a"],
                     "win_rate": result["score_a"] / result["games"],
                     "ci_lo": ci_lo, "ci_hi": ci_hi,
-                    "elo": _elo(result["score_a"] / result["games"]),
-                    "elo_lo": _elo(ci_lo), "elo_hi": _elo(ci_hi),
-                    "score_as_p0": None, "score_as_p1": None,
-                    "avg_plies": None, "seconds": time.monotonic() - started,
+                    "elo": elo(result["score_a"] / result["games"]),
+                    "elo_lo": elo(ci_lo), "elo_hi": elo(ci_hi),
+                    "score_as_p0": result["score_a_as_p0"],
+                    "score_as_p1": result["score_a_as_p1"],
                 }
                 with telemetry.open_telemetry(path_a.parent) as writer:
                     opponent_id = writer.opponent(
                         "checkpoint", {"checkpoint": request.checkpoint_b}
                     )
                     result["match_id"] = writer.write_eval_match(
-                        opponent_id, result, [], source="cli",
+                        opponent_id, result, [], source="deck",
                         checkpoint=path_a.name,
                     )
             else:
