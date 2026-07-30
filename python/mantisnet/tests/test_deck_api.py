@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 import numpy as np
 import pytest
@@ -104,6 +105,64 @@ def test_play_session_engine_rejects_an_occupied_cell(deck_run, tmp_path):
         assert illegal.status_code == 400
         assert illegal.json()["error"]["code"] == "illegal_move"
         assert illegal.json()["error"]["message"]
+
+
+def test_checkpoint_match_plays_paired_openings_and_records_both_seats(deck_run):
+    runs, run = deck_run
+    cfg = MantisConfig(
+        h=32, blocks=1, heads=2, value_queries=2, value_bins=5,
+        policy_hidden=32, value_hidden=32,
+    )
+    paths = []
+    for index, seed in enumerate((7, 8), start=1):
+        torch.manual_seed(seed)
+        model = MantisNet(cfg)
+        path = run / f"checkpoint_00000{index}.pt"
+        save_checkpoint(
+            path, model, torch.optim.Adam(model.parameters()), index,
+            np.random.default_rng(seed),
+        )
+        paths.append(path)
+
+    with TestClient(create_app(runs, device="cpu")) as client:
+        launched = client.post(
+            "/api/matches",
+            json={
+                "checkpoint_a": str(paths[0]),
+                "checkpoint_b": str(paths[1]),
+                "opponent": "checkpoint",
+                "games": 4,
+                "ply_cap": 20,
+            },
+        )
+        assert launched.status_code == 202, launched.text
+        job_id = launched.json()["job_id"]
+        for _attempt in range(600):
+            job = client.get(f"/api/matches/{job_id}").json()
+            if job["status"] in {"completed", "failed"}:
+                break
+            time.sleep(0.1)
+        assert job["status"] == "completed", job.get("error")
+        result = job["result"]
+        assert result["games"] == 4
+        # The seat split partitions the total score, and every game has plies.
+        assert result["score_as_p0"] + result["score_as_p1"] == result["score_a"]
+        assert result["avg_plies"] > 0
+        assert result["match_id"] == 1
+
+    # An odd game count cannot be seat-paired.
+    with TestClient(create_app(runs, device="cpu")) as client:
+        refused = client.post(
+            "/api/matches",
+            json={
+                "checkpoint_a": str(paths[0]),
+                "checkpoint_b": str(paths[1]),
+                "opponent": "checkpoint",
+                "games": 3,
+            },
+        )
+        assert refused.status_code == 400
+        assert refused.json()["error"]["code"] == "invalid_match"
 
 
 def test_inspect_endpoint_equals_direct_inspection(deck_run):
