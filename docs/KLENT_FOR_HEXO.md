@@ -118,25 +118,22 @@ The operator refuses `tau < 0`, `lam < 0`, and `tau + lam <= 0`. Shape, device, 
 
 ## 3. Critic and losses
 
-The consumed model contract is the trunk and legal-cell decoder in [MODEL_SPEC.md](MODEL_SPEC.md) appendix B. For every legal cell in engine order, `cell_head_logits` returns one raw policy logit and the critic's two return-mass logits $(z^{+},z^{-})$; `cell_heads` composes the second into the action value
+The consumed model contract is the trunk and legal-cell decoder in [MODEL_SPEC.md](MODEL_SPEC.md) appendix B. For every legal cell in engine order, `cell_heads` returns one raw policy logit and the action value
 
-$$u^{+}=\sigma(z^{+}),\qquad u^{-}=\sigma(z^{-}),\qquad Q=u^{+}-u^{-}\in(-1,1),$$
+$$Q=\tanh(z)\in(-1,1),$$
 
-which is what every acting path consumes. Fitting reads the raw logits and composes only the taken action from the same pass. KLENT calls no state-value readout and applies no loss to it.
+which is what every acting path consumes. Fitting selects the taken action from the same pass. KLENT calls no state-value readout and applies no loss to it.
 
-For a fitting batch of positions, with $G^{+}_i=\max(G_i,0)$ and $G^{-}_i=\max(-G_i,0)$,
+For a fitting batch of positions,
 
 $$L =
 \frac1P\sum_{i=1}^{P}
 \left[
   -\sum_{a\in A(S_i)}\pi'_i(a)\log\pi_\theta(a\mid S_i)
   +(Q_\theta(S_i,A_i)-G_i)^2
-  +\frac{\eta}{2}\Big(
-     \mathrm{BCE}\big(z^{+}_\theta(S_i,A_i),\,G^{+}_i\big)
-    +\mathrm{BCE}\big(z^{-}_\theta(S_i,A_i),\,G^{-}_i\big)\Big)
 \right].$$
 
-The policy cross-entropy covers the full legal set. All three critic terms select only the stored action rank. $\mathrm{BCE}$ is the with-logits binary cross-entropy against a **soft** target in $[0,1]$: at its optimum $u^{+}=\mathbb E[G^{+}\mid S,A]$ and $u^{-}=\mathbb E[G^{-}\mid S,A]$, hence $Q=\mathbb E[G\mid S,A]$. The policy cross-entropy and the squared error have unit weight; only the mass pair carries a coefficient, $\eta$ = `KlentConfig.mass_weight` (§10). Composition and every loss term are fp32.
+The policy cross-entropy covers the full legal set; the squared error selects only the stored action rank. Both have unit weight, and every loss term is fp32.
 
 | Check | Owner | Exact behavior |
 |---|---|---|
@@ -343,13 +340,12 @@ Acting means cover every position evaluated during the collection call, includin
 | `buffer_samples` | Training samples after whole-dropping capped episodes. |
 | `policy_loss` | Sample-weighted mean full-legal-set cross-entropy over the epoch. |
 | `q_loss` | Sample-weighted mean taken-action $(Q-G)^2$ over the epoch. |
-| `mass_loss` | Sample-weighted mean taken-action $\mathrm{BCE}(z^{+},G^{+})+\mathrm{BCE}(z^{-},G^{-})$ over the epoch, **unweighted** by $\eta$, so it reads as a calibration diagnostic independent of the coefficient. |
 | `fit_steps` | Number of optimizer groups stepped. |
 | `seconds` | Driver interval covering the collection wait and fit; evaluation is excluded. |
 | `eval_results` | One entry per configured opponent, each containing `opponent_name`, strength-defining `opponent_config`, total `score`, `win_rate`, `games`, `capped`, and `forfeits`. A model win or opponent forfeit scores 1, a cap \(1/2\), and a loss 0; forfeits remain explicit rather than being folded into losses. |
 | `eval_seconds` | Wall time across all opponent matches and their telemetry recording. |
 
-`policy_loss`, `q_loss`, `mass_loss`, and `fit_steps` are absent when the buffer is empty. Evaluation fields are absent when no evaluation runs. Empty conditional statistics are serialized as `null`. `mass_loss` has no queryable telemetry column and survives in `metrics.jsonl` and the telemetry `metrics_json` payload. Telemetry writes one `eval_matches` row per `eval_results` entry and additionally derives samples/second, game and ply counts, and per-iteration hardware means and maxima.
+`policy_loss`, `q_loss`, and `fit_steps` are absent when the buffer is empty. Evaluation fields are absent when no evaluation runs. Empty conditional statistics are serialized as `null`. Telemetry writes one `eval_matches` row per `eval_results` entry and additionally derives samples/second, game and ply counts, and per-iteration hardware means and maxima.
 
 ## 9. Deviations from the paper
 
@@ -409,10 +405,6 @@ Acting means cover every position evaluated during the collection call, includin
 
 **Paper:** Experiments use a fixed-action ResNetV2 with policy and action-value heads and no state-value head for KLENT. **Here:** KLENT consumes MantisNet's ragged legal-cell policy and action-value decoders; its model container has a state-value head that KLENT neither calls nor trains. **Grounds:** Hexo's board and legal-action count are variable. **Measured outcomes:** See [ABLATIONS.md § Shared decoder aggregation](ABLATIONS.md#shared-decoder-aggregation-and-triton-segment-reduction) and [§ Critic ranking-stability probe](ABLATIONS.md#critic-ranking-stability-probe).
 
-### 9.15 Critic parameterization
-
-**Paper:** The action-value head emits one scalar per action, fitted by squared error against the $\lambda$-return. **Here:** The head emits two logits per action whose sigmoids are the positive and the negative return mass; their difference is $Q$ and carries the same squared error, and each mass additionally carries a cross-entropy against its own part of the return with weight $\eta/2$. **Grounds:** Each mass is calibrated by its own cross-entropy while $Q$ stays their difference, so the head stores $\mathbb E[G^{+}]$ and $\mathbb E[G^{-}]$ instead of $\mathbb E[G]$ alone. **Measured outcomes:** See [ABLATIONS.md § Training runs](ABLATIONS.md#training-runs).
-
 ## 10. Reference configuration
 
 The current repository reference recipe is:
@@ -423,12 +415,11 @@ The current repository reference recipe is:
 | $\lambda$ | `0.01` |
 | $\tau$ | `0.1` |
 | $\lambda_{\mathrm{ret}}$ | `0.939` |
-| $\eta$ (`mass_weight`) | `0.25` |
-| Critic | two return-mass logits, $Q=u^{+}-u^{-}$ |
+| Critic | one readout row, $Q=\tanh(z)$ |
 
 These are configuration facts recorded in [ABLATIONS.md](ABLATIONS.md), which also records their selection.
 
-**Finding:** `KlentConfig` and the CLI currently default to $\gamma=1.0,\lambda=0.03$; the reference recipe therefore requires explicit flags, and `test_klent_run.py` pins the `0.03` CLI default. `mass_weight` defaults to the $\eta$ above, so `--mass-weight` is needed only to depart from it.
+**Finding:** `KlentConfig` and the CLI currently default to $\gamma=1.0,\lambda=0.03$; the reference recipe therefore requires explicit flags, and `test_klent_run.py` pins the `0.03` CLI default.
 
 ## 11. Open questions
 

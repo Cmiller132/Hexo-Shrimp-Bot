@@ -33,8 +33,8 @@ inputs, and no nodes for empty cells.
   and its joint `(occupancy mask, candidate slot)` class. Trunk cost therefore
   scales with stones and live windows, not with the legal halo.
 - The **policy** decoder emits one raw logit per legal cell. The **action-value**
-  decoder emits two return-mass logits per legal cell and composes them into one
-  action value in `(−1, 1)` (appendix B).
+  decoder emits one score per legal cell, bounded into `(−1, 1)` by `tanh`
+  (appendix B).
 - The **state-value** head reads the board through multi-query attention over the
   window embeddings and outputs a binned distribution over `[−1, 1]`,
   decoded to a scalar in-forward.
@@ -63,8 +63,8 @@ Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
 slot classes = 3 and `DEC_CLASSES = 93` (§4.3), critic logits = 2, and
 `moves_remaining ∈ {1, 2}`.
 
-The default configuration has 1,272,868 parameters: 1,063,648 in the four
-trunk blocks and 209,220 across input/final parameters and the three heads.
+The default configuration has 1,272,739 parameters: 1,063,648 in the four
+trunk blocks and 209,091 across input/final parameters and the three heads.
 
 ---
 
@@ -366,10 +366,9 @@ the forward contains no data-dependent index discovery.
   embedding `N(0, 0.02)`.
 - Optimizer grouping: parameters with `ndim ≤ 1`, all embedding tables,
   and the attention-bias tables are excluded from weight decay.
-- Outputs: raw policy logits; action values composed in fp32 from the critic's
-  two return-mass logits; the state-value bin distribution and its scalar
-  decode. The model applies no policy softmax and does not clamp the decoded
-  state value.
+- Outputs: raw policy logits; action values bounded by `tanh`; the state-value
+  bin distribution and its scalar decode. The model applies no policy softmax
+  and does not clamp the decoded state value.
 
 ---
 
@@ -468,21 +467,16 @@ For each legal cell `a`, the head uses the same window/background routing as
 §6:
 
 ```
-h_a             = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[class(a, w)] )
-[z_pos, z_neg]  = MLP_Q( [ h_a ; g ] )            # 2H → P_H → 2, ReLU
-u_pos           = σ(z_pos),  u_neg = σ(z_neg)
-Q(s, a)         = u_pos − u_neg
+h_a       = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[class(a, w)] )
+z         = MLP_Q( [ h_a ; g ] )                  # 2H → P_H → 1, ReLU
+Q(s, a)   = tanh(z)
 ```
 
-For a background cell, `h_a = E_qbg[nearest-stone bucket(a)]`. The two logits
-decode to the **positive** and the **negative return mass** of the action:
-`u_pos + u_neg` is the head's estimate of `E[|G|]`, and their difference is the
-action value. Both masses lie in `(0, 1)`, so `Q ∈ (−1, 1)` and each mass moves
-`Q` directly. The composition is fp32, as is every loss term over these values.
-
-The raw pair is part of the interface: fitting reads `[z_pos, z_neg]` and
-composes the taken action's `Q` from the same numbers, so one decoder pass
-serves both. Every acting consumer sees only the composed value.
+For a background cell, `h_a = E_qbg[nearest-stone bucket(a)]`. The bound is
+what the improvement step requires rather than a convenience: it exponentiates
+`Q/(τ+λ)`, so an unbounded score could sharpen `π′` without limit. `tanh` is
+monotone, so the readout's own ordering of a position's legal cells is the
+action values' ordering.
 
 The KLENT operator and training contract are specified in
 [`KLENT_FOR_HEXO.md`](KLENT_FOR_HEXO.md). The improvement step consumes the
@@ -493,29 +487,20 @@ policy logits and action values without an additional gain:
 v̂(s)    = E_{a~π′}[Q(s,a)]
 ```
 
-Training selects the taken action and fits both the composed value and the two
-masses. With `G_pos = max(G, 0)`, `G_neg = max(−G, 0)`, and
-`η = mass_weight = 0.25`, the critic term per selected action is
+Training selects the taken action and fits its action value by squared error
+against the λ-return:
 
 ```
 L_Q = (Q − G)^2
-      + (η/2) · [ BCEWithLogits(z_pos, G_pos)
-                + BCEWithLogits(z_neg, G_neg) ]
 ```
 
-The squared error has unit weight. The mass pair alone carries `η/2`, and all
-three terms are evaluated in fp32. `KLENT_FOR_HEXO.md` §3 owns the complete
-loss, including the unit-weight policy cross-entropy.
-
-The parameterization obeys the exact identity
-`sigmoid(2z) − sigmoid(−2z) = tanh(z)`. This is the function-preservation
-identity used when converting compatible checkpoints; it is not a second
-critic mode.
+The term has unit weight and is evaluated in fp32. `KLENT_FOR_HEXO.md` §3 owns
+the complete loss, including the unit-weight policy cross-entropy.
 
 **Both the policy decoder's and action-value decoder's MLP output layers
 initialize to zero**, overriding §10's framework default for those two
 layers. Initial policy logits are therefore exactly zero, and so are the
-initial action values: `z_pos = z_neg = 0` gives `u_pos = u_neg = 1/2`.
+initial action values, since `tanh(0) = 0`.
 
 This head reads the trunk output and adds no inputs. Its two-logit readout
 changes the checkpoint head shape but does not itself change
