@@ -27,14 +27,15 @@ inputs, and no nodes for empty cells.
   they occupy) with self-attention over the stone set, biased only by hex
   distance. The window pathway carries all line/tactical structure; the
   attention pathway carries global context in a single hop.
-- The **policy** is a decoder, not a trunk node set: each legal cell's logit
-  is computed on demand from the live windows passing through it (or from a
-  background path when there are none). Trunk cost therefore scales with
-  stones and live windows, not with the legal halo.
-- The **action-value** head is an independently parameterized decoder with the
-  same routing as policy. It emits two return-mass logits per legal cell,
-  composed into one action value in `(−1, 1)` (appendix B).
-- The **value** head reads the board through multi-query attention over the
+- The **legal-cell decoders** score each legal cell on demand from the live
+  windows passing through it, or from a background path when there are none.
+  Policy and action value have independent parameters but share this routing
+  and its joint `(occupancy mask, candidate slot)` class. Trunk cost therefore
+  scales with stones and live windows, not with the legal halo.
+- The **policy** decoder emits one raw logit per legal cell. The **action-value**
+  decoder emits two return-mass logits per legal cell and composes them into one
+  action value in `(−1, 1)` (appendix B).
+- The **state-value** head reads the board through multi-query attention over the
   window embeddings and outputs a binned distribution over `[−1, 1]`,
   decoded to a scalar in-forward.
 
@@ -59,7 +60,8 @@ group D6, so the whole model is D6-invariant by construction (§8).
 | `DROPOUT` | dropout probability (trunk sub-blocks) | 0.0 |
 
 Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
-slot classes = 3 and `DEC_CLASSES = 93` (§4.3), `moves_remaining ∈ {1, 2}`.
+slot classes = 3 and `DEC_CLASSES = 93` (§4.3), critic logits = 2, and
+`moves_remaining ∈ {1, 2}`.
 
 The default configuration has 1,272,868 parameters: 1,063,648 in the four
 trunk blocks and 209,220 across input/final parameters and the three heads.
@@ -176,11 +178,12 @@ and both are `(000001, near-end)`. Since a cell's decoder input is its window
 rows summed plus its class counts, two cells with the same live windows and
 the same counts get one row and therefore one logit and one action value
 whatever the weights: the merge is an action alias, not an approximation.
-Over uniformly-random playouts, 79% of decoder entries lie in a merged class
-and 57% of positions contain at least one aliased pair of legal moves.
 
 Class embedding tables of width `H` appear in each place a pairing is
-encoded; each site owns its own table.
+encoded; each site owns its own table. The policy and action-value decoders
+each own a 93-row joint-class table. Replacing their former three-row tables
+adds 23,040 parameters in the default model. Stone↔window incidence remains
+keyed by the three-row slot class.
 
 ---
 
@@ -233,45 +236,56 @@ position (§9).
 
 ---
 
-## 6. Policy head (decoder)
+## 6. Legal-cell decoders
 
-One raw logit per legal cell, in **engine legal-move order** — the same
-lexicographic `(q, r)` order `Position` exposes; logit index `j` means
-`legal_moves[j]`, and this coupling is versioned by `ACTION_ORDER_VERSION`
-(ENGINE_SPEC §9). Illegal cells are never scored: masking is by
-construction, not by `−inf`.
+The policy and action-value heads are independently parameterized decoders over
+one shared legal-cell incidence table. Each produces one result per legal cell
+in **engine legal-move order** — the same lexicographic `(q, r)` order
+`Position` exposes; result index `j` means `legal_moves[j]`, and this coupling
+is versioned by `ACTION_ORDER_VERSION` (ENGINE_SPEC §9). Illegal cells are
+never scored: masking is by construction, not by `−inf`.
 
 For each legal cell `a`:
 
 - **Window path** (cell lies in ≥ 1 live window):
 
   ```
-  h_a    = Σ_{w ∋ a, live}  ( P · W_w  +  E_pw[joint(a, w)] )     # ≤ 18 terms
-  logit  = MLP_P( [ h_a ; g ] )                    # 2H → P_H → 1, ReLU
+  h_a^p          = Σ_{w ∋ a, live} ( P_W · W_w + E_pw[joint(a, w)] )
+  h_a^q          = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[joint(a, w)] )  # ≤ 18 terms
+  policy_logit   = MLP_P( [ h_a^p ; g ] )          # 2H → P_H → 1, ReLU
+  [z_pos, z_neg] = MLP_Q( [ h_a^q ; g ] )          # 2H → P_H → 2, ReLU
   ```
 
   `joint(a, w)` is §4.3's joint class of `w`'s occupancy mask and `a`'s slot
-  in it, so `E_pw` has `DEC_CLASSES` rows. The builder emits, per legal cell,
-  its list of (window index, joint class) pairs; the decoder is a gather-sum,
-  never a search.
+  in it, so both `E_pw` and `E_qw` have `DEC_CLASSES = 93` rows. The builder
+  emits, per legal cell, its list of (window index, joint class) pairs. One
+  parameter-free gather-sum produces the shared window sum and joint-class
+  counts; each head then applies its own projection and MLP. The decoder never
+  searches for incidences in-forward.
 
 - **Background path** (cell lies in no live window):
 
   ```
-  h_a    = E_bg[ nearest-stone bucket(a) ]         # §4.2
-  logit  = MLP_P( [ h_a ; g ] )                    # same MLP
+  h_a^p          = E_bg[ nearest-stone bucket(a) ]    # §4.2
+  h_a^q          = E_qbg[ nearest-stone bucket(a) ]
+  policy_logit   = MLP_P( [ h_a^p ; g ] )             # same policy MLP
+  [z_pos, z_neg] = MLP_Q( [ h_a^q ; g ] )             # same critic MLP
   ```
 
-The head scores **single placements**. The two-placements-per-turn
+The policy logit is exported raw. Appendix B defines how the critic's two
+logits compose into `Q(s,a)` and how they are trained.
+
+Both heads score **single placements**. The two-placements-per-turn
 structure enters only through the token's `moves_remaining` input; pairing
 the two placements of a turn is the search's job (it re-evaluates the
 position between them). No softmax and no temperature exist anywhere in the
 model; normalization is downstream.
 
-## 7. Value head
+## 7. State-value head
 
-Multi-query attention readout over the windows plus the token, then a
-binned output:
+This board-level readout is distinct from the per-action critic of §6 and
+appendix B. It uses multi-query attention over the windows plus the token,
+then a binned output:
 
 ```
 keys/values = LN over rows [ W ; g ]               # token always present ⇒ well-defined even with n_w = 0
@@ -371,7 +385,8 @@ move in engine order), `value` (state-value scalar), `value_dist` (`K`
 probabilities), and `value_logits` (`K` raw bin logits). Appendix B defines
 the action-value semantics.
 
-Two version constants govern compatibility:
+Two version constants govern compatibility. The current model has
+`MODEL_REPR_VERSION = 2`:
 
 - `ACTION_ORDER_VERSION` (engine-owned): a bump invalidates every
   checkpoint, as the policy indexes legal moves by position.
@@ -443,11 +458,11 @@ explicit allowlist, not silent prefix matching).
 
 ## Appendix B — action-value head (the KLENT interface)
 
-The action-value head has the §6 decoder shape and emits one action value per
-legal cell in engine legal-move order. It owns a window projection, joint-class
-table, background-bucket table, and MLP distinct from the policy decoder's
-parameters. The policy and action-value heads may share the parameter-free
-pass over the decoder incidence table.
+The action-value head is §6's second decoder and emits one action value per
+legal cell in engine legal-move order. It owns a window projection, 93-row
+joint-class table, background-bucket table, and MLP distinct from the policy
+decoder's parameters. The two decoders share only the parameter-free pass over
+the decoder incidence table.
 
 For each legal cell `a`, the head uses the same window/background routing as
 §6:
@@ -479,13 +494,31 @@ v̂(s)    = E_{a~π′}[Q(s,a)]
 ```
 
 Training selects the taken action and fits both the composed value and the two
-masses; `KLENT_FOR_HEXO.md` §3 owns that loss.
+masses. With `G_pos = max(G, 0)`, `G_neg = max(−G, 0)`, and
+`η = mass_weight = 0.25`, the critic term per selected action is
+
+```
+L_Q = (Q − G)^2
+      + (η/2) · [ BCEWithLogits(z_pos, G_pos)
+                + BCEWithLogits(z_neg, G_neg) ]
+```
+
+The squared error has unit weight. The mass pair alone carries `η/2`, and all
+three terms are evaluated in fp32. `KLENT_FOR_HEXO.md` §3 owns the complete
+loss, including the unit-weight policy cross-entropy.
+
+The parameterization obeys the exact identity
+`sigmoid(2z) − sigmoid(−2z) = tanh(z)`. This is the function-preservation
+identity used when converting compatible checkpoints; it is not a second
+critic mode.
 
 **Both the policy decoder's and action-value decoder's MLP output layers
 initialize to zero**, overriding §10's framework default for those two
 layers. Initial policy logits are therefore exactly zero, and so are the
 initial action values: `z_pos = z_neg = 0` gives `u_pos = u_neg = 1/2`.
 
-This head reads the trunk output and adds no inputs, so it does not change
-`MODEL_REPR_VERSION`. The §7 state-value head is neither called nor trained
-by the KLENT path.
+This head reads the trunk output and adds no inputs. Its two-logit readout
+changes the checkpoint head shape but does not itself change
+`MODEL_REPR_VERSION`; the current version is 2 because §4.3's decoder key is
+part of the representation. The §7 state-value head is neither called nor
+trained by the KLENT path.

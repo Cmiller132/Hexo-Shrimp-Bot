@@ -595,6 +595,14 @@ Each arm's conversion of `conv-disc-lam01/checkpoint_000151.pt` wrote a manifest
 | `brm` | Action values and $\pi'$ are the parent's, since $\sigma(2z)-\sigma(-2z)=\tanh z$ | max $\lvert\Delta Q\rvert$ 1.1920929e-07, mean 2.6443e-08; mean $D_{\mathrm{KL}}(\pi'_{\text{new}}\Vert\pi'_{\text{parent}})$ 1.844e-14, maximum 1.610e-13; median top-16 σ(Q) 0.065138791 against the parent's 0.065138798 |
 | `duel` | Every position's ordering of its legal cells is the parent's; the level is reset | 135,939,358 comparable pairs, 0 discordant, rank agreement 1.0; 185 shared parameters carried bitwise; $v(S)=0$ exactly. max $\lvert\Delta Q\rvert$ 1.4836, mean 0.1596; median removed level −0.006225; median top-16 σ(Q) 0.069721 → 0.072019; mean improved-policy KL 0.001490, maximum 0.024504 |
 | `tail` | Every parent tensor is the source file's bit for bit and the tail is the identity | max $\lvert\Delta Q\rvert$ 0.0, mean 0.0; readout input max $\lvert\Delta\rvert$ 0.0; KL 0.0 mean and maximum; 185 shared tensors unchanged under one SHA-256; median top-16 σ(Q) 0.063669 unchanged |
+| `joint-brm` | The joint-class row replication preserves both cell decoders, and $\sigma(2z)-\sigma(-2z)=\tanh z$ preserves the scalar parent's action values | 181 shared tensors bit-identical; 186 replicated rows checked; MODEL_SPEC §6 decode bitwise equal; `q_max_abs_delta` 6.5565e-07 against tolerance 1e-5; `max_abs_dq` 5.9605e-07 against 1e-5; mean improved-policy KL 2.9768e-12 against 1e-6 |
+
+The composed conversion transforms disjoint tensors: `e_pw` and `e_qw` for
+the joint decoder, versus `mlp_q.out` for the bipolar readout. Each arm's
+detector therefore still covers its own side, and both run on the composed
+output. BRM alone measured max abs dQ 1.19e-7; the composed graft measured
+5.96e-7. The increase is the head GEMM's fp32 reassociation as its K grows
+from 3 to 93, exactly the behavior predicted by the graft module's docstring.
 
 Manager-measured on a shared 96-position set drawn from checkpoint 151's own self-play and replayed against every model, at τ+λ = 0.110:
 
@@ -658,6 +666,38 @@ The merged classes are exactly the mirrored slots of a non-palindromic mask, so 
 | `joint` | Each of the 93 rows is bit for bit the slot-class row it replaces, so the grafted model is the parent as a function | MODEL_SPEC §6's decode over the grafted tables and joint classes is bitwise equal to the parent's over its own tables and slot classes, both heads; 183 shared tensors unchanged under one SHA-256; 186 expanded rows checked; median top-16 σ(Q) 0.0636686347424984 on both sides. The folded path's deltas are fp32 reassociation from the wider head GEMM: max $\lvert\Delta Q\rvert$ 6.557e-07, max $\lvert\Delta\text{logit}\rvert$ 1.526e-05, max improved-policy KL 2.994e-06 — against 1.5e-06, 1.6e-06, and 1.8e-06 for one unmodified model decoded both ways. |
 
 Adam's moments for the two tables are replicated by the same rows as their weights, so each new row inherits the ratio its parent row had rather than taking one bias-corrected cold step.
+
+### `joint-brm-939`
+
+| Field | Record |
+| --- | --- |
+| Init/fork | `runs/grafts/ckpt151-joint-brm.pt`, the function-preserving graft of `conv-disc-lam01/checkpoint_000151.pt`; seed 21 |
+| Delta from reference | The joint-class decoder and bipolar return-mass critic together. `--cell-budget 450000 --collect-cell-budget 1350000`, the joint arm's reduced budgets for the widened decoder aggregate row; otherwise the reference recipe. Branch `joint-brm`. |
+| Target and resumes | 500 iterations, originally 150 and extended in place by `STOP` plus `--resume` at 111 and again at 253 |
+| Question | Measurements from composing the joint decoder class and bipolar return-mass critic in one model |
+| Disposition | **In flight**, currently past iteration 270; no concluded disposition |
+
+In-driver SealBot evaluations, 64 games each, with zero capped games and zero
+forfeits throughout:
+
+| Completed iteration | Score | Capped | Forfeits |
+| ---: | ---: | ---: | ---: |
+| 25 | 53/64 = 0.828125 | 0 | 0 |
+| 50 | 54/64 = 0.84375 | 0 | 0 |
+| 75 | 62/64 = 0.96875 | 0 | 0 |
+| 100 | 58/64 = 0.90625 | 0 | 0 |
+| 125 | 56/64 = 0.875 | 0 | 0 |
+| 150 | 63/64 = 0.984375 | 0 | 0 |
+| 175 | 58/64 = 0.90625 | 0 | 0 |
+| 200 | 60/64 = 0.9375 | 0 | 0 |
+| 225 | 57/64 = 0.890625 | 0 | 0 |
+| 250 | 64/64 = 1.000 | 0 | 0 |
+
+Over the four evaluations the control `lam-ret-939` also ran, at completed
+iterations 25/50/75/100, its scores were 0.8125, 0.875, 0.9219, and 0.9219.
+The control won 226 of 256 games and `joint-brm-939` won 227 of 256: one game
+apart. This separates nothing, consistent with the anchored evaluation's
+inability above to distinguish the reference and ablation arms.
 
 ## Engineering experiments
 
@@ -759,17 +799,25 @@ The initial batch-size probe below is **(run plan, not re-derived)**.
 | Host-spill measurement | Windows host spill was approximately 50× slower |
 | Disposition | Retained |
 
-### Telemetry quantization and browse-order indexes
+### Telemetry schema, quantization, and browse-order indexes
 
 | Field | Record |
 | --- | --- |
 | Baseline writer | Approximately 72 ms/iteration and approximately 1% overhead; approximately 78 bytes/ply and approximately 1.4 GB/hour **(run plan, not re-derived)** |
-| Quantization setup | Schema v2 stores five scalar ply columns as integers in units of \(10^{-4}\); readers divide by 10,000. The former REAL values accounted for 40 of 71 row bytes. |
+| Quantization setup | Schema v2 introduced five scalar ply columns stored as integers in units of \(10^{-4}\); readers divide by 10,000. The former REAL values accounted for 40 of 71 row bytes. |
 | Quantization measurements | Maximum rounding error \(5\times10^{-5}\); a short synthetic workload at mean length 11 measured approximately 65 bytes/ply |
-| Migration behavior | Normal opening refuses schema v1. Explicit conversion is limited to a finished run, creates v2, preserves `telemetry.db.v1.bak`, and never runs against a live database. |
+| Schema v3 | An iteration now evaluates against every configured opponent, so its score is not one number. The `iterations` table no longer carries `eval_score`, `eval_capped`, or `eval_games`, which were a single-opponent projection of the per-opponent data already carried by `eval_matches` rows. |
+| Compatibility decision | There is no v2 converter. Schema-v2 databases written before the v3 bump are not readable by this build; that was deliberate, not an oversight. |
 | Index benchmark | On 575,342 games, a warm lookup changed from 484 ms to 0.05 ms; a deck-order browse changed from 44 s to milliseconds; four indexes added approximately 56 MB |
 | Writer/read behavior | Writers add indexes idempotently without changing the schema version; read-only browsing does not create them |
-| Disposition | Quantization and browse-order indexes retained |
+| Disposition | Schema v3, quantization, and browse-order indexes retained |
+
+### Container-side training over the deck bind mount
+
+| Field | Record |
+| --- | --- |
+| Finding | Training must run container-side while the deck container is up. A Windows-side driver fails because the deck holds `status.json` open across the bind mount and Windows `os.replace` then returns a permission error; Linux can rename over an open file. |
+| Disposition | Run the training driver in the Linux container. |
 
 ### Opponent grounding and SealBot anchored evaluation
 
@@ -806,6 +854,51 @@ Offline `overnight-3` checkpoint curve, depth-1 SealBot at 0.1 s/move using the 
 
 At the later scalar-reference endpoint, `lam-ret-939` measured 56/64 = 0.875, Wilson CI 0.772252–0.935278, Elo 338.039 [212.122, 463.957].
 
+The `joint-brm-939` curve above is noise against a ceiling after roughly
+iteration 75 and reaches a perfect 64/64 at iteration 250. SealBot therefore
+stopped measuring improvement well before the run ended. That saturation is
+the engineering finding that motivated a second anchor.
+
+#### Strix as a second anchored evaluator
+
+The second anchor is a hexo-strix checkpoint served as a native §3.1
+subprocess seat. Its reported identity is name `strix-seat`, digest
+`0x351ed562065bed55`, variant `mcts:sims=32`. Like SealBot, it is an external
+anchor not version-pinned in this repository; its checkpoint and serving
+environment live outside the tree, so its provenance has the same limit.
+
+Strix declares radius-6 candidates while the rules allow radius 8, and its
+checkpoint search is limited to 300 placements. These scores are therefore
+against a handicapped opponent, not peer ratings. The restriction was never
+exhausted: every match below had zero forfeits and zero capped games.
+
+Offline evaluation used 64 games, seed 0, and `mcts:sims=32`:
+
+| Checkpoint | Score against strix | Capped | Forfeits |
+| --- | ---: | ---: | ---: |
+| `ckpt151-joint-brm.pt` (iteration 0) | 12/64 = 0.1875 | 0 | 0 |
+| `checkpoint_000100.pt` | 21/64 = 0.328125 | 0 | 0 |
+| `checkpoint_000253.pt` | 26/64 = 0.40625 | 0 | 0 |
+
+The graft-to-253 change is about 2.8 standard errors, so it is real; adjacent
+steps are not individually resolvable at 64 games. As a reference point under
+the same measurement, `joint-939/checkpoint_000050.pt` scored 17/64 = 0.266
+against strix while scoring 0.81 against SealBot.
+
+A 64-game strix evaluation at `mcts:sims=32` cost 105.8 s on an RTX 4070 Ti.
+The corresponding SealBot cost and its zero-simulation control are recorded
+once in this file's preamble.
+
+### Section 3.1 anchor across the VM boundary
+
+| Field | Record |
+| --- | --- |
+| Deployment constraint | Strix's `hexo_rs` search extension exists only as a CPython 3.14 Windows build, while the driver runs in a Linux container, putting the seat and its orchestrator on opposite sides of a VM boundary. |
+| Protocol consequence | CONTAINER_SPEC §3.1 makes transport unobservable to the protocol. The seat and driver remain unmodified; a relay in the WSL VM carries the seat's stdio, reaches the Windows interpreter through WSL interop, and reaches the container through its bridge gateway. |
+| Exit ordering | The orchestrator gives the seat five seconds to exit after `ok(bye)`. The relay must close the connection before joining its pump threads, not after. |
+| Stdin lifecycle | A stdin pump cannot be a thread: the orchestrator closes the child's stdin only after the child exits, which otherwise leaves the pump thread live inside a socket call during interpreter finalization. |
+| Disposition | Retained as the transport for the in-driver strix anchor. |
+
 ### Segmented reduction under `torch.compile`
 
 | Field | Record |
@@ -831,13 +924,14 @@ At the later scalar-reference endpoint, `lam-ret-939` measured 56/64 = 0.875, Wi
 | Source | Use in this record |
 | --- | --- |
 | `metrics.jsonl` | Legacy evaluation rows and iteration trajectories, including append-only/resumed branches |
-| `telemetry.db` | `eval_matches` score, win rate, Wilson interval, Elo, seat scores, capped count, and forfeits; `iterations` trajectories; `plies` bucket queries. Every database was opened with a read-only URI, `mode=ro`, followed by `PRAGMA query_only=ON`; the five quantized ply scalars were divided by 10,000. |
+| `telemetry.db` | `eval_matches` score, win rate, Wilson interval, Elo, seat scores, capped count, and forfeits per opponent; `iterations` trajectories; `plies` bucket queries. Every database was opened with a read-only URI, `mode=ro`, followed by `PRAGMA query_only=ON`; the five quantized ply scalars were divided by 10,000. |
 | `sealbot_curve.jsonl` | Offline `overnight-3` depth-1 checkpoint scores, Wilson intervals, Elo, seat scores, and mean plies |
 | `config.json`, `invocations.jsonl`, `status.json`, adjacent logs/errors | Forks, exact flags, branch boundaries, dates, completion state, and stop-sentinel evidence |
 | `KLENT_RUN_PLAN.md` §§2–4a | Historical claims and experiment criteria not encoded in the run artifacts. Such measurements are labeled **(run plan, not re-derived)**. |
 | Manager measurements dated 2026-07-29 | `factored-939-s2` report, ply-bucket decomposition, and critic ranking-stability probe |
 | Manager measurements dated 2026-07-30 | The three arms' shared 96-position critic probe, the bipolar head's logit and mass quantities, the fp32 expectation excursion counts, and the segmented-reduction reproduction |
-| `runs/grafts/ckpt151-{brm,duel,tail}.json` | Each arm's graft transform, probe, and preservation measurements, written by the conversion itself |
+| `runs/grafts/ckpt151-{brm,duel,tail,joint,joint-brm}.json` | Each arm's graft transform, probe, and preservation measurements, written by the conversion itself |
+| Externally served strix checkpoint | Offline anchor measurements and the seat-reported name, digest, variant, and restriction; the checkpoint and serving environment are outside this tree and not version-pinned here |
 | `python/mantisnet/README.md`, “Performance” and “Deliberately absent” | Engineering benchmark receipts and retained/removed implementation dispositions |
 
 Every evaluation score was compared with `eval_matches` when the run retained a database row. No score mismatch was found. Resume cleanup left metrics-only evaluations at `pure-2` iteration 200 (0.84375), `conv-disc-lam01` iteration 50 (0.703125), and `factored-939` iteration 50 (0.8125); those rows consequently have no retained database CI or Elo.
@@ -849,7 +943,7 @@ Artifact limits relevant to verification:
 | `shakeout-1`, `sweep-a`, `sweep2-a`, `sweep2-b`, `abl-zeroq-lam01`, `overnight-1`, `overnight-2`, `overnight-3`, `abl-gnd25` | No retained `telemetry.db`; Wilson intervals/Elo and ply buckets cannot be re-derived. All nine lack `status.json`; only `abl-gnd25` has adjacent log/error files. |
 | `sweep2-a` | Four metrics rows only; no evaluation, checkpoint, run-specific log, status, or telemetry record |
 | `pure-1` | No retained `telemetry.db` or `status.json`; evaluation counts are metrics-only and the stop criterion is not recorded. |
-| `runs/grafts/` | Checkpoint only; no transform manifest or run metadata. |
+| `runs/grafts/` | The cited checkpoint conversions have transform manifests; grafts are not training runs and carry no run metadata. |
 | Engineering microbenchmarks | No raw benchmark-output files are retained in the cited source set; the README and run plan are the available receipts. |
 
 Artifact/run-plan discrepancies are stated in the affected reports. They include the `shakeout-1` rounding and critic summaries; `overnight-3` peak/range summaries; the separate grounding-probe values being unlike `abl-gnd25` rows 0–14; `pure-1`’s minimum MAE; `pure-2`’s non-identical repeated trajectory; and unstated aggregation windows for `conv-rho1`, `lam-ret-939`, and `factored-939`.
