@@ -74,26 +74,11 @@ class ModelOutput:
     value_logits: Tensor  # (P, K) the bins' raw logits — what value_loss trains
 
 
-# Width of the action-value readout: the two return-mass logits [z_pos, z_neg]
-# of appendix B. Everything that reads the readout's shape takes it from here.
-CRITIC_LOGITS = 2
-
-
-def compose_q(critic_logits: Tensor) -> Tensor:
-    """Compose the critic's ``(..., 2)`` mass logits into action values, fp32.
-
-    ``[z_pos, z_neg]`` decode to the positive and the negative return mass,
-    ``u_pos = sigmoid(z_pos)`` and ``u_neg = sigmoid(z_neg)``; the action value
-    is their difference and ``u_pos + u_neg`` is the head's estimate of E|G|.
-    Both masses move Q directly, so neither can gate the other out of it.
-
-    Q lies in (−1, 1), which π′ requires: it exponentiates Q/(τ+λ), so an
-    unbounded Q could sharpen without limit. The function is free-standing
-    because the acting seam composes every legal cell while fitting composes
-    only the taken action — off the same raw logits.
-    """
-    u_pos, u_neg = torch.sigmoid(critic_logits.float()).unbind(dim=-1)
-    return u_pos - u_neg
+# Width of the action-value readout: one row per legal cell, scored through
+# tanh (appendix B). Everything that reads the readout's shape takes it from
+# here, so a two-row return-mass checkpoint is refused rather than silently
+# reinterpreted as something this build can score.
+CRITIC_LOGITS = 1
 
 
 def _mlp(d_in: int, d_hidden: int, d_out: int) -> nn.Sequential:
@@ -224,8 +209,7 @@ class MantisNet(nn.Module):
         self.mlp_p = _PairMlp(h, cfg.policy_hidden, 1)
 
         # Appendix B action-value decoder: the same shape as §6 with its own
-        # parameters everywhere, two return-mass logits per legal cell. KLENT's
-        # head.
+        # parameters everywhere, one raw Q per legal cell. KLENT's head.
         self.q = nn.Linear(h, h, bias=False)
         self.e_qw = nn.Embedding(DEC_CLASSES, h)
         self.e_qbg = nn.Embedding(NEAREST_BUCKETS, h)
@@ -249,9 +233,9 @@ class MantisNet(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
         nn.init.normal_(self.token_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
-        # Both decoder outputs start at zero, so the initial policy logits are
-        # constant across legal cells and both mass logits vanish, which makes
-        # the initial action values exactly zero (appendix B).
+        # Both decoder outputs start at zero, so initial policy logits and Q
+        # values are constant across legal cells, and tanh(0) makes the initial
+        # action values exactly zero (appendix B).
         for head in (self.mlp_p, self.mlp_q):
             nn.init.zeros_(head.out.weight)
             nn.init.zeros_(head.out.bias)
@@ -311,15 +295,13 @@ class MantisNet(nn.Module):
             rows, g_half, batch, self.p, self.e_pw, self.e_bg, self.mlp_p
         ).squeeze(-1)
 
-    def cell_head_logits(
-        self, w: Tensor, g: Tensor, batch: Batch
-    ) -> tuple[Tensor, Tensor]:
-        """§6 policy logits ``(N,)`` and appendix-B mass logits ``(N, 2)``.
+    def cell_heads(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor]:
+        """Return §6 policy logits and appendix-B scalar action values.
 
         Both heads use the same parameter-free incidence aggregation and own
-        separate decoder parameters. This is the raw pair: fitting needs the
-        mass logits for their binary losses and composes the taken action's Q
-        from the same numbers, so one pass answers both.
+        separate decoder parameters. Action values are bounded by tanh, which
+        π′ requires: it exponentiates Q/(τ+λ), so an unbounded Q could sharpen
+        without limit.
         """
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
         rows = self._decoder_rows(w, batch, g_p.dtype)
@@ -327,19 +309,12 @@ class MantisNet(nn.Module):
             self._cell_scores(
                 rows, g_p, batch, self.p, self.e_pw, self.e_bg, self.mlp_p
             ).squeeze(-1),
-            self._cell_scores(
-                rows, g_q, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q
+            torch.tanh(
+                self._cell_scores(
+                    rows, g_q, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q
+                ).squeeze(-1)
             ),
         )
-
-    def cell_heads(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor]:
-        """Return §6 policy logits and appendix-B action values in (−1, 1).
-
-        The acting interface: every consumer of a Q sees the composed scalar,
-        one per legal cell in engine order.
-        """
-        policy_logits, critic_logits = self.cell_head_logits(w, g, batch)
-        return policy_logits, compose_q(critic_logits)
 
     def value_head(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """§7: (value, value_dist, value_logits). Multi-query attention

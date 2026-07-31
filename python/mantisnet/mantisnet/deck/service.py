@@ -299,8 +299,8 @@ def _config_from_checkpoint(raw: dict) -> MantisConfig:
     if critic_width != CRITIC_LOGITS:
         raise ValueError(
             f"unsupported critic readout width {critic_width}; this build loads "
-            f"the {CRITIC_LOGITS}-row return-mass critic, and a narrower "
-            "readout must be converted by mantisnet.klent.graft"
+            f"the {CRITIC_LOGITS}-row tanh-scored critic, and a wider readout "
+            "is a bipolar return-mass checkpoint this build cannot score"
         )
     if "model_config" in raw:
         return MantisConfig(**raw["model_config"])
