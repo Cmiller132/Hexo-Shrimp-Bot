@@ -64,23 +64,27 @@ def test_output_contracts(model, positions):
 
 
 @torch.no_grad()
-def test_action_values_are_the_two_return_masses_composed(positions):
-    """Appendix B's composition, written out against the raw readout rows."""
+def test_action_values_are_the_readout_bounded_by_tanh(positions):
+    """Appendix B's scoring, written out against the raw readout row."""
     net = _critic_model()
     batch = collate([from_position(p) for p in positions])
     _s, w, g = net.trunk(batch)
     policy_logits, q = net.cell_heads(w, g, batch)
-    raw_policy, critic_logits = net.cell_head_logits(w, g, batch)
 
-    assert torch.equal(raw_policy, policy_logits)
-    assert critic_logits.shape == (q.shape[0], CRITIC_LOGITS)
+    assert net.mlp_q.out.weight.shape[0] == CRITIC_LOGITS
+    assert q.shape == policy_logits.shape
+    # The same readout the head runs, taken raw: the action value is its tanh.
     # The reference is in double, so the tolerance is fp32 rounding of the
-    # composition, not slack in the formula.
-    u_pos = torch.sigmoid(critic_logits[:, 0].double())
-    u_neg = torch.sigmoid(critic_logits[:, 1].double())
-    torch.testing.assert_close(q.double(), u_pos - u_neg, rtol=0, atol=1e-6)
-    # Both masses are in (0, 1), so their difference is a bounded action value
-    # whatever the logits, and this readout is far from the zero one.
+    # scoring, not slack in the formula.
+    g_q = net.mlp_q.lin_b(g)
+    raw = net._cell_scores(
+        net._decoder_rows(w, batch, g_q.dtype),
+        g_q, batch, net.q, net.e_qw, net.e_qbg, net.mlp_q,
+    ).squeeze(-1)
+    torch.testing.assert_close(q.double(), torch.tanh(raw.double()), rtol=0, atol=1e-6)
+    # The score is bounded whatever the readout holds, which is what keeps
+    # exp(Q / (tau + lam)) from sharpening without limit — and this readout is
+    # far from the zero one.
     assert q.abs().max() < 1.0
     assert q.abs().max() > 0.1
     assert q.dtype == torch.float32

@@ -178,9 +178,8 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
     cfg = KlentConfig(batch_size=64)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     metrics = fit(model, samples, optimizer, cfg, rng)
-    for key in ("policy_loss", "q_loss", "mass_loss"):
+    for key in ("policy_loss", "q_loss"):
         assert np.isfinite(metrics[key]), key
-    assert metrics["mass_loss"] > 0  # two cross-entropies against soft targets
     # Groups close at >= batch_size samples and may overshoot by one chunk,
     # so the step count is bounded by, not equal to, ceil(n / batch_size).
     assert 1 <= metrics["fit_steps"] <= (len(samples) + 63) // 64
@@ -192,11 +191,11 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
             assert p.grad is None, f"value head parameter {name} was trained"
         else:
             assert p.grad is not None, f"{name} received no gradient"
-    # Both critic readout rows train: the squared error moves the composed Q
-    # and each cross-entropy moves its own mass.
+    # The critic readout row trains: the squared error moves the taken action's
+    # scored Q through it.
     rows = model.mlp_q.out.weight.grad.abs().sum(dim=1)
     assert rows.shape == (CRITIC_LOGITS,)
-    assert (rows > 0).all(), "a return mass received no gradient"
+    assert (rows > 0).all(), "the critic readout received no gradient"
 
 
 def test_collect_and_fit_end_to_end():

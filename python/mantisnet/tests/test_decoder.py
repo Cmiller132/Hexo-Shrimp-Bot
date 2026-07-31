@@ -23,8 +23,6 @@ from mantisnet.decoder import (
     aggregate,
     head_matrix,
 )
-from mantisnet.model import compose_q
-
 from .conftest import JOINT_ORBITS
 
 _CUDA = pytest.mark.skipif(
@@ -181,11 +179,11 @@ def test_cell_heads_match_the_spec_decode(positions, model):
     _s, w, g = model.trunk(batch)
     policy, q = model.cell_heads(w, g, batch)
 
-    # Each head's readout rows come off the spec's own per-cell decoder input;
-    # the policy's single row is its logit and the critic's pair composes.
+    # Each head's readout row comes off the spec's own per-cell decoder input;
+    # the policy's is its logit and the critic's is scored through tanh.
     for scores, decode, proj, e_class, e_bg, mlp in (
         (policy, lambda x: x.squeeze(-1), model.p, model.e_pw, model.e_bg, model.mlp_p),
-        (q, compose_q, model.q, model.e_qw, model.e_qbg, model.mlp_q),
+        (q, lambda x: torch.tanh(x.squeeze(-1)), model.q, model.e_qw, model.e_qbg, model.mlp_q),
     ):
         h = _spec_decoder_input(w, batch, proj.weight, e_class.weight, e_bg.weight)
         spec = mlp.out(
