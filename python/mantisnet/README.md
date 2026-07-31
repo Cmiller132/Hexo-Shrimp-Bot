@@ -5,7 +5,7 @@
 `python/mantisnet` requires Python 3.12 or later and contains the MantisNet
 Torch model, independent graph-builder oracle, losses, Hexo KLENT training loop,
 telemetry store, benchmarks, and control-deck backend. The training path uses a policy head and one
-action value per legal cell, composed from the critic's two return-mass logits.
+action value per legal cell, the critic's readout bounded by `tanh`.
 Algorithm obligations are in `docs/KLENT_FOR_HEXO.md`; measured experiment
 outcomes are in `docs/ABLATIONS.md`.
 
@@ -229,15 +229,13 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 - Legal-cell outputs are ragged and follow engine canonical legal order.
 - Policy and action-value decoders share incidence aggregation but own separate
   projections, embeddings, and output MLPs.
-- The critic emits two return-mass logits per legal cell; an action value is
-  `sigmoid(z_pos) - sigmoid(z_neg)` in `(-1, 1)`, composed in fp32.
+- The critic emits one score per legal cell; an action value is `tanh(z)` in
+  `(-1, 1)`.
 - The policy and action-value output layers initialize to zero, so initial
   policy logits and action values are exactly zero.
-- KLENT improvement consumes raw policy logits and composed action values.
-- The KLENT fit objective trains policy cross-entropy, the taken action's
-  squared return error, and the taken action's two return-mass cross-entropies
-  weighted by `mass_weight`.
-- `mass_loss` reports the unweighted mass bracket and has no telemetry column.
+- KLENT improvement consumes raw policy logits and bounded action values.
+- The KLENT fit objective trains policy cross-entropy and the taken action's
+  squared return error, both at unit weight.
 - A slot-class/scalar-critic checkpoint loads only after
   `python -m mantisnet.klent.graft` applies both representation changes; that
   conversion refuses to write unless the exact joint checks and the measured
