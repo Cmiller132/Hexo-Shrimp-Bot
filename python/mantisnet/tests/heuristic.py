@@ -31,9 +31,13 @@ def heuristic_scores(batch) -> torch.Tensor:
 def heuristic_evaluate(batch):
     """The scores as an evaluator: cell scores as policy logits, and the same
     scores scaled into the critic's [0, 1] output range as Q — acting-time
-    v-hat must satisfy `lambda_returns`' [-1, 1] input contract."""
+    v-hat must satisfy `lambda_returns`' [-1, 1] input contract.
+
+    The score π′ ranks by and the value v̂ averages are the same tensor here,
+    which is what a critic whose largest return mass is one would compose."""
     scores = heuristic_scores(batch)
-    return scores, scores / 8.0
+    q = scores / 8.0
+    return scores, q, q
 
 
 def heuristic_choose(positions, rng: np.random.Generator, noise: float = 0.0):

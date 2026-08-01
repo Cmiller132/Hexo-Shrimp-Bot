@@ -170,7 +170,7 @@ def test_graft_preserves_the_parent_decode(tmp_path, positions):
     # this repeats independently of it.
     batch = collate([from_position(p) for p in positions])
     _s, w, g = model.trunk(batch)
-    policy, q = model.cell_heads(w, g, batch)
+    policy, _score, q = model.cell_heads(w, g, batch, 0.2)
     slot_class = torch.from_numpy(_PARENT_ROW)[batch.dec_class]
     for scores, tail, proj, table, bg, mlp in (
         (policy, lambda x: x, "p.weight", "e_pw.weight", "e_bg.weight", "mlp_p"),

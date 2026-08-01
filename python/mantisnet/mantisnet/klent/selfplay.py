@@ -23,8 +23,9 @@ from ..builder import collate_positions
 from .improve import improved_policy
 from .returns import lambda_returns, signs_from_moves_remaining
 
-# Evaluators return flat CPU ``(policy_logits, q_values)`` for one batch.
-Evaluate = Callable[[object], tuple[torch.Tensor, torch.Tensor]]
+# Evaluators return flat CPU ``(policy_logits, q_score, q_value)`` for one
+# batch: π′ ranks by the score, v̂ averages the value.
+Evaluate = Callable[[object], tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
 
 
 @dataclass
@@ -159,11 +160,11 @@ class Collector:
                 sampled = []
                 for chunk, fut in zip(chunks, batches):
                     batch = fut.result()
-                    policy_logits, q_values = evaluate(batch)
+                    policy_logits, q_score, q_value = evaluate(batch)
                     sampled.append(
                         sample_pool.submit(
-                            self._sample, chunk, batch, policy_logits, q_values,
-                            done, stats,
+                            self._sample, chunk, batch, policy_logits, q_score,
+                            q_value, done, stats,
                         )
                     )
                 # Advance every slot before the next step reads stone counts.
@@ -181,10 +182,12 @@ class Collector:
         }
         return done, metrics
 
-    def _sample(self, chunk, batch, policy_logits, q_values, done, stats) -> None:
+    def _sample(
+        self, chunk, batch, policy_logits, q_score, q_value, done, stats
+    ) -> None:
         """Improve, sample, and advance one chunk in sampling-lane order."""
         imp = improved_policy(
-            policy_logits, q_values, batch.legal_offsets, self.tau, self.lam
+            policy_logits, q_score, q_value, batch.legal_offsets, self.tau, self.lam
         )
         stats["kl"] += float(imp.kl.sum())
         stats["ent"] += float(imp.norm_entropy.sum())

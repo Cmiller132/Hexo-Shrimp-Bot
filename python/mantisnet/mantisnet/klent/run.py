@@ -350,6 +350,11 @@ def main(argv=None) -> None:
         "--mass-weight", type=float, default=KlentConfig.mass_weight,
         help="eta: weight on the critic's return-mass cross-entropies",
     )
+    ap.add_argument(
+        "--mass-floor", type=float, default=KlentConfig.mass_floor,
+        help="smallest total return mass pi' measures Q against, which bounds "
+             "the sharpening where the whole legal set is uncommitted",
+    )
     ap.add_argument("--lam-ret", type=float, default=KlentConfig.lam_ret)
     ap.add_argument(
         "--gamma", type=float, default=KlentConfig.gamma,
@@ -457,6 +462,7 @@ def main(argv=None) -> None:
         tau=args.tau,
         lam=args.lam,
         mass_weight=args.mass_weight,
+        mass_floor=args.mass_floor,
         lam_ret=args.lam_ret,
         gamma=args.gamma,
         ply_cap=args.cap,

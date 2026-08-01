@@ -114,6 +114,13 @@ PRESERVATION = (
     "incidence contribution and sigmoid(2z) - sigmoid(-2z) = tanh(z)"
 )
 
+# The graft writes w_pos = 2w and w_neg = -2w, so a grafted cell's total return
+# mass is sigmoid(2z) + sigmoid(-2z) = 1 exactly. π′ therefore measures Q
+# against 1 whatever floor is asked for, and the preservation identity above
+# survives mass-normalized acting unchanged. Any value in (0, 1] would give the
+# same probe, so this one is the run's.
+_GRAFT_FLOOR = 0.2
+
 # The parent's cell-head tensors, by state-dict key: window projection, class
 # table, background-bucket table, and the MLP's prefix.
 _POLICY_HEAD = ("p.weight", "e_pw.weight", "e_bg.weight", "mlp_p")
@@ -471,7 +478,7 @@ def _measure_joint(
 
     with torch.no_grad():
         _s, w, g = model.trunk(batch)
-        policy_new, q_new = model.cell_heads(w, g, batch)
+        policy_new, score_new, q_new = model.cell_heads(w, g, batch, _GRAFT_FLOOR)
         policy_parent = _spec_scores(
             w, g, batch, parent_model, _POLICY_HEAD, slot_class
         )
@@ -491,8 +498,10 @@ def _measure_joint(
 
     offsets = batch.legal_offsets
     kl = _segment_kl(
-        improved_policy(policy_new, q_new, offsets, tau, lam).probs,
-        improved_policy(policy_parent, q_parent, offsets, tau, lam).probs,
+        improved_policy(policy_new, score_new, q_new, offsets, tau, lam).probs,
+        # The parent's scalar critic has no mass to measure against, so its
+        # score is its action value.
+        improved_policy(policy_parent, q_parent, q_parent, offsets, tau, lam).probs,
         offsets,
     )
     q_delta = (q_new - q_parent).abs()
@@ -545,7 +554,7 @@ def _measure(
 
     with torch.no_grad():
         _s, w, g = model.trunk(batch)
-        policy_new, q_new = model.cell_heads(w, g, batch)
+        policy_new, score_new, q_new = model.cell_heads(w, g, batch, _GRAFT_FLOOR)
         # A separate parent trunk forward prevents a mangled shared tensor from
         # disappearing behind shared activations. Its old decoder is evaluated
         # by the independent MODEL_SPEC §6 transcription because this build's
@@ -562,9 +571,11 @@ def _measure(
 
     offsets = batch.legal_offsets
     delta = (q_new - q_parent).abs()
-    pi_new = improved_policy(policy_new.double(), q_new.double(), offsets, tau, lam)
+    pi_new = improved_policy(
+        policy_new.double(), score_new.double(), q_new.double(), offsets, tau, lam
+    )
     pi_parent = improved_policy(
-        policy_parent.double(), q_parent.double(), offsets, tau, lam
+        policy_parent.double(), q_parent.double(), q_parent.double(), offsets, tau, lam
     )
     probs = pi_new.probs
     terms = torch.where(

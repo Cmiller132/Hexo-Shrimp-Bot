@@ -17,7 +17,7 @@ from .conftest import d6_transforms
 
 @torch.no_grad()
 def _forward(model, pos):
-    return model(collate([from_position(pos)]))
+    return model(collate([from_position(pos)]), 0.2)
 
 
 def test_d6_invariance(model, move_lists):

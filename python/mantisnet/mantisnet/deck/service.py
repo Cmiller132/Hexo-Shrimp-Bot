@@ -352,23 +352,36 @@ class InferenceCache:
                     torch.cuda.empty_cache()
             return path, model
 
-    def parameters(self, path: Path, tau, lam) -> tuple[float, float]:
-        if tau is not None and lam is not None:
-            return float(tau), float(lam)
+    def parameters(self, path: Path, tau, lam, mass_floor) -> tuple[float, float, float]:
+        if tau is not None and lam is not None and mass_floor is not None:
+            return float(tau), float(lam), float(mass_floor)
         try:
             run = path.parent
-            config = json_file(run / "config.json")
-            return float(config["klent"]["tau"]), float(config["klent"]["lam"])
+            klent = json_file(run / "config.json")["klent"]
+            return (
+                float(klent["tau"]),
+                float(klent["lam"]),
+                float(klent["mass_floor"]),
+            )
         except (FileNotFoundError, KeyError, TypeError):
             raise ValueError(
-                "a checkpoint outside a run directory requires tau and lam"
+                "a checkpoint outside a run directory requires tau, lam, and "
+                "mass_floor, all three of which pi' depends on"
             ) from None
 
-    def inspect(self, checkpoint: str, moves, t=None, tau=None, lam=None) -> dict:
+    def inspect(
+        self, checkpoint: str, moves, t=None, tau=None, lam=None, mass_floor=None
+    ) -> dict:
         path, model = self.get(checkpoint)
-        tau, lam = self.parameters(path, tau, lam)
+        tau, lam, mass_floor = self.parameters(path, tau, lam, mass_floor)
         return inspect_position(
-            model, moves, len(moves) if t is None else t, tau, lam, self.device
+            model,
+            moves,
+            len(moves) if t is None else t,
+            tau,
+            lam,
+            mass_floor,
+            self.device,
         )
 
 
@@ -446,7 +459,7 @@ class PlaySessions:
             elif seat["kind"] == "checkpoint":
                 read = self.inference.inspect(
                     seat["checkpoint"], session["moves"], tau=seat.get("tau"),
-                    lam=seat.get("lam"),
+                    lam=seat.get("lam"), mass_floor=seat.get("mass_floor"),
                 )
                 key = {"argmax": "policy", "sample": "policy", "improved": "improved"}.get(
                     seat.get("mode", "argmax"), "policy"

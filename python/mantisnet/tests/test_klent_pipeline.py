@@ -229,12 +229,14 @@ def test_network_evaluate_matches_forward():
         model.mlp_q.out.bias.normal_(std=0.5)
     pos = hexo_py.Position.replay([(0, 0), (1, 1), (2, 0)])
     batch = collate([from_position(pos)])
-    logits, q = network_evaluate(model, KlentConfig())(batch)
+    cfg = KlentConfig()
+    logits, score, q = network_evaluate(model, cfg)(batch)
     with torch.no_grad():
-        out = model(batch)
+        out = model(batch, cfg.mass_floor)
     assert q.abs().max() > 0
     assert torch.allclose(logits, out.policy_logits, atol=1e-6)
     assert torch.allclose(q, out.q_values, atol=1e-6)
+    assert torch.allclose(score, out.q_score, atol=1e-6)
 
 
 def test_play_match_is_seat_balanced_and_scores_caps_as_half():

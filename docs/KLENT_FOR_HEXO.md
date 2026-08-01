@@ -82,26 +82,29 @@ Paper equation 3 is implemented as
 
 $$\log\pi_\theta=\operatorname{logsoftmax}(\ell),\qquad
 \pi'=\operatorname{softmax}\left(
-  \frac{Q+\tau\log\pi_\theta}{\tau+\lambda}
+  \frac{\tilde Q+\tau\log\pi_\theta}{\tau+\lambda}
 \right)$$
 
 independently within every legal-action segment.
 
-Boundary identities are part of the contract: `tau == 0` ignores the prior; constant Q gives $\pi'\propto\pi_\theta^{\tau/(\tau+\lambda)}$; and a one-action segment is a point mass with zero KL and normalized entropy.
+$\tilde Q$ is the acting score of [MODEL_SPEC.md](MODEL_SPEC.md) appendix B: $Q$ divided by the largest total return mass in the position's legal set, floored at `mass_floor`. Since that divisor is a single positive number per segment, $\tilde Q$ orders a legal set exactly as $Q$ does, and the operator is equation 3 at a per-state temperature $(\tau+\lambda)\cdot\max_b M(S,b)$ — which leaves $\tau/(\tau+\lambda)$, the weight on the prior, unchanged. $\hat v$ averages the unscaled $Q$, because §1.3's λ-return bootstraps on it and must stay on the outcome's ±1 scale. See §9.16.
+
+Boundary identities are part of the contract: `tau == 0` ignores the prior; constant $\tilde Q$ gives $\pi'\propto\pi_\theta^{\tau/(\tau+\lambda)}$; and a one-action segment is a point mass with zero KL and normalized entropy.
 
 ### 2.1 Function contract
 
 ```python
 improved_policy(
     policy_logits: Tensor,  # (N,)
-    q_values: Tensor,       # (N,)
+    q_score: Tensor,        # (N,) the acting score, what pi' ranks by
+    q_value: Tensor,        # (N,) the action value, what v-hat averages
     offsets: Tensor,        # (P + 1,) CSR boundaries
     tau: float,
     lam: float,
 ) -> ImprovedPolicy
 ```
 
-`policy_logits` and `q_values` are flat, aligned, and ordered by engine legal rank. `offsets` starts at zero, ends at $N$, and defines $P$ positive-width positions. The tensors share a device. Arithmetic runs in the promotion of the two input dtypes with fp32 as a floor, and every return field carries that dtype: acting's fp32 and bf16 both give fp32, and a float64 caller keeps float64. The whole operator is `no_grad`.
+`policy_logits`, `q_score`, and `q_value` are flat, aligned, and ordered by engine legal rank. `offsets` starts at zero, ends at $N$, and defines $P$ positive-width positions. The tensors share a device. Arithmetic runs in the promotion of the two input dtypes with fp32 as a floor, and every return field carries that dtype: acting's fp32 and bf16 both give fp32, and a float64 caller keeps float64. The whole operator is `no_grad`.
 
 | Return field | Shape | Definition |
 |---|---:|---|
@@ -114,7 +117,7 @@ Each per-position expectation — `v_hat`, `kl`, and the entropy behind `norm_en
 
 ### 2.2 Refusal boundary
 
-The operator refuses `tau < 0`, `lam < 0`, and `tau + lam <= 0`. Shape, device, CSR, finiteness, and Q-range requirements are caller preconditions, not explicit refusals. Terminal positions are refused by the model builder, not by this function.
+The operator refuses `tau < 0`, `lam < 0`, `tau + lam <= 0`, and a `q_score`/`q_value` pair of different shapes. Device, CSR, finiteness, and Q-range requirements are caller preconditions, not explicit refusals. Terminal positions are refused by the model builder, not by this function.
 
 ## 3. Critic and losses
 
@@ -122,7 +125,7 @@ The consumed model contract is the trunk and legal-cell decoder in [MODEL_SPEC.m
 
 $$u^{+}=\sigma(z^{+}),\qquad u^{-}=\sigma(z^{-}),\qquad Q=u^{+}-u^{-}\in(-1,1),$$
 
-which is what every acting path consumes. Fitting reads the raw logits and composes only the taken action from the same pass. KLENT calls no state-value readout and applies no loss to it.
+together with the acting score $\tilde Q$ of §2. Every acting path consumes both: $\pi'$ ranks by $\tilde Q$ and $\hat v$ averages $Q$. Fitting reads the raw logits and composes only the taken action's $Q$ from the same pass — the score has no role in the loss, which is why the mass divisor cannot be gamed to sharpen $\pi'$. KLENT calls no state-value readout and applies no loss to it.
 
 For a fitting batch of positions, with $G^{+}_i=\max(G_i,0)$ and $G^{-}_i=\max(-G_i,0)$,
 
@@ -152,10 +155,10 @@ The policy cross-entropy covers the full legal set. All three critic terms selec
 Collection accepts:
 
 ```python
-evaluate(batch) -> (policy_logits, q_values)
+evaluate(batch) -> (policy_logits, q_score, q_value)
 ```
 
-Both outputs are flat fp32 CPU tensors in batch legal-cell order. `network_evaluate` implements the seam with `trunk` plus the cell heads under `no_grad`, composing $Q$ outside the autocast region; it does not evaluate the state-value head.
+All three outputs are flat fp32 CPU tensors in batch legal-cell order. `network_evaluate` implements the seam with `trunk` plus the cell heads under `no_grad`, composing both Q roles outside the autocast region; it does not evaluate the state-value head.
 
 For each acting position, collection computes $\pi'$, $\hat v$, KL, and normalized entropy before sampling. It renormalizes each probability segment in float64 for sampling and fp32 storage, draws one uniform per slot, advances the selected legal rank, and retains the operator's original fp32 diagnostics.
 
@@ -413,6 +416,10 @@ Acting means cover every position evaluated during the collection call, includin
 
 **Paper:** The action-value head emits one scalar per action, fitted by squared error against the $\lambda$-return. **Here:** The head emits two logits per action whose sigmoids are the positive and the negative return mass; their difference is $Q$ and carries the same squared error, and each mass additionally carries a cross-entropy against its own part of the return with weight $\eta/2$. **Grounds:** Each mass is calibrated by its own cross-entropy while $Q$ stays their difference, so the head stores $\mathbb E[G^{+}]$ and $\mathbb E[G^{-}]$ instead of $\mathbb E[G]$ alone. **Measured outcomes:** See [ABLATIONS.md § Training runs](ABLATIONS.md#training-runs).
 
+### 9.16 Acting temperature
+
+**Paper:** $\pi'$ measures $Q$ against a fixed $\tau+\lambda$, so the improvement step's strength tracks the absolute size of $Q$'s spread. **Here:** $\pi'$ ranks by $\tilde Q = Q/\max(\max_b M(S,b), \texttt{mass\_floor})$, which measures $Q$ against the largest return mass the critic has committed anywhere in the legal set; $\hat v$ keeps the unscaled $Q$. **Grounds:** $\gamma$ and $\lambda_{\mathrm{ret}}$ make $|G|$ small wherever the outcome is far off, so a fixed temperature leaves the improvement step nearly inert in exactly the positions that are still open. Measured on `joint-brm-939` at iteration 300, the within-position spread of $Q$ is $0.56$ of $\tau+\lambda$ overall and $0.08$ where nothing is resolved, against $M$ running $0.12$ unresolved to $0.91$ decided. The divisor is per position, so the preference over a legal set is untouched and only the sharpness moves. **Measured outcomes:** See [ABLATIONS.md § Training runs](ABLATIONS.md#training-runs).
+
 ## 10. Reference configuration
 
 The current repository reference recipe is:
@@ -424,11 +431,13 @@ The current repository reference recipe is:
 | $\tau$ | `0.1` |
 | $\lambda_{\mathrm{ret}}$ | `0.939` |
 | $\eta$ (`mass_weight`) | `0.25` |
+| `mass_floor` | `0.2` |
 | Critic | two return-mass logits, $Q=u^{+}-u^{-}$ |
+| Acting score | $Q/\max(\max_b M, \texttt{mass\_floor})$ |
 
 These are configuration facts recorded in [ABLATIONS.md](ABLATIONS.md), which also records their selection.
 
-**Finding:** `KlentConfig` and the CLI currently default to $\gamma=1.0,\lambda=0.03$; the reference recipe therefore requires explicit flags, and `test_klent_run.py` pins the `0.03` CLI default. `mass_weight` defaults to the $\eta$ above, so `--mass-weight` is needed only to depart from it.
+**Finding:** `KlentConfig` and the CLI currently default to $\gamma=1.0,\lambda=0.03$; the reference recipe therefore requires explicit flags, and `test_klent_run.py` pins the `0.03` CLI default. `mass_weight` and `mass_floor` default to the values above, so `--mass-weight` and `--mass-floor` are needed only to depart from them.
 
 ## 11. Open questions
 

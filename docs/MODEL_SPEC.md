@@ -34,7 +34,7 @@ inputs, and no nodes for empty cells.
   scales with stones and live windows, not with the legal halo.
 - The **policy** decoder emits one raw logit per legal cell. The **action-value**
   decoder emits two return-mass logits per legal cell and composes them into one
-  action value in `(−1, 1)` (appendix B).
+  action value in `(−1, 1)`, plus the acting score π′ ranks by (appendix B).
 - The **state-value** head reads the board through multi-query attention over the
   window embeddings and outputs a binned distribution over `[−1, 1]`,
   decoded to a scalar in-forward.
@@ -366,9 +366,9 @@ the forward contains no data-dependent index discovery.
   embedding `N(0, 0.02)`.
 - Optimizer grouping: parameters with `ndim ≤ 1`, all embedding tables,
   and the attention-bias tables are excluded from weight decay.
-- Outputs: raw policy logits; action values composed in fp32 from the critic's
-  two return-mass logits; the state-value bin distribution and its scalar
-  decode. The model applies no policy softmax and does not clamp the decoded
+- Outputs: raw policy logits; action values and the acting score, both composed
+  in fp32 from the critic's two return-mass logits; the state-value bin
+  distribution and its scalar decode. The model applies no policy softmax and does not clamp the decoded
   state value.
 
 ---
@@ -482,16 +482,33 @@ action value. Both masses lie in `(0, 1)`, so `Q ∈ (−1, 1)` and each mass mo
 
 The raw pair is part of the interface: fitting reads `[z_pos, z_neg]` and
 composes the taken action's `Q` from the same numbers, so one decoder pass
-serves both. Every acting consumer sees only the composed value.
+serves both.
+
+Acting consumers see two compositions off that same pair, because the operator
+uses `Q` in two roles that are not the same quantity. Writing `M(s,a) =
+u_pos + u_neg` for the total return mass and `mass_floor` for the run's floor:
+
+```
+Q̃(s, a) = Q(s, a) / max( max_{b legal} M(s, b), mass_floor )
+```
+
+`Q̃` is the **acting score**, and `Q` remains the **action value**. The divisor
+is one number per position, so the order over a legal set is identical under
+both and this is a temperature adaptation rather than a different preference.
+Since `|Q(s,a)| ≤ M(s,a) ≤ max_b M(s,b)`, the score lies in `(−1, 1)` without a
+clamp, which is what π′ requires of anything it exponentiates.
 
 The KLENT operator and training contract are specified in
-[`KLENT_FOR_HEXO.md`](KLENT_FOR_HEXO.md). The improvement step consumes the
-policy logits and action values without an additional gain:
+[`KLENT_FOR_HEXO.md`](KLENT_FOR_HEXO.md). The improvement step ranks by the
+score and averages the value, without an additional gain:
 
 ```
-π′(a|s) ∝ exp[(Q(s,a) + τ·log π_θ(a|s)) / (τ+λ)]
+π′(a|s) ∝ exp[(Q̃(s,a) + τ·log π_θ(a|s)) / (τ+λ)]
 v̂(s)    = E_{a~π′}[Q(s,a)]
 ```
+
+v̂ stays on `Q` because the λ-return bootstraps on it and must remain on the
+outcome's own ±1 scale.
 
 Training selects the taken action and fits both the composed value and the two
 masses. With `G_pos = max(G, 0)`, `G_neg = max(−G, 0)`, and
@@ -510,7 +527,9 @@ loss, including the unit-weight policy cross-entropy.
 The parameterization obeys the exact identity
 `sigmoid(2z) − sigmoid(−2z) = tanh(z)`. This is the function-preservation
 identity used when converting compatible checkpoints; it is not a second
-critic mode.
+critic mode. A checkpoint converted through it has `M ≡ 1` everywhere, since
+`σ(2z) + σ(−2z) = 1`, so `Q̃ = Q` at the moment of conversion and the identity
+holds for the improved policy as well as for the action value.
 
 **Both the policy decoder's and action-value decoder's MLP output layers
 initialize to zero**, overriding §10's framework default for those two

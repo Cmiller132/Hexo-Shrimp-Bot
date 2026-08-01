@@ -114,9 +114,11 @@ def bench_sweep(args) -> None:
                     t0 = time.perf_counter()
                     batch = collate_positions([positions[i] for i in chunk])
                     t1 = time.perf_counter()
-                    policy, q = evaluate(batch)
+                    policy, score, q = evaluate(batch)
                     t2 = time.perf_counter()
-                    imp = improved_policy(policy, q, batch.legal_offsets, 0.1, 0.03)
+                    imp = improved_policy(
+                        policy, score, q, batch.legal_offsets, 0.1, 0.03
+                    )
                     offsets = batch.legal_offsets.numpy()
                     flat = imp.probs.numpy().astype(np.float64)
                     widths = np.diff(offsets)
@@ -179,9 +181,9 @@ class _PhaseTimer:
             self._add("collate", time.perf_counter() - t0)
             return out
 
-        def improved(policy, q, offsets, tau, lam):
+        def improved(policy, score, q, offsets, tau, lam):
             t0 = time.perf_counter()
-            out = self._improved(policy, q, offsets, tau, lam)
+            out = self._improved(policy, score, q, offsets, tau, lam)
             self._add("improve", time.perf_counter() - t0)
             return out
 

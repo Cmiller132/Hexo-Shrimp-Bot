@@ -23,6 +23,7 @@ from torch import Tensor, nn
 from . import decoder
 from .attention import fused_attention
 from .builder import DEC_CLASSES, NEAREST_BUCKETS, NUM_PATTERNS, Batch
+from .segments import segment_ids, segment_max
 
 
 @dataclass(frozen=True)
@@ -68,6 +69,7 @@ class ModelOutput:
     """What one full forward answers (§11 plus the appendix-B Q head)."""
 
     policy_logits: Tensor  # (N_cells,) raw, engine legal order per position
+    q_score: Tensor  # (N_cells,) the score π′ ranks by, same layout
     q_values: Tensor  # (N_cells,) action values, same layout — the KLENT head
     value: Tensor  # (P,) scalar decode, in [-1, 1]
     value_dist: Tensor  # (P, K) softmax over bins, fp32
@@ -79,21 +81,54 @@ class ModelOutput:
 CRITIC_LOGITS = 2
 
 
-def compose_q(critic_logits: Tensor) -> Tensor:
-    """Compose the critic's ``(..., 2)`` mass logits into action values, fp32.
+def return_mass(critic_logits: Tensor) -> tuple[Tensor, Tensor]:
+    """The ``(..., 2)`` mass logits ``[z_pos, z_neg]`` as masses, fp32.
 
-    ``[z_pos, z_neg]`` decode to the positive and the negative return mass,
-    ``u_pos = sigmoid(z_pos)`` and ``u_neg = sigmoid(z_neg)``; the action value
-    is their difference and ``u_pos + u_neg`` is the head's estimate of E|G|.
-    Both masses move Q directly, so neither can gate the other out of it.
-
-    Q lies in (−1, 1), which π′ requires: it exponentiates Q/(τ+λ), so an
-    unbounded Q could sharpen without limit. The function is free-standing
-    because the acting seam composes every legal cell while fitting composes
-    only the taken action — off the same raw logits.
+    ``u_pos = sigmoid(z_pos)`` and ``u_neg = sigmoid(z_neg)``. At the optimum of
+    the mass cross-entropies they are E[G⁺] and E[G⁻], so their difference is
+    E[G] and their sum is E|G|.
     """
-    u_pos, u_neg = torch.sigmoid(critic_logits.float()).unbind(dim=-1)
+    return torch.sigmoid(critic_logits.float()).unbind(dim=-1)
+
+
+def compose_q(critic_logits: Tensor) -> Tensor:
+    """The action value: the two masses' difference, in (−1, 1).
+
+    This is the quantity the λ-return targets and v̂ averages, so it stays on
+    the outcome's own ±1 scale. Both masses move it directly, so neither can
+    gate the other out of it. The function is free-standing because the acting
+    seam composes every legal cell while fitting composes only the taken
+    action — off the same raw logits.
+    """
+    u_pos, u_neg = return_mass(critic_logits)
     return u_pos - u_neg
+
+
+def compose_acting_q(
+    critic_logits: Tensor, offsets: Tensor, mass_floor: float
+) -> Tensor:
+    """The score π′ ranks by: Q in units of the position's committed mass.
+
+    ``u_pos + u_neg`` estimates E|G|, which is how much return magnitude the
+    critic has actually committed to a cell rather than which way it points.
+    Dividing by the largest of them in the legal set states Q as a fraction of
+    what is on the table in this position instead of the ±1 the outcome could
+    eventually reach. KLENT's temperature is in units of value, and this makes
+    that unit local: the operator is eq. 3 at temperature (τ + λ)·maxM, which
+    leaves τ/(τ + λ) — the weight on the prior — exactly where it was.
+
+    One divisor per position, so the order over legal cells is untouched. This
+    adapts the temperature; it does not change which move the critic prefers.
+
+    ``|u_pos − u_neg| <= u_pos + u_neg <= maxM`` keeps the result in (−1, 1),
+    which π′ requires: it exponentiates the score over τ + λ, so an unbounded
+    one could sharpen without limit. ``mass_floor`` bounds the sharpening in a
+    position whose whole legal set is uncommitted.
+    """
+    u_pos, u_neg = return_mass(critic_logits)
+    seg = segment_ids(offsets)
+    scale = segment_max(u_pos + u_neg, seg, offsets.shape[0] - 1).clamp(min=mass_floor)
+    return (u_pos - u_neg) / scale.index_select(0, seg)
 
 
 def _mlp(d_in: int, d_hidden: int, d_out: int) -> nn.Sequential:
@@ -332,14 +367,21 @@ class MantisNet(nn.Module):
             ),
         )
 
-    def cell_heads(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor]:
-        """Return §6 policy logits and appendix-B action values in (−1, 1).
+    def cell_heads(
+        self, w: Tensor, g: Tensor, batch: Batch, mass_floor: float
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return §6 policy logits, the acting score, and the action value.
 
-        The acting interface: every consumer of a Q sees the composed scalar,
-        one per legal cell in engine order.
+        The acting interface, one row per legal cell in engine order. The two
+        Q tensors are the operator's two roles: π′ ranks by the score, and v̂
+        averages the value, which is what the λ-return bootstraps on.
         """
         policy_logits, critic_logits = self.cell_head_logits(w, g, batch)
-        return policy_logits, compose_q(critic_logits)
+        return (
+            policy_logits,
+            compose_acting_q(critic_logits, batch.legal_offsets, mass_floor),
+            compose_q(critic_logits),
+        )
 
     def value_head(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """§7: (value, value_dist, value_logits). Multi-query attention
@@ -366,14 +408,15 @@ class MantisNet(nn.Module):
         value = value_dist @ self.bin_centers
         return value, value_dist, v_logits
 
-    def forward(self, batch: Batch) -> ModelOutput:
+    def forward(self, batch: Batch, mass_floor: float) -> ModelOutput:
         """Every head. KLENT's loop composes `trunk` with the two heads it
         trains instead, skipping the value readout it never reads."""
         s_, w, g = self.trunk(batch)
         value, value_dist, value_logits = self.value_head(w, g, batch)
-        policy_logits, q_values = self.cell_heads(w, g, batch)
+        policy_logits, q_score, q_values = self.cell_heads(w, g, batch, mass_floor)
         return ModelOutput(
             policy_logits=policy_logits,
+            q_score=q_score,
             q_values=q_values,
             value=value,
             value_dist=value_dist,

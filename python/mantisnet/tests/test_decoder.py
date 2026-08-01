@@ -170,7 +170,7 @@ def test_the_joint_class_separates_cells_the_slot_class_could_not(positions, mod
     for out in (scored.mlp_p.out, scored.mlp_q.out):
         out.weight.copy_(torch.randn(out.weight.shape, generator=generator) * 0.1)
     _s, w, g = scored.trunk(batch)
-    policy, q = scored.cell_heads(w, g, batch)
+    policy, _score, q = scored.cell_heads(w, g, batch, 0.2)
     assert policy[a] != policy[b]
     assert q[a] != q[b]
 
@@ -179,7 +179,7 @@ def test_the_joint_class_separates_cells_the_slot_class_could_not(positions, mod
 def test_cell_heads_match_the_spec_decode(positions, model):
     batch = _batch(positions)
     _s, w, g = model.trunk(batch)
-    policy, q = model.cell_heads(w, g, batch)
+    policy, _score, q = model.cell_heads(w, g, batch, 0.2)
 
     # Each head's readout rows come off the spec's own per-cell decoder input;
     # the policy's single row is its logit and the critic's pair composes.
@@ -198,7 +198,7 @@ def test_cell_heads_match_the_spec_decode(positions, model):
 def test_policy_head_matches_the_pair(positions, model):
     batch = _batch(positions)
     _s, w, g = model.trunk(batch)
-    policy, _q = model.cell_heads(w, g, batch)
+    policy, _score, _q = model.cell_heads(w, g, batch, 0.2)
     assert torch.equal(model.policy_head(w, g, batch), policy)
 
 
@@ -269,14 +269,14 @@ def test_kernel_gradient_matches_the_scatter(positions):
 def test_compiled_dynamic_heads_match_eager(positions, model):
     model = model.to("cuda")
     compiled = torch.compile(
-        lambda m, b: m.cell_heads(*m.trunk(b)[1:], b), dynamic=True
+        lambda m, b: m.cell_heads(*m.trunk(b)[1:], b, 0.2), dynamic=True
     )
     try:
         # Several shapes through one dynamic graph: the aggregation stays in it
         # only if its fake kernel tracks the symbolic cell count.
         for count in (2, 5, len(positions)):
             batch = _batch(positions[:count]).to("cuda")
-            eager = model.cell_heads(*model.trunk(batch)[1:], batch)
+            eager = model.cell_heads(*model.trunk(batch)[1:], batch, 0.2)
             got = compiled(model, batch)
             for a, b in zip(got, eager):
                 torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-4)

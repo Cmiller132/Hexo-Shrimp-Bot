@@ -99,8 +99,8 @@ def gumbel_choose(
 ):
     """Build a batched Gumbel root-sampling and sequential-halving chooser.
 
-    ``evaluate(batch)`` returns flat CPU ``(policy_logits, q_values)`` tensors
-    in engine legal order. ``tau`` and ``lam`` are the run's KLENT
+    ``evaluate(batch)`` returns flat CPU ``(policy_logits, q_score, q_value)``
+    tensors in engine legal order. ``tau`` and ``lam`` are the run's KLENT
     coefficients; every interior line step acts by the same improved policy
     used during collection. ``sims == 0`` is exactly policy-logit argmax.
 
@@ -142,9 +142,10 @@ def gumbel_choose(
             raise ValueError("gumbel chooser needs an RNG")
 
         root_batch = collate_positions(positions)
-        root_logits, root_q = evaluate(root_batch)
+        root_logits, root_score, root_value = evaluate(root_batch)
         root_logits = root_logits.float().cpu()
-        root_q = root_q.float().cpu()
+        root_score = root_score.float().cpu()
+        root_value = root_value.float().cpu()
         offsets = root_batch.legal_offsets.tolist()
 
         if sims == 0:
@@ -166,7 +167,8 @@ def gumbel_choose(
         # sampling deliberately uses raw policy logits, as Gumbel MuZero does.
         improved_policy(
             root_logits,
-            root_q,
+            root_score,
+            root_value,
             root_batch.legal_offsets,
             tau,
             lam,
@@ -258,12 +260,12 @@ def gumbel_choose(
                 leaf_batch = collate_positions(
                     [line.position for _search, line in pending]
                 )
-                logits, q_values = evaluate(leaf_batch)
+                logits, score, value = evaluate(leaf_batch)
                 logits = logits.float().cpu()
-                q_values = q_values.float().cpu()
                 leaf = improved_policy(
                     logits,
-                    q_values,
+                    score.float().cpu(),
+                    value.float().cpu(),
                     leaf_batch.legal_offsets,
                     tau,
                     lam,

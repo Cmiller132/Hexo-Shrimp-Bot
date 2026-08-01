@@ -25,6 +25,7 @@ def inspect_position(
     t: int,
     tau: float,
     lam: float,
+    mass_floor: float,
     device: str = "cpu",
 ) -> dict:
     """A checkpoint's policy, Q, π′, and v̂ over the legal set at ``moves[:t]``.
@@ -32,9 +33,10 @@ def inspect_position(
     ``checkpoint`` is a path or an already-loaded model. Passing a model avoids
     loading the checkpoint again for each inspected prefix.
 
-    ``tau`` and ``lam`` are required because π′ depends on them. For a recorded
-    ply, callers must use the invocation parameters that applied to its
-    iteration; the latest ``config.json`` can differ after resume.
+    ``tau``, ``lam``, and ``mass_floor`` are required because π′ depends on all
+    three. For a recorded ply, callers must use the invocation parameters that
+    applied to its iteration; the latest ``config.json`` can differ after
+    resume.
 
     Returns the position's own scalars plus one entry per legal move, in the
     engine order used by telemetry ranks. A supplied model is left in eval mode.
@@ -58,11 +60,12 @@ def inspect_position(
     batch = collate_prefixes([moves], [t]).to(device)
     with torch.no_grad():
         _s, w, g = model.trunk(batch)
-        logits, q_values = model.cell_heads(w, g, batch)
+        logits, q_score, q_values = model.cell_heads(w, g, batch, mass_floor)
         logits, q_values = logits.float().cpu(), q_values.float().cpu()
+        q_score = q_score.float().cpu()
     offsets = batch.legal_offsets.cpu()
     log_pi = segment_log_softmax(logits, offsets)
-    imp = improved_policy(logits, q_values, offsets, tau, lam)
+    imp = improved_policy(logits, q_score, q_values, offsets, tau, lam)
 
     legal = position.legal_moves()
     if len(legal) != logits.shape[0]:
@@ -79,6 +82,7 @@ def inspect_position(
         "legal_count": len(legal),
         "tau": tau,
         "lam": lam,
+        "mass_floor": mass_floor,
         "v_hat": float(imp.v_hat[0]),
         "kl": float(imp.kl[0]),
         "norm_entropy": float(imp.norm_entropy[0]),
@@ -91,6 +95,7 @@ def inspect_position(
                 "logit": float(logits[rank]),
                 "policy": float(log_pi[rank].exp()),
                 "q": float(q_values[rank]),
+                "q_score": float(q_score[rank]),
                 "improved": float(imp.probs[rank]),
             }
             for rank, move in enumerate(legal)

@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from ..builder import collate_prefixes
 from ..losses import policy_loss
-from ..model import compose_q
+from ..model import compose_acting_q, compose_q
 from .selfplay import Collector, Sample, collection_stats
 
 
@@ -34,6 +34,11 @@ class KlentConfig:
     # error of the composed Q keeps unit weight; this scales the pair of mass
     # cross-entropies that fix where that Q's two halves sit.
     mass_weight: float = 0.25
+    # The smallest total return mass π′ will measure Q against, which bounds
+    # the sharpening in a position where the whole legal set is uncommitted.
+    # Measured on joint-brm-939 at iteration 300 the largest mass in a legal
+    # set runs 0.12 unresolved to 0.91 decided, so this binds rarely.
+    mass_floor: float = 0.2
     # e^-1/16 corresponds to an eight-turn horizon at two placements per turn.
     lam_ret: float = 0.939
     # Per-ply return-discount magnitude (the mover-change sign is separate).
@@ -90,7 +95,11 @@ def _policy_q_fn(cfg: KlentConfig):
 
 def network_evaluate(model, cfg: KlentConfig):
     """The self-play evaluator, returning flat CPU tensors so the collection
-    loop stays device-ignorant."""
+    loop stays device-ignorant.
+
+    Three tensors: the policy logits, the score π′ ranks by, and the action
+    value v̂ averages. The last two differ by the position's own committed
+    return mass."""
     policy_q = _policy_q_fn(cfg)
 
     def evaluate(batch):
@@ -98,9 +107,15 @@ def network_evaluate(model, cfg: KlentConfig):
             b = batch.to(cfg.device)
             with torch.no_grad(), torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
                 policy, critic_logits = policy_q(model, b)
-            # Composition is fp32 and outside the autocast region, so the
-            # acting Q the operator consumes does not depend on autocast.
-            return policy.float().cpu(), compose_q(critic_logits).cpu()
+            # Composition is fp32 and outside the autocast region, so neither
+            # Q the operator consumes depends on autocast.
+            return (
+                policy.float().cpu(),
+                compose_acting_q(
+                    critic_logits, b.legal_offsets, cfg.mass_floor
+                ).cpu(),
+                compose_q(critic_logits).cpu(),
+            )
 
     return evaluate
 

@@ -5,7 +5,8 @@
 `python/mantisnet` requires Python 3.12 or later and contains the MantisNet
 Torch model, independent graph-builder oracle, losses, Hexo KLENT training loop,
 telemetry store, benchmarks, and control-deck backend. The training path uses a policy head and one
-action value per legal cell, composed from the critic's two return-mass logits.
+action value per legal cell, composed from the critic's two return-mass logits,
+and the acting score π′ ranks by.
 Algorithm obligations are in `docs/KLENT_FOR_HEXO.md`; measured experiment
 outcomes are in `docs/ABLATIONS.md`.
 
@@ -49,7 +50,8 @@ Core modules:
 | `deck.service` | Run registry, inference cache, and play sessions |
 | `deck.state` | Deck-owned reviews, probes, presets, and match jobs |
 
-`MantisNet.forward(batch)` returns raw policy logits, composed action values,
+`MantisNet.forward(batch, mass_floor)` returns raw policy logits, the acting
+score, composed action values,
 distributional state value outputs, and the decoded state value. KLENT
 collection and fitting call `trunk` plus the cell heads and do not consume the
 state-value head.
@@ -233,7 +235,9 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
   `sigmoid(z_pos) - sigmoid(z_neg)` in `(-1, 1)`, composed in fp32.
 - The policy and action-value output layers initialize to zero, so initial
   policy logits and action values are exactly zero.
-- KLENT improvement consumes raw policy logits and composed action values.
+- KLENT improvement ranks by the acting score — the action value over the
+  position's largest total return mass, floored — and averages the unscaled
+  action value for v-hat.
 - The KLENT fit objective trains policy cross-entropy, the taken action's
   squared return error, and the taken action's two return-mass cross-entropies
   weighted by `mass_weight`.
