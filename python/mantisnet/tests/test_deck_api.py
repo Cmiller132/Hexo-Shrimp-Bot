@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 
 import numpy as np
@@ -12,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from mantisnet import MantisConfig, MantisNet
 from mantisnet.deck.app import create_app
+from mantisnet.deck.service import telemetry_connection
 from mantisnet.klent import telemetry
 from mantisnet.klent.inspect import inspect_position
 from mantisnet.klent.run import _versions, save_checkpoint
@@ -264,3 +266,65 @@ def test_deck_database_refuses_a_version_mismatch(tmp_path):
     with pytest.raises(RuntimeError, match="there are no migrations"):
         with TestClient(create_app(path)):
             pass
+
+
+def test_telemetry_connection_closes_when_its_block_exits(deck_run):
+    """``with sqlite3.connect(...)`` opens a transaction; it does not close.
+
+    The deck served 500s after two days of polling because every query
+    endpoint held its connection open, so this asserts the handle is dead
+    once the block ends rather than merely that the query worked.
+    """
+    _runs, run = deck_run
+    with telemetry_connection(run) as conn:
+        conn.execute("SELECT version FROM schema_version").fetchone()
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT version FROM schema_version")
+
+
+def test_repeated_queries_leave_no_connection_open(deck_run, monkeypatch):
+    """One request must not cost a descriptor.
+
+    Counting live connections rather than file descriptors keeps the check
+    meaningful on every platform the suite runs on.
+    """
+    runs, _run = deck_run
+    live: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(target, *args, **kwargs):
+        conn = real_connect(target, *args, **kwargs)
+        # The deck's own review database is opened once for the app's life;
+        # only the per-request telemetry handles are under test here.
+        if telemetry.DB_NAME in str(target):
+            live.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+    requests = 8
+    with TestClient(create_app(runs, device="cpu")) as client:
+        for _ in range(requests):
+            assert client.get("/api/runs/fixture/summary").status_code == 200
+    assert len(live) == requests, (
+        f"expected one telemetry connection per request, got {len(live)}"
+    )
+
+    def closed(conn: sqlite3.Connection) -> bool:
+        try:
+            conn.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            return True
+        return False
+
+    assert [c for c in live if not closed(c)] == []
+
+
+def test_a_missing_telemetry_database_still_maps_to_404(deck_run, tmp_path):
+    """Entering the connection inside the request must not cost the status
+    codes: the failure now happens one frame later than it used to."""
+    runs, _run = deck_run
+    (runs / "empty").mkdir()
+    with TestClient(create_app(runs, device="cpu")) as client:
+        response = client.get("/api/runs/empty/summary")
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "telemetry_not_found"

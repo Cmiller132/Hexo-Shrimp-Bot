@@ -8,7 +8,7 @@ import math
 import os
 import shlex
 import threading
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Any, Literal
 
@@ -324,13 +324,25 @@ def create_app(
         except (FileNotFoundError, RuntimeError) as exc:
             raise _error(409, "cannot_kill", str(exc)) from exc
 
+    @contextmanager
     def conn_for(request: Request, run: str):
-        try:
-            return telemetry_connection(request.app.state.registry.path(run))
-        except (ValueError, FileNotFoundError) as exc:
-            raise _error(404, "telemetry_not_found", str(exc)) from exc
-        except RuntimeError as exc:
-            raise _error(500, "telemetry_error", str(exc)) from exc
+        """The run's telemetry for the duration of one request.
+
+        A context manager, not a connection: the endpoints below already say
+        ``with``, and handing them a bare connection is what leaked a
+        descriptor per request. Entering happens inside the stack so a missing
+        or unreadable database still maps to its status code.
+        """
+        with ExitStack() as stack:
+            try:
+                conn = stack.enter_context(
+                    telemetry_connection(request.app.state.registry.path(run))
+                )
+            except (ValueError, FileNotFoundError) as exc:
+                raise _error(404, "telemetry_not_found", str(exc)) from exc
+            except RuntimeError as exc:
+                raise _error(500, "telemetry_error", str(exc)) from exc
+            yield conn
 
     @app.get("/api/runs/{run}/summary")
     def summary(run: str, request: Request):
