@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from . import decoder
+from . import decoder, message_passing
 from .attention import fused_attention
 from .builder import DEC_CLASSES, NEAREST_BUCKETS, NUM_PATTERNS, Batch
 from .segments import segment_ids, segment_max
@@ -191,14 +191,26 @@ class _Block(nn.Module):
         # §5.1: windows aggregate their stones. Sum, not mean — the count is
         # signal.
         x = self.u(self.ln_ws_s(s))
-        msg = x.index_select(0, batch.inc_stone) + self.e_ws(batch.inc_class)
-        agg = msg.new_zeros(w.shape[0], cfg.h).index_add_(0, batch.inc_window, msg)
+        agg = message_passing.aggregate_to_windows(
+            x,
+            self.e_ws.weight,
+            batch.inc_stone,
+            batch.inc_window,
+            batch.inc_class,
+            w.shape[0],
+        )
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
         # §5.2: stones aggregate their windows.
         y = self.v(self.ln_sw_w(w))
-        msg = y.index_select(0, batch.inc_window) + self.e_sw(batch.inc_class)
-        agg = msg.new_zeros(s.shape[0], cfg.h).index_add_(0, batch.inc_stone, msg)
+        agg = message_passing.aggregate_to_stones(
+            y,
+            self.e_sw.weight,
+            batch.inc_stone,
+            batch.inc_window,
+            batch.inc_class,
+            s.shape[0],
+        )
         s = s + self.drop(self.mlp_s(self.ln_sw_s(s), agg))
 
         # §5.3: attention over [token; stones], block-diagonal per position.
