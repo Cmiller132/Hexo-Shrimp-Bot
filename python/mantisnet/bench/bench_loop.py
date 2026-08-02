@@ -252,11 +252,15 @@ def metrics_f(episodes) -> float:
 
 def bench_fit(args) -> None:
     episodes, _ = bench_collect(args)
-    samples = [s for e in episodes for s in episode_samples(e, 1.0)]
+    cfg = _cfg(args)
+    # The return coefficients come from the bench's own config rather than
+    # being spelled here, so this call cannot drift from episode_samples again.
+    samples = [
+        s for e in episodes for s in episode_samples(e, cfg.lam_ret, cfg.gamma)
+    ]
     if not samples:
         raise SystemExit("no finished games — nothing to fit on")
     model = _load_or_fresh(args)
-    cfg = _cfg(args)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     fit(model, samples, optimizer, cfg, np.random.default_rng(0))  # Exclude compilation from timing.
     _sync(args.device)
