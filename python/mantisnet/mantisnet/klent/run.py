@@ -79,6 +79,10 @@ def save_checkpoint(path: Path, model, optimizer, iteration: int, rng) -> None:
     torch.save(
         {
             "model": model.state_dict(),
+            # The architecture travels with the weights: the trunk's depth is a
+            # run choice, so a checkpoint that did not name it could only be
+            # read by guessing.
+            "model_config": dataclasses.asdict(model.cfg),
             "optimizer": optimizer.state_dict(),
             "iteration": iteration,  # iterations completed
             "rng_state": rng.bit_generator.state,
@@ -89,17 +93,29 @@ def save_checkpoint(path: Path, model, optimizer, iteration: int, rng) -> None:
     tmp.replace(path)
 
 
-def load_model(path: Path, device: str = "cpu"):
-    """A checkpoint's model half, version-checked.
+def model_config(ckpt: dict) -> MantisConfig:
+    """The architecture a checkpoint was written with.
 
-    The loader constructs the default :class:`MantisConfig`; checkpoints with
-    another shape fail state-dict validation."""
+    Checkpoints record ``model_config``. One written before they did can only
+    hold the defaults — the trainer had no flag to build anything else — so
+    resolving its absence that way reads the older format rather than
+    substituting a default for something the checkpoint meant to say.
+    """
+    return (
+        MantisConfig(**ckpt["model_config"])
+        if "model_config" in ckpt
+        else MantisConfig()
+    )
+
+
+def load_model(path: Path, device: str = "cpu"):
+    """A checkpoint's model half, version-checked, at its own architecture."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if ckpt["versions"] != _versions():
         raise ValueError(
             f"checkpoint versions {ckpt['versions']} != this build {_versions()}"
         )
-    model = MantisNet(MantisConfig()).to(device)
+    model = MantisNet(model_config(ckpt)).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model
@@ -115,6 +131,13 @@ def load_checkpoint(path: Path, model, optimizer, rng=None) -> int:
     if ckpt["versions"] != _versions():
         raise ValueError(
             f"checkpoint versions {ckpt['versions']} != this build {_versions()}"
+        )
+    recorded = model_config(ckpt)
+    if recorded != model.cfg:
+        raise ValueError(
+            f"checkpoint architecture {recorded} != this run's {model.cfg}; a "
+            "depth change is a conversion, so run mantisnet.klent.deepen rather "
+            "than pointing a differently shaped run at the checkpoint"
         )
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
@@ -423,6 +446,12 @@ def main(argv=None) -> None:
         "--init-from", type=Path, default=None,
         help="fork a fresh run from a checkpoint's model+optimizer (iteration 0, own seed)",
     )
+    ap.add_argument(
+        "--blocks", type=int, default=MantisConfig.blocks,
+        help="B: trunk blocks. A run's checkpoints record it, and a resume or "
+             "--init-from at another depth is refused; mantisnet.klent.deepen "
+             "converts a checkpoint to a deeper trunk",
+    )
     ap.add_argument("--seed", type=int, default=0, help="the run's RNG seed")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-compile", action="store_true")
@@ -488,7 +517,8 @@ def main(argv=None) -> None:
         raise SystemExit(f"{out} exists and is not empty; use --resume to continue it")
 
     torch.manual_seed(args.seed)
-    model = MantisNet(MantisConfig()).to(cfg.device)
+    model_cfg = MantisConfig(blocks=args.blocks)
+    model = MantisNet(model_cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     rng = np.random.default_rng(args.seed)
 
@@ -507,7 +537,7 @@ def main(argv=None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     config = {
         "klent": dataclasses.asdict(cfg),
-        "model": dataclasses.asdict(MantisConfig()),
+        "model": dataclasses.asdict(model_cfg),
         "iterations": args.iterations,
         "checkpoint_every": args.checkpoint_every,
         "eval_every": args.eval_every,

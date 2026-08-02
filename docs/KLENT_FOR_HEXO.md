@@ -267,7 +267,7 @@ A fresh CLI run requires an absent or empty `--out`. A nonempty directory requir
 | `metrics.jsonl` | Appends and flushes one strict-JSON row per executed iteration; NaN statistics become `null`. Resume does not prune a tail beyond the restored checkpoint, so superseded or duplicate iteration numbers may remain. |
 | `status.json` | Atomically replaced heartbeat with exactly `updated`, `iteration`, `collect`, `fit`, and `eval`; idle lanes are `null`. A clean, STOP, or starvation return clears the lanes. |
 | `telemetry.db` | Schema-versioned WAL database. Each iteration's row, games, plies, and hardware aggregates commit in one transaction; every in-driver opponent result is stored as its own attributed match row. Resume removes driver/self-play rows at and beyond the restored iteration before replay. Seat crossplay writes its standalone manifest instead. |
-| `checkpoint_NNNNNN.pt` | Atomic write containing model, optimizer, completed-iteration count, main NumPy RNG state, and versions. `NNNNNN` is the completed count. |
+| `checkpoint_NNNNNN.pt` | Atomic write containing model, the model configuration it was built with, optimizer, completed-iteration count, main NumPy RNG state, and versions. `NNNNNN` is the completed count. A resume or `--init-from` whose `--blocks` disagrees with the recorded configuration is refused; `mantisnet.klent.deepen` converts a checkpoint to a deeper trunk instead. |
 | `CHECKPOINT` | At the next iteration commit, forces a checkpoint, is consumed, and training continues. |
 | `STOP` | After the current iteration, forces a checkpoint, is consumed, and returns normally; a starvation return takes precedence. |
 
