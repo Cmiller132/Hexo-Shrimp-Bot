@@ -12,9 +12,11 @@ import sys
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 import torch
@@ -37,29 +39,39 @@ def json_file(path: Path) -> dict:
         raise RuntimeError(f"cannot read {path}: {exc}") from exc
 
 
-def telemetry_connection(run_dir: Path) -> sqlite3.Connection:
+@contextmanager
+def telemetry_connection(run_dir: Path) -> Iterator[sqlite3.Connection]:
+    """A read-only, schema-checked connection, closed when the block exits.
+
+    This is a context manager rather than a bare connection because
+    ``with sqlite3.connect(...)`` does not close anything — it opens a
+    transaction and commits or rolls it back, leaving the handle live. Every
+    caller here already wrote ``with``, so a returned connection leaked one
+    descriptor per request until the deck hit its 1024 limit and served 500s
+    for two days' worth of polling. Yielding makes the closing form the only
+    form.
+    """
     path = run_dir / telemetry.DB_NAME
     if not path.is_file():
         raise FileNotFoundError(f"missing required run artifact: {path}")
     conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA query_only=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
     try:
-        row = conn.execute("SELECT version FROM schema_version").fetchone()
-    except sqlite3.Error as exc:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=5000")
+        try:
+            row = conn.execute("SELECT version FROM schema_version").fetchone()
+        except sqlite3.Error as exc:
+            raise RuntimeError(f"cannot read telemetry database {path}: {exc}") from exc
+        if row is None:  # created, version row not yet committed
+            raise RuntimeError(f"telemetry database {path} is still materializing")
+        if row[0] != telemetry.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"telemetry schema {row[0]} != this build {telemetry.SCHEMA_VERSION}"
+            )
+        yield conn
+    finally:
         conn.close()
-        raise RuntimeError(f"cannot read telemetry database {path}: {exc}") from exc
-    if row is None:  # created, version row not yet committed
-        conn.close()
-        raise RuntimeError(f"telemetry database {path} is still materializing")
-    version = row[0]
-    if version != telemetry.SCHEMA_VERSION:
-        conn.close()
-        raise RuntimeError(
-            f"telemetry schema {version} != this build {telemetry.SCHEMA_VERSION}"
-        )
-    return conn
 
 
 class RunRegistry:
