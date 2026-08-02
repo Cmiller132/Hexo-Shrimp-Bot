@@ -81,6 +81,15 @@ def test_incidence_matches_oracle(positions):
         assert built == expected
 
 
+def test_incidence_entries_arrive_in_window_order(positions):
+    # Each window's entries remain contiguous before and after collation.
+    graphs = [from_position(pos) for pos in positions]
+    for g in graphs:
+        assert (np.diff(g.inc_window) >= 0).all()
+    batch = collate(graphs)
+    assert (batch.inc_window[1:] >= batch.inc_window[:-1]).all()
+
+
 def test_decoder_table_ordering_and_coverage(positions):
     for pos in positions:
         g = from_position(pos)
