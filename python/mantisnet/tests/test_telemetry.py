@@ -519,7 +519,7 @@ def test_search_and_series_filter_as_asked(tmp_path):
     assert tel.iteration_series(conn, ["games", "plies"]) == [
         {"iteration": 0, "games": 3, "plies": 5}
     ]
-    with pytest.raises(ValueError, match="no such iteration columns"):
+    with pytest.raises(ValueError, match="no such iteration metrics"):
         tel.iteration_series(conn, ["f", "not_a_metric"])
 
     atlas = tel.opening_atlas(conn, plies=2)
