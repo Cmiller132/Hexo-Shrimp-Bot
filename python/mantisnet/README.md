@@ -4,7 +4,8 @@
 
 `python/mantisnet` requires Python 3.12 or later and contains the MantisNet
 Torch model, independent graph-builder oracle, losses, Hexo KLENT training loop,
-telemetry store, benchmarks, and control-deck backend. The training path uses a policy head and one
+shared fitting engine, frozen-corpus laboratory, telemetry store, and
+control-deck backend. The training path uses a policy head and one
 action value per legal cell, composed from a three-outcome categorical critic,
 and the committed-mass-normalized acting score π′ ranks by.
 Algorithm obligations are in `docs/KLENT_FOR_HEXO.md`; measured experiment
@@ -34,6 +35,8 @@ Core modules:
 | `decoder` | Shared legal-cell incidence aggregation |
 | `segments` | Ragged segment reductions |
 | `losses` | Policy and distributional value losses |
+| `fitloop` | Loss-agnostic packed epoch engine shared by KLENT and lab cells |
+| `lab` | Frozen corpora, supervised cells, evaluation, reports, benchmarks, profiles, probes, and contract checks |
 | `klent.improve` | Closed-form improved policy |
 | `klent.selfplay` | Persistent-slot collection and samples |
 | `klent.train` | Network evaluation, packing, collection, and fit |
@@ -114,12 +117,28 @@ uv run python -m mantisnet.klent.trigraft \
   --tau 0.1 --lam 0.01 --mass-floor 0.2
 ```
 
-Inspect telemetry and run benchmarks:
+Inspect telemetry and run the consolidated laboratory modes:
 
 ```sh
 uv run python -m mantisnet.klent.telemetry --run runs/readme-smoke summary
-uv run python bench/bench_forward.py
-uv run python bench/bench_loop.py sweep --device cpu --stones 20 --cohorts 16 --iters 1
+uv run python -m mantisnet.lab --help
+uv run python -m mantisnet.lab bench forward --device cpu --batch 16 --iters 1
+uv run python -m mantisnet.lab bench sweep --device cpu --depths 20 --cohorts 16 --iters 1
+uv run python -m mantisnet.lab smoke
+```
+
+Freeze a run's completed self-play games and train three supervised seeds:
+
+```sh
+uv run python -m mantisnet.lab freeze \
+  --run runs/joint-mnorm --iters 100 149 --name mnorm-late-v1
+uv run python -m mantisnet.lab train \
+  --corpus mnorm-late-v1 --sweep representation-v1 --variant mantis \
+  --model-kw h=96 blocks=6 heads=4 --seeds 3 --device cpu
+uv run python -m mantisnet.lab evaluate \
+  --cell runs/lab/representation-v1/mantis+blocks6+h96+heads4/s0 \
+  --corpus mnorm-late-v1 --device cpu
+uv run python -m mantisnet.lab report --sweep runs/lab/representation-v1
 ```
 
 Anchor in-driver evaluation against one native §3.1 seat by putting exactly one
@@ -225,6 +244,8 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
   representation contract.
 - [`docs/KLENT_FOR_HEXO.md`](../../docs/KLENT_FOR_HEXO.md) defines KLENT's Hexo
   adaptation and training obligations.
+- [`docs/LAB_SPEC.md`](../../docs/LAB_SPEC.md) defines frozen corpora,
+  supervised cells, metrics, artifacts, and measurement modes.
 - [`docs/KLENT_PAPER.md`](../../docs/KLENT_PAPER.md) records the source
   algorithm.
 - [`docs/ABLATIONS.md`](../../docs/ABLATIONS.md) owns measured run outcomes.
@@ -261,6 +282,12 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 - `games` is a completed-game quota; `envs` is the number of persistent slots.
 - Fit and collection batches obey separate attention-pair and legal-cell
   budgets.
+- Corpus freezes open source telemetry strictly read-only, refuse a schema
+  mismatch, replay-verify every sampled game, and pin rules and action order.
+- Frozen-corpus loading verifies the archive SHA and version pins before
+  exposing samples.
+- A lab cell is fresh-only: a nonempty cell directory is refused and there is
+  no resume path. Every score identifies the exact corpus SHA.
 - Checkpoints contain model state, optimizer state, completed iteration, and
   NumPy RNG state.
 - A fresh run refuses a nonempty output directory.

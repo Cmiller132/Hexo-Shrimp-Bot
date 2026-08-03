@@ -19,6 +19,9 @@ change. Specifications define obligations; measured results belong only in
   artifacts and exposes lifecycle, telemetry, inspection, play, and match
   interfaces. Read it before changing the deck API, frontend, or Compose
   services.
+- [`LAB_SPEC.md`](LAB_SPEC.md) defines frozen supervised corpora, architecture
+  cells, metric artifacts, aggregation, and the shared model-measurement
+  commands. Read it before changing `mantisnet.lab` or its formats.
 
 ## KLENT references and evidence
 

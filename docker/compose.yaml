@@ -19,7 +19,7 @@ services:
       - SEALBOT_ROOT=/sealbot
       - NVIDIA_VISIBLE_DEVICES=all
       # The deps venv deliberately omits the project (it lives on the
-      # mount); scripts like bench/ find it through the path instead.
+      # mount); module entry points such as mantisnet.lab find it via this path.
       - PYTHONPATH=/workspace/python/mantisnet
     working_dir: /workspace/python/mantisnet
 

@@ -1,0 +1,373 @@
+"""Stage-attribution profiles over production-shaped MantisNet cohorts."""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import torch
+
+from ..attention import fused_attention
+from ..builder import collate_positions
+from ..klent.run import load_model
+from ..klent.train import KlentConfig, _policy_q, network_evaluate
+from ..model import compose_acting_q, compose_q
+from .cohort import corpus_cohort, selfplay_cohort
+
+
+def _sync(device: str) -> None:
+    if device == "cuda":
+        torch.cuda.synchronize()
+
+
+def _elapsed(device: str, fn):
+    _sync(device)
+    start = time.perf_counter()
+    out = fn()
+    _sync(device)
+    return out, time.perf_counter() - start
+
+
+def _positions(model, *, corpus, split, envs, steps, seed, device, compile):
+    if envs <= 0 or steps < 0:
+        raise ValueError(f"envs must be positive and steps nonnegative, got {envs}, {steps}")
+    if corpus is not None:
+        return corpus_cohort(corpus, split=split, count=envs, seed=seed)
+    cfg = KlentConfig(
+        device=device,
+        autocast=device == "cuda",
+        compile=compile,
+    )
+    return selfplay_cohort(
+        envs=envs,
+        steps=steps,
+        evaluate=network_evaluate(model, cfg),
+        seed=seed,
+        pair_budget=cfg.collect_pair_budget,
+        cell_budget=cfg.collect_cell_budget,
+    )
+
+
+def _replicated_block(block, s, w, g, batch, seq_lens, device, timings):
+    """Transcribe one ``_Block`` without hooks or model instrumentation."""
+    cfg = block.cfg
+
+    def window_from_stones():
+        nonlocal w
+        x = block.u(block.ln_ws_s(s))
+        msg = x.index_select(0, batch.inc_stone) + block.e_ws(batch.inc_class)
+        agg = msg.new_zeros(w.shape[0], cfg.h).index_add_(0, batch.inc_window, msg)
+        w = w + block.drop(block.mlp_w(block.ln_ws_w(w), agg))
+
+    _, dt = _elapsed(device, window_from_stones)
+    timings["window_from_stones"] += dt
+
+    def stone_from_windows():
+        nonlocal s
+        y = block.v(block.ln_sw_w(w))
+        msg = y.index_select(0, batch.inc_window) + block.e_sw(batch.inc_class)
+        agg = msg.new_zeros(s.shape[0], cfg.h).index_add_(0, batch.inc_stone, msg)
+        s = s + block.drop(block.mlp_s(block.ln_sw_s(s), agg))
+
+    _, dt = _elapsed(device, stone_from_windows)
+    timings["stone_from_windows"] += dt
+
+    def attention():
+        nonlocal s, g
+        p, max_t = g.shape[0], batch.attn_valid.shape[1]
+        rows = s.new_zeros(p * max_t, cfg.h)
+        token_slot = torch.arange(p, device=s.device) * max_t
+        rows.index_copy_(0, token_slot, g)
+        rows.index_copy_(0, batch.stone_slot, s)
+        z = block.ln_attn(rows.view(p, max_t, cfg.h))
+        hd = cfg.h // cfg.heads
+        q = block.wq(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
+        k = block.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
+        v = block.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
+        out = fused_attention(q, k, v, batch.coords, seq_lens, block.dist_bias)
+        out = block.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(
+            p * max_t, cfg.h
+        )
+        s = s + block.drop(out.index_select(0, batch.stone_slot))
+        g = g + block.drop(out.index_select(0, token_slot))
+
+    _, dt = _elapsed(device, attention)
+    timings["attention"] += dt
+
+    def ffn():
+        nonlocal s, g
+        rows = torch.cat([s, g], dim=0)
+        rows = block.drop(block.ffn(block.ln_ffn(rows)))
+        s = s + rows[: s.shape[0]]
+        g = g + rows[s.shape[0] :]
+
+    _, dt = _elapsed(device, ffn)
+    timings["ffn"] += dt
+    return s, w, g
+
+
+def _replicated_trunk(model, batch, device: str):
+    s = model.stone_table(batch.stone_own)
+    w = model.window_table(batch.window_feat)
+    g = model.token_base + model.token_moves(batch.moves_idx)
+    seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
+    per_block = []
+    for block in model.blocks:
+        timings = {
+            "window_from_stones": 0.0,
+            "stone_from_windows": 0.0,
+            "attention": 0.0,
+            "ffn": 0.0,
+        }
+        s, w, g = _replicated_block(
+            block, s, w, g, batch, seq_lens, device, timings
+        )
+        per_block.append(timings)
+    return (model.ln_out(s), model.ln_out(w), model.ln_out(g)), per_block
+
+
+def _assert_trunk_match(expected, actual, *, atol: float = 1e-5) -> None:
+    for name, want, got in zip(("stones", "windows", "token"), expected, actual):
+        if not torch.allclose(want, got, rtol=1e-5, atol=atol):
+            drift = float((want - got).abs().max())
+            raise ValueError(
+                f"replicated trunk drift in {name}: max |replica-model|={drift:.3e}"
+            )
+
+
+def profile_trunk(
+    *,
+    checkpoint,
+    corpus=None,
+    split: str = "test",
+    envs: int = 16,
+    steps: int = 32,
+    iters: int = 5,
+    seed: int = 0,
+    device: str = "cpu",
+    compile: bool = False,
+) -> dict:
+    """Attribute replicated trunk blocks and enforce the drift detector."""
+    if iters <= 0:
+        raise ValueError(f"iters must be positive, got {iters}")
+    model = load_model(Path(checkpoint), device).eval()
+    positions = _positions(
+        model,
+        corpus=corpus,
+        split=split,
+        envs=envs,
+        steps=steps,
+        seed=seed,
+        device=device,
+        compile=compile,
+    )
+    batch = collate_positions(positions).to(device)
+    with torch.no_grad(), torch.autocast(
+        device, torch.bfloat16, enabled=device == "cuda"
+    ):
+        expected = model.trunk(batch)
+        actual, _ = _replicated_trunk(model, batch, device)
+        _assert_trunk_match(expected, actual)
+        totals = [
+            {
+                "window_from_stones": 0.0,
+                "stone_from_windows": 0.0,
+                "attention": 0.0,
+                "ffn": 0.0,
+            }
+            for _ in model.blocks
+        ]
+        total_seconds = 0.0
+        for _ in range(iters):
+            start = time.perf_counter()
+            actual, measured = _replicated_trunk(model, batch, device)
+            _sync(device)
+            total_seconds += time.perf_counter() - start
+            _assert_trunk_match(expected, actual)
+            for aggregate, row in zip(totals, measured):
+                for name, seconds in row.items():
+                    aggregate[name] += seconds
+
+    for row in totals:
+        for name in row:
+            row[name] = row[name] / iters * 1e3
+    report = {
+        "mode": "trunk",
+        "device": device,
+        "positions": len(positions),
+        "blocks": len(model.blocks),
+        "per_block_ms": totals,
+        "replicated_total_ms": total_seconds / iters * 1e3,
+        "drift_atol": 1e-5,
+    }
+    print(json.dumps(report, indent=2))
+    return report
+
+
+def _profile_activities(device: str):
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if device == "cuda":
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    return activities
+
+
+def profile_decode(
+    *,
+    checkpoint,
+    corpus=None,
+    split: str = "test",
+    envs: int = 16,
+    steps: int = 32,
+    iters: int = 5,
+    seed: int = 0,
+    device: str = "cpu",
+    compile: bool = False,
+) -> dict:
+    """Attribute eager trunk/decoder time, then optional compiled total."""
+    if iters <= 0:
+        raise ValueError(f"iters must be positive, got {iters}")
+    model = load_model(Path(checkpoint), device).eval()
+    positions = _positions(
+        model,
+        corpus=corpus,
+        split=split,
+        envs=envs,
+        steps=steps,
+        seed=seed,
+        device=device,
+        compile=compile,
+    )
+    batch = collate_positions(positions).to(device)
+    trunk_s = decode_s = 0.0
+    with torch.no_grad(), torch.autocast(
+        device, torch.bfloat16, enabled=device == "cuda"
+    ):
+        model(batch, 0.2)
+        for _ in range(iters):
+            (s, w, g), dt = _elapsed(device, lambda: model.trunk(batch))
+            trunk_s += dt
+            _, dt = _elapsed(device, lambda: model.cell_heads(w, g, batch, 0.2))
+            decode_s += dt
+
+        compiled_ms = None
+        if compile:
+            compiled_fn = torch.compile(
+                lambda m, b: m.cell_heads(*m.trunk(b)[1:], b, 0.2), dynamic=True
+            )
+            compiled_fn(model, batch)
+            compiled_total = 0.0
+            for _ in range(iters):
+                _, dt = _elapsed(device, lambda: compiled_fn(model, batch))
+                compiled_total += dt
+            compiled_ms = compiled_total / iters * 1e3
+
+        _s, w, g = model.trunk(batch)
+        with torch.profiler.profile(activities=_profile_activities(device)) as prof:
+            model.cell_heads(w, g, batch, 0.2)
+            _sync(device)
+    table = prof.key_averages().table(
+        sort_by="self_cuda_time_total" if device == "cuda" else "self_cpu_time_total",
+        row_limit=25,
+    )
+    report = {
+        "mode": "decode",
+        "device": device,
+        "positions": len(positions),
+        "eager": {
+            "trunk_ms": trunk_s / iters * 1e3,
+            "cell_heads_ms": decode_s / iters * 1e3,
+            "total_ms": (trunk_s + decode_s) / iters * 1e3,
+        },
+        "compiled_total_ms": compiled_ms,
+        "decoder_profiler": table,
+    }
+    print(json.dumps(report, indent=2))
+    return report
+
+
+def _seam_once(model, batch, cfg, policy_q):
+    moved, transfer_s = _elapsed(cfg.device, lambda: batch.to(cfg.device))
+
+    def forward():
+        with torch.no_grad(), torch.autocast(
+            cfg.device, torch.bfloat16, enabled=cfg.autocast
+        ):
+            return policy_q(model, moved)
+
+    (policy, critic), forward_s = _elapsed(cfg.device, forward)
+
+    def compose_return():
+        return (
+            policy.float().cpu(),
+            compose_acting_q(critic, moved.legal_offsets, cfg.mass_floor).cpu(),
+            compose_q(critic).cpu(),
+        )
+
+    _out, compose_s = _elapsed(cfg.device, compose_return)
+    return transfer_s, forward_s, compose_s
+
+
+def profile_seam(
+    *,
+    checkpoint,
+    corpus=None,
+    split: str = "test",
+    envs: int = 16,
+    steps: int = 32,
+    iters: int = 5,
+    seed: int = 0,
+    device: str = "cpu",
+    compile: bool = False,
+) -> dict:
+    """Split the network-evaluation seam into transfer/forward/composition."""
+    if iters <= 0:
+        raise ValueError(f"iters must be positive, got {iters}")
+    model = load_model(Path(checkpoint), device).eval()
+    cfg = KlentConfig(
+        device=device, autocast=device == "cuda", compile=compile
+    )
+    positions = _positions(
+        model,
+        corpus=corpus,
+        split=split,
+        envs=envs,
+        steps=steps,
+        seed=seed,
+        device=device,
+        compile=compile,
+    )
+    batch = collate_positions(positions)
+
+    def measure(fn):
+        sums = [0.0, 0.0, 0.0]
+        _seam_once(model, batch, cfg, fn)
+        for _ in range(iters):
+            row = _seam_once(model, batch, cfg, fn)
+            sums = [a + b for a, b in zip(sums, row)]
+        return {
+            "transfer_ms": sums[0] / iters * 1e3,
+            "forward_ms": sums[1] / iters * 1e3,
+            "compose_return_ms": sums[2] / iters * 1e3,
+            "total_ms": sum(sums) / iters * 1e3,
+        }
+
+    eager = measure(_policy_q)
+    compiled = measure(torch.compile(_policy_q, dynamic=True)) if compile else None
+    report = {
+        "mode": "seam",
+        "device": device,
+        "positions": len(positions),
+        "eager": eager,
+        "compiled": compiled,
+    }
+    print(json.dumps(report, indent=2))
+    return report
+
+
+def run_profile(mode: str, **kwargs) -> dict:
+    return {
+        "trunk": profile_trunk,
+        "decode": profile_decode,
+        "seam": profile_seam,
+    }[mode](**kwargs)

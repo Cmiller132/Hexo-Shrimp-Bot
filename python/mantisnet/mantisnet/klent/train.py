@@ -11,7 +11,6 @@ The state-value head is not part of this path. See ``docs/KLENT_FOR_HEXO.md``
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -19,6 +18,7 @@ import torch
 import torch.nn.functional as F
 
 from ..builder import collate_prefixes
+from ..fitloop import FitBudgets, fit_epoch, pack_chunks
 from ..losses import policy_loss
 from ..model import compose_acting_q, compose_q
 from .selfplay import Collector, Sample, collection_stats
@@ -109,27 +109,6 @@ def network_evaluate(model, cfg: KlentConfig):
     return evaluate
 
 
-def _refuse_nonfinite_parameters(model, step: int) -> None:
-    """Refuse a weight update that left the finite range, at the step that did it.
-
-    A single non-finite parameter makes every later evaluation non-finite, and
-    the first thing that notices is the return recursion refusing a whole
-    corpus one collection later — which names neither the step nor the tensor.
-    One fused multi-tensor norm and one synchronization per optimizer step buy
-    that name; the per-parameter walk runs only when the check has already
-    failed.
-    """
-    total = torch.stack(torch._foreach_norm(list(model.parameters()))).sum()
-    if torch.isfinite(total):
-        return
-    guilty = [n for n, p in model.named_parameters() if not torch.isfinite(p).all()]
-    raise ValueError(
-        f"optimizer step {step} left {len(guilty)} parameter tensors non-finite: "
-        + ", ".join(guilty[:8])
-        + (" ..." if len(guilty) > 8 else "")
-    )
-
-
 def _rebuild(samples: list[Sample]):
     """Rebuild buffered move prefixes in parallel into one batch.
 
@@ -148,32 +127,13 @@ def _rebuild(samples: list[Sample]):
 
 
 def _pack(samples: list[Sample], order, cfg: KlentConfig) -> list[list[int]]:
-    """Pack sample indices into fit chunks under ``batch_size`` and both
-    memory budgets. Sorted by position size (descending, ties in ``order``'s
-    random order), so each chunk pads to its first element. A sample that
-    exceeds a budget alone occupies its own chunk.
-    """
-    idx = sorted(order, key=lambda i: samples[i].t, reverse=True)
-    chunks: list[list[int]] = []
-    chunk: list[int] = []
-    chunk_t, cells = 0, 0
-    for i in idx:
-        t_pad = samples[i].t + 1  # + the global token row
-        c = len(samples[i].improved)
-        if chunk and (
-            len(chunk) == cfg.batch_size
-            or (len(chunk) + 1) * chunk_t * chunk_t > cfg.pair_budget
-            or cells + c > cfg.cell_budget
-        ):
-            chunks.append(chunk)
-            chunk, cells = [], 0
-        if not chunk:
-            chunk_t = t_pad
-        chunk.append(int(i))
-        cells += c
-    if chunk:
-        chunks.append(chunk)
-    return chunks
+    """Compatibility wrapper for the shared fit-loop packer."""
+    return pack_chunks(
+        [s.t + 1 for s in samples],
+        [len(s.improved) for s in samples],
+        order,
+        FitBudgets(cfg.batch_size, cfg.pair_budget, cfg.cell_budget),
+    )
 
 
 def fit(
@@ -186,7 +146,7 @@ def fit(
 ):
     """Fit one epoch over the buffer.
 
-    ``progress(chunk, chunks)`` is called after each consumed chunk.
+    ``progress(consumed, chunks)`` is called after each consumed chunk.
 
     The memory budgets cap what one forward may hold, so chunks accumulate
     sample-weighted gradients until at least ``batch_size`` samples have
@@ -195,94 +155,65 @@ def fit(
     totals remain on-device until the returned sample-weighted means are read."""
     model.train()
     policy_q = _policy_q_fn(cfg)
-    chunks = _pack(samples, rng.permutation(len(samples)), cfg)
 
-    groups: list[tuple[list[int], int]] = []
-    group: list[int] = []
-    count = 0
-    for k in rng.permutation(len(chunks)):
-        group.append(int(k))
-        count += len(chunks[k])
-        if count >= cfg.batch_size:
-            groups.append((group, count))
-            group, count = [], 0
-    if group:
-        groups.append((group, count))
-
-    def prep(k: int):
-        chunk = [samples[i] for i in chunks[k]]
+    def prep(indices: list[int]):
+        chunk = [samples[i] for i in indices]
         batch = _rebuild(chunk)
         target = torch.from_numpy(np.concatenate([s.improved for s in chunk]))
         ranks = torch.tensor([s.rank for s in chunk])
         returns = torch.tensor([s.g for s in chunk], dtype=torch.float32)
-        return chunk, batch, target, ranks, returns
+        return batch, target, ranks, returns
 
-    order = [k for group, _ in groups for k in group]
-    policy_sum = torch.zeros((), device=cfg.device)
-    q_sum = torch.zeros((), device=cfg.device)
-    critic_ce_sum = torch.zeros((), device=cfg.device)
-    total = 0
-    step = 0
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        prepped = {k: pool.submit(prep, k) for k in order[:1]}
-        consumed = 0
-        for group, group_n in groups:
-            optimizer.zero_grad(set_to_none=True)
-            for k in group:
-                if consumed + 1 < len(order):
-                    nxt = order[consumed + 1]
-                    prepped[nxt] = pool.submit(prep, nxt)
-                chunk, batch, target, ranks, returns = prepped.pop(k).result()
-                consumed += 1
-                with _gpu_lock:
-                    batch = batch.to(cfg.device)
-                    target = target.to(cfg.device)
-                    ranks = ranks.to(cfg.device)
-                    returns = returns.to(cfg.device)
+    def fit_step(payload):
+        batch, target, ranks, returns = payload
+        batch = batch.to(cfg.device)
+        target = target.to(cfg.device)
+        ranks = ranks.to(cfg.device)
+        returns = returns.to(cfg.device)
 
-                    with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
-                        policy_logits, critic_logits = policy_q(model, batch)
-                    ce = policy_loss(policy_logits.float(), batch.legal_offsets, target)
-                    # G in [-1, 1] makes (G⁺, G⁻, 1-|G|) a distribution.
-                    # Its categorical CE is the critic's sole trained term. At
-                    # the optimum p = E[target | s,a], hence p⁺-p⁻ = E[G].
-                    taken = critic_logits.index_select(
-                        0, batch.legal_offsets[:-1] + ranks
-                    ).float()
-                    critic_target = torch.stack(
-                        (
-                            returns.clamp(min=0.0),
-                            (-returns).clamp(min=0.0),
-                            1.0 - returns.abs(),
-                        ),
-                        dim=-1,
-                    )
-                    critic_ce = -(
-                        critic_target * F.log_softmax(taken, dim=-1)
-                    ).sum(dim=-1).mean()
-                    # Cross-arm curve only: measured under no_grad and absent
-                    # from the objective, so it cannot double-cover Q.
-                    with torch.no_grad():
-                        q_mse = (compose_q(taken) - returns).square().mean()
+        with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
+            policy_logits, critic_logits = policy_q(model, batch)
+        ce = policy_loss(policy_logits.float(), batch.legal_offsets, target)
+        # G in [-1, 1] makes (G⁺, G⁻, 1-|G|) a distribution. Its
+        # categorical CE is the critic's sole trained term.
+        taken = critic_logits.index_select(
+            0, batch.legal_offsets[:-1] + ranks
+        ).float()
+        critic_target = torch.stack(
+            (
+                returns.clamp(min=0.0),
+                (-returns).clamp(min=0.0),
+                1.0 - returns.abs(),
+            ),
+            dim=-1,
+        )
+        critic_ce = -(
+            critic_target * F.log_softmax(taken, dim=-1)
+        ).sum(dim=-1).mean()
+        # Cross-arm curve only: measured under no_grad and absent from the
+        # objective, so it cannot double-cover Q.
+        with torch.no_grad():
+            q_mse = (compose_q(taken) - returns).square().mean()
 
-                    loss = ce + critic_ce
-                    (loss * (len(chunk) / group_n)).backward()
-                    policy_sum += ce.detach() * len(chunk)
-                    q_sum += q_mse * len(chunk)
-                    critic_ce_sum += critic_ce.detach() * len(chunk)
-                if progress is not None:
-                    progress(consumed, len(order))
-            optimizer.step()
-            step += 1
-            _refuse_nonfinite_parameters(model, step)
-            total += group_n
-    return {
-        "policy_loss": float(policy_sum) / total,
-        # Measured diagnostic, not a trained term.
-        "q_loss": float(q_sum) / total,
-        "critic_ce": float(critic_ce_sum) / total,
-        "fit_steps": len(groups),
-    }
+        return ce + critic_ce, {
+            "policy_loss": ce.detach(),
+            # Measured diagnostic, not a trained term.
+            "q_loss": q_mse,
+            "critic_ce": critic_ce.detach(),
+        }
+
+    return fit_epoch(
+        model,
+        optimizer,
+        rng,
+        lengths=[s.t + 1 for s in samples],
+        cells=[len(s.improved) for s in samples],
+        budgets=FitBudgets(cfg.batch_size, cfg.pair_budget, cfg.cell_budget),
+        prepare=prep,
+        step=fit_step,
+        lock=_gpu_lock,
+        progress=progress,
+    )
 
 
 def collect_episodes(
