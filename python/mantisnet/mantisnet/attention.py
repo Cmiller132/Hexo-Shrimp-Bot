@@ -196,6 +196,33 @@ def _bias_table(q: Tensor, dist_bias: Tensor) -> Tensor:
     return torch.cat((table, pad), dim=1)
 
 
+def _bucket_index(coords: Tensor, seq_lens: Tensor, t: int, d_max: int):
+    """The (P, T, T) bias-bucket index and (P, T) key validity."""
+    dq = coords[:, :, None, 0] - coords[:, None, :, 0]
+    dr = coords[:, :, None, 1] - coords[:, None, :, 1]
+    distance = torch.maximum(dq.abs(), torch.maximum(dr.abs(), (dq + dr).abs()))
+    bucket = distance.clamp(1, d_max) - 1
+
+    rows = torch.arange(t, device=coords.device)
+    bucket = torch.where(rows[:, None] == rows[None, :], d_max, bucket)
+    token = (rows[:, None] == 0) | (rows[None, :] == 0)
+    bucket = torch.where(token, d_max + 1, bucket)
+    valid = rows[None, :] < seq_lens[:, None]
+    bucket = torch.where(valid[:, None, :], bucket, d_max + 2)
+    return bucket, valid
+
+
+def _apply_reference(q: Tensor, k: Tensor, v: Tensor, mask: Tensor, valid: Tensor) -> Tensor:
+    result = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+    result = result.masked_fill(~valid[:, None, :, None], 0)
+
+    # Match empty_like(q)'s preserved strides in every dispatch path. The
+    # model's following head-to-row transpose can then remain a view.
+    out = torch.empty_like(q)
+    out.copy_(result)
+    return out
+
+
 def _attention_reference_table(
     q: Tensor,
     k: Tensor,
@@ -207,27 +234,9 @@ def _attention_reference_table(
     """The dense formulation used by CPU, failed launches, and recompute."""
     _, _, t, _ = q.shape
     d_max = table.shape[1] - 3
-    dq = coords[:, :, None, 0] - coords[:, None, :, 0]
-    dr = coords[:, :, None, 1] - coords[:, None, :, 1]
-    distance = torch.maximum(dq.abs(), torch.maximum(dr.abs(), (dq + dr).abs()))
-    bucket = distance.clamp(1, d_max) - 1
-
-    rows = torch.arange(t, device=q.device)
-    bucket = torch.where(rows[:, None] == rows[None, :], d_max, bucket)
-    token = (rows[:, None] == 0) | (rows[None, :] == 0)
-    bucket = torch.where(token, d_max + 1, bucket)
-    valid = rows[None, :] < seq_lens[:, None]
-    bucket = torch.where(valid[:, None, :], bucket, d_max + 2)
-
+    bucket, valid = _bucket_index(coords, seq_lens, t, d_max)
     mask = table[:, bucket.long()].permute(1, 0, 2, 3)
-    result = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-    result = result.masked_fill(~valid[:, None, :, None], 0)
-
-    # Match empty_like(q)'s preserved strides in every dispatch path. The
-    # model's following head-to-row transpose can then remain a view.
-    out = torch.empty_like(q)
-    out.copy_(result)
-    return out
+    return _apply_reference(q, k, v, mask, valid)
 
 
 def _attention_reference(
@@ -385,17 +394,32 @@ def _setup_context(ctx, inputs, output) -> None:
 
 def _backward(ctx, grad_out: Tensor):
     q, k, v, coords, seq_lens, table = ctx.saved_tensors
+    t = q.shape[2]
+    d_max = table.shape[1] - 3
+    bucket, valid = _bucket_index(coords, seq_lens, t, d_max)
     with torch.enable_grad():
         q_ = q.detach().requires_grad_(True)
         k_ = k.detach().requires_grad_(True)
         v_ = v.detach().requires_grad_(True)
-        table_ = table.detach().requires_grad_(True)
-        out = _attention_reference_table(q_, k_, v_, coords, seq_lens, table_)
-        dq, dk, dv, dtable = torch.autograd.grad(
+        # The dense bias enters the scores additively, so its gradient is the
+        # per-pair score gradient. Differentiating the mask directly (instead
+        # of the table gather) keeps the scatter out of autograd: reducing
+        # P*A*T*T gradients into a table this small serializes on atomics.
+        mask = table.detach()[:, bucket.long()].permute(1, 0, 2, 3).requires_grad_(True)
+        out = _apply_reference(q_, k_, v_, mask, valid)
+        dq, dk, dv, dmask = torch.autograd.grad(
             out,
-            (q_, k_, v_, table_),
+            (q_, k_, v_, mask),
             grad_out,
         )
+    grads = dmask.float()
+    dtable = torch.stack(
+        [
+            (grads * (bucket == b).unsqueeze(1)).sum(dim=(0, 2, 3))
+            for b in range(d_max + 3)
+        ],
+        dim=1,
+    ).to(table.dtype)
     return dq, dk, dv, None, None, dtable
 
 
