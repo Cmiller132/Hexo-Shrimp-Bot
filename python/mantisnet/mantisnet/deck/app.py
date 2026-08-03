@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from ..builder import collate_prefixes
 from ..klent import telemetry
 from ..klent.evaluate import argmax_choose, play_match
+from ..klent.headtohead import sign_test
 from ..klent.run import _versions
 from ..klent.opponents import elo, shared_openings, wilson
 from ..klent.sealbot import record_match, sealbot_match
@@ -124,6 +125,97 @@ def _jsonable(value):
     if isinstance(value, float) and not math.isfinite(value):
         return None
     return value
+
+
+def _opponent_family(name: str) -> str:
+    """The readout family encoded by the telemetry opponent name.
+
+    Native seats record their protocol ``welcome.name`` verbatim. The Strix
+    deployment's actual name is ``strix-seat``; there is no synthetic
+    ``seat:`` namespace in the writer.
+    """
+    if name == "sealbot":
+        return "sealbot"
+    if name == "strix-seat":
+        return "seat"
+    if name.startswith("h2h:"):
+        return "h2h"
+    return "other"
+
+
+def _h2h_sign_readout(conn, match: dict) -> dict:
+    """Rebuild one H2H sign test from its seat-swapped game pairs.
+
+    Pair order, model seats, and shared opening are structural data, not hints.
+    A malformed match is refused with its id so an operator can identify the
+    corrupt boundary. Capped pairs are valid but non-decisions, matching the
+    head-to-head instrument's own statistical contract.
+    """
+    match_id = match["match_id"]
+
+    def refuse(message: str):
+        raise ValueError(f"h2h match {match_id} does not pair cleanly: {message}")
+
+    games = [
+        dict(row)
+        for row in conn.execute(
+            "SELECT game_index, winner, capped, model_seat, opening_len, moves "
+            "FROM games WHERE kind='eval' AND match=? ORDER BY game_index",
+            (match_id,),
+        )
+    ]
+    expected = int(match["games"])
+    if expected < 2 or expected % 2:
+        refuse(f"summary games is {expected}, expected a positive even count")
+    if len(games) != expected:
+        refuse(f"summary names {expected} games but {len(games)} rows exist")
+    indices = [row["game_index"] for row in games]
+    if indices != list(range(expected)):
+        refuse(f"game_index must be consecutive 0..{expected - 1}, got {indices}")
+
+    counts = {"model_both": 0, "split": 0, "reference_both": 0, "capped": 0}
+    for pair_index in range(expected // 2):
+        pair = games[2 * pair_index : 2 * pair_index + 2]
+        seats = [row["model_seat"] for row in pair]
+        if seats != [0, 1]:
+            refuse(f"pair {pair_index} model seats are {seats}, expected [0, 1]")
+        opening_lengths = [row["opening_len"] for row in pair]
+        if opening_lengths[0] is None or opening_lengths[0] != opening_lengths[1]:
+            refuse(f"pair {pair_index} opening lengths are {opening_lengths}")
+        opening_len = int(opening_lengths[0])
+        if opening_len < 1:
+            refuse(f"pair {pair_index} has non-positive opening length {opening_len}")
+        moves = [telemetry.unpack_moves(row["moves"]) for row in pair]
+        if any(opening_len > len(line) for line in moves):
+            refuse(
+                f"pair {pair_index} opening length {opening_len} exceeds a game length"
+            )
+        if moves[0][:opening_len] != moves[1][:opening_len]:
+            refuse(f"pair {pair_index} does not share its recorded opening")
+        for row in pair:
+            if bool(row["capped"]) != (row["winner"] is None):
+                refuse(
+                    f"game {row['game_index']} capped={row['capped']} "
+                    f"but winner={row['winner']!r}"
+                )
+            if row["winner"] not in (None, 0, 1):
+                refuse(f"game {row['game_index']} has invalid winner {row['winner']!r}")
+        if any(row["capped"] for row in pair):
+            counts["capped"] += 1
+            continue
+        model_wins = sum(row["winner"] == row["model_seat"] for row in pair)
+        if model_wins == 2:
+            counts["model_both"] += 1
+        elif model_wins == 1:
+            counts["split"] += 1
+        else:
+            counts["reference_both"] += 1
+    decisive = counts["model_both"] + counts["reference_both"]
+    return {
+        "sign_test_p": sign_test(counts["model_both"], decisive),
+        "decisive_pairs": decisive,
+        "pair_counts": counts,
+    }
 
 
 class MatchRunner:
@@ -363,6 +455,18 @@ def create_app(
         except ValueError as exc:
             raise _error(400, "invalid_query", str(exc)) from exc
 
+    @app.get("/api/runs/{run}/horizon")
+    def horizon(
+        run: str, request: Request,
+        lo: int | None = Query(default=None, ge=0),
+        hi: int | None = Query(default=None, ge=0),
+    ):
+        try:
+            with conn_for(request, run) as conn:
+                return telemetry.knowledge_horizon(conn, lo=lo, hi=hi)
+        except ValueError as exc:
+            raise _error(400, "invalid_query", str(exc)) from exc
+
     @app.get("/api/runs/{run}/games")
     def games(
         run: str, request: Request, kind: str | None = None,
@@ -454,8 +558,16 @@ def create_app(
 
     @app.get("/api/runs/{run}/strength")
     def strength(run: str, request: Request, opponent_id: int | None = None):
-        with conn_for(request, run) as conn:
-            return _jsonable(telemetry.strength_curve(conn, opponent_id=opponent_id))
+        try:
+            with conn_for(request, run) as conn:
+                rows = telemetry.strength_curve(conn, opponent_id=opponent_id)
+                for row in rows:
+                    row["family"] = _opponent_family(row["opponent_name"])
+                    if row["family"] == "h2h":
+                        row.update(_h2h_sign_readout(conn, row))
+                return _jsonable(rows)
+        except ValueError as exc:
+            raise _error(500, "invalid_eval_match", str(exc)) from exc
 
     @app.get("/api/runs/{run}/crossplay")
     def crossplay(run: str, request: Request):

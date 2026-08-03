@@ -15,7 +15,7 @@ The application has four persistent screens:
 | --- | --- | --- |
 | Play | `src/screens/Play.tsx` | Engine-backed play sessions and arena jobs |
 | Game history | `src/screens/History.tsx` | Game search, replay, reviews, and aggregates |
-| Live run | `src/screens/LiveRun.tsx` | Heartbeat, metrics, SSE, sentinels, and kill |
+| Live run | `src/screens/LiveRun.tsx` | Heartbeat, health metrics, knowledge horizon comparison, per-opponent evaluation, SSE, sentinels, and kill |
 | Model lab | `src/screens/Lab.tsx` | Position lines, checkpoint reads, D6, and attention |
 
 The shared modules are:
@@ -26,7 +26,7 @@ The shared modules are:
 | `src/api.ts` | JSON requests, posts, query encoding, and `useApi` |
 | `src/types.ts` | Deck response and UI state types |
 | `src/components/Board.tsx` | Hex board, legal masks, policy/Q overlays, move input |
-| `src/components/Chart.tsx` | Multi-series SVG chart |
+| `src/components/Chart.tsx` | Multi-series SVG chart with optional confidence envelopes |
 | `src/components/Replay.tsx` | Replay transport and deck key binding |
 | `src/components/Pane.tsx` | Persistent mounted-screen visibility |
 | `src/components/Ui.tsx` | Panels, notices, metrics, controls, and formatting |
@@ -115,6 +115,13 @@ npm run lan-relay -- 192.168.68.62 8000 127.0.0.1 8000
 - Play mutations are accepted only at the live session position.
 - Expensive history aggregates are manual requests and do not run on screen
   mount.
+- Live Run places Knowledge horizon directly after iteration telemetry: its
+  primary recent window and optional previous/first overlay share the fixed
+  distance-from-end buckets returned by `/api/runs/{run}/horizon`.
+- Evaluation curves use `/api/runs/{run}/strength` opponent families. SealBot
+  and the native `strix-seat` anchor plot win rate with Wilson envelopes; H2H
+  opponents plot stored paired Elo envelopes and display the deck-recomputed
+  exact sign-test p at the latest boundary.
 - Reviews, probes, presets, and match jobs persist through deck API calls.
 - The dead-CSS scan is conservative for dynamically assembled class names.
 - `npm test` always rebuilds before inspecting emitted artifacts.

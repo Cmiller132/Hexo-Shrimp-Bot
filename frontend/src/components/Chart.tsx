@@ -10,6 +10,8 @@ export interface Series {
   label: string;
   /** `[x, y]`; a null `y` breaks the path. A missing value is never inferred. */
   points: Array<[number, number | null]>;
+  /** Confidence / uncertainty envelope `[x, lower, upper]` for this line. */
+  interval?: Array<[number, number | null, number | null]>;
   tone?: Tone;
   /** Redundant second cue: solid = this checkpoint now, dashed = the stored
    *  acting-net trace, dotted = the compare checkpoint. */
@@ -107,6 +109,12 @@ export default function Chart({
         if (Number.isFinite(x)) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); }
         if (y != null && Number.isFinite(y) && (yScale === "linear" || y > 0)) { y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
       }
+      for (const [x, lower, upper] of item.interval ?? []) {
+        if (Number.isFinite(x)) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); }
+        for (const y of [lower, upper]) {
+          if (y != null && Number.isFinite(y) && (yScale === "linear" || y > 0)) { y0 = Math.min(y0, y); y1 = Math.max(y1, y); }
+        }
+      }
     }
     const xd = xDomain ?? (Number.isFinite(x0) ? [x0, x1] as [number, number] : [0, 1] as [number, number]);
     let yd: [number, number];
@@ -148,7 +156,23 @@ export default function Chart({
       open = true;
     }
     const last = [...item.points].reverse().find(([, value]) => value != null && Number.isFinite(value));
-    return { item, line, last: last ? { x: sx(last[0]), y: sy(last[1] as number) } : null };
+    const intervalPaths: string[] = [];
+    let segment: Array<[number, number, number]> = [];
+    const flush = () => {
+      if (!segment.length) return;
+      const upper = segment.map(([x, , hi], index) => `${index ? "L" : "M"}${sx(x).toFixed(2)},${sy(hi).toFixed(2)}`).join("");
+      const lower = [...segment].reverse().map(([x, lo]) => `L${sx(x).toFixed(2)},${sy(lo).toFixed(2)}`).join("");
+      intervalPaths.push(`${upper}${lower}Z`);
+      segment = [];
+    };
+    for (const [x, lower, upper] of item.interval ?? []) {
+      const usable = lower != null && upper != null && Number.isFinite(lower) && Number.isFinite(upper)
+        && (yScale === "linear" || (lower > 0 && upper > 0));
+      if (!usable) { flush(); continue; }
+      segment.push([x, lower, upper]);
+    }
+    flush();
+    return { item, line, intervalPaths, last: last ? { x: sx(last[0]), y: sy(last[1] as number) } : null };
   }), [visible, sx, sy, yScale]);
 
   const xs = useMemo(() => {
@@ -243,9 +267,10 @@ export default function Chart({
         {straddles && <line className="deck-chart-zero" x1={MARGIN.left} x2={MARGIN.left + plotW} y1={sy(0)} y2={sy(0)} />}
 
         <g className="deck-chart-series">
-          {paths.map(({ item, line }) => <path
-            key={item.id} className="deck-chart-line" data-tone={item.tone} data-dash={item.dash ?? "solid"} d={line}
-          />)}
+          {paths.flatMap(({ item, intervalPaths }) => intervalPaths.map((path, index) => <path
+            key={`${item.id}-interval-${index}`} className="deck-chart-interval" data-tone={item.tone} d={path}
+          />))}
+          {paths.map(({ item, line }) => <path key={item.id} className="deck-chart-line" data-tone={item.tone} data-dash={item.dash ?? "solid"} d={line} />)}
         </g>
 
         <g className="deck-chart-markers" aria-hidden="true">

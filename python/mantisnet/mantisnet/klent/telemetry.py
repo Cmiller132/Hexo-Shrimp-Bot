@@ -752,21 +752,171 @@ def _iteration_range(iterations, table=""):
 
 
 def iteration_series(conn, columns, *, iterations=None) -> list[dict]:
-    """Metric columns against iteration, in order — a line chart's data.
+    """Fixed and JSON metrics against iteration, in order.
 
-    Column names must exist in the ``iterations`` table.
+    Every dynamic ``metrics_json`` key is surfaced, even when the caller did
+    not name it, so readers learn new training metrics without a schema change.
+    Metrics with canonical fixed columns are intentionally duplicated by the
+    writer and must agree. Any other collision is corrupt telemetry and is
+    refused instead of choosing one value silently.
     """
+    if not columns:
+        raise ValueError("iteration series needs at least one metric column")
     known = {r["name"] for r in conn.execute("PRAGMA table_info(iterations)")}
-    unknown = [c for c in columns if c not in known]
-    if unknown:
-        raise ValueError(f"no such iteration columns: {unknown}; have {sorted(known)}")
+    if "metrics_json" in columns:
+        raise ValueError("metrics_json is storage, not an iteration metric")
+    fixed = [c for c in columns if c in known]
+    dynamic = [c for c in columns if c not in known]
     where, params = _iteration_range(iterations)
-    return _rows(
+    stored = _rows(
         conn,
-        f"SELECT iteration, {', '.join(columns)} FROM iterations"
+        "SELECT * FROM iterations"
         f"{' WHERE ' + where if where else ''} ORDER BY iteration",
         params,
     )
+    # ``iteration`` is part of the metric event too; like the promoted metric
+    # columns, it is deliberately present in both representations.
+    fixed_metric_names = {"iteration", *(name for name, _kind in _ITERATION_METRICS)}
+    seen_dynamic: set[str] = set()
+    out = []
+    for stored_row in stored:
+        try:
+            metrics = json.loads(stored_row["metrics_json"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"iteration {stored_row['iteration']} has invalid metrics_json: {exc}"
+            ) from exc
+        if not isinstance(metrics, dict):
+            raise ValueError(
+                f"iteration {stored_row['iteration']} metrics_json must be an object"
+            )
+        row = {"iteration": stored_row["iteration"]}
+        row.update({column: stored_row[column] for column in fixed if column != "iteration"})
+        for key, value in metrics.items():
+            if key in known:
+                if key not in fixed_metric_names:
+                    raise ValueError(
+                        f"iteration {stored_row['iteration']} metrics_json key {key!r} "
+                        "collides with a fixed iterations column"
+                    )
+                if stored_row[key] != value:
+                    raise ValueError(
+                        f"iteration {stored_row['iteration']} metrics_json key {key!r} "
+                        f"disagrees with its fixed column: {value!r} != {stored_row[key]!r}"
+                    )
+                continue
+            if key in row:
+                raise ValueError(
+                    f"iteration {stored_row['iteration']} metrics_json key {key!r} "
+                    "collides with a returned fixed column"
+                )
+            row[key] = value
+            seen_dynamic.add(key)
+        for key in dynamic:
+            row.setdefault(key, None)
+        out.append(row)
+    unknown = [column for column in dynamic if column not in seen_dynamic]
+    if stored and unknown:
+        raise ValueError(
+            f"no such iteration metrics: {unknown}; dynamic metrics present are "
+            f"{sorted(seen_dynamic)}"
+        )
+    return out
+
+
+_HORIZON_BUCKETS = (
+    (1, 4, "1–4"),
+    (5, 8, "5–8"),
+    (9, 12, "9–12"),
+    (13, 16, "13–16"),
+    (17, 24, "17–24"),
+    (25, 32, "25–32"),
+    (33, 48, "33–48"),
+    (49, 64, "49–64"),
+    (65, None, "65+"),
+)
+
+
+def knowledge_horizon(conn, *, lo=None, hi=None) -> dict:
+    """Critic sign and magnitude by distance from a decisive game's end.
+
+    Bounds are inclusive. An absent side defaults to the corresponding bound
+    of the last six iteration rows. Bucketing and aggregation stay in one SQL
+    statement over ``plies`` joined to ``games``; Python only shapes its fixed
+    9 by 2 result grid.
+    """
+    if lo is not None and hi is not None and lo > hi:
+        raise ValueError(f"horizon lo must be <= hi, got {lo} > {hi}")
+    bucket_values = ",".join(
+        f"({lower},{'NULL' if upper is None else upper},'{label}')"
+        for lower, upper, label in _HORIZON_BUCKETS
+    )
+    rows = _rows(
+        conn,
+        f"""
+        WITH recent(iteration) AS (
+            SELECT iteration FROM iterations ORDER BY iteration DESC LIMIT 6
+        ),
+        bounds(lo, hi) AS (
+            SELECT COALESCE(?, MIN(iteration)), COALESCE(?, MAX(iteration))
+            FROM recent
+        ),
+        bucket_defs(k_min, k_max, label) AS (VALUES {bucket_values}),
+        outcomes(outcome) AS (VALUES ('won'), ('lost')),
+        horizon AS (
+            SELECT
+                CASE
+                    WHEN g.length - p.t <= 4 THEN 1
+                    WHEN g.length - p.t <= 8 THEN 5
+                    WHEN g.length - p.t <= 12 THEN 9
+                    WHEN g.length - p.t <= 16 THEN 13
+                    WHEN g.length - p.t <= 24 THEN 17
+                    WHEN g.length - p.t <= 32 THEN 25
+                    WHEN g.length - p.t <= 48 THEN 33
+                    WHEN g.length - p.t <= 64 THEN 49
+                    ELSE 65
+                END AS k_min,
+                CASE WHEN p.mover = g.winner THEN 'won' ELSE 'lost' END AS outcome,
+                COUNT(*) AS count,
+                AVG(CASE
+                    WHEN p.mover = g.winner AND p.v_hat > 0 THEN 1.0
+                    WHEN p.mover != g.winner AND p.v_hat < 0 THEN 1.0
+                    ELSE 0.0
+                END) AS sign_accuracy,
+                AVG(ABS(p.v_hat) / 10000.0) AS mean_abs_v_hat
+            FROM plies AS p
+            JOIN games AS g ON g.game_id = p.game_id
+            CROSS JOIN bounds AS w
+            WHERE g.kind = 'selfplay'
+              AND g.capped = 0
+              AND g.winner IN (0, 1)
+              AND g.iteration BETWEEN w.lo AND w.hi
+            GROUP BY k_min, outcome
+        )
+        SELECT w.lo, w.hi, b.k_min, b.k_max, b.label AS bucket,
+               o.outcome, COALESCE(h.count, 0) AS count,
+               h.sign_accuracy, h.mean_abs_v_hat
+        FROM bounds AS w
+        CROSS JOIN bucket_defs AS b
+        CROSS JOIN outcomes AS o
+        LEFT JOIN horizon AS h ON h.k_min = b.k_min AND h.outcome = o.outcome
+        ORDER BY b.k_min, CASE o.outcome WHEN 'won' THEN 0 ELSE 1 END
+        """,
+        [lo, hi],
+    )
+    resolved_lo, resolved_hi = rows[0]["lo"], rows[0]["hi"]
+    if resolved_lo is not None and resolved_hi is not None and resolved_lo > resolved_hi:
+        raise ValueError(
+            f"horizon lo must be <= hi, got {resolved_lo} > {resolved_hi}"
+        )
+    return {
+        "lo": resolved_lo,
+        "hi": resolved_hi,
+        "buckets": [
+            {key: value for key, value in row.items() if key not in {"lo", "hi"}}
+            for row in rows
+        ],
+    }
 
 
 # Every browser order ends in the natural game key for stable paging and must

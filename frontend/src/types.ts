@@ -27,6 +27,50 @@ export interface Run {
   checkpoints: Checkpoint[];
 }
 
+export interface HorizonBucket {
+  k_min: number;
+  k_max: number | null;
+  bucket: string;
+  outcome: "won" | "lost";
+  count: number;
+  sign_accuracy: number | null;
+  mean_abs_v_hat: number | null;
+}
+
+export interface HorizonReadout {
+  lo: number | null;
+  hi: number | null;
+  buckets: HorizonBucket[];
+}
+
+export interface EvalReadout {
+  match_id: number;
+  opponent: number;
+  opponent_name: string;
+  opponent_config: string;
+  family: "sealbot" | "seat" | "h2h" | "other";
+  iteration: number | null;
+  checkpoint: string | null;
+  games: number;
+  win_rate: number;
+  ci_lo: number | null;
+  ci_hi: number | null;
+  elo: number | null;
+  elo_lo: number | null;
+  elo_hi: number | null;
+  score_as_p0: number | null;
+  score_as_p1: number | null;
+  opponent_depth_mean: number | null;
+  sign_test_p?: number;
+  decisive_pairs?: number;
+  pair_counts?: {
+    model_both: number;
+    split: number;
+    reference_both: number;
+    capped: number;
+  };
+}
+
 /** One legal move from `/api/inspect`; `rank` is its engine-order index. */
 export interface InspectLegal {
   move: Move;

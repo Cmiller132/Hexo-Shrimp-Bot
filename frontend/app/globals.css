@@ -547,6 +547,11 @@ kbd {
 .pipeline strong { margin-top:8px; color:var(--text); font:11px/1 var(--mono); font-weight:500; }
 .pipeline>b { color:var(--dim); text-align:center; }
 .two-column { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.eval-grid { display:grid; margin-top:9px; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:8px; }
+.eval-card { min-width:0; padding:8px; border:1px solid var(--line-soft); background:var(--bg-raised); }
+.eval-card-head { display:flex; align-items:baseline; justify-content:space-between; gap:8px; color:var(--text); font:8px/1.3 var(--mono); }
+.eval-card-head b { overflow:hidden; font-weight:500; text-overflow:ellipsis; white-space:nowrap; }
+.eval-card-head span { color:var(--dim); font-size:6px; letter-spacing:.1em; text-transform:uppercase; }
 .data-list { display:flex; flex-direction:column; }
 .data-list>div,.data-list>button { display:flex; min-height:31px; padding:6px 2px; align-items:center; justify-content:space-between; gap:8px; color:var(--muted); border:0; border-bottom:1px solid var(--line-soft); background:transparent; font:8px/1.3 var(--mono); text-align:left; }
 .data-list b { color:var(--text); font-weight:500; text-align:right; }
@@ -716,6 +721,7 @@ tbody tr { cursor:pointer; } tbody tr:hover,tbody tr.selected { color:var(--text
 .deck-chart-gridline { fill:none; stroke:var(--line-soft); stroke-width:1; }
 .deck-chart-zero { stroke:var(--line-bright); stroke-width:1; }
 .deck-chart-band { fill:var(--line-soft); opacity:.35; }
+.deck-chart-interval { fill:var(--tone); stroke:none; opacity:.12; }
 .deck-chart-line { fill:none; stroke:var(--tone); stroke-width:2; stroke-linecap:round; stroke-linejoin:round; }
 .deck-chart-line[data-dash="dashed"] { stroke-dasharray:5 3; }
 .deck-chart-line[data-dash="dotted"] { stroke-dasharray:1.5 3; }
