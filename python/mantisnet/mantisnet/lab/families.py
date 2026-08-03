@@ -1,0 +1,618 @@
+"""Checkpoint-family compatibility for the MantisNet laboratory.
+
+Production training deliberately has one current checkpoint format.  The lab
+has a different job: measure historical models without changing their native
+critic readout or guessing how an experimental head behaved.  This module is
+the complete, explicit compatibility boundary for that job.
+"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Mapping
+
+import torch
+from torch import Tensor, nn
+
+from ..builder import DEC_CLASSES, NEAREST_BUCKETS, NUM_PATTERNS
+from ..klent.graft import _PARENT_ROW
+from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
+from ..model import MantisConfig, MantisNet, ModelOutput
+from ..segments import segment_ids, segment_max
+
+
+_SLOT_CLASSES = 3
+_BLOCK_KEY = re.compile(r"^blocks\.(\d+)\.")
+
+
+@dataclass(frozen=True, slots=True)
+class Composition:
+    """The fp32 interpretation of one family's native critic logits."""
+
+    name: str
+    width: int
+    q_formula: str
+    mass_formula: str
+    _decode: Callable[[Tensor], tuple[Tensor, Tensor]]
+
+    def _q_mass(self, logits: Tensor) -> tuple[Tensor, Tensor]:
+        if logits.ndim < 1 or logits.shape[-1] != self.width:
+            raise ValueError(
+                f"{self.name} composition requires logits ending in width "
+                f"{self.width}, got {tuple(logits.shape)}"
+            )
+        q, mass = self._decode(logits.float())
+        return q.float(), mass.float()
+
+    def q_value(self, logits: Tensor) -> Tensor:
+        return self._q_mass(logits)[0]
+
+    def mass(self, logits: Tensor) -> Tensor:
+        return self._q_mass(logits)[1]
+
+    def q_score(self, logits: Tensor, offsets: Tensor, mass_floor: float) -> Tensor:
+        if not 0 < mass_floor <= 1:
+            raise ValueError(f"mass_floor must be in (0, 1], got {mass_floor}")
+        q, mass = self._q_mass(logits)
+        segments = segment_ids(offsets)
+        scale = segment_max(mass, segments, offsets.shape[0] - 1).clamp(
+            min=mass_floor
+        )
+        return q / scale.index_select(0, segments)
+
+    @property
+    def flags(self) -> dict[str, object]:
+        return {
+            "name": self.name,
+            "native_logits": self.width,
+            "q_value": self.q_formula,
+            "mass": self.mass_formula,
+            "acting_score": "Q / max(max_b M(s,b), mass_floor)",
+            "fp32": True,
+        }
+
+
+def _trinomial(logits: Tensor) -> tuple[Tensor, Tensor]:
+    positive, negative, zero = logits.softmax(dim=-1).unbind(dim=-1)
+    return positive - negative, 1.0 - zero
+
+
+def _bipolar(logits: Tensor) -> tuple[Tensor, Tensor]:
+    positive, negative = logits.sigmoid().unbind(dim=-1)
+    return positive - negative, positive + negative
+
+
+def _scalar(logits: Tensor) -> tuple[Tensor, Tensor]:
+    q = logits.squeeze(-1).tanh()
+    return q, q.abs()
+
+
+def _factored(logits: Tensor) -> tuple[Tensor, Tensor]:
+    mover_win, magnitude = logits.unbind(dim=-1)
+    mass = magnitude.sigmoid()
+    return (2.0 * mover_win.sigmoid() - 1.0) * mass, mass
+
+
+TRINOMIAL = Composition(
+    "trinomial", 3, "softmax(z)[+] - softmax(z)[-]", "1 - softmax(z)[0]", _trinomial
+)
+BIPOLAR = Composition(
+    "bipolar", 2, "sigmoid(z[+]) - sigmoid(z[-])", "sigmoid(z[+]) + sigmoid(z[-])", _bipolar
+)
+SCALAR = Composition("scalar", 1, "tanh(z)", "abs(tanh(z))", _scalar)
+FACTORED = Composition(
+    "factored",
+    2,
+    "(2*sigmoid(z_p)-1) * sigmoid(z_m)",
+    "sigmoid(z_m)",
+    _factored,
+)
+
+
+class FamilyMantisNet(MantisNet):
+    """A current trunk/decoder with a family's native critic readout."""
+
+    def __init__(self, cfg: MantisConfig, composition: Composition) -> None:
+        super().__init__(cfg)
+        self.mlp_q.out = nn.Linear(cfg.policy_hidden, composition.width)
+        self.family_composition = composition
+
+    def cell_heads(self, w, g, batch, mass_floor):
+        policy, critic = self.cell_head_logits(w, g, batch)
+        composition = self.family_composition
+        return (
+            policy,
+            composition.q_score(critic, batch.legal_offsets, mass_floor),
+            composition.q_value(critic),
+        )
+
+    def forward(self, batch, mass_floor: float) -> ModelOutput:
+        _stones, windows, token = self.trunk(batch)
+        value, value_dist, value_logits = self.value_head(windows, token, batch)
+        policy, q_score, q_values = self.cell_heads(
+            windows, token, batch, mass_floor
+        )
+        return ModelOutput(
+            policy_logits=policy,
+            q_score=q_score,
+            q_values=q_values,
+            value=value,
+            value_dist=value_dist,
+            value_logits=value_logits,
+        )
+
+
+def _block_count(state_dict: Mapping[str, Tensor]) -> int | None:
+    indices = {
+        int(match.group(1))
+        for key in state_dict
+        if (match := _BLOCK_KEY.match(key)) is not None
+    }
+    if not indices or indices != set(range(max(indices) + 1)):
+        return None
+    return max(indices) + 1
+
+
+_COMMON_KEYS = {
+    "stone_table.weight",
+    "window_table.weight",
+    "token_base",
+    "token_moves.weight",
+    "ln_out.weight",
+    "ln_out.bias",
+    "p.weight",
+    "e_pw.weight",
+    "e_bg.weight",
+    "mlp_p.lin_a.weight",
+    "mlp_p.lin_a.bias",
+    "mlp_p.lin_b.weight",
+    "mlp_p.out.weight",
+    "mlp_p.out.bias",
+    "q.weight",
+    "e_qw.weight",
+    "e_qbg.weight",
+    "mlp_q.lin_a.weight",
+    "mlp_q.lin_a.bias",
+    "mlp_q.lin_b.weight",
+    "mlp_q.out.weight",
+    "mlp_q.out.bias",
+    "value_queries",
+    "ln_value.weight",
+    "ln_value.bias",
+    "mlp_v.0.weight",
+    "mlp_v.0.bias",
+    "mlp_v.2.weight",
+    "mlp_v.2.bias",
+}
+
+_BLOCK_SUFFIXES = {
+    "ln_ws_s.weight", "ln_ws_s.bias", "ln_ws_w.weight", "ln_ws_w.bias",
+    "u.weight", "e_ws.weight", "mlp_w.lin_a.weight", "mlp_w.lin_a.bias",
+    "mlp_w.lin_b.weight", "mlp_w.out.weight", "mlp_w.out.bias",
+    "ln_sw_w.weight", "ln_sw_w.bias", "ln_sw_s.weight", "ln_sw_s.bias",
+    "v.weight", "e_sw.weight", "mlp_s.lin_a.weight", "mlp_s.lin_a.bias",
+    "mlp_s.lin_b.weight", "mlp_s.out.weight", "mlp_s.out.bias",
+    "ln_attn.weight", "ln_attn.bias", "wq.weight", "wq.bias", "wk.weight",
+    "wk.bias", "wv.weight", "wv.bias", "wo.weight", "wo.bias", "dist_bias",
+    "ln_ffn.weight", "ln_ffn.bias", "ffn.0.weight", "ffn.0.bias",
+    "ffn.2.weight", "ffn.2.bias",
+}
+
+_TAIL_KEYS = {
+    "q_tail_ln.weight", "q_tail_ln.bias", "q_tail.0.weight", "q_tail.0.bias",
+    "q_tail.2.weight", "q_tail.2.bias",
+}
+_DUEL_KEYS = {
+    "mlp_qbase.0.weight", "mlp_qbase.0.bias",
+    "mlp_qbase.2.weight", "mlp_qbase.2.bias",
+}
+
+
+def _base_keys(blocks: int) -> set[str]:
+    return _COMMON_KEYS | {
+        f"blocks.{index}.{suffix}"
+        for index in range(blocks)
+        for suffix in _BLOCK_SUFFIXES
+    }
+
+
+def _shape(state_dict: Mapping[str, Tensor], key: str) -> tuple[int, ...] | None:
+    value = state_dict.get(key)
+    return tuple(value.shape) if isinstance(value, Tensor) else None
+
+
+def _claims(
+    state_dict: Mapping[str, Tensor],
+    *,
+    width: int,
+    table_rows: int,
+    extras: set[str] | None = None,
+) -> bool:
+    blocks = _block_count(state_dict)
+    if blocks is None or set(state_dict) != _base_keys(blocks) | (extras or set()):
+        return False
+    stone = _shape(state_dict, "stone_table.weight")
+    readout = _shape(state_dict, "mlp_q.out.weight")
+    return bool(
+        stone is not None
+        and len(stone) == 2
+        and stone[0] == 2
+        and _shape(state_dict, "e_pw.weight") == (table_rows, stone[1])
+        and _shape(state_dict, "e_qw.weight") == (table_rows, stone[1])
+        and readout is not None
+        and len(readout) == 2
+        and readout[0] == width
+        and _shape(state_dict, "mlp_q.out.bias") == (width,)
+    )
+
+
+def _require_tensor(state_dict: Mapping[str, Tensor], key: str) -> Tensor:
+    value = state_dict.get(key)
+    if not isinstance(value, Tensor):
+        raise ValueError(f"tensor {key!r} is missing or is not a tensor")
+    return value
+
+
+def _expect_shape(state_dict: Mapping[str, Tensor], key: str, shape: tuple[int, ...]) -> None:
+    tensor = _require_tensor(state_dict, key)
+    if tuple(tensor.shape) != shape:
+        raise ValueError(f"tensor {key!r} has shape {tuple(tensor.shape)}, expected {shape}")
+
+
+def _expected_shapes(
+    cfg: MantisConfig, *, table_rows: int, critic_width: int
+) -> dict[str, tuple[int, ...]]:
+    h, ph, vh, q, k = (
+        cfg.h, cfg.policy_hidden, cfg.value_hidden, cfg.value_queries, cfg.value_bins
+    )
+    shapes = {
+        "stone_table.weight": (2, h),
+        "window_table.weight": (2 * NUM_PATTERNS, h),
+        "token_base": (h,),
+        "token_moves.weight": (2, h),
+        "ln_out.weight": (h,), "ln_out.bias": (h,),
+        "p.weight": (h, h), "e_pw.weight": (table_rows, h),
+        "e_bg.weight": (NEAREST_BUCKETS, h),
+        "mlp_p.lin_a.weight": (ph, h), "mlp_p.lin_a.bias": (ph,),
+        "mlp_p.lin_b.weight": (ph, h), "mlp_p.out.weight": (1, ph),
+        "mlp_p.out.bias": (1,),
+        "q.weight": (h, h), "e_qw.weight": (table_rows, h),
+        "e_qbg.weight": (NEAREST_BUCKETS, h),
+        "mlp_q.lin_a.weight": (ph, h), "mlp_q.lin_a.bias": (ph,),
+        "mlp_q.lin_b.weight": (ph, h),
+        "mlp_q.out.weight": (critic_width, ph),
+        "mlp_q.out.bias": (critic_width,),
+        "value_queries": (q, h), "ln_value.weight": (h,), "ln_value.bias": (h,),
+        "mlp_v.0.weight": (vh, q * h), "mlp_v.0.bias": (vh,),
+        "mlp_v.2.weight": (k, vh), "mlp_v.2.bias": (k,),
+    }
+    fh = cfg.ffn_factor * h
+    for index in range(cfg.blocks):
+        prefix = f"blocks.{index}."
+        for name in (
+            "ln_ws_s", "ln_ws_w", "ln_sw_w", "ln_sw_s", "ln_attn", "ln_ffn"
+        ):
+            shapes[prefix + name + ".weight"] = (h,)
+            shapes[prefix + name + ".bias"] = (h,)
+        for name in ("u", "v"):
+            shapes[prefix + name + ".weight"] = (h, h)
+        for name in ("e_ws", "e_sw"):
+            shapes[prefix + name + ".weight"] = (3, h)
+        for name in ("mlp_w", "mlp_s"):
+            shapes[prefix + name + ".lin_a.weight"] = (h, h)
+            shapes[prefix + name + ".lin_a.bias"] = (h,)
+            shapes[prefix + name + ".lin_b.weight"] = (h, h)
+            shapes[prefix + name + ".out.weight"] = (h, h)
+            shapes[prefix + name + ".out.bias"] = (h,)
+        for name in ("wq", "wk", "wv", "wo"):
+            shapes[prefix + name + ".weight"] = (h, h)
+            shapes[prefix + name + ".bias"] = (h,)
+        shapes[prefix + "dist_bias"] = (cfg.heads, cfg.d_max + 2)
+        shapes[prefix + "ffn.0.weight"] = (fh, h)
+        shapes[prefix + "ffn.0.bias"] = (fh,)
+        shapes[prefix + "ffn.2.weight"] = (h, fh)
+        shapes[prefix + "ffn.2.bias"] = (h,)
+    return shapes
+
+
+def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
+    """Recover every tensor-backed MantisConfig field from a state dict."""
+
+    stone = _require_tensor(state_dict, "stone_table.weight")
+    if stone.ndim != 2 or stone.shape[0] != 2 or stone.shape[1] <= 0:
+        raise ValueError(
+            f"tensor 'stone_table.weight' has shape {tuple(stone.shape)}, expected (2, H)"
+        )
+    h = int(stone.shape[1])
+    blocks = _block_count(state_dict)
+    if blocks is None:
+        raise ValueError("tensor block indices are missing or not contiguous from blocks.0")
+
+    bias = _require_tensor(state_dict, "blocks.0.dist_bias")
+    if bias.ndim != 2 or bias.shape[0] <= 0 or bias.shape[1] < 3:
+        raise ValueError(
+            f"tensor 'blocks.0.dist_bias' has shape {tuple(bias.shape)}, expected (heads, d_max+2)"
+        )
+    heads, d_max = int(bias.shape[0]), int(bias.shape[1] - 2)
+    if h % heads:
+        raise ValueError(
+            "tensors 'stone_table.weight' and 'blocks.0.dist_bias' imply "
+            f"H={h}, heads={heads}, which do not divide evenly"
+        )
+
+    ffn = _require_tensor(state_dict, "blocks.0.ffn.0.weight")
+    if ffn.ndim != 2 or ffn.shape[0] <= 0 or ffn.shape[1] != h or ffn.shape[0] % h:
+        raise ValueError(
+            f"tensor 'blocks.0.ffn.0.weight' has shape {tuple(ffn.shape)}, expected (ffn_factor*{h}, {h})"
+        )
+    ffn_factor = int(ffn.shape[0] // h)
+
+    policy = _require_tensor(state_dict, "mlp_p.lin_a.weight")
+    if policy.ndim != 2 or policy.shape[1] != h or policy.shape[0] <= 0:
+        raise ValueError(
+            f"tensor 'mlp_p.lin_a.weight' has shape {tuple(policy.shape)}, expected (policy_hidden, {h})"
+        )
+    policy_hidden = int(policy.shape[0])
+
+    queries = _require_tensor(state_dict, "value_queries")
+    if queries.ndim != 2 or queries.shape[1] != h or queries.shape[0] <= 0:
+        raise ValueError(
+            f"tensor 'value_queries' has shape {tuple(queries.shape)}, expected (value_queries, {h})"
+        )
+    value_queries = int(queries.shape[0])
+
+    value_first = _require_tensor(state_dict, "mlp_v.0.weight")
+    if (
+        value_first.ndim != 2
+        or value_first.shape[0] <= 0
+        or value_first.shape[1] != value_queries * h
+    ):
+        raise ValueError(
+            f"tensor 'mlp_v.0.weight' has shape {tuple(value_first.shape)}, expected "
+            f"(value_hidden, {value_queries * h})"
+        )
+    value_hidden = int(value_first.shape[0])
+
+    value_out = _require_tensor(state_dict, "mlp_v.2.weight")
+    if value_out.ndim != 2 or value_out.shape[1] != value_hidden or value_out.shape[0] <= 0:
+        raise ValueError(
+            f"tensor 'mlp_v.2.weight' has shape {tuple(value_out.shape)}, expected "
+            f"(value_bins, {value_hidden})"
+        )
+    value_bins = int(value_out.shape[0])
+    if value_bins % 2 == 0:
+        raise ValueError(
+            f"tensor 'mlp_v.2.weight' implies even value_bins={value_bins}; an odd width is required"
+        )
+
+    cfg = MantisConfig(
+        h=h,
+        blocks=blocks,
+        heads=heads,
+        ffn_factor=ffn_factor,
+        d_max=d_max,
+        value_queries=value_queries,
+        value_bins=value_bins,
+        policy_hidden=policy_hidden,
+        value_hidden=value_hidden,
+        dropout=0.0,
+    )
+
+    table = _require_tensor(state_dict, "e_pw.weight")
+    critic = _require_tensor(state_dict, "mlp_q.out.weight")
+    if table.ndim != 2 or table.shape[0] not in {_SLOT_CLASSES, DEC_CLASSES}:
+        raise ValueError(
+            f"tensor 'e_pw.weight' has shape {tuple(table.shape)}, expected (3, H) or ({DEC_CLASSES}, H)"
+        )
+    if critic.ndim != 2 or critic.shape[0] not in {1, 2, 3}:
+        raise ValueError(
+            f"tensor 'mlp_q.out.weight' has shape {tuple(critic.shape)}, expected native width 1, 2, or 3"
+        )
+    for key, shape in _expected_shapes(
+        cfg, table_rows=int(table.shape[0]), critic_width=int(critic.shape[0])
+    ).items():
+        _expect_shape(state_dict, key, shape)
+    return cfg
+
+
+@dataclass(frozen=True, slots=True)
+class FamilyEntry:
+    name: str
+    claims: Callable[[Mapping[str, Tensor]], bool]
+    scoreable: bool
+    composition: Composition | None
+    table_rows: int
+    reason: str | None = None
+
+    def load(
+        self, checkpoint_model_dict: Mapping[str, Tensor], device: str | torch.device
+    ) -> nn.Module:
+        if not self.scoreable or self.composition is None:
+            raise ValueError(_unscoreable_message(self))
+        cfg = infer_config(checkpoint_model_dict)
+        state = dict(checkpoint_model_dict)
+        if self.table_rows == _SLOT_CLASSES:
+            rows = torch.from_numpy(_PARENT_ROW).to(dtype=torch.long)
+            for key in ("e_pw.weight", "e_qw.weight"):
+                state[key] = state[key].index_select(0, rows)
+        model = FamilyMantisNet(cfg, self.composition)
+        model.load_state_dict(state, strict=True)
+        return model.to(device).eval()
+
+
+def _entry(
+    name: str,
+    width: int,
+    rows: int,
+    composition: Composition | None,
+    *,
+    extras: set[str] | None = None,
+    reason: str | None = None,
+) -> FamilyEntry:
+    return FamilyEntry(
+        name=name,
+        claims=lambda state, w=width, r=rows, e=extras: _claims(
+            state, width=w, table_rows=r, extras=e
+        ),
+        scoreable=composition is not None,
+        composition=composition,
+        table_rows=rows,
+        reason=reason,
+    )
+
+
+_COMPAT_REQUIREMENT = (
+    "docs/LAB_SPEC.md requires a family entry and a composition-parity test "
+    "before checkpoints with a new critic parameterization, decoder key, or head format are scoreable"
+)
+
+FAMILIES: tuple[FamilyEntry, ...] = (
+    _entry("trinomial-joint", 3, DEC_CLASSES, TRINOMIAL),
+    _entry("bipolar-joint", 2, DEC_CLASSES, BIPOLAR),
+    _entry("scalar-joint", 1, DEC_CLASSES, SCALAR),
+    _entry("scalar-slot", 1, _SLOT_CLASSES, SCALAR),
+    _entry("bipolar-slot", 2, _SLOT_CLASSES, BIPOLAR),
+    _entry("factored-slot", 2, _SLOT_CLASSES, FACTORED),
+    _entry(
+        "tail-slot", 1, _SLOT_CLASSES, None, extras=_TAIL_KEYS,
+        reason=(
+            "its private q_tail.* and q_tail_ln.* forward semantics live only "
+            "on retired branch 83e5f13, and a composition-parity test against "
+            "runnable historical code is not possible in this tree"
+        ),
+    ),
+    _entry(
+        "duel-slot", 1, _SLOT_CLASSES, None, extras=_DUEL_KEYS,
+        reason=(
+            "its private mlp_qbase.* forward semantics live only on retired "
+            "branch 4c8bed8, and a composition-parity test against runnable "
+            "historical code is not possible in this tree"
+        ),
+    ),
+)
+
+
+def _names(entries=FAMILIES) -> str:
+    return ", ".join(entry.name for entry in entries)
+
+
+def _unscoreable_message(entry: FamilyEntry) -> str:
+    return f"checkpoint family {entry.name!r} is not scoreable: {entry.reason}; {_COMPAT_REQUIREMENT}"
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedCheckpoint:
+    model: nn.Module
+    family: FamilyEntry
+    config: MantisConfig
+    composition: Composition
+    versions: Mapping[str, object]
+    iteration: int | None
+
+    @property
+    def metadata(self) -> dict[str, object]:
+        return {
+            "family": self.family.name,
+            "versions": dict(self.versions),
+            "iteration": self.iteration,
+            "composition": self.composition.flags,
+        }
+
+
+def load_checkpoint(
+    path: str | Path,
+    *,
+    family: str | None = None,
+    device: str | torch.device = "cpu",
+) -> LoadedCheckpoint:
+    """Identify, version-check, and load a production checkpoint for the lab."""
+
+    checkpoint_path = Path(path)
+    raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("model"), Mapping):
+        raise ValueError(f"{checkpoint_path} is not a production checkpoint with a model state dict")
+    state = raw["model"]
+    versions = raw.get("versions")
+    if not isinstance(versions, Mapping):
+        raise ValueError(f"checkpoint {checkpoint_path} has no versions mapping")
+
+    import hexo_py
+
+    for key, running in (
+        ("RULES_VERSION", hexo_py.RULES_VERSION),
+        ("ACTION_ORDER_VERSION", hexo_py.ACTION_ORDER_VERSION),
+    ):
+        stored = versions.get(key)
+        if stored != running:
+            raise ValueError(
+                f"checkpoint {key}={stored!r} does not match running hexo_py {key}={running!r}"
+            )
+
+    if family is not None:
+        matches = [entry for entry in FAMILIES if entry.name == family]
+        if not matches:
+            raise ValueError(f"unknown checkpoint family {family!r}; registered families: {_names()}")
+        entry = matches[0]
+        if not entry.claims(state):
+            candidates = [candidate for candidate in FAMILIES if candidate.claims(state)]
+            found = _names(candidates) if candidates else "none"
+            raise ValueError(
+                f"checkpoint does not structurally claim named family {family!r}; "
+                f"structural candidates: {found}"
+            )
+    else:
+        candidates = [entry for entry in FAMILIES if entry.claims(state)]
+        if not candidates:
+            raise ValueError(
+                f"checkpoint is not identifiable by the family registry ({_names()}); "
+                "see docs/LAB_SPEC.md for the compatibility contract"
+            )
+        if len(candidates) != 1:
+            raise ValueError(
+                f"checkpoint family is ambiguous among {_names(candidates)}; "
+                "pass --family with one of those candidates"
+            )
+        entry = candidates[0]
+
+    if not entry.scoreable:
+        raise ValueError(_unscoreable_message(entry))
+    config = infer_config(state)
+    model = entry.load(state, device)
+    assert entry.composition is not None
+    return LoadedCheckpoint(
+        model=model,
+        family=entry,
+        config=config,
+        composition=entry.composition,
+        versions=dict(versions),
+        iteration=raw.get("iteration"),
+    )
+
+
+def composition_evaluate(model, composition: Composition, cfg: KlentConfig):
+    """Build the production evaluator seam with an explicit composition."""
+
+    policy_q = _policy_q_fn(cfg)
+
+    def evaluate(batch):
+        with _gpu_lock:
+            moved = batch.to(cfg.device)
+            with torch.no_grad(), torch.autocast(
+                cfg.device, torch.bfloat16, enabled=cfg.autocast
+            ):
+                policy, critic = policy_q(model, moved)
+            return (
+                policy.float().cpu(),
+                composition.q_score(
+                    critic, moved.legal_offsets, cfg.mass_floor
+                ).cpu(),
+                composition.q_value(critic).cpu(),
+            )
+
+    return evaluate
+
+
+def family_evaluate(loaded: LoadedCheckpoint, cfg: KlentConfig):
+    return composition_evaluate(loaded.model, loaded.composition, cfg)

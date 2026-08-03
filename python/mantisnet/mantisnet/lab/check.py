@@ -12,8 +12,8 @@ import torch
 
 from ..builder import AXES, collate, from_position
 from ..klent import telemetry
-from ..klent.run import load_model
 from .cohort import CohortCase, corpus_cohort, selfplay_cohort
+from .families import load_checkpoint
 from .variants import VARIANTS, build_variant, variant_spec
 
 
@@ -229,6 +229,7 @@ def run_check(
     seed: int = 0,
     device: str = "cpu",
     compile: bool = False,
+    family: str | None = None,
 ) -> dict:
     """Load a checkpoint or fresh variant and run the contract battery."""
     if (checkpoint is None) == (variant is None):
@@ -237,10 +238,13 @@ def run_check(
         raise ValueError(f"envs must be positive and steps nonnegative, got {envs}, {steps}")
     if checkpoint is not None and model_kw:
         raise ValueError("model_kw applies only to a fresh --variant, not --checkpoint")
+    if checkpoint is None and family is not None:
+        raise ValueError("--family applies only with --checkpoint")
     if checkpoint is not None:
-        model = load_model(Path(checkpoint), device)
+        loaded = load_checkpoint(Path(checkpoint), family=family, device=device)
+        model = loaded.model
         spec = variant_spec("mantis")
-        identity = {"checkpoint": str(Path(checkpoint))}
+        identity = {"checkpoint": str(Path(checkpoint)), **loaded.metadata}
     else:
         if variant not in VARIANTS:
             raise ValueError(f"unknown variant {variant!r}; choose from {sorted(VARIANTS)}")

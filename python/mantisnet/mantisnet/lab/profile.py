@@ -10,10 +10,9 @@ import torch
 
 from ..attention import fused_attention
 from ..builder import collate_positions
-from ..klent.run import load_model
-from ..klent.train import KlentConfig, _policy_q, network_evaluate
-from ..model import compose_acting_q, compose_q
+from ..klent.train import KlentConfig, _policy_q
 from .cohort import corpus_cohort, selfplay_cohort
+from .families import family_evaluate, load_checkpoint
 
 
 def _sync(device: str) -> None:
@@ -29,7 +28,7 @@ def _elapsed(device: str, fn):
     return out, time.perf_counter() - start
 
 
-def _positions(model, *, corpus, split, envs, steps, seed, device, compile):
+def _positions(model, loaded, *, corpus, split, envs, steps, seed, device, compile):
     if envs <= 0 or steps < 0:
         raise ValueError(f"envs must be positive and steps nonnegative, got {envs}, {steps}")
     if corpus is not None:
@@ -42,7 +41,7 @@ def _positions(model, *, corpus, split, envs, steps, seed, device, compile):
     return selfplay_cohort(
         envs=envs,
         steps=steps,
-        evaluate=network_evaluate(model, cfg),
+        evaluate=family_evaluate(loaded, cfg),
         seed=seed,
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
@@ -147,13 +146,15 @@ def profile_trunk(
     seed: int = 0,
     device: str = "cpu",
     compile: bool = False,
+    family: str | None = None,
 ) -> dict:
     """Attribute replicated trunk blocks and enforce the drift detector."""
     if iters <= 0:
         raise ValueError(f"iters must be positive, got {iters}")
-    model = load_model(Path(checkpoint), device).eval()
+    loaded = load_checkpoint(Path(checkpoint), family=family, device=device)
+    model = loaded.model
     positions = _positions(
-        model,
+        model, loaded,
         corpus=corpus,
         split=split,
         envs=envs,
@@ -194,6 +195,7 @@ def profile_trunk(
             row[name] = row[name] / iters * 1e3
     report = {
         "mode": "trunk",
+        **loaded.metadata,
         "device": device,
         "positions": len(positions),
         "blocks": len(model.blocks),
@@ -223,13 +225,15 @@ def profile_decode(
     seed: int = 0,
     device: str = "cpu",
     compile: bool = False,
+    family: str | None = None,
 ) -> dict:
     """Attribute eager trunk/decoder time, then optional compiled total."""
     if iters <= 0:
         raise ValueError(f"iters must be positive, got {iters}")
-    model = load_model(Path(checkpoint), device).eval()
+    loaded = load_checkpoint(Path(checkpoint), family=family, device=device)
+    model = loaded.model
     positions = _positions(
-        model,
+        model, loaded,
         corpus=corpus,
         split=split,
         envs=envs,
@@ -272,6 +276,7 @@ def profile_decode(
     )
     report = {
         "mode": "decode",
+        **loaded.metadata,
         "device": device,
         "positions": len(positions),
         "eager": {
@@ -286,7 +291,7 @@ def profile_decode(
     return report
 
 
-def _seam_once(model, batch, cfg, policy_q):
+def _seam_once(model, batch, cfg, policy_q, composition):
     moved, transfer_s = _elapsed(cfg.device, lambda: batch.to(cfg.device))
 
     def forward():
@@ -300,8 +305,8 @@ def _seam_once(model, batch, cfg, policy_q):
     def compose_return():
         return (
             policy.float().cpu(),
-            compose_acting_q(critic, moved.legal_offsets, cfg.mass_floor).cpu(),
-            compose_q(critic).cpu(),
+            composition.q_score(critic, moved.legal_offsets, cfg.mass_floor).cpu(),
+            composition.q_value(critic).cpu(),
         )
 
     _out, compose_s = _elapsed(cfg.device, compose_return)
@@ -319,16 +324,18 @@ def profile_seam(
     seed: int = 0,
     device: str = "cpu",
     compile: bool = False,
+    family: str | None = None,
 ) -> dict:
     """Split the network-evaluation seam into transfer/forward/composition."""
     if iters <= 0:
         raise ValueError(f"iters must be positive, got {iters}")
-    model = load_model(Path(checkpoint), device).eval()
+    loaded = load_checkpoint(Path(checkpoint), family=family, device=device)
+    model = loaded.model
     cfg = KlentConfig(
         device=device, autocast=device == "cuda", compile=compile
     )
     positions = _positions(
-        model,
+        model, loaded,
         corpus=corpus,
         split=split,
         envs=envs,
@@ -341,9 +348,9 @@ def profile_seam(
 
     def measure(fn):
         sums = [0.0, 0.0, 0.0]
-        _seam_once(model, batch, cfg, fn)
+        _seam_once(model, batch, cfg, fn, loaded.composition)
         for _ in range(iters):
-            row = _seam_once(model, batch, cfg, fn)
+            row = _seam_once(model, batch, cfg, fn, loaded.composition)
             sums = [a + b for a, b in zip(sums, row)]
         return {
             "transfer_ms": sums[0] / iters * 1e3,
@@ -356,6 +363,7 @@ def profile_seam(
     compiled = measure(torch.compile(_policy_q, dynamic=True)) if compile else None
     report = {
         "mode": "seam",
+        **loaded.metadata,
         "device": device,
         "positions": len(positions),
         "eager": eager,

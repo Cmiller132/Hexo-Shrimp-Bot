@@ -1,4 +1,4 @@
-"""Probe the categorical critic's committed return mass on real workloads."""
+"""Probe a checkpoint family's committed return mass on real workloads."""
 
 from __future__ import annotations
 
@@ -9,10 +9,9 @@ import numpy as np
 import torch
 
 from ..builder import collate_positions
-from ..klent.run import load_model
-from ..klent.train import KlentConfig, network_evaluate
-from ..model import CRITIC_LOGITS, compose_acting_q, return_mass
+from ..klent.train import KlentConfig
 from .cohort import corpus_cohort, selfplay_cohort
+from .families import family_evaluate, load_checkpoint
 
 
 FLOORS = (0.1, 0.2, 0.3, 0.5)
@@ -58,13 +57,15 @@ def probe_mass(
     seed: int = 0,
     device: str = "cpu",
     compile: bool = False,
+    family: str | None = None,
 ) -> dict:
-    """Measure ``M = 1 - p_zero`` and acting-score floor sensitivity."""
+    """Measure the family's ``M`` and acting-score floor sensitivity."""
     if stride <= 0:
         raise ValueError(f"stride must be positive, got {stride}")
     if envs <= 0 or steps < 0:
         raise ValueError(f"envs must be positive and steps nonnegative, got {envs}, {steps}")
-    model = load_model(Path(checkpoint), device).eval()
+    loaded = load_checkpoint(Path(checkpoint), family=family, device=device)
+    model = loaded.model
     cfg = KlentConfig(
         device=device, autocast=device == "cuda", compile=compile
     )
@@ -72,7 +73,7 @@ def probe_mass(
         positions = selfplay_cohort(
             envs=envs,
             steps=steps,
-            evaluate=network_evaluate(model, cfg),
+            evaluate=family_evaluate(loaded, cfg),
             seed=seed,
             pair_budget=cfg.collect_pair_budget,
             cell_budget=cfg.collect_cell_budget,
@@ -85,13 +86,8 @@ def probe_mass(
     ):
         _s, w, g = model.trunk(batch)
         _policy, critic = model.cell_head_logits(w, g, batch)
-    if critic.shape[-1] != CRITIC_LOGITS or CRITIC_LOGITS != 3:
-        raise ValueError(
-            f"mass probe requires the trinomial critic, got shape {tuple(critic.shape)}"
-        )
-    positive, negative = return_mass(critic)
-    mass = positive + negative
-    q_value = positive - negative
+    mass = loaded.composition.mass(critic)
+    q_value = loaded.composition.q_value(critic)
     offsets = batch.legal_offsets.cpu().numpy()
     mass_np = mass.cpu().numpy()
     q_np = q_value.cpu().numpy()
@@ -108,7 +104,9 @@ def probe_mass(
     reference_score = None
     reference_top = None
     for floor in FLOORS:
-        score = compose_acting_q(critic, batch.legal_offsets, floor).cpu().numpy()
+        score = loaded.composition.q_score(
+            critic, batch.legal_offsets, floor
+        ).cpu().numpy()
         top = _segment_argmax(score, offsets)
         if floor == 0.2:
             reference_score = score
@@ -120,7 +118,9 @@ def probe_mass(
         }
     assert reference_score is not None and reference_top is not None
     for floor in FLOORS:
-        score = compose_acting_q(critic, batch.legal_offsets, floor).cpu().numpy()
+        score = loaded.composition.q_score(
+            critic, batch.legal_offsets, floor
+        ).cpu().numpy()
         top = _segment_argmax(score, offsets)
         row = sensitivity[f"{floor:g}"]
         row["top1_changed_vs_0.2"] = float(np.mean(top != reference_top))
@@ -130,6 +130,7 @@ def probe_mass(
 
     report = {
         "mode": "mass",
+        **loaded.metadata,
         "checkpoint": str(Path(checkpoint)),
         "device": device,
         "positions": len(positions),

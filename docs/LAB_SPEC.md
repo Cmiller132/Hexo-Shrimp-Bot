@@ -237,7 +237,7 @@ prefixes replayed through the engine.
 | `profile trunk` | Attribute replicated trunk stages and refuse drift from `model.trunk` |
 | `profile decode` | Attribute eager trunk and cell heads, optional compiled total, and decoder kernels |
 | `profile seam` | Attribute transfer, forward, and composition/return around network evaluation |
-| `mass` | Measure trinomial committed mass, Q/M behavior, and acting-floor sensitivity |
+| `mass` | Measure the loaded family's committed mass, Q/M behavior, and acting-floor sensitivity |
 | `check` | Run D6, batch-parity, decoder-coverage, and applicable Python/Rust builder contracts |
 | `smoke` | Run a tiny synthetic-telemetry freeze, CPU cell, evaluation, and report end to end |
 
@@ -247,3 +247,55 @@ uses `1e-6`. Decoder coverage requires one output per legal cell and identifies
 background cells exactly as legal cells belonging to no live window. A variant
 declaring the Rust path must match the independent Python builder field for
 field before it is eligible for training experiments.
+
+## 8. Production checkpoint families
+
+Every lab command that accepts `--checkpoint` loads through the ordered family
+registry. The registry identifies a checkpoint structurally from its complete
+model key set, native critic-readout width, and decoder-table row count. A named
+`--family` must itself claim the checkpoint. Zero matches refuse with the full
+registry and this compatibility contract; multiple matches refuse with all tied
+candidates and require `--family`. Stored `RULES_VERSION` and
+`ACTION_ORDER_VERSION` must equal the running engine. A differing
+`MODEL_REPR_VERSION` or Torch version is recorded but is not a reason to refuse
+measurement.
+
+Configuration is inferred from the state-dict tensors, never from current
+defaults: `h`, block count, attention heads and distance clamp, FFN factor,
+policy/value hidden widths, value-query count, and value-bin count all come from
+their corresponding shapes. Dropout is zero for evaluation. Three-row
+slot-class decoder tables are expanded at load time to the 93 joint classes;
+each joint row copies slot class `min(s, 5-s)` of either member of its reversal
+orbit. Native critic readouts are not transformed.
+
+The shipped families and their exact fp32 compositions are:
+
+| Family | Native critic | Decoder table | Q | M | Scoreable |
+| --- | --- | --- | --- | --- | --- |
+| `trinomial-joint` | 3 logits | 93 joint rows | `softmax(z)[+] - softmax(z)[-]` | `1 - softmax(z)[0]` | yes |
+| `bipolar-joint` | 2 logits | 93 joint rows | `sigmoid(z[+]) - sigmoid(z[-])` | `sigmoid(z[+]) + sigmoid(z[-])` | yes |
+| `scalar-joint` | 1 logit | 93 joint rows | `tanh(z)` | `abs(Q)` | yes |
+| `scalar-slot` | 1 logit | 3 slot rows | `tanh(z)` | `abs(Q)` | yes, after table expansion |
+| `bipolar-slot` | 2 logits | 3 slot rows | `sigmoid(z[+]) - sigmoid(z[-])` | `sigmoid(z[+]) + sigmoid(z[-])` | yes, after table expansion |
+| `factored-slot` | 2 logits | 3 slot rows | `(2*sigmoid(z_p)-1) * sigmoid(z_m)` | `sigmoid(z_m)` | yes, after table expansion |
+| `tail-slot` | 1 logit plus `q_tail.*`, `q_tail_ln.*` | 3 slot rows | unknown in this tree | unknown | no |
+| `duel-slot` | 1 logit plus `mlp_qbase.*` | 3 slot rows | unknown in this tree | unknown | no |
+
+`bipolar-slot` and `factored-slot` intentionally tie because their key sets and
+shapes are identical. Scoring either therefore requires its explicit family.
+`tail-slot` and `duel-slot` are named so refusal is stable and informative:
+their private forward semantics live only on retired branches `83e5f13` and
+`4c8bed8`, respectively, and no composition-parity test against runnable
+historical code is possible in this tree.
+
+For every scoreable family, acting uses
+`Q_tilde = Q / max(max_b M(s,b), mass_floor)`. This includes scalar families,
+where `M = abs(Q) <= 1`; it is documented semantics, not a special case.
+`v_hat` is the result of `improved_policy(policy, Q_tilde, Q, offsets, tau,
+lam).v_hat`. Production checkpoints never score the untrained state-value head.
+
+This registry is the checkpoint compatibility boundary. A new critic
+parameterization, decoder key, or head format must land with a family entry and
+a composition-parity test before its checkpoints are scoreable. Merely having
+loadable tensor shapes is insufficient. The named-but-unscoreable tail and duel
+families are the normative refusal example.

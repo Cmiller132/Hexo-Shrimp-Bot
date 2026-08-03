@@ -37,6 +37,7 @@ Core modules:
 | `losses` | Policy and distributional value losses |
 | `fitloop` | Loss-agnostic packed epoch engine shared by KLENT and lab cells |
 | `lab` | Frozen corpora, supervised cells, evaluation, reports, benchmarks, profiles, probes, and contract checks |
+| `lab.families` | Structural checkpoint-family registry, config inference, slot-table expansion, and historical critic composition |
 | `klent.improve` | Closed-form improved policy |
 | `klent.selfplay` | Persistent-slot collection and samples |
 | `klent.train` | Network evaluation, packing, collection, and fit |
@@ -288,6 +289,11 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
   exposing samples.
 - A lab cell is fresh-only: a nonempty cell directory is refused and there is
   no resume path. Every score identifies the exact corpus SHA.
+- Every lab `--checkpoint` consumer uses the family registry. Shipped scoreable
+  families are `trinomial-joint`, `bipolar-joint`, `scalar-joint`,
+  `scalar-slot`, `bipolar-slot`, and `factored-slot`; the shape-identical two-row
+  slot families require `--family`. `tail-slot` and `duel-slot` are identified
+  by name and refused until they have runnable composition-parity evidence.
 - Checkpoints contain model state, optimizer state, completed iteration, and
   NumPy RNG state.
 - A fresh run refuses a nonempty output directory.

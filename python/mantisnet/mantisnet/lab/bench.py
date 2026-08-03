@@ -18,6 +18,7 @@ from ..klent.improve import improved_policy
 from ..klent.selfplay import Collector, episode_samples
 from ..klent.train import KlentConfig, fit, network_evaluate
 from .cohort import corpus_cohort, selfplay_cohort
+from .families import family_evaluate, load_checkpoint
 from .variants import build_variant
 
 
@@ -68,16 +69,24 @@ def _load_or_fresh(
     device: str,
     model_kw: dict | None = None,
     seed: int = 0,
+    family: str | None = None,
 ):
     if checkpoint is not None:
         if model_kw:
             raise ValueError("model_kw applies only to fresh weights, not a checkpoint")
-        from ..klent.run import load_model
-
-        return load_model(Path(checkpoint), device)
+        loaded = load_checkpoint(Path(checkpoint), family=family, device=device)
+        return loaded.model, loaded
+    if family is not None:
+        raise ValueError("--family applies only with --checkpoint")
     torch.manual_seed(seed)
     model, _normalized, _spec = build_variant("mantis", model_kw or {})
-    return model.to(device).eval()
+    return model.to(device).eval(), None
+
+
+def _family_fields(loaded) -> dict:
+    if loaded is None:
+        return {}
+    return loaded.metadata
 
 
 def _positions(
@@ -89,13 +98,18 @@ def _positions(
     seed: int,
     corpus=None,
     split: str = "test",
+    loaded=None,
 ):
     if corpus is not None:
         return corpus_cohort(corpus, split=split, count=count, seed=seed)
     return selfplay_cohort(
         envs=count,
         steps=steps,
-        model=model,
+        evaluate=(
+            family_evaluate(loaded, cfg)
+            if loaded is not None
+            else network_evaluate(model, cfg)
+        ),
         seed=seed,
         device=cfg.device,
         compile=cfg.compile,
@@ -137,6 +151,7 @@ def bench_forward(
     device: str = "cpu",
     compile: bool = False,
     model_kw: dict | None = None,
+    family: str | None = None,
 ) -> dict:
     """Time Python build/collate, Rust build+collate, and model forward."""
     if batch_size <= 0 or iters <= 0 or cohort_steps < 0:
@@ -144,8 +159,8 @@ def bench_forward(
             "batch_size and iters must be positive and cohort_steps nonnegative"
         )
     cfg = _config(device, compile)
-    model = _load_or_fresh(
-        checkpoint, device=device, model_kw=model_kw, seed=seed
+    model, loaded = _load_or_fresh(
+        checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
     )
     positions = _positions(
         model=model,
@@ -155,6 +170,7 @@ def bench_forward(
         seed=seed,
         corpus=corpus,
         split=split,
+        loaded=loaded,
     )
 
     start = time.perf_counter()
@@ -195,6 +211,7 @@ def bench_forward(
 
     report = {
         "mode": "forward",
+        **_family_fields(loaded),
         "device": device,
         "positions": len(positions),
         "stones": sum(g.n_stones for g in graphs),
@@ -302,14 +319,21 @@ def _collect(
     cell_budget: int | None = None,
     model_kw: dict | None = None,
     emit: bool = True,
+    family: str | None = None,
 ):
     if games <= 0 or envs <= 0 or cap <= 0:
         raise ValueError(
             f"games, envs, and cap must be positive, got {games}, {envs}, {cap}"
         )
     cfg = _config(device, compile, pair_budget, cell_budget)
-    model = _load_or_fresh(checkpoint, device=device, model_kw=model_kw, seed=seed)
-    evaluate = network_evaluate(model, cfg)
+    model, loaded = _load_or_fresh(
+        checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
+    )
+    evaluate = (
+        family_evaluate(loaded, cfg)
+        if loaded is not None
+        else network_evaluate(model, cfg)
+    )
     collector = Collector(
         envs,
         cap,
@@ -331,6 +355,7 @@ def _collect(
     samples = sum(len(e.ranks) for e in episodes)
     report = {
         "mode": "collect",
+        **_family_fields(loaded),
         "device": device,
         "envs": envs,
         "games_quota": games,
@@ -376,10 +401,19 @@ def bench_fit(
     pair_budget: int | None = None,
     cell_budget: int | None = None,
     model_kw: dict | None = None,
+    family: str | None = None,
 ) -> dict:
     """Benchmark a production KLENT fit or one supervised corpus epoch."""
     cfg = _config(device, compile, pair_budget, cell_budget)
-    model = _load_or_fresh(checkpoint, device=device, model_kw=model_kw, seed=seed)
+    model, loaded = _load_or_fresh(
+        checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
+    )
+    if loaded is not None and loaded.family.name != "trinomial-joint":
+        raise ValueError(
+            "bench fit has only the current trinomial training objective; "
+            f"checkpoint family {loaded.family.name!r} is scoreable but its "
+            "historical fitting loss is outside the lab family contract"
+        )
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     if corpus is None:
         model, cfg, episodes, _ = _collect(
@@ -394,6 +428,7 @@ def bench_fit(
             cell_budget=cell_budget,
             model_kw=model_kw,
             emit=False,
+            family=family,
         )
         optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
         samples = [
@@ -444,6 +479,7 @@ def bench_fit(
     seconds = time.perf_counter() - start
     report = {
         "mode": "fit",
+        **_family_fields(loaded),
         "source": source,
         "device": device,
         "samples": sample_count,
@@ -481,6 +517,7 @@ def bench_sweep(
     pair_budget: int | None = None,
     cell_budget: int | None = None,
     model_kw: dict | None = None,
+    family: str | None = None,
 ) -> dict:
     """Measure collate/forward/improve+sample over depth × cohort size."""
     if iters <= 0:
@@ -490,8 +527,14 @@ def bench_sweep(
     if not cohorts or any(int(cohort) <= 0 for cohort in cohorts):
         raise ValueError(f"cohorts must be a nonempty sequence of positive values: {cohorts}")
     cfg = _config(device, compile, pair_budget, cell_budget)
-    model = _load_or_fresh(checkpoint, device=device, model_kw=model_kw, seed=seed)
-    evaluate = network_evaluate(model, cfg)
+    model, loaded = _load_or_fresh(
+        checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
+    )
+    evaluate = (
+        family_evaluate(loaded, cfg)
+        if loaded is not None
+        else network_evaluate(model, cfg)
+    )
     rows = []
     for depth in depths:
         pool = selfplay_cohort(
@@ -549,6 +592,11 @@ def bench_sweep(
                     "peak_vram_gib": _vram_peak_gib(device),
                 }
             )
-    report = {"mode": "sweep", "device": device, "rows": rows}
+    report = {
+        "mode": "sweep",
+        **_family_fields(loaded),
+        "device": device,
+        "rows": rows,
+    }
     print(json.dumps(report, indent=2))
     return report

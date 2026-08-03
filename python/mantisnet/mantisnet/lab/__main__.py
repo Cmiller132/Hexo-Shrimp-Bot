@@ -28,6 +28,7 @@ def _cohort(parser: argparse.ArgumentParser, *, checkpoint_required=False) -> No
     parser.add_argument(
         "--checkpoint", required=checkpoint_required, help="production KLENT checkpoint"
     )
+    parser.add_argument("--family", help="explicit checkpoint family when structurally ambiguous")
     parser.add_argument("--corpus", help="frozen corpus path or name")
     parser.add_argument("--split", choices=("train", "val", "test"), default="test")
     parser.add_argument("--envs", type=int, default=16, help="cohort position count")
@@ -84,6 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--corpus", required=True, help="frozen corpus path or name")
     evaluate.add_argument("--split", choices=("train", "val", "test"), default="test")
     evaluate.add_argument("--out", help="required for a production checkpoint")
+    evaluate.add_argument("--family", help="explicit checkpoint family when structurally ambiguous")
     evaluate.add_argument("--tau", type=float, default=0.1)
     evaluate.add_argument("--lam", type=float, default=0.01)
     evaluate.add_argument("--mass-floor", type=float, default=0.2)
@@ -99,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     forward = bench_modes.add_parser("forward", help="builder and model forward")
     forward.add_argument("--checkpoint")
+    forward.add_argument("--family")
     forward.add_argument("--corpus")
     forward.add_argument("--split", choices=("train", "val", "test"), default="test")
     forward.add_argument("--batch", dest="batch_size", type=int, default=64)
@@ -110,6 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     collect = bench_modes.add_parser("collect", help="instrument Collector.collect")
     collect.add_argument("--checkpoint")
+    collect.add_argument("--family")
     collect.add_argument("--games", type=int, default=32)
     collect.add_argument("--envs", type=int, default=16)
     collect.add_argument("--cap", type=int, default=512)
@@ -121,6 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     fit = bench_modes.add_parser("fit", help="benchmark a production fit epoch")
     fit.add_argument("--checkpoint")
+    fit.add_argument("--family")
     fit.add_argument("--corpus")
     fit.add_argument("--split", choices=("train", "val", "test"), default="train")
     fit.add_argument("--games", type=int, default=32)
@@ -134,6 +139,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sweep = bench_modes.add_parser("sweep", help="depth by cohort-size stage grid")
     sweep.add_argument("--checkpoint")
+    sweep.add_argument("--family")
     sweep.add_argument("--depths", type=int, nargs="+", default=(20, 50, 100))
     sweep.add_argument("--cohorts", type=int, nargs="+", default=(16, 64))
     sweep.add_argument("--iters", type=int, default=3)
@@ -150,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
         _cohort(mode, checkpoint_required=True)
         mode.add_argument("--iters", type=int, default=5)
 
-    mass = commands.add_parser("mass", help="probe trinomial critic committed mass")
+    mass = commands.add_parser("mass", help="probe checkpoint-family critic mass")
     _cohort(mass, checkpoint_required=True)
     mass.set_defaults(envs=32, steps=64)
     mass.add_argument("--stride", type=int, default=16)
@@ -159,6 +165,7 @@ def build_parser() -> argparse.ArgumentParser:
     check_target = check.add_mutually_exclusive_group(required=True)
     check_target.add_argument("--checkpoint")
     check_target.add_argument("--variant")
+    check.add_argument("--family")
     _model_kw(check)
     check.add_argument("--corpus")
     check.add_argument("--split", choices=("train", "val", "test"), default="test")
@@ -266,10 +273,12 @@ def main(argv=None) -> None:
             mass_floor=args.mass_floor,
         )
         if args.cell:
+            if args.family:
+                parser.error("--family applies only with --checkpoint")
             result = evaluate_cell(args.cell, corpus, **common)
         else:
             result = evaluate_checkpoint(
-                args.checkpoint, corpus, out=args.out, **common
+                args.checkpoint, corpus, out=args.out, family=args.family, **common
             )
         _json(result)
         return

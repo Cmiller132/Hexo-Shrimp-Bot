@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import json
 import os
@@ -12,9 +13,9 @@ import numpy as np
 import torch
 
 from ..klent.improve import improved_policy
-from ..klent.run import load_model
 from ..klent.train import KlentConfig, _gpu_lock
 from ..model import compose_acting_q, compose_q
+from .families import Composition, load_checkpoint
 from .corpus import FrozenCorpus
 from .train import (
     _as_corpus,
@@ -129,6 +130,7 @@ def evaluate_model(
     mass_floor: float = 0.2,
     pair_budget: int = KlentConfig.collect_pair_budget,
     cell_budget: int = KlentConfig.collect_cell_budget,
+    composition: Composition | None = None,
 ) -> dict[str, object]:
     """Return metric blocks for an already-loaded model, without writing."""
 
@@ -192,8 +194,16 @@ def evaluate_model(
             policy, critic, state_value = forward(model, batch)
         policy = policy.float()
         critic = critic.float()
-        q_score = compose_acting_q(critic, batch.legal_offsets, mass_floor)
-        q_value = compose_q(critic)
+        q_score = (
+            composition.q_score(critic, batch.legal_offsets, mass_floor)
+            if composition is not None
+            else compose_acting_q(critic, batch.legal_offsets, mass_floor)
+        )
+        q_value = (
+            composition.q_value(critic)
+            if composition is not None
+            else compose_q(critic)
+        )
         improved = improved_policy(
             policy, q_score, q_value, batch.legal_offsets, tau, lam
         )
@@ -231,6 +241,18 @@ def evaluate_model(
             "state_value_scored": include_state_value,
             "autocast": use_autocast,
             "compile": compile,
+            "composition": (
+                composition.flags
+                if composition is not None
+                else {
+                    "name": "trinomial",
+                    "native_logits": 3,
+                    "q_value": "softmax(z)[+] - softmax(z)[-]",
+                    "mass": "1 - softmax(z)[0]",
+                    "acting_score": "Q / max(max_b M(s,b), mass_floor)",
+                    "fp32": True,
+                }
+            ),
         },
         "imitation": _imitation_block(top1, top3, masks),
         "horizon": horizon,
@@ -245,14 +267,23 @@ def _write_scores(path: Path, scores: dict[str, object]) -> None:
     )
 
 
-def _checkpoint_metadata(path: Path, kind: str, versions: Mapping[str, object], count: int):
-    return {
+def _checkpoint_metadata(
+    path: Path,
+    kind: str,
+    versions: Mapping[str, object],
+    count: int,
+    iteration: int | None = None,
+):
+    metadata = {
         "kind": kind,
         "path": str(path.resolve()),
         "sha256": _sha256(path),
         "versions": dict(versions),
         "param_count": count,
     }
+    if iteration is not None:
+        metadata["iteration"] = iteration
+    return metadata
 
 
 def evaluate_cell(
@@ -349,15 +380,15 @@ def evaluate_checkpoint(
     tau: float = 0.1,
     lam: float = 0.01,
     mass_floor: float = 0.2,
+    family: str | None = None,
 ) -> dict[str, object]:
     """Score a production KLENT checkpoint; ``out`` is mandatory."""
 
     if out is None:
         raise ValueError("--out is required when evaluating a production checkpoint")
     checkpoint_path = Path(checkpoint)
-    raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    versions = raw.get("versions")
-    model = load_model(checkpoint_path, device=device)
+    loaded = load_checkpoint(checkpoint_path, family=family, device=device)
+    model = loaded.model
     parameter_count = count_parameters(model)
     frozen = _as_corpus(corpus)
     blocks = evaluate_model(
@@ -372,16 +403,23 @@ def evaluate_checkpoint(
         tau=tau,
         lam=lam,
         mass_floor=mass_floor,
+        composition=loaded.composition,
     )
     scores = {
         "scores_format": 1,
         "variant": "mantis",
-        "model_kw": {},
+        "model_kw": dataclasses.asdict(loaded.config),
+        "family": loaded.family.name,
+        "composition": loaded.composition.flags,
         "seed": None,
         "corpus": {"name": frozen.name, "sha256": frozen.sha256},
         "split": split,
         "checkpoint": _checkpoint_metadata(
-            checkpoint_path, "production_klent", versions, parameter_count
+            checkpoint_path,
+            "production_klent",
+            loaded.versions,
+            parameter_count,
+            loaded.iteration,
         ),
         **blocks,
     }

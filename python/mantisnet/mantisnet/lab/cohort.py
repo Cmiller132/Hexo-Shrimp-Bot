@@ -78,7 +78,13 @@ def selfplay_cohort(
 
             torch.manual_seed(seed)
             model = MantisNet(MantisConfig()).to(device).eval()
-        evaluate = network_evaluate(model, cfg)
+        composition = getattr(model, "family_composition", None)
+        if composition is None:
+            evaluate = network_evaluate(model, cfg)
+        else:
+            from .families import composition_evaluate
+
+            evaluate = composition_evaluate(model, composition, cfg)
 
     collector = Collector(
         envs=envs,
