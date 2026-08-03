@@ -294,11 +294,19 @@ def run_training(
             if metrics.get("eval_results"):
                 rendered = []
                 for result in metrics["eval_results"]:
-                    rendered.append(
+                    entry = (
                         f"{result['opponent_name']} {result['win_rate']:.3f} "
                         f"({result['capped']}/{result['games']} capped, "
                         f"{result['forfeits']} forfeits)"
                     )
+                    # Head-to-head entries carry the paired figures the
+                    # anchors cannot have; an unbounded Elo stays absent.
+                    if result.get("elo") is not None:
+                        entry += (
+                            f" elo {result['elo']:+.0f}"
+                            f" p {result['sign_test_p']:.4f}"
+                        )
+                    rendered.append(entry)
                 line += " | eval " + "; ".join(rendered)
             print(line, flush=True)
 
@@ -411,6 +419,19 @@ def main(argv=None) -> None:
         help="model Gumbel line-search simulations (0 = policy argmax)",
     )
     ap.add_argument(
+        "--h2h-ref", type=Path, default=None,
+        help=(
+            "checkpoint for an in-driver paired head-to-head every "
+            "--eval-every iterations: the resolution instrument, since two "
+            "independent anchored scores cannot separate what one paired "
+            "match can"
+        ),
+    )
+    ap.add_argument(
+        "--h2h-pairs", type=int, default=64,
+        help="shared openings per head-to-head, each played from both seats",
+    )
+    ap.add_argument(
         "--starve-limit", type=int, default=10,
         help="stop after N consecutive starved iterations (0 = never)",
     )
@@ -428,14 +449,23 @@ def main(argv=None) -> None:
         args.eval_every > 0
         and args.sealbot is None
         and args.eval_seat is None
+        and args.h2h_ref is None
     ):
-        raise SystemExit("--eval-every > 0 needs --sealbot and/or --eval-seat")
+        raise SystemExit(
+            "--eval-every > 0 needs --sealbot, --eval-seat, and/or --h2h-ref"
+        )
     if args.eval_depth is not None and args.eval_depth < 1:
         raise SystemExit("--eval-depth must be >= 1")
     if args.eval_time <= 0:
         raise SystemExit("--eval-time must be > 0")
     if args.eval_sims < 0:
         raise SystemExit("--eval-sims must be >= 0")
+    if args.h2h_ref is not None and args.eval_every <= 0:
+        raise SystemExit("--h2h-ref plays at eval boundaries; it needs --eval-every > 0")
+    if args.h2h_pairs < 2:
+        raise SystemExit(
+            "--h2h-pairs must be >= 2: one pair has no paired spread to estimate"
+        )
     if args.resume and args.init_from is not None:
         raise SystemExit("--resume and --init-from are exclusive")
 
@@ -516,6 +546,9 @@ def main(argv=None) -> None:
         }
         if args.eval_seat
         else None,
+        "h2h": {"ref": str(args.h2h_ref), "pairs": args.h2h_pairs}
+        if args.h2h_ref
+        else None,
         "seed": args.seed,
         "init_from": str(args.init_from) if args.init_from else None,
         "versions": _versions(),
@@ -539,6 +572,9 @@ def main(argv=None) -> None:
         }
         if args.eval_seat
         else None,
+        "h2h": {"ref": str(args.h2h_ref), "pairs": args.h2h_pairs}
+        if args.h2h_ref
+        else None,
         "starve_limit": args.starve_limit,
         "init_from": str(args.init_from) if args.init_from else None,
         "seed": args.seed,
@@ -558,6 +594,30 @@ def main(argv=None) -> None:
         from .search import gumbel_choose
         from .sealbot import record_match
         from .train import network_evaluate
+
+        h2h = None
+        if args.h2h_ref is not None:
+            from .headtohead import _audit, driver_match
+
+            # The audit pins what the reference *is* — digest and iteration —
+            # so the opponents row is a strength-defining record, not a path.
+            audit = _audit(args.h2h_ref, "--h2h-ref")
+            h2h = {
+                "model": load_model(args.h2h_ref, cfg.device),
+                "name": f"h2h:{args.h2h_ref.parent.name}/{args.h2h_ref.stem}",
+                "config": {
+                    "checkpoint": str(args.h2h_ref),
+                    "sha256": audit["sha256"],
+                    "iteration": audit["iteration"],
+                    "pairs": args.h2h_pairs,
+                    "sims": args.eval_sims,
+                    "tau": cfg.tau,
+                    "lam": cfg.lam,
+                    "temperature": 1.0,
+                    "opening_range": [2, 6],
+                    "ply_cap": cfg.ply_cap,
+                },
+            }
 
         def evaluate_fn(m, done, telemetry):
             # Evaluation derives its RNG from (run seed, completed iteration).
@@ -607,6 +667,44 @@ def main(argv=None) -> None:
                         "capped": result["capped"],
                         "games": result["games"],
                         "forfeits": result["forfeits"],
+                    }
+                )
+            if h2h is not None:
+                result, per_game, stats = driver_match(
+                    m,
+                    h2h["model"],
+                    h2h["name"],
+                    h2h["config"],
+                    cfg=cfg,
+                    pairs=args.h2h_pairs,
+                    sims=args.eval_sims,
+                    tau=cfg.tau,
+                    lam=cfg.lam,
+                    ply_cap=cfg.ply_cap,
+                    # The same derivation as the anchors: adding or removing
+                    # an opponent perturbs no other opponent's schedule.
+                    rng=np.random.default_rng([args.seed, done]),
+                )
+                record_match(
+                    telemetry, result, per_game, source="driver", iteration=done
+                )
+                results.append(
+                    {
+                        "opponent_name": result["opponent_name"],
+                        "opponent_config": result["opponent_config"],
+                        "score": result["score"],
+                        "win_rate": result["win_rate"],
+                        "capped": result["capped"],
+                        "games": result["games"],
+                        "forfeits": result["forfeits"],
+                        # The paired figures are what this opponent exists
+                        # for; anchors have no analogue, so only h2h entries
+                        # carry them.
+                        "elo": result["elo"],
+                        "elo_lo": result["elo_lo"],
+                        "elo_hi": result["elo_hi"],
+                        "sign_test_p": stats["sign_test_p"],
+                        "pair_counts": stats["pair_counts"],
                     }
                 )
             return {"eval_results": results}

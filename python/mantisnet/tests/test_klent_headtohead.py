@@ -388,3 +388,87 @@ def test_head_to_head_refuses_a_file_that_is_not_a_checkpoint(checkpoints, tmp_p
     torch.save({"model": {}}, junk)
     with pytest.raises(ValueError, match="not a checkpoint"):
         _match(path_a, junk)
+
+
+# --- driver_match: the in-driver instrument over the same statistics ---
+
+
+def _driver_match(checkpoints, *, pairs=2, seed=7, **overrides):
+    from mantisnet.klent.headtohead import driver_match
+    from mantisnet.klent.run import load_model
+    from mantisnet.klent.train import KlentConfig
+
+    path_a, path_b = checkpoints
+    settings = dict(
+        cfg=KlentConfig(device="cpu"),
+        pairs=pairs,
+        sims=0,
+        tau=0.1,
+        lam=0.01,
+        ply_cap=64,
+        rng=np.random.default_rng([seed]),
+    )
+    settings.update(overrides)
+    return driver_match(
+        load_model(path_a),
+        load_model(path_b),
+        "h2h:run2/checkpoint_002000",
+        {"checkpoint": str(path_b), "pairs": pairs},
+        **settings,
+    )
+
+
+def test_driver_match_records_through_the_real_telemetry_writer(
+    checkpoints, tmp_path
+):
+    """The result and games must fit ``write_eval_match`` as they are: the
+    contract is the database row, not a key list."""
+    from mantisnet.klent import telemetry as tel
+    from mantisnet.klent.sealbot import record_match
+
+    result, per_game, stats = _driver_match(checkpoints)
+    assert result["games"] == len(per_game) == 4
+    with tel.open_telemetry(tmp_path) as writer:
+        match_id = record_match(
+            writer, result, per_game, source="driver", iteration=50
+        )
+    import sqlite3
+
+    with sqlite3.connect(tmp_path / "telemetry.db") as db:
+        row = db.execute(
+            "SELECT games, win_rate, score_as_p0 + score_as_p1, forfeits"
+            " FROM eval_matches WHERE match_id = ?",
+            (match_id,),
+        ).fetchone()
+        games = db.execute(
+            "SELECT COUNT(*), SUM(model_seat) FROM games WHERE match = ?",
+            (match_id,),
+        ).fetchone()
+    assert row == (4, result["win_rate"], result["score"], 0)
+    # Pair-major seat swaps: two P0 games and two P1 games.
+    assert games == (4, 2)
+
+
+def test_driver_match_pairs_share_openings_and_swap_seats(checkpoints):
+    result, per_game, stats = _driver_match(checkpoints, pairs=3)
+    assert stats["pairs"] == 3 and result["games"] == 6
+    for k in range(0, 6, 2):
+        first, second = per_game[k], per_game[k + 1]
+        assert (first["seat"], second["seat"]) == (0, 1)
+        # One shared prefix per pair: the opening placements agree.
+        length = first["opening_len"]
+        assert second["opening_len"] == length
+        assert first["moves"][:length] == second["moves"][:length]
+
+
+def test_driver_match_is_deterministic_under_a_repeated_generator(checkpoints):
+    one = _driver_match(checkpoints, seed=13)
+    two = _driver_match(checkpoints, seed=13)
+    assert [g["moves"] for g in one[1]] == [g["moves"] for g in two[1]]
+    assert one[0]["score"] == two[0]["score"]
+    assert one[2]["d_mean"] == two[2]["d_mean"]
+
+
+def test_driver_match_refuses_a_single_pair(checkpoints):
+    with pytest.raises(ValueError, match="pairs >= 2"):
+        _driver_match(checkpoints, pairs=1)

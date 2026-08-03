@@ -30,6 +30,7 @@ Run from ``python/mantisnet``:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import math
@@ -236,6 +237,99 @@ def paired_statistics(pairs: list[list[dict]]) -> dict:
         else _finite(elo(min(1.0, score + Z * score_se))),
         "warnings": warnings,
     }
+
+
+def driver_match(
+    model,
+    ref_model,
+    ref_name: str,
+    ref_config: dict,
+    *,
+    cfg: KlentConfig,
+    pairs: int,
+    sims: int,
+    tau: float,
+    lam: float,
+    ply_cap: int,
+    rng: np.random.Generator,
+    temperature: float = 1.0,
+) -> tuple[dict, list[dict], dict]:
+    """The in-driver paired match: the live model against a fixed reference.
+
+    This is :func:`head_to_head`'s instrument on the training loop's cadence.
+    Both models are already in memory, so there is no checkpoint audit here —
+    the caller identifies the reference; ``ref_config`` is its strength-defining
+    record and travels into the ``opponents`` table unchanged.
+
+    One schedule of ``pairs`` shared openings plays as a single batched match,
+    so each lockstep step forwards every live game of a side at once rather
+    than two at a time — the offline tool optimizes per-pair reproducibility,
+    this one optimizes the GPU it is borrowing from training. Pairing is by
+    schedule structure (games ``2i`` and ``2i + 1`` share pair ``i``), which
+    one generator for the whole match does not disturb.
+
+    Returns ``(result, per_game, stats)``: the first two shaped exactly for
+    ``sealbot.record_match`` — the summary carries ``paired_statistics``' Elo,
+    whose interval comes from the paired standard error — and ``stats`` is the
+    full paired summary for the caller's own record.
+    """
+    if pairs < 2:
+        raise ValueError(
+            f"a driver match needs pairs >= 2 to estimate its paired spread, got {pairs}"
+        )
+    # Eager on both sides: the compiled callable is shared process-wide and
+    # keyed on the training model; evaluating a second architecture through it
+    # would recompile under the training loop.
+    eval_cfg = dataclasses.replace(cfg, compile=False)
+    choose_live, choose_ref = (
+        gumbel_choose(
+            network_evaluate(net, eval_cfg),
+            tau=tau,
+            lam=lam,
+            sims=sims,
+            temperature=temperature,
+        )
+        for net in (model, ref_model)
+    )
+
+    started = time.monotonic()
+    schedule = shared_openings(rng, pairs)
+    _summary, rows = play_match(choose_live, choose_ref, schedule, ply_cap, rng)
+    stats = paired_statistics([rows[k : k + 2] for k in range(0, len(rows), 2)])
+
+    per_game = [
+        {
+            "seat": row["seat"],
+            "winner": row["winner"],
+            "capped": row["capped"],
+            "forfeit": False,
+            "score": row["score_a"],
+            "opening_len": len(row["opening"]),
+            "depth_mean": None,
+            "moves": row["moves"],
+        }
+        for row in rows
+    ]
+    result = {
+        "score": stats["a_wins"],
+        "games": stats["games"],
+        "capped": stats["capped"],
+        "win_rate": stats["score"],
+        "ci_lo": stats["ci_lo"],
+        "ci_hi": stats["ci_hi"],
+        "elo": stats["elo"],
+        "elo_lo": stats["elo_lo"],
+        "elo_hi": stats["elo_hi"],
+        "score_as_p0": stats["score_as_p0"],
+        "score_as_p1": stats["score_as_p1"],
+        "forfeits": 0,
+        "opponent_name": ref_name,
+        "opponent_config": ref_config,
+        "opponent_depth_mean": None,
+        "avg_plies": sum(len(row["moves"]) for row in rows) / len(rows),
+        "seconds": time.monotonic() - started,
+    }
+    return result, per_game, stats
 
 
 def head_to_head(

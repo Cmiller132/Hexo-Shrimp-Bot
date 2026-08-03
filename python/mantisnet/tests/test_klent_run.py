@@ -320,3 +320,30 @@ def test_checkpoint_refuses_version_drift(tmp_path):
     torch.save(ckpt, path)
     with pytest.raises(ValueError, match="versions"):
         load_checkpoint(path, model, optimizer, rng)
+
+
+def test_h2h_flags_are_validated_before_any_work(tmp_path):
+    """Both refusals fire at argument time: no run directory, no model."""
+    base = ["--out", str(tmp_path / "run"), "--iterations", "1", "--device", "cpu"]
+    ref = str(tmp_path / "ref.pt")
+    with pytest.raises(SystemExit, match="--h2h-ref plays at eval boundaries"):
+        main(base + ["--h2h-ref", ref])
+    with pytest.raises(SystemExit, match="pairs must be >= 2"):
+        main(
+            base
+            + ["--h2h-ref", ref, "--eval-every", "25", "--h2h-pairs", "1"]
+        )
+    assert not (tmp_path / "run").exists()
+
+
+def test_h2h_ref_satisfies_the_eval_opponent_requirement(tmp_path):
+    """--eval-every with only --h2h-ref passes the opponent check and then
+    fails on the missing checkpoint, not on the flag combination."""
+    with pytest.raises(FileNotFoundError, match="--h2h-ref"):
+        main(
+            [
+                "--out", str(tmp_path / "run"), "--iterations", "1",
+                "--device", "cpu", "--eval-every", "25",
+                "--h2h-ref", str(tmp_path / "absent.pt"),
+            ]
+        )
