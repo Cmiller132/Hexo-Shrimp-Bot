@@ -12,6 +12,7 @@ from mantisnet.attention import (
     _FAILED_BACKWARD_SHAPES,
     _FAILED_SHAPES,
     _attention_reference,
+    _bucket_index,
     fused_attention,
 )
 
@@ -77,6 +78,19 @@ def _dist_bias(dtype: torch.dtype, seed: int) -> torch.Tensor:
     )
 
 
+def _axis_bias(dtype: torch.dtype, seed: int) -> torch.Tensor:
+    generator = torch.Generator(device=_DEVICE).manual_seed(seed)
+    return (
+        torch.randn(
+            (_HEADS, _D_MAX),
+            device=_DEVICE,
+            dtype=dtype,
+            generator=generator,
+        )
+        * 0.25
+    )
+
+
 def _dense_bias(
     coords: torch.Tensor, seq_lens: torch.Tensor, dist_bias: torch.Tensor
 ) -> torch.Tensor:
@@ -100,6 +114,70 @@ def _dense_bias(
         [dist_bias, dist_bias.new_full((_HEADS, 1), -3.0e4)], dim=1
     )
     return table[:, bucket.long()].permute(1, 0, 2, 3)
+
+
+def test_axis_bucket_semantics_are_hand_derived():
+    coords = torch.tensor(
+        [
+            [
+                [0, 0],
+                [0, 0],
+                [1, 0],
+                [0, 2],
+                [2, -2],
+                [2, 1],
+                [3, 0],
+                [4, 0],
+                [3, 1],
+                [1, 1],
+                [1, 0],
+            ]
+        ],
+        dtype=torch.int32,
+        device=_DEVICE,
+    )
+    seq_lens = torch.tensor([10], dtype=torch.int32, device=_DEVICE)
+
+    bucket, valid = _bucket_index(
+        coords, seq_lens, t=11, d_max=3, axis_mode=True
+    )
+
+    expected = (
+        ("R axis", 1, 2, 6),
+        ("Q axis", 1, 3, 7),
+        ("QR axis", 1, 4, 7),
+        ("off axis at clamp", 1, 5, 2),
+        ("axis at clamp", 1, 6, 8),
+        ("axis beyond clamp", 1, 7, 8),
+        ("off axis beyond clamp", 1, 8, 2),
+        ("self overrides axis", 2, 2, 3),
+        ("query token overrides axis", 0, 2, 4),
+        ("key token overrides axis", 2, 0, 4),
+        ("pad overrides axis", 1, 10, 5),
+        ("pad overrides token", 0, 10, 5),
+        ("pad overrides self", 10, 10, 5),
+    )
+    for name, query, key, literal_bucket in expected:
+        assert bucket[0, query, key].item() == literal_bucket, name
+    assert valid.tolist() == [
+        [True, True, True, True, True, True, True, True, True, True, False]
+    ]
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(_HEADS, 0), (_HEADS, _D_MAX - 1), (_HEADS + 1, _D_MAX)],
+)
+def test_public_attention_rejects_wrong_axis_shape(shape: tuple[int, int]):
+    p, t, d = 1, 2, 16
+    seq_lens = _seq_lens(p, t, ragged=False)
+    coords = _coords(p, t, seq_lens)
+    q, k, v = _qkv(p, t, d, torch.float16, seed=9_000)
+    dist_bias = _dist_bias(torch.float32, seed=9_001)
+    axis_bias = torch.zeros(shape, dtype=torch.float32, device=_DEVICE)
+
+    with pytest.raises(ValueError, match="axis_bias"):
+        fused_attention(q, k, v, coords, seq_lens, dist_bias, axis_bias)
 
 
 @pytest.mark.parametrize("p", [1, 3, 64])
@@ -328,6 +406,172 @@ def test_triton_gradients_match_reference_across_shape_grid(
                 f"{case_name}, P={p}, T={t}, D={d}, dtype={dtype}, {grad_name}: "
                 f"relative gradient error {relative:.6g}"
             )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("p", "t", "d"), _GRAD_SHAPES)
+def test_axis_triton_forward_and_gradients_match_reference_across_shape_grid(
+    p: int, t: int, d: int, dtype: torch.dtype
+):
+    q0, k0, v0 = _qkv(
+        p,
+        t,
+        d,
+        dtype,
+        seed=80_000 + p * 1000 + t * 10 + d,
+    )
+    bias0 = _dist_bias(torch.float32, seed=90_000 + p * 1000 + t * 10 + d)
+    axis0 = _axis_bias(
+        torch.float32, seed=100_000 + p * 1000 + t * 10 + d
+    )
+    generator = torch.Generator(device=_DEVICE).manual_seed(
+        110_000 + p * 1000 + t * 10 + d
+    )
+    upstream = torch.randn(
+        (p, _HEADS, t, d),
+        dtype=dtype,
+        device=_DEVICE,
+        generator=generator,
+    )
+
+    cases = [("dense", _seq_lens(p, t, ragged=False))]
+    ragged = _seq_lens(p, t, ragged=True)
+    if not torch.equal(ragged, cases[0][1]):
+        cases.append(("ragged", ragged))
+
+    for case_name, seq_lens in cases:
+        coords = _coords(p, t, seq_lens)
+        fast_inputs = [
+            x.detach().clone().requires_grad_()
+            for x in (q0, k0, v0, bias0, axis0)
+        ]
+        ref_inputs = [
+            x.detach().clone().requires_grad_()
+            for x in (q0, k0, v0, bias0, axis0)
+        ]
+
+        fast_out = fused_attention(
+            fast_inputs[0],
+            fast_inputs[1],
+            fast_inputs[2],
+            coords,
+            seq_lens,
+            fast_inputs[3],
+            fast_inputs[4],
+        )
+        fast_grads = torch.autograd.grad(
+            (fast_out * upstream).sum(), tuple(fast_inputs)
+        )
+
+        ref_out = _attention_reference(
+            ref_inputs[0],
+            ref_inputs[1],
+            ref_inputs[2],
+            coords,
+            seq_lens,
+            ref_inputs[3],
+            ref_inputs[4],
+        )
+        ref_grads = torch.autograd.grad(
+            (ref_out * upstream).sum(), tuple(ref_inputs)
+        )
+
+        torch.cuda.synchronize()
+        assert not _FAILED_SHAPES, _FAILED_SHAPES
+        assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
+        max_abs = (fast_out.float() - ref_out.float()).abs().max().item()
+        assert max_abs <= 2.0e-2, (
+            f"{case_name}, P={p}, T={t}, D={d}, dtype={dtype}: "
+            f"max abs diff {max_abs:.6g}"
+        )
+        for grad_name, actual, expected in zip(
+            ("q", "k", "v", "dist_bias", "axis_bias"),
+            fast_grads,
+            ref_grads,
+        ):
+            assert torch.isfinite(actual).all(), f"{case_name}: {grad_name}"
+            expected_float = expected.float()
+            denominator = expected_float.norm().clamp_min(1.0e-7)
+            relative = (
+                (actual.float() - expected_float).norm() / denominator
+            ).item()
+            assert relative <= 3.0e-2, (
+                f"{case_name}, P={p}, T={t}, D={d}, dtype={dtype}, {grad_name}: "
+                f"relative gradient error {relative:.6g}"
+            )
+
+
+def test_public_attention_reads_axis_rows():
+    p, t, d = 1, 4, 16
+    seq_lens = torch.tensor([t], dtype=torch.int32, device=_DEVICE)
+    coords = torch.tensor(
+        [[[0, 0], [0, 0], [1, 0], [2, 1]]],
+        dtype=torch.int32,
+        device=_DEVICE,
+    )
+    q = torch.zeros((p, _HEADS, t, d), dtype=torch.float16, device=_DEVICE)
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    v[..., :t] = torch.eye(t, dtype=torch.float16, device=_DEVICE)
+    dist_bias = torch.zeros(
+        (_HEADS, _D_MAX + 2), dtype=torch.float32, device=_DEVICE
+    )
+    axis_rows = 20.0 + torch.arange(
+        _D_MAX, dtype=torch.float32, device=_DEVICE
+    )
+    axis_bias = axis_rows.unsqueeze(0).expand(_HEADS, -1).clone()
+
+    with torch.no_grad():
+        expected = _attention_reference(
+            q, k, v, coords, seq_lens, dist_bias, axis_bias
+        )
+        actual = fused_attention(
+            q, k, v, coords, seq_lens, dist_bias, axis_bias
+        )
+        stock = fused_attention(q, k, v, coords, seq_lens, dist_bias)
+
+    torch.cuda.synchronize()
+    assert not _FAILED_SHAPES, _FAILED_SHAPES
+    max_abs = (actual.float() - expected.float()).abs().max().item()
+    assert max_abs <= 2.0e-2, f"max abs diff {max_abs:.6g}"
+    on_axis_query_diff = (
+        actual[:, :, 1].float() - stock[:, :, 1].float()
+    ).abs()
+    assert on_axis_query_diff.max().item() > 0.5
+
+
+def test_axis_bias_gradient_histogram_covers_present_rows():
+    p, t, d = 1, 4, 32
+    seq_lens = torch.tensor([t], dtype=torch.int32, device=_DEVICE)
+    coords = torch.tensor(
+        [[[0, 0], [0, 0], [1, 0], [20, 0]]],
+        dtype=torch.int32,
+        device=_DEVICE,
+    )
+    q = torch.zeros((p, _HEADS, t, d), dtype=torch.float16, device=_DEVICE)
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    v[..., :t] = torch.eye(t, dtype=torch.float16, device=_DEVICE)
+    dist_bias = torch.zeros(
+        (_HEADS, _D_MAX + 2), dtype=torch.float32, device=_DEVICE
+    )
+    axis_bias = torch.zeros(
+        (_HEADS, _D_MAX), dtype=torch.float32, device=_DEVICE, requires_grad=True
+    )
+    upstream = torch.zeros_like(q)
+    upstream[:, :, 1, 2:4] = 1
+
+    out = fused_attention(q, k, v, coords, seq_lens, dist_bias, axis_bias)
+    (grad,) = torch.autograd.grad((out * upstream).sum(), (axis_bias,))
+    torch.cuda.synchronize()
+
+    assert not _FAILED_SHAPES, _FAILED_SHAPES
+    assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
+    assert torch.isfinite(grad).all()
+    present = grad[:, [0, _D_MAX - 1]]
+    assert torch.count_nonzero(present).item() == present.numel()
+    absent = grad[:, 1 : _D_MAX - 1]
+    assert torch.equal(absent, torch.zeros_like(absent))
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

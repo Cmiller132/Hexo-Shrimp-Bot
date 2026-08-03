@@ -75,6 +75,7 @@ if triton is not None:
         n_ctx,
         sm_scale,
         D_MAX: tl.constexpr,
+        AXIS_MODE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -176,6 +177,9 @@ if triton is not None:
                     tl.maximum(tl.abs(dr), tl.abs(dq + dr)),
                 )
                 bucket = tl.minimum(tl.maximum(distance, 1), D_MAX) - 1
+                if AXIS_MODE:
+                    on_axis = (dq == 0) | (dr == 0) | (dq + dr == 0)
+                    bucket = tl.where(on_axis, D_MAX + 3 + bucket, bucket)
                 bucket = tl.where(
                     offs_m[:, None] == offs_n[None, :],
                     D_MAX,
@@ -324,10 +328,12 @@ if triton is not None:
         n_ctx,
         sm_scale,
         D_MAX: tl.constexpr,
+        AXIS_MODE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_BUCKETS: tl.constexpr,
+        TABLE_WIDTH: tl.constexpr,
     ):
         start_m = tl.program_id(0) * BLOCK_M
         off_ph = tl.program_id(1)
@@ -443,6 +449,13 @@ if triton is not None:
                     tl.maximum(tl.abs(coord_r), tl.abs(coord_q + coord_r)),
                 )
                 bucket = tl.minimum(tl.maximum(distance, 1), D_MAX) - 1
+                if AXIS_MODE:
+                    on_axis = (
+                        (coord_q == 0)
+                        | (coord_r == 0)
+                        | (coord_q + coord_r == 0)
+                    )
+                    bucket = tl.where(on_axis, D_MAX + 3 + bucket, bucket)
                 bucket = tl.where(
                     offs_m[:, None] == offs_n[None, :],
                     D_MAX,
@@ -469,7 +482,7 @@ if triton is not None:
                 ds = p * (dp - delta[:, None])
                 dq_acc += tl.dot(ds.to(k_ptr.dtype.element_ty), k) * sm_scale
 
-                for b in tl.static_range(0, D_MAX + 3):
+                for b in tl.static_range(0, TABLE_WIDTH):
                     bucket_grad = tl.sum(
                         tl.sum(tl.where(bucket == b, ds, 0.0), axis=1),
                         axis=0,
@@ -483,7 +496,7 @@ if triton is not None:
                 + off_h * stride_dth
                 + offs_b * stride_dtb,
                 dtable_acc,
-                mask=offs_b < D_MAX + 3,
+                mask=offs_b < TABLE_WIDTH,
             )
 
 
@@ -540,6 +553,7 @@ if triton is not None:
         n_ctx,
         sm_scale,
         D_MAX: tl.constexpr,
+        AXIS_MODE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -664,6 +678,13 @@ if triton is not None:
                     tl.maximum(tl.abs(coord_r), tl.abs(coord_q + coord_r)),
                 )
                 bucket = tl.minimum(tl.maximum(distance, 1), D_MAX) - 1
+                if AXIS_MODE:
+                    on_axis = (
+                        (coord_q == 0)
+                        | (coord_r == 0)
+                        | (coord_q + coord_r == 0)
+                    )
+                    bucket = tl.where(on_axis, D_MAX + 3 + bucket, bucket)
                 bucket = tl.where(
                     offs_m[:, None] == offs_n[None, :],
                     D_MAX,
@@ -703,19 +724,40 @@ if triton is not None:
             tl.store(dv_ptrs, dv_acc, mask=offs_n[:, None] < n_ctx)
 
 
-def _bias_table(q: Tensor, dist_bias: Tensor) -> Tensor:
-    """Cast the learned rows once and append the finite PAD sentinel."""
+def _bias_table(
+    q: Tensor, dist_bias: Tensor, axis_bias: Tensor | None = None
+) -> Tensor:
+    """Cast learned rows once and insert the finite PAD sentinel."""
+    if dist_bias.ndim != 2 or dist_bias.shape[1] < 3:
+        raise ValueError("dist_bias must have shape (A, d_max + 2) with d_max >= 1")
+    d_max = dist_bias.shape[1] - 2
+    if axis_bias is not None and axis_bias.shape != (dist_bias.shape[0], d_max):
+        raise ValueError("axis_bias must have shape (A, d_max)")
     table = dist_bias.to(q.dtype)
     pad = table.new_full((table.shape[0], 1), _PAD_BIAS)
-    return torch.cat((table, pad), dim=1)
+    parts = (table, pad)
+    if axis_bias is not None:
+        parts += (axis_bias.to(q.dtype),)
+    return torch.cat(parts, dim=1)
 
 
-def _bucket_index(coords: Tensor, seq_lens: Tensor, t: int, d_max: int):
+def _bucket_index(
+    coords: Tensor,
+    seq_lens: Tensor,
+    t: int,
+    d_max: int,
+    axis_mode: bool = False,
+):
     """The (P, T, T) bias-bucket index and (P, T) key validity."""
     dq = coords[:, :, None, 0] - coords[:, None, :, 0]
     dr = coords[:, :, None, 1] - coords[:, None, :, 1]
     distance = torch.maximum(dq.abs(), torch.maximum(dr.abs(), (dq + dr).abs()))
-    bucket = distance.clamp(1, d_max) - 1
+    base = distance.clamp(1, d_max) - 1
+    if axis_mode:
+        on_axis = (dq == 0) | (dr == 0) | (dq + dr == 0)
+        bucket = torch.where(on_axis, d_max + 3 + base, base)
+    else:
+        bucket = base
 
     rows = torch.arange(t, device=coords.device)
     bucket = torch.where(rows[:, None] == rows[None, :], d_max, bucket)
@@ -744,11 +786,12 @@ def _attention_reference_table(
     coords: Tensor,
     seq_lens: Tensor,
     table: Tensor,
+    d_max: int,
 ) -> Tensor:
     """The dense formulation used by CPU, failed launches, and recompute."""
     _, _, t, _ = q.shape
-    d_max = table.shape[1] - 3
-    bucket, valid = _bucket_index(coords, seq_lens, t, d_max)
+    axis_mode = table.shape[1] == 2 * d_max + 3
+    bucket, valid = _bucket_index(coords, seq_lens, t, d_max, axis_mode)
     mask = table[:, bucket.long()].permute(1, 0, 2, 3)
     return _apply_reference(q, k, v, mask, valid)
 
@@ -760,10 +803,18 @@ def _attention_reference(
     coords: Tensor,
     seq_lens: Tensor,
     dist_bias: Tensor,
+    axis_bias: Tensor | None = None,
 ) -> Tensor:
     """Reference attention with the checkpoint-compatible bias parameter."""
+    d_max = dist_bias.shape[1] - 2
     return _attention_reference_table(
-        q, k, v, coords, seq_lens, _bias_table(q, dist_bias)
+        q,
+        k,
+        v,
+        coords,
+        seq_lens,
+        _bias_table(q, dist_bias, axis_bias),
+        d_max,
     )
 
 
@@ -774,6 +825,7 @@ def _shape_key(
     coords: Tensor,
     seq_lens: Tensor,
     table: Tensor,
+    d_max: int,
 ) -> tuple[object, ...]:
     return (
         q.device.type,
@@ -787,6 +839,7 @@ def _shape_key(
         tuple(seq_lens.stride()),
         tuple(table.shape),
         tuple(table.stride()),
+        d_max,
     )
 
 
@@ -797,6 +850,7 @@ def _validate_inputs(
     coords: Tensor,
     seq_lens: Tensor,
     table: Tensor,
+    d_max: int,
 ) -> None:
     if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape:
         raise ValueError("q, k, and v must have the same (P, A, T, D) shape")
@@ -805,8 +859,18 @@ def _validate_inputs(
         raise ValueError("coords must be int32 with shape (P, T, 2)")
     if seq_lens.shape != (p,) or seq_lens.dtype != torch.int32:
         raise ValueError("seq_lens must be int32 with shape (P,)")
-    if table.ndim != 2 or table.shape[0] != heads or table.shape[1] < 4:
-        raise ValueError("bias table must have shape (A, d_max + 3)")
+    if d_max < 1:
+        raise ValueError("d_max must be at least 1")
+    table_widths = (d_max + 3, 2 * d_max + 3)
+    if (
+        table.ndim != 2
+        or table.shape[0] != heads
+        or table.shape[1] not in table_widths
+    ):
+        raise ValueError(
+            "bias table must have shape (A, d_max + 3) or "
+            "(A, 2 * d_max + 3)"
+        )
     tensors = (k, v, coords, seq_lens, table)
     if any(x.device != q.device for x in tensors):
         raise ValueError("all attention inputs must be on one device")
@@ -821,6 +885,7 @@ def _launch_triton(
     coords: Tensor,
     seq_lens: Tensor,
     table: Tensor,
+    d_max: int,
 ) -> tuple[Tensor, Tensor]:
     p, heads, t, head_dim = q.shape
     out = torch.empty_like(q)
@@ -846,7 +911,8 @@ def _launch_triton(
         heads,
         t,
         1.0 / math.sqrt(head_dim),
-        D_MAX=table.shape[1] - 3,
+        D_MAX=d_max,
+        AXIS_MODE=table.shape[1] == 2 * d_max + 3,
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
@@ -866,6 +932,7 @@ def _launch_triton_backward(
     out: Tensor,
     lse: Tensor,
     grad_out: Tensor,
+    d_max: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     p, heads, t, head_dim = q.shape
     delta = torch.empty((p, heads, t), dtype=torch.float32, device=q.device)
@@ -918,11 +985,13 @@ def _launch_triton_backward(
         heads,
         t,
         1.0 / math.sqrt(head_dim),
-        D_MAX=table.shape[1] - 3,
+        D_MAX=d_max,
+        AXIS_MODE=table.shape[1] == 2 * d_max + 3,
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
         BLOCK_BUCKETS=triton.next_power_of_2(table.shape[1]),
+        TABLE_WIDTH=table.shape[1],
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
@@ -952,7 +1021,8 @@ def _launch_triton_backward(
         heads,
         t,
         1.0 / math.sqrt(head_dim),
-        D_MAX=table.shape[1] - 3,
+        D_MAX=d_max,
+        AXIS_MODE=table.shape[1] == 2 * d_max + 3,
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
@@ -970,8 +1040,9 @@ def _fused_attention_op(
     coords: Tensor,
     seq_lens: Tensor,
     table: Tensor,
+    d_max: int,
 ) -> tuple[Tensor, Tensor]:
-    _validate_inputs(q, k, v, coords, seq_lens, table)
+    _validate_inputs(q, k, v, coords, seq_lens, table, d_max)
     supported = (
         triton is not None
         and q.is_cuda
@@ -979,15 +1050,19 @@ def _fused_attention_op(
         and q.shape[-1] in (16, 32, 64)
     )
     if not supported:
-        out = _attention_reference_table(q, k, v, coords, seq_lens, table)
+        out = _attention_reference_table(
+            q, k, v, coords, seq_lens, table, d_max
+        )
         return out, torch.empty(0, dtype=torch.float32, device=q.device)
 
-    key = _shape_key(q, k, v, coords, seq_lens, table)
+    key = _shape_key(q, k, v, coords, seq_lens, table, d_max)
     if key in _FAILED_SHAPES:
-        out = _attention_reference_table(q, k, v, coords, seq_lens, table)
+        out = _attention_reference_table(
+            q, k, v, coords, seq_lens, table, d_max
+        )
         return out, torch.empty(0, dtype=torch.float32, device=q.device)
     try:
-        return _launch_triton(q, k, v, coords, seq_lens, table)
+        return _launch_triton(q, k, v, coords, seq_lens, table, d_max)
     except Exception as exc:
         _FAILED_SHAPES[key] = f"{type(exc).__name__}: {exc}"
         warnings.warn(
@@ -997,7 +1072,9 @@ def _fused_attention_op(
             RuntimeWarning,
             stacklevel=2,
         )
-        out = _attention_reference_table(q, k, v, coords, seq_lens, table)
+        out = _attention_reference_table(
+            q, k, v, coords, seq_lens, table, d_max
+        )
         return out, torch.empty(0, dtype=torch.float32, device=q.device)
 
 
@@ -1009,6 +1086,7 @@ def _(
     coords: Tensor,
     seq_lens: Tensor,
     table: Tensor,
+    d_max: int,
 ) -> tuple[Tensor, Tensor]:
     supported = (
         triton is not None
@@ -1024,17 +1102,19 @@ def _(
 
 
 def _setup_context(ctx, inputs, output) -> None:
-    q, k, v, coords, seq_lens, table = inputs
+    q, k, v, coords, seq_lens, table, d_max = inputs
     out, lse = output
     ctx.save_for_backward(q, k, v, coords, seq_lens, table, out, lse)
+    ctx.d_max = d_max
     ctx.mark_non_differentiable(lse)
 
 
 def _backward(ctx, grad_out: Tensor):
     q, k, v, coords, seq_lens, table = ctx.saved_tensors
     t = q.shape[2]
-    d_max = table.shape[1] - 3
-    bucket, valid = _bucket_index(coords, seq_lens, t, d_max)
+    d_max = ctx.d_max
+    axis_mode = table.shape[1] == 2 * d_max + 3
+    bucket, valid = _bucket_index(coords, seq_lens, t, d_max, axis_mode)
     with torch.enable_grad():
         q_ = q.detach().requires_grad_(True)
         k_ = k.detach().requires_grad_(True)
@@ -1054,25 +1134,26 @@ def _backward(ctx, grad_out: Tensor):
     dtable = torch.stack(
         [
             (grads * (bucket == b).unsqueeze(1)).sum(dim=(0, 2, 3))
-            for b in range(d_max + 3)
+            for b in range(table.shape[1])
         ],
         dim=1,
     ).to(table.dtype)
-    return dq, dk, dv, None, None, dtable
+    return dq, dk, dv, None, None, dtable, None
 
 
 class _DenseBackwardContext:
-    def __init__(self, saved_tensors: tuple[Tensor, ...]) -> None:
+    def __init__(self, saved_tensors: tuple[Tensor, ...], d_max: int) -> None:
         self.saved_tensors = saved_tensors
+        self.d_max = d_max
 
 
 def _dense_backward_below_autograd(
-    saved_tensors: tuple[Tensor, ...], grad_out: Tensor
+    saved_tensors: tuple[Tensor, ...], d_max: int, grad_out: Tensor
 ):
     with torch._C._ForceDispatchKeyGuard(
         _DENSE_BACKWARD_INCLUDE_KEYS, _DENSE_BACKWARD_EXCLUDE_KEYS
     ):
-        return _backward(_DenseBackwardContext(saved_tensors), grad_out)
+        return _backward(_DenseBackwardContext(saved_tensors, d_max), grad_out)
 
 
 def _backward_shape_key(
@@ -1083,8 +1164,9 @@ def _backward_shape_key(
     seq_lens: Tensor,
     table: Tensor,
     grad_out: Tensor,
+    d_max: int,
 ) -> tuple[object, ...]:
-    return _shape_key(q, k, v, coords, seq_lens, table) + (
+    return _shape_key(q, k, v, coords, seq_lens, table, d_max) + (
         grad_out.dtype,
         tuple(grad_out.stride()),
     )
@@ -1101,27 +1183,31 @@ def _fused_attention_backward_op(
     out: Tensor,
     lse: Tensor,
     grad_out: Tensor,
+    d_max: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    _validate_inputs(q, k, v, coords, seq_lens, table, d_max)
     saved = (q, k, v, coords, seq_lens, table)
     # The outer autograd formula handles this branch in eager mode. Keep the
     # sentinel check inside the opaque op as well: a compiled graph may have
     # been traced for Triton before a runtime forward launch marks the shape
     # failed and returns the dense sentinel.
     if lse.numel() == 0:
-        dq, dk, dv, _, _, dtable = _dense_backward_below_autograd(
-            saved, grad_out
+        dq, dk, dv, _, _, dtable, _ = _dense_backward_below_autograd(
+            saved, d_max, grad_out
         )
         return dq, dk, dv, dtable
 
-    key = _backward_shape_key(q, k, v, coords, seq_lens, table, grad_out)
+    key = _backward_shape_key(
+        q, k, v, coords, seq_lens, table, grad_out, d_max
+    )
     if key in _FAILED_BACKWARD_SHAPES:
-        dq, dk, dv, _, _, dtable = _dense_backward_below_autograd(
-            saved, grad_out
+        dq, dk, dv, _, _, dtable, _ = _dense_backward_below_autograd(
+            saved, d_max, grad_out
         )
         return dq, dk, dv, dtable
     try:
         return _launch_triton_backward(
-            q, k, v, coords, seq_lens, table, out, lse, grad_out
+            q, k, v, coords, seq_lens, table, out, lse, grad_out, d_max
         )
     except Exception as exc:
         _FAILED_BACKWARD_SHAPES[key] = f"{type(exc).__name__}: {exc}"
@@ -1132,8 +1218,8 @@ def _fused_attention_backward_op(
             RuntimeWarning,
             stacklevel=2,
         )
-        dq, dk, dv, _, _, dtable = _dense_backward_below_autograd(
-            saved, grad_out
+        dq, dk, dv, _, _, dtable, _ = _dense_backward_below_autograd(
+            saved, d_max, grad_out
         )
         return dq, dk, dv, dtable
 
@@ -1149,6 +1235,7 @@ def _(
     out: Tensor,
     lse: Tensor,
     grad_out: Tensor,
+    d_max: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     return (
         torch.empty_like(q),
@@ -1160,15 +1247,18 @@ def _(
 
 def _dispatch_backward(ctx, grad_out: Tensor, _grad_lse: Tensor | None):
     q, k, v, coords, seq_lens, table, out, lse = ctx.saved_tensors
+    d_max = ctx.d_max
     if lse.numel() == 0:
         return _backward(
-            _DenseBackwardContext((q, k, v, coords, seq_lens, table)),
+            _DenseBackwardContext(
+                (q, k, v, coords, seq_lens, table), d_max
+            ),
             grad_out,
         )
     dq, dk, dv, dtable = _fused_attention_backward_op(
-        q, k, v, coords, seq_lens, table, out, lse, grad_out
+        q, k, v, coords, seq_lens, table, out, lse, grad_out, d_max
     )
-    return dq, dk, dv, None, None, dtable
+    return dq, dk, dv, None, None, dtable, None
 
 
 _fused_attention_op.register_autograd(
@@ -1183,9 +1273,17 @@ def fused_attention(
     coords: Tensor,
     seq_lens: Tensor,
     dist_bias: Tensor,
+    axis_bias: Tensor | None = None,
 ) -> Tensor:
     """Apply fused attention while retaining the checkpoint bias layout."""
+    d_max = dist_bias.shape[1] - 2
     out, _ = _fused_attention_op(
-        q, k, v, coords, seq_lens, _bias_table(q, dist_bias)
+        q,
+        k,
+        v,
+        coords,
+        seq_lens,
+        _bias_table(q, dist_bias, axis_bias),
+        d_max,
     )
     return out

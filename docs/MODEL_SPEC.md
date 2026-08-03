@@ -58,13 +58,15 @@ group D6, so the whole model is D6-invariant by construction (§8).
 | `P_H` | policy and action-value decoder MLP hidden width | 128 |
 | `V_H` | value MLP hidden width | 128 |
 | `DROPOUT` | dropout probability (trunk sub-blocks) | 0.0 |
+| `axis_bias` | enable the on-axis/off-axis attention-bias ablation | `False` |
+| `cell_pass` | enable the window-to-window shared-empty-cell ablation | `False` |
 
 Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
-slot classes = 3 and `DEC_CLASSES = 93` (§4.3), critic logits = 2, and
+slot classes = 3 and `DEC_CLASSES = 93` (§4.3), critic logits = 3, and
 `moves_remaining ∈ {1, 2}`.
 
-The default configuration has 1,272,868 parameters: 1,063,648 in the four
-trunk blocks and 209,220 across input/final parameters and the three heads.
+The default configuration has 1,272,997 parameters: 1,063,648 in the four
+trunk blocks and 209,349 across input/final parameters and the three heads.
 
 ---
 
@@ -133,11 +135,40 @@ aggregation.
 
 ### 4.1 Hex distance buckets
 
-For stones `i, j`: `d(i,j) = max(|Δq|, |Δr|, |Δq+Δr|)`, clamped to `D_MAX`.
-The attention bias table (§5.3) has, per head, one learned scalar per bucket
-`1..D_MAX`, plus two dedicated indices: `SELF` (i = j) and `TOKEN` (any pair
-involving the global token). Hex distance is D6-invariant, which is what
-makes the attention pathway symmetry-safe.
+For stones `i, j`, let `dq = q_i - q_j` and `dr = r_i - r_j`. Their distance is
+`d(i,j) = max(|dq|, |dr|, |dq+dr|)`, clamped to `D_MAX`. The stock attention
+bias (§5.3) has, per head, one learned scalar per distance bucket
+`1..D_MAX`, plus two dedicated learned indices: `SELF` (`i = j`) and `TOKEN`
+(either row is the global token). A non-parameter `PAD` column is appended at
+runtime for keys beyond a position's live prefix, giving the row layout
+
+```
+[ d=1..D_MAX | SELF | TOKEN | PAD ]
+```
+
+`MantisConfig.axis_bias` is an independently gated ablation axis. It is
+`False` by default and is off in production. When true, a pair is **on-axis**
+exactly when
+
+```
+dq == 0  or  dr == 0  or  dq + dr == 0.
+```
+
+The three geometric axes share one on-axis class; no axis identity is exposed.
+Each block then owns a separate learned `A × D_MAX` `axis_bias` parameter, in
+addition to the unchanged `A × (D_MAX + 2)` stock distance table. Its runtime
+row layout is
+
+```
+[ off-axis d=1..D_MAX | SELF | TOKEN | PAD | on-axis d=1..D_MAX ].
+```
+
+The distance clamp is applied before the on-axis remap. `SELF`, then `TOKEN`,
+then `PAD` override that remap in order, so later cases win and `PAD` remains
+at index `D_MAX + 2`. The axis rows initialize to zero, making the enabled
+variant functionally identical to stock at initialization. Both hex distance
+and the shared on-axis predicate are D6-invariant, so either table is
+symmetry-safe.
 
 ### 4.2 Nearest-stone buckets (background policy path)
 
@@ -210,6 +241,32 @@ W_w   = W_w + MLP_W( [ LN(W_w) ; agg_w ] )        # MLP_W: 2H → H → H, ReLU
 Aggregation is a sum, not a mean; the stone count remains represented in its
 magnitude.
 
+### 5.1b Window ← windows through shared empty cells
+
+`MantisConfig.cell_pass` enables an independently gated ablation axis. It is
+`False` by default and is off in production. When enabled, this step runs
+after §5.1 and before §5.2, so a stone reads fork-aware window embeddings in
+the same block.
+
+The builder's decoder incidence triples `(w, joint(a,w), a)` are the bipartite
+graph between every live window `w` and its empty cells `a`. For each triple:
+
+```
+X_w       = U_cp · LN_cp,in(W_w)
+m_{w,a}   = X_w + E_cp[joint(a,w)]
+C_a       = ReLU( Σ_{w ∋ a} m_{w,a} )
+agg_cp,w  = Σ_{a ∈ w, empty} C_a
+W_w       = W_w + MLP_cp( [ LN_cp,w(W_w) ; agg_cp,w ] )
+```
+
+`E_cp` has `DEC_CLASSES = 93` rows and `MLP_cp` is `2H → H → H` with ReLU.
+Both sums are accumulated in fp32 and are sums, not means: incidence count is
+signal. The per-cell ReLU is essential—it makes several strong windows meeting
+at one particular cell a nonlinear conjunction rather than reducing the two
+scatters to a linear co-incidence operator. A background cell has no incidence,
+stays zero, and contributes nothing back. The cell activations are transient
+scatter buffers, not persistent empty-cell nodes.
+
 ### 5.2 Stone ← windows
 
 For each stone `i`, over the (≤ 18) windows containing it:
@@ -253,7 +310,7 @@ For each legal cell `a`:
   h_a^p          = Σ_{w ∋ a, live} ( P_W · W_w + E_pw[joint(a, w)] )
   h_a^q          = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[joint(a, w)] )  # ≤ 18 terms
   policy_logit   = MLP_P( [ h_a^p ; g ] )          # 2H → P_H → 1, ReLU
-  [z_pos, z_neg] = MLP_Q( [ h_a^q ; g ] )          # 2H → P_H → 2, ReLU
+  [z_pos, z_neg, z_zero] = MLP_Q( [ h_a^q ; g ] )  # 2H → P_H → 3, ReLU
   ```
 
   `joint(a, w)` is §4.3's joint class of `w`'s occupancy mask and `a`'s slot
@@ -269,11 +326,11 @@ For each legal cell `a`:
   h_a^p          = E_bg[ nearest-stone bucket(a) ]    # §4.2
   h_a^q          = E_qbg[ nearest-stone bucket(a) ]
   policy_logit   = MLP_P( [ h_a^p ; g ] )             # same policy MLP
-  [z_pos, z_neg] = MLP_Q( [ h_a^q ; g ] )             # same critic MLP
+  [z_pos, z_neg, z_zero] = MLP_Q( [ h_a^q ; g ] )     # same critic MLP
   ```
 
-The policy logit is exported raw. Appendix B defines how the critic's two
-logits compose into `Q(s,a)` and how they are trained.
+The policy logit is exported raw. Appendix B defines how the critic's three
+categorical logits compose into `Q(s,a)` and how they are trained.
 
 Both heads score **single placements**. The two-placements-per-turn
 structure enters only through the token's `moves_remaining` input; pairing

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -211,9 +212,30 @@ def test_infer_config_recovers_a_nondefault_deep_shape_exactly():
     assert infer_config(MantisNet(cfg).state_dict()) == cfg
 
 
+@pytest.mark.parametrize(
+    ("field", "variant_key"),
+    (
+        ("cell_pass", "blocks.0.e_cp.weight"),
+        ("axis_bias", "blocks.0.axis_bias"),
+    ),
+)
+def test_ablation_state_dicts_are_refused_by_family_registry(
+    tmp_path, field, variant_key
+):
+    cfg = replace(TINY, **{field: True})
+    state = _family_state("trinomial-joint", cfg=cfg)
+    assert variant_key in state
+
+    path = tmp_path / f"{field}.pt"
+    torch.save({"model": state, "versions": _versions(), "iteration": 1}, path)
+    with pytest.raises(ValueError, match="not identifiable by the family registry"):
+        load_checkpoint(path)
+    with pytest.raises(ValueError, match="does not structurally claim named family"):
+        load_checkpoint(path, family="trinomial-joint")
+
+
 def test_unidentifiable_state_names_registry_and_contract(tmp_path):
     path = tmp_path / "unknown.pt"
     torch.save({"model": {"mystery": torch.zeros(1)}, "versions": _versions()}, path)
     with pytest.raises(ValueError, match="family registry.*trinomial-joint.*docs/LAB_SPEC.md"):
         load_checkpoint(path)
-

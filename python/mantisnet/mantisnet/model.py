@@ -40,6 +40,8 @@ class MantisConfig:
     policy_hidden: int = 128  # P_H
     value_hidden: int = 128  # V_H
     dropout: float = 0.0
+    axis_bias: bool = False
+    cell_pass: bool = False
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
@@ -161,6 +163,19 @@ class _Block(nn.Module):
         self.u = nn.Linear(h, h, bias=False)
         self.e_ws = nn.Embedding(3, h)
         self.mlp_w = _PairMlp(h, h, h)
+        # §5.1b window <- windows through their shared empty cells.
+        if cfg.cell_pass:
+            self.ln_cp_in = nn.LayerNorm(h)
+            self.u_cp = nn.Linear(h, h, bias=False)
+            self.e_cp = nn.Embedding(DEC_CLASSES, h)
+            self.ln_cp_w = nn.LayerNorm(h)
+            self.mlp_cp = _PairMlp(h, h, h)
+        else:
+            self.ln_cp_in = None
+            self.u_cp = None
+            self.e_cp = None
+            self.ln_cp_w = None
+            self.mlp_cp = None
         # §5.2 stone <- windows
         self.ln_sw_w = nn.LayerNorm(h)
         self.ln_sw_s = nn.LayerNorm(h)
@@ -174,11 +189,39 @@ class _Block(nn.Module):
         self.wv = nn.Linear(h, h)
         self.wo = nn.Linear(h, h)
         self.dist_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.d_max + 2))
+        self.axis_bias = (
+            nn.Parameter(torch.zeros(cfg.heads, cfg.d_max)) if cfg.axis_bias else None
+        )
         self.ln_ffn = nn.LayerNorm(h)
         self.ffn = nn.Sequential(
             nn.Linear(h, cfg.ffn_factor * h), nn.ReLU(), nn.Linear(cfg.ffn_factor * h, h)
         )
         self.drop = nn.Dropout(cfg.dropout)
+
+    def _cell_pass(self, w: Tensor, batch: Batch) -> Tensor:
+        """Update windows through the live-window/empty-cell incidence graph."""
+        if not self.cfg.cell_pass:
+            raise RuntimeError("cell pass is disabled for this block")
+        assert self.ln_cp_in is not None
+        assert self.u_cp is not None
+        assert self.e_cp is not None
+        assert self.ln_cp_w is not None
+        assert self.mlp_cp is not None
+
+        x = self.u_cp(self.ln_cp_in(w))
+        msg = x.index_select(0, batch.dec_window) + self.e_cp(batch.dec_class)
+        cells = torch.zeros(
+            batch.cell_pos.shape[0], w.shape[1], dtype=torch.float32, device=w.device
+        ).index_add_(0, batch.dec_cell, msg.float())
+        cells = F.relu(cells)
+        agg = torch.zeros(
+            w.shape[0], w.shape[1], dtype=torch.float32, device=w.device
+        ).index_add_(
+            0,
+            batch.dec_window,
+            cells.index_select(0, batch.dec_cell),
+        )
+        return w + self.drop(self.mlp_cp(self.ln_cp_w(w), agg.to(w.dtype)))
 
     def forward(
         self, s: Tensor, w: Tensor, g: Tensor, batch: Batch, seq_lens: Tensor
@@ -200,6 +243,9 @@ class _Block(nn.Module):
             w.shape[0],
         )
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
+
+        if cfg.cell_pass:
+            w = self._cell_pass(w, batch)
 
         # §5.2: stones aggregate their windows.
         y = self.v(self.ln_sw_w(w))
@@ -228,7 +274,9 @@ class _Block(nn.Module):
         # Coordinates become distance buckets inside the attention kernel.
         # Each position's key loop stops at its live prefix instead of doing
         # quadratic work over padding.
-        out = fused_attention(q, k, v, batch.coords, seq_lens, self.dist_bias)
+        out = fused_attention(
+            q, k, v, batch.coords, seq_lens, self.dist_bias, self.axis_bias
+        )
         out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(p * max_t, cfg.h)
         s = s + self.drop(out.index_select(0, batch.stone_slot))
         g = g + self.drop(out.index_select(0, token_slot))

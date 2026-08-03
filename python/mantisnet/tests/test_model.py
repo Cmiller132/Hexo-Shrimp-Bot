@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hexo_py
 import pytest
 import torch
+import torch.nn.functional as F
 
 from mantisnet import MantisConfig, MantisNet, collate, from_position
+from mantisnet.lab.variants import count_parameters
 from mantisnet.model import (
     CRITIC_LOGITS,
     compose_acting_q,
@@ -174,6 +177,167 @@ def test_dropout_config_runs_and_eval_is_deterministic(positions):
         a, b = net(batch, 0.2), net(batch, 0.2)
     assert torch.equal(a.policy_logits, b.policy_logits)
     assert torch.equal(a.value, b.value)
+
+
+def _stock_state_keys(blocks: int) -> set[str]:
+    top_level = {
+        "token_base",
+        "value_queries",
+        "stone_table.weight",
+        "window_table.weight",
+        "token_moves.weight",
+        "ln_out.weight",
+        "ln_out.bias",
+        "p.weight",
+        "e_pw.weight",
+        "e_bg.weight",
+        "q.weight",
+        "e_qw.weight",
+        "e_qbg.weight",
+        "ln_value.weight",
+        "ln_value.bias",
+    }
+    for head in ("mlp_p", "mlp_q"):
+        top_level.update(
+            {
+                f"{head}.lin_a.weight",
+                f"{head}.lin_a.bias",
+                f"{head}.lin_b.weight",
+                f"{head}.out.weight",
+                f"{head}.out.bias",
+            }
+        )
+    top_level.update(
+        {
+            "mlp_v.0.weight",
+            "mlp_v.0.bias",
+            "mlp_v.2.weight",
+            "mlp_v.2.bias",
+        }
+    )
+
+    block_suffixes = {
+        "ln_ws_s.weight",
+        "ln_ws_s.bias",
+        "ln_ws_w.weight",
+        "ln_ws_w.bias",
+        "u.weight",
+        "e_ws.weight",
+        "ln_sw_w.weight",
+        "ln_sw_w.bias",
+        "ln_sw_s.weight",
+        "ln_sw_s.bias",
+        "v.weight",
+        "e_sw.weight",
+        "ln_attn.weight",
+        "ln_attn.bias",
+        "dist_bias",
+        "ln_ffn.weight",
+        "ln_ffn.bias",
+        "ffn.0.weight",
+        "ffn.0.bias",
+        "ffn.2.weight",
+        "ffn.2.bias",
+    }
+    for mlp in ("mlp_w", "mlp_s"):
+        block_suffixes.update(
+            {
+                f"{mlp}.lin_a.weight",
+                f"{mlp}.lin_a.bias",
+                f"{mlp}.lin_b.weight",
+                f"{mlp}.out.weight",
+                f"{mlp}.out.bias",
+            }
+        )
+    for projection in ("wq", "wk", "wv", "wo"):
+        block_suffixes.update({f"{projection}.weight", f"{projection}.bias"})
+    return top_level | {
+        f"blocks.{block}.{suffix}"
+        for block in range(blocks)
+        for suffix in block_suffixes
+    }
+
+
+@torch.no_grad()
+def test_cell_pass_matches_literal_incidence_reference():
+    # P0's stones occupy two intersecting axes; the remote P1 stones only
+    # advance the turn so P0 can place both of them.
+    pos = hexo_py.Position.replay(
+        [(0, 0), (-8, 8), (-8, 9), (1, 0), (0, 1)]
+    )
+    batch = collate([from_position(pos)])
+    shared = torch.bincount(
+        batch.dec_cell, minlength=batch.cell_pos.shape[0]
+    )
+    assert (shared >= 2).any()
+
+    torch.manual_seed(19)
+    cfg = MantisConfig(
+        h=16,
+        blocks=1,
+        heads=2,
+        value_queries=2,
+        value_bins=5,
+        policy_hidden=16,
+        value_hidden=16,
+        cell_pass=True,
+    )
+    block = MantisNet(cfg).blocks[0].eval()
+    w = torch.randn(batch.window_feat.shape[0], cfg.h)
+
+    x = block.u_cp(block.ln_cp_in(w))
+    cells = torch.zeros(batch.cell_pos.shape[0], cfg.h, dtype=torch.float32)
+    entries = zip(
+        batch.dec_window.tolist(),
+        batch.dec_class.tolist(),
+        batch.dec_cell.tolist(),
+    )
+    for window, cls, cell in entries:
+        cells[cell] += (x[window] + block.e_cp.weight[cls]).float()
+    cells = F.relu(cells)
+    agg = torch.zeros(w.shape[0], cfg.h, dtype=torch.float32)
+    for window, cell in zip(batch.dec_window.tolist(), batch.dec_cell.tolist()):
+        agg[window] += cells[cell]
+    expected = w + block.drop(block.mlp_cp(block.ln_cp_w(w), agg.to(w.dtype)))
+
+    actual = block._cell_pass(w, batch)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@torch.no_grad()
+def test_cell_pass_default_preserves_stock_keys_and_forward(positions):
+    torch.manual_seed(23)
+    implicit = MantisNet(MantisConfig()).eval()
+    torch.manual_seed(23)
+    explicit = MantisNet(MantisConfig(cell_pass=False)).eval()
+
+    expected_keys = _stock_state_keys(implicit.cfg.blocks)
+    assert set(implicit.state_dict()) == expected_keys
+    assert set(explicit.state_dict()) == expected_keys
+    for implicit_parameter, explicit_parameter in zip(
+        implicit.parameters(), explicit.parameters(), strict=True
+    ):
+        assert torch.equal(implicit_parameter, explicit_parameter)
+
+    batch = collate([from_position(positions[3])])
+    implicit_out = implicit(batch, 0.2)
+    explicit_out = explicit(batch, 0.2)
+    for implicit_tensor, explicit_tensor in zip(
+        vars(implicit_out).values(), vars(explicit_out).values(), strict=True
+    ):
+        assert torch.equal(implicit_tensor, explicit_tensor)
+
+
+@torch.no_grad()
+def test_cell_pass_variant_runs_and_has_expected_parameter_count(positions):
+    torch.manual_seed(29)
+    net = MantisNet(MantisConfig(cell_pass=True)).eval()
+    batch = collate([from_position(positions[3])])
+    out = net(batch, 0.2)
+
+    assert count_parameters(net) == 1_585_829
+    for tensor in vars(out).values():
+        assert torch.isfinite(tensor).all()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA device")
