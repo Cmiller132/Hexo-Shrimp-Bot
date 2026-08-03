@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -37,14 +39,54 @@ def json_file(path: Path) -> dict:
         raise RuntimeError(f"cannot read {path}: {exc}") from exc
 
 
+_SNAPSHOT_ROOT = Path(tempfile.gettempdir()) / "deck-telemetry"
+_SNAPSHOT_LOCK = threading.Lock()
+_SNAPSHOT_SOURCES: dict[Path, tuple[int, int]] = {}
+
+
+def _telemetry_snapshot(path: Path, run_name: str) -> Path:
+    """Copy the run's telemetry database to local disk and return the copy.
+
+    In a container the runs root sits on a loosely cached network mount
+    (drvfs 9p on Windows hosts), where SQLite's locking and WAL shared-memory
+    protocols are unreliable: opens fail spuriously whenever the trainer — a
+    different mount client — has recently committed. Queries therefore run
+    against a local snapshot, refreshed when the source file changes. The
+    trainer checkpoints and truncates the WAL on every commit, so the main
+    file alone is a complete database as of the last commit.
+    """
+    snap = _SNAPSHOT_ROOT / f"{run_name}.db"
+    with _SNAPSHOT_LOCK:
+        for _ in range(3):
+            before = path.stat()
+            key = (before.st_mtime_ns, before.st_size)
+            if _SNAPSHOT_SOURCES.get(snap) == key and snap.is_file():
+                return snap
+            _SNAPSHOT_ROOT.mkdir(parents=True, exist_ok=True)
+            tmp = snap.with_name(snap.name + ".copying")
+            shutil.copyfile(path, tmp)
+            after = path.stat()
+            # An unchanged stat pair brackets the copy: no commit landed
+            # mid-read, so the snapshot is not torn.
+            if (after.st_mtime_ns, after.st_size) == key:
+                os.replace(tmp, snap)
+                _SNAPSHOT_SOURCES[snap] = key
+                return snap
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"telemetry database {path} kept changing during snapshot")
+
+
 def telemetry_connection(run_dir: Path) -> sqlite3.Connection:
     path = run_dir / telemetry.DB_NAME
     if not path.is_file():
         raise FileNotFoundError(f"missing required run artifact: {path}")
-    conn = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    try:
+        snap = _telemetry_snapshot(path, run_dir.name)
+        conn = sqlite3.connect(f"{snap.as_uri()}?mode=ro", uri=True)
+    except (OSError, sqlite3.Error) as exc:
+        raise RuntimeError(f"cannot read telemetry database {path}: {exc}") from exc
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA query_only=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
     try:
         row = conn.execute("SELECT version FROM schema_version").fetchone()
     except sqlite3.Error as exc:
