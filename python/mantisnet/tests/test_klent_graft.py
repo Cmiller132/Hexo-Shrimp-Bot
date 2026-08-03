@@ -1,4 +1,4 @@
-"""The composed joint-class and bipolar-return-mass graft.
+"""The composed joint-class and trinomial critic graft.
 
 The synthetic parent has both old shapes: three slot-class rows per decoder and
 one scalar-tanh critic row. Tests cover each tensor transform, their composed
@@ -170,7 +170,7 @@ def test_graft_preserves_the_parent_decode(tmp_path, positions):
     # this repeats independently of it.
     batch = collate([from_position(p) for p in positions])
     _s, w, g = model.trunk(batch)
-    policy, q = model.cell_heads(w, g, batch)
+    policy, _score, q = model.cell_heads(w, g, batch, 0.2)
     slot_class = torch.from_numpy(_PARENT_ROW)[batch.dec_class]
     for scores, tail, proj, table, bg, mlp in (
         (policy, lambda x: x, "p.weight", "e_pw.weight", "e_bg.weight", "mlp_p"),
@@ -195,11 +195,22 @@ def test_graft_preserves_the_parent_decode(tmp_path, positions):
         assert grafted[key].shape == (DEC_CLASSES, model.cfg.h)
         for cls in range(DEC_CLASSES):
             assert torch.equal(grafted[key][cls], parent[key][_PARENT_ROW[cls]])
-    for key in _READOUT_KEYS:
-        assert torch.equal(
-            grafted[key],
-            torch.cat([2 * parent[key], -2 * parent[key]], dim=0),
-        )
+    assert torch.equal(
+        grafted[_READOUT_KEYS[0]],
+        torch.cat(
+            [parent[_READOUT_KEYS[0]], -parent[_READOUT_KEYS[0]],
+             torch.zeros_like(parent[_READOUT_KEYS[0]])],
+            dim=0,
+        ),
+    )
+    assert torch.equal(
+        grafted[_READOUT_KEYS[1]],
+        torch.cat(
+            [parent[_READOUT_KEYS[1]], -parent[_READOUT_KEYS[1]],
+             torch.full_like(parent[_READOUT_KEYS[1]], -20.0)],
+            dim=0,
+        ),
+    )
     for key, tensor in grafted.items():
         if key not in (*_EXPANDED_KEYS, *_READOUT_KEYS):
             assert torch.equal(tensor, parent[key]), key
@@ -232,11 +243,13 @@ def test_adam_moments_follow_their_rows_and_absence_is_carried(tmp_path):
             elif name in _READOUT_KEYS:
                 if field == "exp_avg":
                     expected = torch.cat(
-                        [2 * parent_state[name][field], -2 * parent_state[name][field]]
+                        [parent_state[name][field], -parent_state[name][field],
+                         torch.zeros_like(parent_state[name][field])]
                     )
                 else:
                     expected = torch.cat(
-                        [parent_state[name][field], parent_state[name][field]]
+                        [parent_state[name][field], parent_state[name][field],
+                         torch.zeros_like(parent_state[name][field])]
                     )
                 assert torch.equal(entry[field], expected)
             else:
@@ -249,7 +262,7 @@ def test_the_cli_writes_the_same_manifest(tmp_path):
     manifest_path = new.with_suffix(".json")
     main([str(old), str(new), "--tau", str(TAU), "--lam", str(LAM)])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["arm"] == "joint-brm"
+    assert manifest["arm"] == "joint-trinomial"
     assert manifest["classes"] == DEC_CLASSES == 93
     assert manifest["class_to_parent_row"] == _PARENT_ROW.tolist()
     assert manifest["preservation"]["holds"]
@@ -337,7 +350,7 @@ def test_one_path_for_both_is_refused(tmp_path):
         graft(old, old, TAU, LAM, manifest_path)
 
 
-def test_brm_probe_is_deterministic_and_nonterminal():
+def test_critic_probe_is_deterministic_and_nonterminal():
     prefixes = _probe_prefixes()
     assert len(prefixes) == PROBE_POSITIONS
     lengths = [len(moves) for moves in prefixes]
@@ -348,17 +361,17 @@ def test_brm_probe_is_deterministic_and_nonterminal():
         assert not hexo_py.Position.replay(moves).is_terminal
 
 
-def test_a_wrong_brm_gain_is_caught(tmp_path, monkeypatch):
-    """Gain one composes to tanh(z / 2), so the BRM battery must refuse it."""
+def test_a_wrong_zero_logit_is_caught(tmp_path, monkeypatch):
+    """A large zero probability breaks the scalar identity and is refused."""
     old, new, manifest_path = _write_parent(tmp_path)
-    monkeypatch.setattr(graft_module, "READOUT_GAIN", 1.0)
+    monkeypatch.setattr(graft_module, "ZERO_LOGIT", 0.0)
     with pytest.raises(ValueError, match="checks failed|not function preserving"):
         graft(old, new, TAU, LAM, manifest_path)
     assert not new.exists() and not manifest_path.exists()
 
 
 def test_a_mangled_shared_tensor_is_caught(tmp_path, monkeypatch):
-    """The separate parent forward makes the BRM probe cover shared tensors."""
+    """The separate parent forward makes the critic probe cover shared tensors."""
     victim = "blocks.0.ffn.0.weight"
     convert = graft_module._converted_state
 
@@ -374,7 +387,7 @@ def test_a_mangled_shared_tensor_is_caught(tmp_path, monkeypatch):
     assert not new.exists() and not manifest_path.exists()
 
 
-def test_missing_brm_adam_state_is_refused(tmp_path):
+def test_missing_critic_adam_state_is_refused(tmp_path):
     checkpoint = _parent_checkpoint()
     names = list(checkpoint["model"])
     index = names.index(_READOUT_KEYS[0])

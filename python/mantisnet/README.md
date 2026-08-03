@@ -5,7 +5,8 @@
 `python/mantisnet` requires Python 3.12 or later and contains the MantisNet
 Torch model, independent graph-builder oracle, losses, Hexo KLENT training loop,
 telemetry store, benchmarks, and control-deck backend. The training path uses a policy head and one
-action value per legal cell, composed from the critic's two return-mass logits.
+action value per legal cell, composed from a three-outcome categorical critic,
+and the committed-mass-normalized acting score π′ ranks by.
 Algorithm obligations are in `docs/KLENT_FOR_HEXO.md`; measured experiment
 outcomes are in `docs/ABLATIONS.md`.
 
@@ -36,7 +37,8 @@ Core modules:
 | `klent.improve` | Closed-form improved policy |
 | `klent.selfplay` | Persistent-slot collection and samples |
 | `klent.train` | Network evaluation, packing, collection, and fit |
-| `klent.graft` | Joint-class plus bipolar-critic checkpoint conversion, measured and refusing |
+| `klent.graft` | Slot-class/scalar to joint-class/trinomial conversion, measured and refusing |
+| `klent.trigraft` | Joint-class/scalar to trinomial conversion, measured and refusing |
 | `klent.run` | Checkpointed iteration driver and CLI |
 | `klent.telemetry` | SQLite writes, queries, and CLI |
 | `klent.search` | Gumbel line search used by Python evaluation |
@@ -49,7 +51,8 @@ Core modules:
 | `deck.service` | Run registry, inference cache, and play sessions |
 | `deck.state` | Deck-owned reviews, probes, presets, and match jobs |
 
-`MantisNet.forward(batch)` returns raw policy logits, composed action values,
+`MantisNet.forward(batch, mass_floor)` returns raw policy logits, acting scores,
+composed action values,
 distributional state value outputs, and the decoded state value. KLENT
 collection and fitting call `trunk` plus the cell heads and do not consume the
 state-value head.
@@ -93,13 +96,22 @@ uv run python -m mantisnet.klent.run \
 ```
 
 Convert one slot-class/scalar-critic checkpoint to this build's composed
-joint-class/bipolar representation. The evidence sidecar is written beside the
+joint-class/trinomial representation. The evidence sidecar is written beside the
 new checkpoint with a `.json` suffix:
 
 ```sh
 uv run python -m mantisnet.klent.graft \
   runs/source/checkpoint_000151.pt runs/forked/checkpoint_000151.pt \
   --tau 0.1 --lam 0.01
+```
+
+Convert a v2 joint-class scalar checkpoint without changing its decoder:
+
+```sh
+uv run python -m mantisnet.klent.trigraft \
+  --old runs/joint-939/checkpoint_000300.pt \
+  --new runs/grafts/joint939-300-tri.pt \
+  --tau 0.1 --lam 0.01 --mass-floor 0.2
 ```
 
 Inspect telemetry and run benchmarks:
@@ -229,19 +241,20 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 - Legal-cell outputs are ragged and follow engine canonical legal order.
 - Policy and action-value decoders share incidence aggregation but own separate
   projections, embeddings, and output MLPs.
-- The critic emits two return-mass logits per legal cell; an action value is
-  `sigmoid(z_pos) - sigmoid(z_neg)` in `(-1, 1)`, composed in fp32.
+- The critic emits positive, negative, and zero logits per legal cell. Their
+  fp32 softmax gives `Q = p_pos - p_neg` and `M = 1 - p_zero <= 1`.
 - The policy and action-value output layers initialize to zero, so initial
   policy logits and action values are exactly zero.
-- KLENT improvement consumes raw policy logits and composed action values.
-- The KLENT fit objective trains policy cross-entropy, the taken action's
-  squared return error, and the taken action's two return-mass cross-entropies
-  weighted by `mass_weight`.
-- `mass_loss` reports the unweighted mass bracket and has no telemetry column.
+- KLENT improvement ranks by Q over the position's floored maximum committed
+  mass and averages unscaled Q for v-hat.
+- The KLENT fit objective trains policy cross-entropy plus the taken action's
+  categorical cross-entropy against `(G⁺, G⁻, 1−|G|)`.
+- `critic_ce` reports that trained critic term; `q_loss` is a detached measured
+  diagnostic. Neither has a dedicated telemetry column.
 - A slot-class/scalar-critic checkpoint loads only after
   `python -m mantisnet.klent.graft` applies both representation changes; that
   conversion refuses to write unless the exact joint checks and the measured
-  bipolar checks all hold.
+  trinomial checks all hold.
 - KLENT fitting does not train or read the distributional state-value head.
 - Stored training states are move prefixes and are rebuilt through `hexo_py`.
 - Capped self-play episodes are excluded from the fitting buffer.

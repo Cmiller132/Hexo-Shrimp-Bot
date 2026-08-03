@@ -33,8 +33,8 @@ inputs, and no nodes for empty cells.
   and its joint `(occupancy mask, candidate slot)` class. Trunk cost therefore
   scales with stones and live windows, not with the legal halo.
 - The **policy** decoder emits one raw logit per legal cell. The **action-value**
-  decoder emits two return-mass logits per legal cell and composes them into one
-  action value in `(−1, 1)` (appendix B).
+  decoder emits three categorical logits per legal cell and composes them into
+  one action value in `(−1, 1)` plus the acting score π′ ranks by (appendix B).
 - The **state-value** head reads the board through multi-query attention over the
   window embeddings and outputs a binned distribution over `[−1, 1]`,
   decoded to a scalar in-forward.
@@ -366,10 +366,10 @@ the forward contains no data-dependent index discovery.
   embedding `N(0, 0.02)`.
 - Optimizer grouping: parameters with `ndim ≤ 1`, all embedding tables,
   and the attention-bias tables are excluded from weight decay.
-- Outputs: raw policy logits; action values composed in fp32 from the critic's
-  two return-mass logits; the state-value bin distribution and its scalar
-  decode. The model applies no policy softmax and does not clamp the decoded
-  state value.
+- Outputs: raw policy logits; action values and acting scores composed in fp32
+  from the critic's three categorical logits; the state-value bin distribution
+  and its scalar decode. The model applies no policy softmax and does not clamp
+  the decoded state value.
 
 ---
 
@@ -464,60 +464,67 @@ joint-class table, background-bucket table, and MLP distinct from the policy
 decoder's parameters. The two decoders share only the parameter-free pass over
 the decoder incidence table.
 
-For each legal cell `a`, the head uses the same window/background routing as
-§6:
+For each legal cell `a`, the head uses the same window/background routing as §6:
 
 ```
-h_a             = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[class(a, w)] )
-[z_pos, z_neg]  = MLP_Q( [ h_a ; g ] )            # 2H → P_H → 2, ReLU
-u_pos           = σ(z_pos),  u_neg = σ(z_neg)
-Q(s, a)         = u_pos − u_neg
+h_a                      = Σ_{w ∋ a, live} ( Q_W · W_w + E_qw[class(a, w)] )
+[z_pos, z_neg, z_zero]    = MLP_Q( [ h_a ; g ] )  # 2H → P_H → 3, ReLU
+[p_pos, p_neg, p_zero]    = softmax([z_pos, z_neg, z_zero])
+Q(s, a)                  = p_pos − p_neg
+M(s, a)                  = p_pos + p_neg = 1 − p_zero
 ```
 
-For a background cell, `h_a = E_qbg[nearest-stone bucket(a)]`. The two logits
-decode to the **positive** and the **negative return mass** of the action:
-`u_pos + u_neg` is the head's estimate of `E[|G|]`, and their difference is the
-action value. Both masses lie in `(0, 1)`, so `Q ∈ (−1, 1)` and each mass moves
-`Q` directly. The composition is fp32, as is every loss term over these values.
+For a background cell, `h_a = E_qbg[nearest-stone bucket(a)]`. The softmax is
+fp32. Its positive and negative probabilities are the return masses and the
+zero probability is their remainder. Thus `Q ∈ (−1, 1)` and committed mass
+`M ∈ (0, 1)` by construction; the head cannot claim `E|G| > 1`.
 
-The raw pair is part of the interface: fitting reads `[z_pos, z_neg]` and
-composes the taken action's `Q` from the same numbers, so one decoder pass
-serves both. Every acting consumer sees only the composed value.
+The raw triple is part of the interface: fitting reads the taken action's row,
+while acting composes every legal row, so one decoder pass serves both.
+
+Acting consumes two compositions from that triple. With `mass_floor` supplied
+by the run:
+
+```
+Q̃(s, a) = Q(s, a) / max( max_{b legal} M(s, b), mass_floor )
+```
+
+`Q̃` is the acting score and `Q` remains the action value. The divisor is one
+positive number per position, so it cannot change the legal-action order.
+Since `|Q| ≤ M ≤ max_b M`, the unfloored score lies in `(−1, 1)`; the floor
+bounds sharpening when the whole legal set assigns most mass to zero return.
 
 The KLENT operator and training contract are specified in
-[`KLENT_FOR_HEXO.md`](KLENT_FOR_HEXO.md). The improvement step consumes the
-policy logits and action values without an additional gain:
+[`KLENT_FOR_HEXO.md`](KLENT_FOR_HEXO.md). The improvement step ranks by the
+score and averages the value:
 
 ```
-π′(a|s) ∝ exp[(Q(s,a) + τ·log π_θ(a|s)) / (τ+λ)]
+π′(a|s) ∝ exp[(Q̃(s,a) + τ·log π_θ(a|s)) / (τ+λ)]
 v̂(s)    = E_{a~π′}[Q(s,a)]
 ```
 
-Training selects the taken action and fits both the composed value and the two
-masses. With `G_pos = max(G, 0)`, `G_neg = max(−G, 0)`, and
-`η = mass_weight = 0.25`, the critic term per selected action is
+Training selects the taken action. For `G ∈ [−1, 1]`, its categorical
+target is a distribution:
 
 ```
-L_Q = (Q − G)^2
-      + (η/2) · [ BCEWithLogits(z_pos, G_pos)
-                + BCEWithLogits(z_neg, G_neg) ]
+target = [max(G, 0), max(−G, 0), 1 − |G|]
+L_critic = −target · log_softmax([z_pos, z_neg, z_zero])
 ```
 
-The squared error has unit weight. The mass pair alone carries `η/2`, and all
-three terms are evaluated in fp32. `KLENT_FOR_HEXO.md` §3 owns the complete
-loss, including the unit-weight policy cross-entropy.
+This single proper score is the critic's complete trained term. At its optimum,
+`p = E[target | S,A]`, so `Q = p_pos − p_neg = E[G | S,A]` exactly. The
+reported `(Q−G)²` is a detached measured diagnostic, not another objective.
 
-The parameterization obeys the exact identity
-`sigmoid(2z) − sigmoid(−2z) = tanh(z)`. This is the function-preservation
-identity used when converting compatible checkpoints; it is not a second
-critic mode.
+A scalar-tanh checkpoint maps `z` to logits `(z, −z, −20)`. Its softmax
+difference is `tanh(z) / (1 + exp(−20)/(2 cosh z))`, a relative error at most
+`exp(−20)/2`; this is a converter identity, not a second critic mode.
 
 **Both the policy decoder's and action-value decoder's MLP output layers
 initialize to zero**, overriding §10's framework default for those two
 layers. Initial policy logits are therefore exactly zero, and so are the
-initial action values: `z_pos = z_neg = 0` gives `u_pos = u_neg = 1/2`.
+initial action values: equal logits give `p_pos = p_neg = p_zero = 1/3`.
 
-This head reads the trunk output and adds no inputs. Its two-logit readout
+This head reads the trunk output and adds no inputs. Its three-logit readout
 changes the checkpoint head shape but does not itself change
 `MODEL_REPR_VERSION`; the current version is 2 because §4.3's decoder key is
 part of the representation. The §7 state-value head is neither called nor

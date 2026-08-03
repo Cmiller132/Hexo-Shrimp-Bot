@@ -48,7 +48,7 @@ def test_immediate_win_overrides_a_better_policy_logit():
             logits[win_rank] = 100.0
             logits[decoy_rank] = 101.0
         calls += 1
-        return logits, q
+        return logits, q, q
 
     choose = gumbel_choose(evaluate, tau=0.1, lam=0.03, sims=32)
     move = choose([pos], np.random.default_rng(4))[0]
@@ -137,7 +137,7 @@ def test_depth_exposes_an_opponent_reply_trap():
                 # the opposite sign from the root P1 frame.
                 root_value = -1.0 if trap else (0.2 if safe else -0.5)
                 q[lo:hi] = -root_value
-        return logits, q
+        return logits, q, q
 
     argmax = gumbel_choose(evaluate, 0.1, 0.03, sims=0)
     shallow = gumbel_choose(evaluate, 0.1, 0.03, sims=2)

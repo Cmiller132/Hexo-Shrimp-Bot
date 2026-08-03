@@ -355,8 +355,8 @@ def main(argv=None) -> None:
     ap.add_argument("--tau", type=float, default=KlentConfig.tau)
     ap.add_argument("--lam", type=float, default=KlentConfig.lam)
     ap.add_argument(
-        "--mass-weight", type=float, default=KlentConfig.mass_weight,
-        help="eta: weight on the critic's return-mass cross-entropies",
+        "--mass-floor", type=float, default=KlentConfig.mass_floor,
+        help="smallest committed mass pi' measures Q against",
     )
     ap.add_argument("--lam-ret", type=float, default=KlentConfig.lam_ret)
     ap.add_argument(
@@ -486,7 +486,7 @@ def main(argv=None) -> None:
     cfg = KlentConfig(
         tau=args.tau,
         lam=args.lam,
-        mass_weight=args.mass_weight,
+        mass_floor=args.mass_floor,
         lam_ret=args.lam_ret,
         gamma=args.gamma,
         ply_cap=args.cap,

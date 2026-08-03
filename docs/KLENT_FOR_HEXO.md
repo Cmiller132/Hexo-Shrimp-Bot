@@ -82,26 +82,29 @@ Paper equation 3 is implemented as
 
 $$\log\pi_\theta=\operatorname{logsoftmax}(\ell),\qquad
 \pi'=\operatorname{softmax}\left(
-  \frac{Q+\tau\log\pi_\theta}{\tau+\lambda}
+  \frac{\tilde Q+\tau\log\pi_\theta}{\tau+\lambda}
 \right)$$
 
 independently within every legal-action segment.
 
-Boundary identities are part of the contract: `tau == 0` ignores the prior; constant Q gives $\pi'\propto\pi_\theta^{\tau/(\tau+\lambda)}$; and a one-action segment is a point mass with zero KL and normalized entropy.
+$\tilde Q$ is appendix B's acting score: $Q$ divided by the largest committed mass in the position's legal set, floored at `mass_floor`. The one positive divisor per segment preserves Q's action order; $\hat v$ averages unscaled Q so the λ-return remains on the outcome's ±1 scale.
+
+Boundary identities are part of the contract: `tau == 0` ignores the prior; constant $\tilde Q$ gives $\pi'\propto\pi_\theta^{\tau/(\tau+\lambda)}$; and a one-action segment is a point mass with zero KL and normalized entropy.
 
 ### 2.1 Function contract
 
 ```python
 improved_policy(
     policy_logits: Tensor,  # (N,)
-    q_values: Tensor,       # (N,)
+    q_score: Tensor,        # (N,) what π′ ranks by
+    q_value: Tensor,        # (N,) what v-hat averages
     offsets: Tensor,        # (P + 1,) CSR boundaries
     tau: float,
     lam: float,
 ) -> ImprovedPolicy
 ```
 
-`policy_logits` and `q_values` are flat, aligned, and ordered by engine legal rank. `offsets` starts at zero, ends at $N$, and defines $P$ positive-width positions. The tensors share a device. Arithmetic runs in the promotion of the two input dtypes with fp32 as a floor, and every return field carries that dtype: acting's fp32 and bf16 both give fp32, and a float64 caller keeps float64. The whole operator is `no_grad`.
+`policy_logits`, `q_score`, and `q_value` are flat, aligned, and ordered by engine legal rank. `offsets` starts at zero, ends at $N$, and defines $P$ positive-width positions. The tensors share a device. Arithmetic runs in their promoted dtype with fp32 as a floor, and every return field carries that dtype: acting's fp32 and bf16 both give fp32, and a float64 caller keeps float64. The whole operator is `no_grad`.
 
 | Return field | Shape | Definition |
 |---|---:|---|
@@ -114,35 +117,32 @@ Each per-position expectation — `v_hat`, `kl`, and the entropy behind `norm_en
 
 ### 2.2 Refusal boundary
 
-The operator refuses `tau < 0`, `lam < 0`, and `tau + lam <= 0`. Shape, device, CSR, finiteness, and Q-range requirements are caller preconditions, not explicit refusals. Terminal positions are refused by the model builder, not by this function.
+The operator refuses `tau < 0`, `lam < 0`, `tau + lam <= 0`, and a `q_score`/`q_value` shape mismatch. Device, CSR, finiteness, and Q-range requirements are caller preconditions. Terminal positions are refused by the model builder.
 
 ## 3. Critic and losses
 
-The consumed model contract is the trunk and legal-cell decoder in [MODEL_SPEC.md](MODEL_SPEC.md) appendix B. For every legal cell in engine order, `cell_head_logits` returns one raw policy logit and the critic's two return-mass logits $(z^{+},z^{-})$; `cell_heads` composes the second into the action value
+The consumed model contract is the trunk and legal-cell decoder in [MODEL_SPEC.md](MODEL_SPEC.md) appendix B. For every legal cell in engine order, `cell_head_logits` returns one raw policy logit and three critic logits $(z^{+},z^{-},z^{0})$. Their fp32 softmax gives
 
-$$u^{+}=\sigma(z^{+}),\qquad u^{-}=\sigma(z^{-}),\qquad Q=u^{+}-u^{-}\in(-1,1),$$
+$$p=\operatorname{softmax}(z),\qquad Q=p^{+}-p^{-}\in(-1,1),\qquad M=p^{+}+p^{-}=1-p^0\in(0,1).$$
 
-which is what every acting path consumes. Fitting reads the raw logits and composes only the taken action from the same pass. KLENT calls no state-value readout and applies no loss to it.
+Acting ranks by $\tilde Q=Q/\max(\max_b M(S,b),\texttt{mass\_floor})$ and averages unscaled $Q$. Fitting reads only the taken action's raw triple. KLENT calls no state-value readout and applies no loss to it.
 
-For a fitting batch of positions, with $G^{+}_i=\max(G_i,0)$ and $G^{-}_i=\max(-G_i,0)$,
+For a fitting batch, $G_i\in[-1,1]$ makes $y_i=(G_i^+,G_i^-,1-|G_i|)$ a distribution, and
 
 $$L =
 \frac1P\sum_{i=1}^{P}
 \left[
   -\sum_{a\in A(S_i)}\pi'_i(a)\log\pi_\theta(a\mid S_i)
-  +(Q_\theta(S_i,A_i)-G_i)^2
-  +\frac{\eta}{2}\Big(
-     \mathrm{BCE}\big(z^{+}_\theta(S_i,A_i),\,G^{+}_i\big)
-    +\mathrm{BCE}\big(z^{-}_\theta(S_i,A_i),\,G^{-}_i\big)\Big)
+  -\sum_{c\in\{+,-,0\}} y_{i,c}\log p_{\theta,c}(S_i,A_i)
 \right].$$
 
-The policy cross-entropy covers the full legal set. All three critic terms select only the stored action rank. $\mathrm{BCE}$ is the with-logits binary cross-entropy against a **soft** target in $[0,1]$: at its optimum $u^{+}=\mathbb E[G^{+}\mid S,A]$ and $u^{-}=\mathbb E[G^{-}\mid S,A]$, hence $Q=\mathbb E[G\mid S,A]$. The policy cross-entropy and the squared error have unit weight; only the mass pair carries a coefficient, $\eta$ = `KlentConfig.mass_weight` (§10). Composition and every loss term are fp32.
+The policy cross-entropy covers the full legal set; the categorical term selects only the stored action rank. This one proper critic score has optimum $p=\mathbb E[y\mid S,A]$, hence $Q=\mathbb E[G\mid S,A]$ exactly. No second objective double-covers Q and there is no critic weighting coefficient. Composition and both trained loss terms are fp32. The detached $(Q-G)^2$ metric is measured only.
 
 | Check | Owner | Exact behavior |
 |---|---|---|
 | Policy target normalization | `policy_loss` | Accumulates each segment in float64 and refuses sums not `torch.allclose` to one with `atol=1e-4` and the default relative tolerance; NaN, infinity, and truncated targets fail. It does not separately refuse negative entries. |
 | Outcome range | `value_target` | Refuses values outside $[-1,1]$. KLENT does not call this binned state-value helper. |
-| Scalar return range | KLENT fitter | No explicit range or finiteness check; valid collection through bounded $Q$ and the return recursion keeps $G$ in $[-1,1]$, which is also what makes $G^{\pm}$ admissible cross-entropy targets. |
+| Scalar return range | KLENT fitter | No explicit range or finiteness check; valid collection through bounded $Q$ and the return recursion keeps $G$ in $[-1,1]$, which makes $(G^+,G^-,1-|G|)$ a distribution. |
 | Stored-policy width | `_rebuild` | Refuses a stored $\pi'$ whose length differs from the replayed position's legal count. |
 
 ## 4. Collection and buffer
@@ -152,10 +152,10 @@ The policy cross-entropy covers the full legal set. All three critic terms selec
 Collection accepts:
 
 ```python
-evaluate(batch) -> (policy_logits, q_values)
+evaluate(batch) -> (policy_logits, q_score, q_value)
 ```
 
-Both outputs are flat fp32 CPU tensors in batch legal-cell order. `network_evaluate` implements the seam with `trunk` plus the cell heads under `no_grad`, composing $Q$ outside the autocast region; it does not evaluate the state-value head.
+All three outputs are flat fp32 CPU tensors in batch legal-cell order. `network_evaluate` implements the seam with `trunk` plus the cell heads under `no_grad`, composing both Q roles outside the autocast region; it does not evaluate the state-value head.
 
 For each acting position, collection computes $\pi'$, $\hat v$, KL, and normalized entropy before sampling. It renormalizes each probability segment in float64 for sampling and fp32 storage, draws one uniform per slot, advances the selected legal rank, and retains the operator's original fp32 diagnostics.
 
@@ -344,14 +344,14 @@ Acting means cover every position evaluated during the collection call, includin
 | `v_hat_mae` | Mean $|\hat v-z|$ on naturally terminal episode plies, with mover-frame $z\in\{-1,+1\}$. |
 | `buffer_samples` | Training samples after whole-dropping capped episodes. |
 | `policy_loss` | Sample-weighted mean full-legal-set cross-entropy over the epoch. |
-| `q_loss` | Sample-weighted mean taken-action $(Q-G)^2$ over the epoch. |
-| `mass_loss` | Sample-weighted mean taken-action $\mathrm{BCE}(z^{+},G^{+})+\mathrm{BCE}(z^{-},G^{-})$ over the epoch, **unweighted** by $\eta$, so it reads as a calibration diagnostic independent of the coefficient. |
+| `q_loss` | Sample-weighted mean taken-action $(Q-G)^2$ over the epoch, measured under `no_grad`; a detached diagnostic, not a trained term. |
+| `critic_ce` | Sample-weighted mean taken-action categorical cross-entropy against $(G^+,G^-,1-|G|)$; the trained critic term. |
 | `fit_steps` | Number of optimizer groups stepped. |
 | `seconds` | Driver interval covering the collection wait and fit; evaluation is excluded. |
 | `eval_results` | One entry per configured opponent, each containing `opponent_name`, strength-defining `opponent_config`, total `score`, `win_rate`, `games`, `capped`, and `forfeits`. A model win or opponent forfeit scores 1, a cap \(1/2\), and a loss 0; forfeits remain explicit rather than being folded into losses. A head-to-head entry additionally carries `elo`, `elo_lo`, `elo_hi`, `sign_test_p`, and `pair_counts` from §6.4's paired statistics. |
 | `eval_seconds` | Wall time across all opponent matches and their telemetry recording. |
 
-`policy_loss`, `q_loss`, `mass_loss`, and `fit_steps` are absent when the buffer is empty. Evaluation fields are absent when no evaluation runs. Empty conditional statistics are serialized as `null`. `mass_loss` has no queryable telemetry column and survives in `metrics.jsonl` and the telemetry `metrics_json` payload. Telemetry writes one `eval_matches` row per `eval_results` entry and additionally derives samples/second, game and ply counts, and per-iteration hardware means and maxima.
+`policy_loss`, `q_loss`, `critic_ce`, and `fit_steps` are absent when the buffer is empty. Evaluation fields are absent when no evaluation runs. Empty conditional statistics are serialized as `null`. `critic_ce` has no queryable telemetry column and survives in `metrics.jsonl` and the telemetry `metrics_json` payload. Telemetry writes one `eval_matches` row per `eval_results` entry and additionally derives samples/second, game and ply counts, and per-iteration hardware means and maxima.
 
 ## 9. Deviations from the paper
 
@@ -413,7 +413,11 @@ Acting means cover every position evaluated during the collection call, includin
 
 ### 9.15 Critic parameterization
 
-**Paper:** The action-value head emits one scalar per action, fitted by squared error against the $\lambda$-return. **Here:** The head emits two logits per action whose sigmoids are the positive and the negative return mass; their difference is $Q$ and carries the same squared error, and each mass additionally carries a cross-entropy against its own part of the return with weight $\eta/2$. **Grounds:** Each mass is calibrated by its own cross-entropy while $Q$ stays their difference, so the head stores $\mathbb E[G^{+}]$ and $\mathbb E[G^{-}]$ instead of $\mathbb E[G]$ alone. **Measured outcomes:** See [ABLATIONS.md § Training runs](ABLATIONS.md#training-runs).
+**Paper:** The action-value head emits one scalar per action, fitted by squared error against the $\lambda$-return. **Here:** The head emits a three-outcome categorical distribution with target $(G^+,G^-,1-|G|)$ and one cross-entropy objective; $Q=p^+-p^-$ and $M=1-p^0$. **Grounds:** One proper objective has the same optimum $Q=\mathbb E[G]$, places committed mass on a simplex so $M\le1$ structurally, and subsumes the bipolar return-mass pair as its positive/negative two-of-three marginal without a separate Q loss or coefficient. **Measured outcomes:** See [ABLATIONS.md § Training runs](ABLATIONS.md#training-runs).
+
+### 9.16 Acting temperature
+
+**Paper:** $\pi'$ measures Q against a fixed $\tau+\lambda$. **Here:** $\pi'$ ranks by $\tilde Q=Q/\max(\max_b M(S,b),\texttt{mass\_floor})$, while $\hat v$ keeps unscaled Q. **Grounds:** The per-position divisor adapts sharpness to committed return mass without changing action order, and `mass_floor` bounds the adaptation where the critic assigns almost all probability to zero return. **Measured outcomes:** See [ABLATIONS.md § Training runs](ABLATIONS.md#training-runs).
 
 ## 10. Reference configuration
 
@@ -425,12 +429,13 @@ The current repository reference recipe is:
 | $\lambda$ | `0.01` |
 | $\tau$ | `0.1` |
 | $\lambda_{\mathrm{ret}}$ | `0.939` |
-| $\eta$ (`mass_weight`) | `0.25` |
-| Critic | two return-mass logits, $Q=u^{+}-u^{-}$ |
+| `mass_floor` | `0.2` |
+| Critic | three logits, $p=\operatorname{softmax}(z)$, $Q=p^+-p^-$, $M=1-p^0$ |
+| Acting score | $Q/\max(\max_b M,\texttt{mass\_floor})$ |
 
 These are configuration facts recorded in [ABLATIONS.md](ABLATIONS.md), which also records their selection.
 
-**Finding:** `KlentConfig` and the CLI currently default to $\gamma=1.0,\lambda=0.03$; the reference recipe therefore requires explicit flags, and `test_klent_run.py` pins the `0.03` CLI default. `mass_weight` defaults to the $\eta$ above, so `--mass-weight` is needed only to depart from it.
+**Finding:** `KlentConfig` and the CLI currently default to $\gamma=1.0,\lambda=0.03$; the reference recipe therefore requires explicit flags, and `test_klent_run.py` pins the `0.03` CLI default. `mass_floor` defaults to the value above.
 
 ## 11. Open questions
 

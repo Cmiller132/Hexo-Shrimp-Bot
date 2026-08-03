@@ -1,6 +1,6 @@
 """The closed-form improvement step (``KLENT_FOR_HEXO.md`` §2, paper eq. 3), ragged.
 
-    π′(a|s) ∝ exp[ (Q(s,a) + τ·log π_θ(a|s)) / (τ + λ) ]
+    π′(a|s) ∝ exp[ (Q̃(s,a) + τ·log π_θ(a|s)) / (τ + λ) ]
     v̂(s)    = E_{A~π′(·|s)}[ Q(s, A) ]
 
 τ weighs reverse KL to the current policy, and λ weighs entropy of π′. The
@@ -31,14 +31,20 @@ class ImprovedPolicy:
 @torch.no_grad()
 def improved_policy(
     policy_logits: Tensor,
-    q_values: Tensor,
+    q_score: Tensor,
+    q_value: Tensor,
     offsets: Tensor,
     tau: float,
     lam: float,
 ) -> ImprovedPolicy:
-    """Apply eq. 3 within each position of a ragged batch."""
+    """Apply eq. 3 to the acting score while averaging the action value."""
     if tau < 0 or lam < 0 or tau + lam <= 0:
         raise ValueError(f"need tau, lam >= 0 with tau + lam > 0, got ({tau}, {lam})")
+    if q_score.shape != q_value.shape:
+        raise ValueError(
+            "q_score and q_value must have the same shape, got "
+            f"{tuple(q_score.shape)} and {tuple(q_value.shape)}"
+        )
     p = offsets.shape[0] - 1
     seg = segment_ids(offsets)
 
@@ -46,11 +52,17 @@ def improved_policy(
     # float64 when both inputs are, so a caller comparing two improved policies
     # keeps a difference the operator would otherwise round away.
     dtype = torch.promote_types(
-        torch.promote_types(policy_logits.dtype, q_values.dtype), torch.float32
+        torch.promote_types(
+            torch.promote_types(policy_logits.dtype, q_score.dtype), q_value.dtype
+        ),
+        torch.float32,
     )
     log_pi = segment_log_softmax(policy_logits.to(dtype), offsets)
-    q = q_values.to(dtype)
-    log_improved = segment_log_softmax((q + tau * log_pi) / (tau + lam), offsets)
+    score = q_score.to(dtype)
+    q = q_value.to(dtype)
+    log_improved = segment_log_softmax(
+        (score + tau * log_pi) / (tau + lam), offsets
+    )
     probs = log_improved.exp()
 
     # Every expectation divides by the segment's own probability mass. π′ sums

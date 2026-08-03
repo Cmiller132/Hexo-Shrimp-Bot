@@ -1,9 +1,8 @@
 """KLENT training for Hexo as specified by ``docs/KLENT_FOR_HEXO.md``.
 
-The package trains MantisNet's trunk, policy head, and return-mass
-action-value head. Its loss does not include the state-value head; see §3
-and §9. ``graft`` is a one-off command-line conversion, not part of the
-training surface.
+The package trains MantisNet's trunk, policy head, and categorical action-value
+head. Its loss does not include the state-value head; see §3 and §9. The
+checkpoint graft modules are one-off commands, not part of the training surface.
 """
 
 from .improve import ImprovedPolicy, improved_policy

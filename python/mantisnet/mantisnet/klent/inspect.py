@@ -25,6 +25,7 @@ def inspect_position(
     t: int,
     tau: float,
     lam: float,
+    mass_floor: float,
     device: str = "cpu",
 ) -> dict:
     """A checkpoint's policy, Q, π′, and v̂ over the legal set at ``moves[:t]``.
@@ -58,11 +59,12 @@ def inspect_position(
     batch = collate_prefixes([moves], [t]).to(device)
     with torch.no_grad():
         _s, w, g = model.trunk(batch)
-        logits, q_values = model.cell_heads(w, g, batch)
+        logits, q_score, q_values = model.cell_heads(w, g, batch, mass_floor)
         logits, q_values = logits.float().cpu(), q_values.float().cpu()
+        q_score = q_score.float().cpu()
     offsets = batch.legal_offsets.cpu()
     log_pi = segment_log_softmax(logits, offsets)
-    imp = improved_policy(logits, q_values, offsets, tau, lam)
+    imp = improved_policy(logits, q_score, q_values, offsets, tau, lam)
 
     legal = position.legal_moves()
     if len(legal) != logits.shape[0]:
@@ -79,6 +81,7 @@ def inspect_position(
         "legal_count": len(legal),
         "tau": tau,
         "lam": lam,
+        "mass_floor": mass_floor,
         "v_hat": float(imp.v_hat[0]),
         "kl": float(imp.kl[0]),
         "norm_entropy": float(imp.norm_entropy[0]),
@@ -91,6 +94,7 @@ def inspect_position(
                 "logit": float(logits[rank]),
                 "policy": float(log_pi[rank].exp()),
                 "q": float(q_values[rank]),
+                "q_score": float(q_score[rank]),
                 "improved": float(imp.probs[rank]),
             }
             for rank, move in enumerate(legal)

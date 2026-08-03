@@ -99,8 +99,8 @@ def gumbel_choose(
 ):
     """Build a batched Gumbel root-sampling and sequential-halving chooser.
 
-    ``evaluate(batch)`` returns flat CPU ``(policy_logits, q_values)`` tensors
-    in engine legal order. ``tau`` and ``lam`` are the run's KLENT
+    ``evaluate(batch)`` returns flat CPU ``(policy_logits, q_score, q_value)``
+    tensors in engine legal order. ``tau`` and ``lam`` are the run's KLENT
     coefficients; every interior line step acts by the same improved policy
     used during collection. ``sims == 0`` is exactly policy-logit argmax.
 
@@ -142,8 +142,9 @@ def gumbel_choose(
             raise ValueError("gumbel chooser needs an RNG")
 
         root_batch = collate_positions(positions)
-        root_logits, root_q = evaluate(root_batch)
+        root_logits, root_score, root_q = evaluate(root_batch)
         root_logits = root_logits.float().cpu()
+        root_score = root_score.float().cpu()
         root_q = root_q.float().cpu()
         offsets = root_batch.legal_offsets.tolist()
 
@@ -166,6 +167,7 @@ def gumbel_choose(
         # sampling deliberately uses raw policy logits, as Gumbel MuZero does.
         improved_policy(
             root_logits,
+            root_score,
             root_q,
             root_batch.legal_offsets,
             tau,
@@ -258,11 +260,13 @@ def gumbel_choose(
                 leaf_batch = collate_positions(
                     [line.position for _search, line in pending]
                 )
-                logits, q_values = evaluate(leaf_batch)
+                logits, q_score, q_values = evaluate(leaf_batch)
                 logits = logits.float().cpu()
+                q_score = q_score.float().cpu()
                 q_values = q_values.float().cpu()
                 leaf = improved_policy(
                     logits,
+                    q_score,
                     q_values,
                     leaf_batch.legal_offsets,
                     tau,

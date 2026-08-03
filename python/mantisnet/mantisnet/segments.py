@@ -3,7 +3,7 @@
 Model outputs are flat over every legal cell of every position, bounded by a
 (P + 1,) CSR offset tensor. Everything that normalises or reduces within a
 position — the policy loss, KLENT's improvement operator — goes through these
-three helpers, so the ragged arithmetic exists once.
+four helpers, so the ragged arithmetic exists once.
 """
 
 from __future__ import annotations
@@ -24,12 +24,20 @@ def segment_sum(values: Tensor, seg: Tensor, p: int) -> Tensor:
     return values.new_zeros(p).index_add_(0, seg, values)
 
 
+def segment_max(values: Tensor, seg: Tensor, p: int) -> Tensor:
+    """Per-segment maximum of a flat ``(N,)`` tensor into ``(P,)``.
+
+    Every model position has at least one legal cell, so the identity fill is
+    never returned.
+    """
+    out = values.new_full((p,), torch.finfo(values.dtype).min)
+    return out.index_reduce_(0, seg, values, "amax", include_self=True)
+
+
 def segment_log_softmax(values: Tensor, offsets: Tensor) -> Tensor:
     """log-softmax within each segment, numerically shifted per segment."""
     p = offsets.shape[0] - 1
     seg = segment_ids(offsets)
-    seg_max = values.new_full((p,), torch.finfo(values.dtype).min)
-    seg_max.index_reduce_(0, seg, values, "amax", include_self=True)
-    shifted = values - seg_max.index_select(0, seg)
+    shifted = values - segment_max(values, seg, p).index_select(0, seg)
     lse = segment_sum(shifted.exp(), seg, p).log()
     return shifted - lse.index_select(0, seg)

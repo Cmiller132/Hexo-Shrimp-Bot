@@ -178,9 +178,9 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
     cfg = KlentConfig(batch_size=64)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     metrics = fit(model, samples, optimizer, cfg, rng)
-    for key in ("policy_loss", "q_loss", "mass_loss"):
+    for key in ("policy_loss", "q_loss", "critic_ce"):
         assert np.isfinite(metrics[key]), key
-    assert metrics["mass_loss"] > 0  # two cross-entropies against soft targets
+    assert metrics["critic_ce"] > 0
     # Groups close at >= batch_size samples and may overshoot by one chunk,
     # so the step count is bounded by, not equal to, ceil(n / batch_size).
     assert 1 <= metrics["fit_steps"] <= (len(samples) + 63) // 64
@@ -192,11 +192,10 @@ def test_fit_trains_policy_and_q_and_never_the_value_head():
             assert p.grad is None, f"value head parameter {name} was trained"
         else:
             assert p.grad is not None, f"{name} received no gradient"
-    # Both critic readout rows train: the squared error moves the composed Q
-    # and each cross-entropy moves its own mass.
+    # Every outcome row participates in the categorical proper score.
     rows = model.mlp_q.out.weight.grad.abs().sum(dim=1)
     assert rows.shape == (CRITIC_LOGITS,)
-    assert (rows > 0).all(), "a return mass received no gradient"
+    assert (rows > 0).all(), "a categorical outcome received no gradient"
 
 
 def test_collect_and_fit_end_to_end():
@@ -229,11 +228,12 @@ def test_network_evaluate_matches_forward():
         model.mlp_q.out.bias.normal_(std=0.5)
     pos = hexo_py.Position.replay([(0, 0), (1, 1), (2, 0)])
     batch = collate([from_position(pos)])
-    logits, q = network_evaluate(model, KlentConfig())(batch)
+    logits, score, q = network_evaluate(model, KlentConfig())(batch)
     with torch.no_grad():
-        out = model(batch)
+        out = model(batch, KlentConfig.mass_floor)
     assert q.abs().max() > 0
     assert torch.allclose(logits, out.policy_logits, atol=1e-6)
+    assert torch.allclose(score, out.q_score, atol=1e-6)
     assert torch.allclose(q, out.q_values, atol=1e-6)
 
 

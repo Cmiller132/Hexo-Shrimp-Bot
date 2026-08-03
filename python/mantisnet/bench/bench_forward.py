@@ -37,7 +37,7 @@ def make_positions(count: int, seed: int) -> list[hexo_py.Position]:
 def time_forward(net, batch, iters: int, device: str, autocast: bool) -> float:
     def once():
         with torch.autocast(device, dtype=torch.bfloat16, enabled=autocast):
-            net(batch)
+            net(batch, 0.2)
 
     with torch.no_grad():
         for _ in range(5):

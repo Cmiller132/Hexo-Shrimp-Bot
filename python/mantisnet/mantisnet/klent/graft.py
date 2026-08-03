@@ -1,13 +1,15 @@
-"""Apply the joint-class decoder and bipolar return-mass grafts together.
+"""Apply the joint-class decoder and trinomial critic grafts together.
 
 The parent has three-row slot-class tables in both cell heads and a one-row
 scalar critic readout followed by ``tanh``. This build has 93-row joint-class
-tables and a two-row critic composed as ``sigmoid(z_pos) - sigmoid(z_neg)``.
+tables and a three-row categorical critic composed as ``p_pos - p_neg``.
 The transforms are disjoint:
 
 * each joint-class row copies the slot-class row it replaces; and
-* ``(W, b)`` becomes ``(2W, 2b)`` and ``(-2W, -2b)``, because
-  ``sigmoid(2z) - sigmoid(-2z) = tanh(z)``.
+* ``(W, b)`` becomes positive row ``(W, b)``, negative row ``(-W, -b)``,
+  and zero row ``(0, -20)``. With a vanishing zero outcome this is the
+  softmax gap-``2z`` identity ``p_pos - p_neg = tanh(z)`` up to relative
+  error at most ``exp(-20) / 2``.
 
 The conversion applies both in one state-dict pass and remaps each parameter's
 Adam moments exactly as its transform requires. There is no single-arm mode.
@@ -15,7 +17,7 @@ Adam moments exactly as its transform requires. There is no single-arm mode.
 The joint detector compares every untouched tensor with a second read of the
 source file, checks every replicated row bit for bit, and transcribes
 MODEL_SPEC §6 independently to compare the parent slot decode with the expanded
-joint decode bit for bit. The BRM detector runs the complete grafted model and
+joint decode bit for bit. The critic detector runs the complete grafted model and
 the parent checkpoint in its own architecture on a separate fixed probe, then
 enforces ``MAX_ABS_DQ`` and ``MAX_MEAN_KL`` at the supplied ``--tau``/``--lam``.
 A failed check writes neither output.
@@ -59,16 +61,17 @@ from ..segments import segment_ids, segment_sum
 from .improve import improved_policy
 from .run import _versions
 
-ARM = "joint-brm"
+ARM = "joint-trinomial"
 
 _EXPANDED_KEYS = ("e_pw.weight", "e_qw.weight")
 _READOUT_KEYS = ("mlp_q.out.weight", "mlp_q.out.bias")
 _TRANSFORMED_KEYS = frozenset((*_EXPANDED_KEYS, *_READOUT_KEYS))
-READOUT_GAIN = 2.0
+ZERO_LOGIT = -20.0
 TRANSFORM = (
     "expand e_pw and e_qw from 3 slot-class rows to 93 joint-class rows by "
-    "parent-row replication; set the scalar critic readout to W_pos = 2 W_s, "
-    "b_pos = 2 b_s, W_neg = -2 W_s, b_neg = -2 b_s; copy every other parent "
+    "parent-row replication; set the scalar critic readout to W_pos = W_s, "
+    "b_pos = b_s, W_neg = -W_s, b_neg = -b_s, W_zero = 0, b_zero = -20; "
+    "copy every other parent "
     "tensor unchanged"
 )
 
@@ -85,7 +88,7 @@ JOINT_PROBE_POSITIONS = 64
 JOINT_PROBE_PLIES = (20, 60)
 JOINT_PROBE_TOP_K = 16
 
-# The BRM arm's fixed parent-vs-grafted probe, retained from that arm.
+# The critic arm's fixed parent-vs-grafted probe, retained from that arm.
 PROBE_SEED = 314_159
 PROBE_POSITIONS = 64
 PROBE_PLIES = (20, 60)
@@ -103,16 +106,21 @@ Q_TOLERANCE = 1e-5
 POLICY_TOLERANCE = 1e-4  # raw logits, which are not squashed into [-1, 1]
 KL_TOLERANCE = 1e-5
 
-# The BRM arm's stated preservation bounds. These are fixed evidence gates, not
+# The critic arm's stated preservation bounds. These are fixed evidence gates, not
 # tuning parameters.
 MAX_ABS_DQ = 1e-5
 MAX_MEAN_KL = 1e-6
 PRESERVATION = (
-    "the composed joint-class and bipolar-return-mass model agrees with the "
+    "the composed joint-class and trinomial model agrees with the "
     "slot-class scalar-tanh parent on every probe cell's action value and on "
     "the improved policy, because replicated decoder rows preserve each "
-    "incidence contribution and sigmoid(2z) - sigmoid(-2z) = tanh(z)"
+    "incidence contribution and a softmax over (z, -z, -20) agrees with "
+    "tanh(z) to the stated bounds"
 )
+
+# The graft begins at committed mass approximately one. The floor therefore
+# does not bind, but the evidence names the reference recipe's operating point.
+_GRAFT_FLOOR = 0.2
 
 # The parent's cell-head tensors, by state-dict key: window projection, class
 # table, background-bucket table, and the MLP's prefix.
@@ -166,9 +174,9 @@ def _expand(table: Tensor) -> Tensor:
     return table.index_select(0, torch.from_numpy(_PARENT_ROW))
 
 
-def _signed_rows(row: Tensor) -> Tensor:
-    """The bipolar readout's positive and negative rows from one scalar row."""
-    return torch.cat([READOUT_GAIN * row, -READOUT_GAIN * row], dim=0)
+def _critic_rows(row: Tensor, zero: float = 0.0) -> Tensor:
+    """Map one scalar row to positive, negative, and constant-zero rows."""
+    return torch.cat([row, -row, torch.full_like(row, zero)], dim=0)
 
 
 def _converted_state(old_model: dict[str, Any]) -> dict[str, Any]:
@@ -176,8 +184,10 @@ def _converted_state(old_model: dict[str, Any]) -> dict[str, Any]:
     converted = dict(old_model)
     for key in _EXPANDED_KEYS:
         converted[key] = _expand(old_model[key])
-    for key in _READOUT_KEYS:
-        converted[key] = _signed_rows(old_model[key])
+    converted[_READOUT_KEYS[0]] = _critic_rows(old_model[_READOUT_KEYS[0]])
+    converted[_READOUT_KEYS[1]] = _critic_rows(
+        old_model[_READOUT_KEYS[1]], zero=ZERO_LOGIT
+    )
     return converted
 
 
@@ -277,10 +287,9 @@ def _remap_adam(
     """Remap both transforms' Adam moments onto this build's parameter list.
 
     Joint-table moments replicate by the same parent-row map as their weights.
-    For a bipolar row scaled by ``s = ±2``, the first moment scales by ``s`` and
-    the second moment is duplicated unchanged. Adam's ratio then makes the
-    first post-graft update ``s`` times the parent's, preserving the readout's
-    relation in function space.
+    A scalar readout's first moment maps to ``(+m, -m, 0)`` and its second to
+    ``(v, v, 0)``; the step is unchanged. The zero row therefore begins with
+    no inherited optimizer direction or variance.
     """
     if not isinstance(saved, dict) or not isinstance(saved.get("state"), dict):
         raise ValueError("checkpoint must contain an Adam optimizer state dict")
@@ -337,11 +346,16 @@ def _remap_adam(
             if extra:
                 raise ValueError(
                     f"optimizer state for {name} carries {sorted(extra)}, which "
-                    "cannot be mapped onto two rows"
+                    "cannot be mapped onto three rows"
                 )
-            entry["exp_avg"] = _signed_rows(entry["exp_avg"])
+            entry["exp_avg"] = _critic_rows(entry["exp_avg"])
             entry["exp_avg_sq"] = torch.cat(
-                [entry["exp_avg_sq"], entry["exp_avg_sq"]], dim=0
+                [
+                    entry["exp_avg_sq"],
+                    entry["exp_avg_sq"],
+                    torch.zeros_like(entry["exp_avg_sq"]),
+                ],
+                dim=0,
             )
         state[index] = entry
     if not state:
@@ -376,7 +390,7 @@ def _joint_probe_positions() -> list:
 
 
 def _probe_prefixes() -> list[list[tuple[int, int]]]:
-    """The BRM arm's deterministic nonterminal move-prefix probe."""
+    """The critic graft's deterministic nonterminal move-prefix probe."""
     rng = np.random.default_rng(PROBE_SEED)
     low, high = PROBE_PLIES
     prefixes: list[list[tuple[int, int]]] = []
@@ -464,14 +478,16 @@ def _measure_joint(
     slot_class = torch.from_numpy(_PARENT_ROW).index_select(0, batch.dec_class)
     # This intermediate state exists only for the independent joint detector:
     # expanded tables, but the parent's scalar readout. It isolates the class
-    # transform from the disjoint BRM transform without creating an artifact.
+    # transform from the disjoint critic transform without creating an artifact.
     joint_state = dict(parent_model)
     for key in _EXPANDED_KEYS:
         joint_state[key] = _expand(parent_model[key])
 
     with torch.no_grad():
         _s, w, g = model.trunk(batch)
-        policy_new, q_new = model.cell_heads(w, g, batch)
+        policy_new, score_new, q_new = model.cell_heads(
+            w, g, batch, _GRAFT_FLOOR
+        )
         policy_parent = _spec_scores(
             w, g, batch, parent_model, _POLICY_HEAD, slot_class
         )
@@ -491,8 +507,12 @@ def _measure_joint(
 
     offsets = batch.legal_offsets
     kl = _segment_kl(
-        improved_policy(policy_new, q_new, offsets, tau, lam).probs,
-        improved_policy(policy_parent, q_parent, offsets, tau, lam).probs,
+        improved_policy(
+            policy_new, score_new, q_new, offsets, tau, lam
+        ).probs,
+        improved_policy(
+            policy_parent, q_parent, q_parent, offsets, tau, lam
+        ).probs,
         offsets,
     )
     q_delta = (q_new - q_parent).abs()
@@ -537,7 +557,7 @@ def _parent_model(old_model: dict[str, Any], cfg: MantisConfig) -> MantisNet:
 def _measure(
     model: MantisNet, parent: MantisNet, tau: float, lam: float
 ) -> dict:
-    """Run the BRM arm's complete parent-vs-composed-model probe."""
+    """Run the categorical arm's complete parent-vs-model probe."""
     prefixes = _probe_prefixes()
     batch = collate_prefixes(prefixes, [len(moves) for moves in prefixes])
     parent_state = parent.state_dict()
@@ -545,7 +565,9 @@ def _measure(
 
     with torch.no_grad():
         _s, w, g = model.trunk(batch)
-        policy_new, q_new = model.cell_heads(w, g, batch)
+        policy_new, score_new, q_new = model.cell_heads(
+            w, g, batch, _GRAFT_FLOOR
+        )
         # A separate parent trunk forward prevents a mangled shared tensor from
         # disappearing behind shared activations. Its old decoder is evaluated
         # by the independent MODEL_SPEC §6 transcription because this build's
@@ -562,9 +584,12 @@ def _measure(
 
     offsets = batch.legal_offsets
     delta = (q_new - q_parent).abs()
-    pi_new = improved_policy(policy_new.double(), q_new.double(), offsets, tau, lam)
+    pi_new = improved_policy(
+        policy_new.double(), score_new.double(), q_new.double(), offsets, tau, lam
+    )
     pi_parent = improved_policy(
-        policy_parent.double(), q_parent.double(), offsets, tau, lam
+        policy_parent.double(), q_parent.double(), q_parent.double(), offsets,
+        tau, lam
     )
     probs = pi_new.probs
     terms = torch.where(
@@ -690,7 +715,9 @@ def graft(
         )
 
     joint_measurement = _measure_joint(model, parent_model, tau, lam)
-    brm_measurement = _measure(model, _parent_model(parent_model, cfg), tau, lam)
+    critic_measurement = _measure(
+        model, _parent_model(parent_model, cfg), tau, lam
+    )
     manifest = {
         "arm": ARM,
         "source": str(old_path),
@@ -706,7 +733,8 @@ def graft(
         "tau": tau,
         "lam": lam,
         **joint_measurement,
-        **brm_measurement,
+        "mass_floor": _GRAFT_FLOOR,
+        **critic_measurement,
     }
     joint_holds = (
         manifest["spec_decode_bitwise_equal"]
@@ -714,7 +742,7 @@ def graft(
         and manifest["policy_max_abs_delta"] <= POLICY_TOLERANCE
         and manifest["kl_max"] <= KL_TOLERANCE
     )
-    brm_holds = (
+    critic_holds = (
         manifest["max_abs_dq"] <= MAX_ABS_DQ
         and abs(manifest["mean_improved_kl"]) <= MAX_MEAN_KL
     )
@@ -734,7 +762,7 @@ def graft(
         "max_abs_dq_tolerance": MAX_ABS_DQ,
         "mean_improved_kl": manifest["mean_improved_kl"],
         "mean_improved_kl_tolerance": MAX_MEAN_KL,
-        "holds": joint_holds and brm_holds,
+        "holds": joint_holds and critic_holds,
     }
     if not joint_holds:
         raise ValueError(
@@ -745,9 +773,9 @@ def graft(
             f"(bound {POLICY_TOLERANCE:.0e}), max KL = {manifest['kl_max']:.3e} "
             f"(bound {KL_TOLERANCE:.0e}); nothing written"
         )
-    if not brm_holds:
+    if not critic_holds:
         raise ValueError(
-            "the BRM graft is not function preserving on the probe set: max "
+            "the trinomial graft is not function preserving on the probe set: max "
             f"|Q_new - Q_parent| = {manifest['max_abs_dq']:.3e} (tolerance "
             f"{MAX_ABS_DQ:.0e}), mean KL(pi'_new || pi'_parent) = "
             f"{manifest['mean_improved_kl']:.3e} (tolerance {MAX_MEAN_KL:.0e}); "
@@ -763,7 +791,7 @@ def graft(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
-        description="apply the joint-class decoder and BRM critic graft together"
+        description="apply the joint-class decoder and trinomial critic graft together"
     )
     parser.add_argument("old", type=Path, metavar="OLD.pt")
     parser.add_argument("new", type=Path, metavar="NEW.pt")

@@ -92,7 +92,7 @@ def test_every_parameter_receives_gradient(positions):
     net.train()
     # Includes ply 0, so the background bucket table participates too.
     batch = collate([from_position(p) for p in positions])
-    out = net(batch)
+    out = net(batch, 0.2)
 
     counts = batch.legal_offsets[1:] - batch.legal_offsets[:-1]
     targets = torch.cat([torch.full((int(c),), 1.0 / int(c)) for c in counts])

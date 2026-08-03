@@ -70,6 +70,7 @@ class InspectRequest(BaseModel):
     t: int | None = Field(default=None, ge=0)
     tau: float | None = Field(default=None, gt=0)
     lam: float | None = Field(default=None, ge=0)
+    mass_floor: float | None = Field(default=None, gt=0, le=1)
 
 
 class PlayRequest(BaseModel):
@@ -525,7 +526,8 @@ def create_app(
             for index, transform in enumerate(telemetry.D6_TRANSFORMS):
                 transformed = [transform(move) for move in body.moves]
                 read = request.app.state.inference.inspect(
-                    body.checkpoint, transformed, body.t, body.tau, body.lam
+                    body.checkpoint, transformed, body.t, body.tau, body.lam,
+                    body.mass_floor,
                 )
                 mapped = {tuple(row["move"]): row for row in read["legal"]}
                 policy_dev = max(

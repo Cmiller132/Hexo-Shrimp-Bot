@@ -159,11 +159,11 @@ class Collector:
                 sampled = []
                 for chunk, fut in zip(chunks, batches):
                     batch = fut.result()
-                    policy_logits, q_values = evaluate(batch)
+                    policy_logits, q_score, q_values = evaluate(batch)
                     sampled.append(
                         sample_pool.submit(
-                            self._sample, chunk, batch, policy_logits, q_values,
-                            done, stats,
+                            self._sample, chunk, batch, policy_logits, q_score,
+                            q_values, done, stats,
                         )
                     )
                 # Advance every slot before the next step reads stone counts.
@@ -181,10 +181,17 @@ class Collector:
         }
         return done, metrics
 
-    def _sample(self, chunk, batch, policy_logits, q_values, done, stats) -> None:
+    def _sample(
+        self, chunk, batch, policy_logits, q_score, q_values, done, stats
+    ) -> None:
         """Improve, sample, and advance one chunk in sampling-lane order."""
         imp = improved_policy(
-            policy_logits, q_values, batch.legal_offsets, self.tau, self.lam
+            policy_logits,
+            q_score,
+            q_values,
+            batch.legal_offsets,
+            self.tau,
+            self.lam,
         )
         stats["kl"] += float(imp.kl.sum())
         stats["ent"] += float(imp.norm_entropy.sum())

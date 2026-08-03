@@ -23,6 +23,7 @@ from torch import Tensor, nn
 from . import decoder
 from .attention import fused_attention
 from .builder import DEC_CLASSES, NEAREST_BUCKETS, NUM_PATTERNS, Batch
+from .segments import segment_ids, segment_max
 
 
 @dataclass(frozen=True)
@@ -68,32 +69,62 @@ class ModelOutput:
     """What one full forward answers (§11 plus the appendix-B Q head)."""
 
     policy_logits: Tensor  # (N_cells,) raw, engine legal order per position
+    q_score: Tensor  # (N_cells,) the score π′ ranks by, same layout
     q_values: Tensor  # (N_cells,) action values, same layout — the KLENT head
     value: Tensor  # (P,) scalar decode, in [-1, 1]
     value_dist: Tensor  # (P, K) softmax over bins, fp32
     value_logits: Tensor  # (P, K) the bins' raw logits — what value_loss trains
 
 
-# Width of the action-value readout: the two return-mass logits [z_pos, z_neg]
-# of appendix B. Everything that reads the readout's shape takes it from here.
-CRITIC_LOGITS = 2
+# Width of appendix B's categorical action-value readout: the three logits
+# [z_pos, z_neg, z_zero]. Every reader takes the checkpoint shape from here.
+CRITIC_LOGITS = 3
+
+
+def return_mass(critic_logits: Tensor) -> tuple[Tensor, Tensor]:
+    """Decode ``(..., 3)`` categorical logits as positive/negative mass, fp32.
+
+    The softmax rows are ``(p_pos, p_neg, p_zero)``. At the categorical
+    cross-entropy optimum, the returned pair is ``(E[G⁺], E[G⁻])``;
+    their sum is ``E|G|`` and is at most one because the omitted zero mass is
+    the remainder of the same simplex.
+    """
+    p_pos, p_neg, _p_zero = critic_logits.float().softmax(dim=-1).unbind(dim=-1)
+    return p_pos, p_neg
 
 
 def compose_q(critic_logits: Tensor) -> Tensor:
-    """Compose the critic's ``(..., 2)`` mass logits into action values, fp32.
+    """Compose ``(..., 3)`` categorical logits into action values, fp32.
 
-    ``[z_pos, z_neg]`` decode to the positive and the negative return mass,
-    ``u_pos = sigmoid(z_pos)`` and ``u_neg = sigmoid(z_neg)``; the action value
-    is their difference and ``u_pos + u_neg`` is the head's estimate of E|G|.
-    Both masses move Q directly, so neither can gate the other out of it.
+    ``Q = p_pos - p_neg`` is the quantity the λ-return targets and v̂ averages.
+    The categorical simplex makes ``Q`` lie in ``(-1, 1)`` and committed mass
+    ``p_pos + p_neg`` lie in ``(0, 1)`` by construction.
 
-    Q lies in (−1, 1), which π′ requires: it exponentiates Q/(τ+λ), so an
-    unbounded Q could sharpen without limit. The function is free-standing
-    because the acting seam composes every legal cell while fitting composes
-    only the taken action — off the same raw logits.
+    The function is free-standing because acting composes every legal cell
+    while fitting composes only the taken action, off the same raw logits.
     """
-    u_pos, u_neg = torch.sigmoid(critic_logits.float()).unbind(dim=-1)
-    return u_pos - u_neg
+    p_pos, p_neg = return_mass(critic_logits)
+    return p_pos - p_neg
+
+
+def compose_acting_q(
+    critic_logits: Tensor, offsets: Tensor, mass_floor: float
+) -> Tensor:
+    """Return Q divided by the position's floored maximum committed mass.
+
+    ``M = p_pos + p_neg = 1 - p_zero`` is structurally in ``(0, 1)``. One
+    positive divisor is shared by every legal cell in a position, so the score
+    preserves Q's order while expressing it in units of the most committed
+    action. Since ``|Q| <= M <= max M``, an unfloored score lies in ``(-1, 1)``;
+    ``mass_floor`` additionally bounds sharpening when all actions put most
+    probability on zero return.
+    """
+    p_pos, p_neg = return_mass(critic_logits)
+    seg = segment_ids(offsets)
+    scale = segment_max(p_pos + p_neg, seg, offsets.shape[0] - 1).clamp(
+        min=mass_floor
+    )
+    return (p_pos - p_neg) / scale.index_select(0, seg)
 
 
 def _mlp(d_in: int, d_hidden: int, d_out: int) -> nn.Sequential:
@@ -224,8 +255,8 @@ class MantisNet(nn.Module):
         self.mlp_p = _PairMlp(h, cfg.policy_hidden, 1)
 
         # Appendix B action-value decoder: the same shape as §6 with its own
-        # parameters everywhere, two return-mass logits per legal cell. KLENT's
-        # head.
+        # parameters everywhere, three outcome logits per legal cell. KLENT's
+        # categorical critic head.
         self.q = nn.Linear(h, h, bias=False)
         self.e_qw = nn.Embedding(DEC_CLASSES, h)
         self.e_qbg = nn.Embedding(NEAREST_BUCKETS, h)
@@ -250,7 +281,7 @@ class MantisNet(nn.Module):
         nn.init.normal_(self.token_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
         # Both decoder outputs start at zero, so the initial policy logits are
-        # constant across legal cells and both mass logits vanish, which makes
+        # constant across legal cells and all outcome logits vanish, which makes
         # the initial action values exactly zero (appendix B).
         for head in (self.mlp_p, self.mlp_q):
             nn.init.zeros_(head.out.weight)
@@ -314,12 +345,12 @@ class MantisNet(nn.Module):
     def cell_head_logits(
         self, w: Tensor, g: Tensor, batch: Batch
     ) -> tuple[Tensor, Tensor]:
-        """§6 policy logits ``(N,)`` and appendix-B mass logits ``(N, 2)``.
+        """§6 policy logits ``(N,)`` and categorical logits ``(N, 3)``.
 
         Both heads use the same parameter-free incidence aggregation and own
-        separate decoder parameters. This is the raw pair: fitting needs the
-        mass logits for their binary losses and composes the taken action's Q
-        from the same numbers, so one pass answers both.
+        separate decoder parameters. Fitting takes one categorical score on
+        the selected row; acting composes its score and value from the same
+        logits, so one pass answers both.
         """
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
         rows = self._decoder_rows(w, batch, g_p.dtype)
@@ -332,14 +363,19 @@ class MantisNet(nn.Module):
             ),
         )
 
-    def cell_heads(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor]:
-        """Return §6 policy logits and appendix-B action values in (−1, 1).
+    def cell_heads(
+        self, w: Tensor, g: Tensor, batch: Batch, mass_floor: float
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return policy logits, acting scores, and values in legal order.
 
-        The acting interface: every consumer of a Q sees the composed scalar,
-        one per legal cell in engine order.
+        π′ ranks by the score; v̂ and the λ-return use the unscaled value.
         """
         policy_logits, critic_logits = self.cell_head_logits(w, g, batch)
-        return policy_logits, compose_q(critic_logits)
+        return (
+            policy_logits,
+            compose_acting_q(critic_logits, batch.legal_offsets, mass_floor),
+            compose_q(critic_logits),
+        )
 
     def value_head(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """§7: (value, value_dist, value_logits). Multi-query attention
@@ -366,14 +402,15 @@ class MantisNet(nn.Module):
         value = value_dist @ self.bin_centers
         return value, value_dist, v_logits
 
-    def forward(self, batch: Batch) -> ModelOutput:
+    def forward(self, batch: Batch, mass_floor: float) -> ModelOutput:
         """Every head. KLENT's loop composes `trunk` with the two heads it
         trains instead, skipping the value readout it never reads."""
         s_, w, g = self.trunk(batch)
         value, value_dist, value_logits = self.value_head(w, g, batch)
-        policy_logits, q_values = self.cell_heads(w, g, batch)
+        policy_logits, q_score, q_values = self.cell_heads(w, g, batch, mass_floor)
         return ModelOutput(
             policy_logits=policy_logits,
+            q_score=q_score,
             q_values=q_values,
             value=value,
             value_dist=value_dist,

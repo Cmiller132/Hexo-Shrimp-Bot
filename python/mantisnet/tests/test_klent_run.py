@@ -69,7 +69,7 @@ def test_run_resume_and_artifacts(tmp_path):
 
     config = json.loads((out / "config.json").read_text())
     assert config["klent"]["tau"] == 0.1 and config["klent"]["lam"] == 0.03
-    assert config["klent"]["mass_weight"] == 0.25
+    assert config["klent"]["mass_floor"] == 0.2
     assert config["eval_time"] == 0.1
     assert config["eval_depth"] is None
     assert config["eval_sims"] == 32
@@ -320,6 +320,30 @@ def test_checkpoint_refuses_version_drift(tmp_path):
     torch.save(ckpt, path)
     with pytest.raises(ValueError, match="versions"):
         load_checkpoint(path, model, optimizer, rng)
+
+
+def test_two_row_brm_checkpoint_fails_strictly_at_the_named_readout(tmp_path):
+    """There is no compatibility shim for the superseded two-row head."""
+    from mantisnet import MantisConfig, MantisNet
+    from mantisnet.klent.run import _versions
+
+    model = MantisNet(MantisConfig())
+    state = model.state_dict()
+    for key in ("mlp_q.out.weight", "mlp_q.out.bias"):
+        state[key] = state[key][:2].clone()
+    path = tmp_path / "brm.pt"
+    torch.save(
+        {
+            "model": state,
+            "optimizer": torch.optim.Adam(model.parameters()).state_dict(),
+            "iteration": 1,
+            "rng_state": np.random.default_rng(0).bit_generator.state,
+            "versions": _versions(),
+        },
+        path,
+    )
+    with pytest.raises(RuntimeError, match="mlp_q.out.(weight|bias)"):
+        load_checkpoint(path, model, torch.optim.Adam(model.parameters()))
 
 
 def test_h2h_flags_are_validated_before_any_work(tmp_path):

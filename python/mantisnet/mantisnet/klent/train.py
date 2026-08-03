@@ -1,9 +1,9 @@
 """Collect and fit one KLENT iteration.
 
 Each iteration consumes one on-policy buffer for one fitting epoch and then
-discards it. The objective is policy cross-entropy against π′ plus the taken
-action's critic loss: squared error of the composed Q against its λ-return,
-plus the weighted binary cross-entropies that calibrate the two return masses.
+discards it. The objective is policy cross-entropy against π′ plus one
+categorical cross-entropy on the taken action's positive, negative, and zero
+return masses. The reported Q squared error is measured, not trained.
 The state-value head is not part of this path. See ``docs/KLENT_FOR_HEXO.md``
 §3 and §5.
 """
@@ -20,7 +20,7 @@ import torch.nn.functional as F
 
 from ..builder import collate_prefixes
 from ..losses import policy_loss
-from ..model import compose_q
+from ..model import compose_acting_q, compose_q
 from .selfplay import Collector, Sample, collection_stats
 
 
@@ -30,10 +30,9 @@ class KlentConfig:
 
     tau: float = 0.1  # reverse-KL weight (the paper's beta)
     lam: float = 0.03  # entropy weight (the paper's alpha)
-    # eta: weight on the critic's return-mass calibration term. The squared
-    # error of the composed Q keeps unit weight; this scales the pair of mass
-    # cross-entropies that fix where that Q's two halves sit.
-    mass_weight: float = 0.25
+    # Smallest committed mass π′ measures Q against; this bounds sharpening
+    # when a position's legal set assigns almost all probability to zero return.
+    mass_floor: float = 0.2
     # e^-1/16 corresponds to an eight-turn horizon at two placements per turn.
     lam_ret: float = 0.939
     # Per-ply return-discount magnitude (the mover-change sign is separate).
@@ -63,9 +62,8 @@ class KlentConfig:
 def _policy_q(model, batch):
     """The KLENT pass: trunk + the two heads it trains, never the value head.
 
-    It returns the raw pair — policy logits and the critic's mass logits —
-    because that is what both callers need from the graph: the fitter takes
-    binary losses on the logits, and the acting seam composes Q outside.
+    It returns policy logits and the critic's raw categorical logits. The
+    fitter scores the taken row; acting composes both Q roles outside.
     """
     _s, w, g = model.trunk(batch)
     return model.cell_head_logits(w, g, batch)
@@ -90,7 +88,7 @@ def _policy_q_fn(cfg: KlentConfig):
 
 def network_evaluate(model, cfg: KlentConfig):
     """The self-play evaluator, returning flat CPU tensors so the collection
-    loop stays device-ignorant."""
+    loop stays device-ignorant: policy logits, acting score, and action value."""
     policy_q = _policy_q_fn(cfg)
 
     def evaluate(batch):
@@ -98,9 +96,15 @@ def network_evaluate(model, cfg: KlentConfig):
             b = batch.to(cfg.device)
             with torch.no_grad(), torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
                 policy, critic_logits = policy_q(model, b)
-            # Composition is fp32 and outside the autocast region, so the
-            # acting Q the operator consumes does not depend on autocast.
-            return policy.float().cpu(), compose_q(critic_logits).cpu()
+            # Composition is fp32 and outside autocast, so neither Q role
+            # depends on autocast precision.
+            return (
+                policy.float().cpu(),
+                compose_acting_q(
+                    critic_logits, b.legal_offsets, cfg.mass_floor
+                ).cpu(),
+                compose_q(critic_logits).cpu(),
+            )
 
     return evaluate
 
@@ -216,7 +220,7 @@ def fit(
     order = [k for group, _ in groups for k in group]
     policy_sum = torch.zeros((), device=cfg.device)
     q_sum = torch.zeros((), device=cfg.device)
-    mass_sum = torch.zeros((), device=cfg.device)
+    critic_ce_sum = torch.zeros((), device=cfg.device)
     total = 0
     step = 0
     with ThreadPoolExecutor(max_workers=1) as pool:
@@ -239,28 +243,33 @@ def fit(
                     with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
                         policy_logits, critic_logits = policy_q(model, batch)
                     ce = policy_loss(policy_logits.float(), batch.legal_offsets, target)
-                    # The critic loss is the taken action's only: its composed
-                    # Q against the λ-return, plus the two masses against the
-                    # return's positive and negative parts. Soft targets are
-                    # intended — at the cross-entropy optimum each mass is the
-                    # conditional expectation of its part, so their difference
-                    # is E[G | s, a]. Composition and losses are fp32.
+                    # G in [-1, 1] makes (G⁺, G⁻, 1-|G|) a distribution.
+                    # Its categorical CE is the critic's sole trained term. At
+                    # the optimum p = E[target | s,a], hence p⁺-p⁻ = E[G].
                     taken = critic_logits.index_select(
                         0, batch.legal_offsets[:-1] + ranks
                     ).float()
-                    q_mse = (compose_q(taken) - returns).square().mean()
-                    z_pos, z_neg = taken.unbind(dim=-1)
-                    mass = F.binary_cross_entropy_with_logits(
-                        z_pos, returns.clamp(min=0.0)
-                    ) + F.binary_cross_entropy_with_logits(
-                        z_neg, (-returns).clamp(min=0.0)
+                    critic_target = torch.stack(
+                        (
+                            returns.clamp(min=0.0),
+                            (-returns).clamp(min=0.0),
+                            1.0 - returns.abs(),
+                        ),
+                        dim=-1,
                     )
+                    critic_ce = -(
+                        critic_target * F.log_softmax(taken, dim=-1)
+                    ).sum(dim=-1).mean()
+                    # Cross-arm curve only: measured under no_grad and absent
+                    # from the objective, so it cannot double-cover Q.
+                    with torch.no_grad():
+                        q_mse = (compose_q(taken) - returns).square().mean()
 
-                    loss = ce + q_mse + 0.5 * cfg.mass_weight * mass
+                    loss = ce + critic_ce
                     (loss * (len(chunk) / group_n)).backward()
                     policy_sum += ce.detach() * len(chunk)
-                    q_sum += q_mse.detach() * len(chunk)
-                    mass_sum += mass.detach() * len(chunk)
+                    q_sum += q_mse * len(chunk)
+                    critic_ce_sum += critic_ce.detach() * len(chunk)
                 if progress is not None:
                     progress(consumed, len(order))
             optimizer.step()
@@ -269,10 +278,9 @@ def fit(
             total += group_n
     return {
         "policy_loss": float(policy_sum) / total,
+        # Measured diagnostic, not a trained term.
         "q_loss": float(q_sum) / total,
-        # The unweighted mass bracket, so the calibration reads independently
-        # of eta.
-        "mass_loss": float(mass_sum) / total,
+        "critic_ce": float(critic_ce_sum) / total,
         "fit_steps": len(groups),
     }
 

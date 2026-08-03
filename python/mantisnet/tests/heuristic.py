@@ -2,7 +2,8 @@
 
 Scores each legal cell by the stone count of its best own live window, with
 a six-completing cell assigned the maximum score. It implements the evaluator
-``(batch) -> (logits, q)`` and chooser ``(positions, rng) -> moves`` test
+``(batch) -> (logits, q_score, q_value)`` and chooser
+``(positions, rng) -> moves`` test
 seams and is not part of the training package.
 """
 
@@ -33,7 +34,8 @@ def heuristic_evaluate(batch):
     scores scaled into the critic's [0, 1] output range as Q — acting-time
     v-hat must satisfy `lambda_returns`' [-1, 1] input contract."""
     scores = heuristic_scores(batch)
-    return scores, scores / 8.0
+    q = scores / 8.0
+    return scores, q, q
 
 
 def heuristic_choose(positions, rng: np.random.Generator, noise: float = 0.0):

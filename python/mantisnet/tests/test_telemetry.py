@@ -708,15 +708,18 @@ def test_inspect_position_matches_a_direct_forward():
 
     model = _tiny_model().eval()
     moves = [(0, 0), (1, 1), (2, 0), (-1, 0), (0, 2)]
-    tau, lam = 0.1, 0.03
-    out = inspect_position(model, moves, t=3, tau=tau, lam=lam)
+    tau, lam, floor = 0.1, 0.03, 0.2
+    out = inspect_position(
+        model, moves, t=3, tau=tau, lam=lam, mass_floor=floor
+    )
 
     position = hexo_py.Position.replay(moves[:3])
     batch = collate_positions([position])
     with torch.no_grad():
-        result = model(batch)
+        result = model(batch, floor)
     imp = improved_policy(
-        result.policy_logits, result.q_values, batch.legal_offsets, tau, lam
+        result.policy_logits, result.q_score, result.q_values,
+        batch.legal_offsets, tau, lam
     )
     policy = torch.softmax(result.policy_logits, 0)
 
@@ -746,8 +749,8 @@ def test_inspect_position_loads_a_checkpoint_by_path(tmp_path, model):
         path, model, torch.optim.Adam(model.parameters()), 1, np.random.default_rng(0)
     )
     moves = [(0, 0), (1, 1), (2, 0)]
-    by_path = inspect_position(path, moves, 2, 0.1, 0.03)
-    by_object = inspect_position(model, moves, 2, 0.1, 0.03)
+    by_path = inspect_position(path, moves, 2, 0.1, 0.03, 0.2)
+    by_object = inspect_position(model, moves, 2, 0.1, 0.03, 0.2)
     assert by_path == by_object
 
 
@@ -757,13 +760,13 @@ def test_inspect_position_walks_a_line_one_move_at_a_time():
     model = _tiny_model().eval()
     moves = [(0, 0), (1, 1), (2, 0), (-1, 0), (0, 2)]
     for t in range(len(moves) + 1):
-        out = inspect_position(model, moves, t, 0.1, 0.03)
+        out = inspect_position(model, moves, t, 0.1, 0.03, 0.2)
         assert out["stone_count"] == t
         assert out["played"] == (moves[t] if t < len(moves) else None)
         assert out["legal_count"] == len(out["legal"]) > 0
 
     with pytest.raises(ValueError, match="outside"):
-        inspect_position(model, moves, len(moves) + 1, 0.1, 0.03)
+        inspect_position(model, moves, len(moves) + 1, 0.1, 0.03, 0.2)
 
 
 def test_inspect_position_reproduces_a_recorded_ply(tmp_path):
@@ -788,7 +791,9 @@ def test_inspect_position_reproduces_a_recorded_ply(tmp_path):
     # The tolerance covers the quantization half-step plus float noise.
     q = 0.5 / tel._Q + 1e-6
     for ply in game["plies"][:3]:
-        out = inspect_position(actor, game["moves"], ply["t"], cfg.tau, cfg.lam)
+        out = inspect_position(
+            actor, game["moves"], ply["t"], cfg.tau, cfg.lam, cfg.mass_floor
+        )
         probs = [e["improved"] for e in out["legal"]]
         assert out["legal_count"] == ply["legal_count"]
         assert out["v_hat"] == pytest.approx(ply["v_hat"], abs=q)
