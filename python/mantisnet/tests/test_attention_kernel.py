@@ -9,6 +9,7 @@ import torch
 
 import mantisnet.attention as attention_impl
 from mantisnet.attention import (
+    _FAILED_BACKWARD_SHAPES,
     _FAILED_SHAPES,
     _attention_reference,
     fused_attention,
@@ -240,6 +241,128 @@ def test_fp32_gradients_match_sdpa():
         assert relative <= 3.0e-2, f"{name}: relative gradient error {relative:.6g}"
 
 
+_GRAD_SHAPES = tuple(
+    (p, t, 32)
+    for p in (1, 3, 64)
+    for t in (2, 31, 64, 65, 200, 513)
+) + (
+    (3, 65, 16),
+    (3, 65, 64),
+)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize(("p", "t", "d"), _GRAD_SHAPES)
+def test_triton_gradients_match_reference_across_shape_grid(
+    p: int, t: int, d: int, dtype: torch.dtype
+):
+    q0, k0, v0 = _qkv(
+        p,
+        t,
+        d,
+        dtype,
+        seed=40_000 + p * 1000 + t * 10 + d,
+    )
+    bias0 = _dist_bias(torch.float32, seed=50_000 + p * 1000 + t * 10 + d)
+    generator = torch.Generator(device=_DEVICE).manual_seed(
+        60_000 + p * 1000 + t * 10 + d
+    )
+    upstream = torch.randn(
+        (p, _HEADS, t, d),
+        dtype=dtype,
+        device=_DEVICE,
+        generator=generator,
+    )
+
+    cases = [("dense", _seq_lens(p, t, ragged=False))]
+    ragged = _seq_lens(p, t, ragged=True)
+    if not torch.equal(ragged, cases[0][1]):
+        cases.append(("ragged", ragged))
+
+    for case_name, seq_lens in cases:
+        coords = _coords(p, t, seq_lens)
+        fast_inputs = [
+            x.detach().clone().requires_grad_() for x in (q0, k0, v0, bias0)
+        ]
+        ref_inputs = [
+            x.detach().clone().requires_grad_() for x in (q0, k0, v0, bias0)
+        ]
+
+        fast_out = fused_attention(
+            fast_inputs[0],
+            fast_inputs[1],
+            fast_inputs[2],
+            coords,
+            seq_lens,
+            fast_inputs[3],
+        )
+        fast_grads = torch.autograd.grad(
+            (fast_out * upstream).sum(), tuple(fast_inputs)
+        )
+
+        ref_out = _attention_reference(
+            ref_inputs[0],
+            ref_inputs[1],
+            ref_inputs[2],
+            coords,
+            seq_lens,
+            ref_inputs[3],
+        )
+        ref_grads = torch.autograd.grad(
+            (ref_out * upstream).sum(), tuple(ref_inputs)
+        )
+
+        torch.cuda.synchronize()
+        assert not _FAILED_SHAPES, _FAILED_SHAPES
+        assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
+        for grad_name, actual, expected in zip(
+            ("q", "k", "v", "dist_bias"), fast_grads, ref_grads
+        ):
+            assert torch.isfinite(actual).all(), f"{case_name}: {grad_name}"
+            expected_float = expected.float()
+            denominator = expected_float.norm().clamp_min(1.0e-7)
+            relative = (
+                (actual.float() - expected_float).norm() / denominator
+            ).item()
+            assert relative <= 3.0e-2, (
+                f"{case_name}, P={p}, T={t}, D={d}, dtype={dtype}, {grad_name}: "
+                f"relative gradient error {relative:.6g}"
+            )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_triton_backward_has_exactly_zero_gradients_for_padded_rows(
+    dtype: torch.dtype,
+):
+    p, t, d = 3, 65, 32
+    seq_lens = torch.tensor([t, 17, 1], dtype=torch.int32, device=_DEVICE)
+    coords = _coords(p, t, seq_lens)
+    q, k, v = _qkv(p, t, d, dtype, seed=70_000)
+    inputs = [x.requires_grad_() for x in (q, k, v)]
+    dist_bias = _dist_bias(torch.float32, seed=70_001).requires_grad_()
+    generator = torch.Generator(device=_DEVICE).manual_seed(70_002)
+    upstream = torch.randn(
+        (p, _HEADS, t, d),
+        dtype=dtype,
+        device=_DEVICE,
+        generator=generator,
+    )
+
+    out = fused_attention(
+        inputs[0], inputs[1], inputs[2], coords, seq_lens, dist_bias
+    )
+    grads = torch.autograd.grad((out * upstream).sum(), tuple(inputs))
+    torch.cuda.synchronize()
+
+    assert not _FAILED_SHAPES, _FAILED_SHAPES
+    assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
+    invalid = torch.arange(t, device=_DEVICE).unsqueeze(0) >= seq_lens.unsqueeze(1)
+    assert invalid.any()
+    for name, grad in zip(("q", "k", "v"), grads):
+        padded_rows = grad.permute(0, 2, 1, 3)[invalid]
+        assert torch.equal(padded_rows, torch.zeros_like(padded_rows)), name
+
+
 def test_dynamic_fullgraph_compile_keeps_attention_opaque():
     def attention(q, k, v, coords, seq_lens, dist_bias):
         return fused_attention(q, k, v, coords, seq_lens, dist_bias)
@@ -278,6 +401,7 @@ def test_dynamic_fullgraph_compile_backward_reaches_dist_bias():
     torch.cuda.synchronize()
 
     assert not _FAILED_SHAPES, _FAILED_SHAPES
+    assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
     for name, tensor in (
         ("q", q),
         ("k", k),
