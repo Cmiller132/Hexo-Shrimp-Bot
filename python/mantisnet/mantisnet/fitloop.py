@@ -1,7 +1,7 @@
 """Shared packed fitting machinery for production and lab training.
 
 The engine owns only epoch mechanics: memory-budget packing, optimizer
-grouping, one-ahead CPU preparation, sample-weighted accumulation, and the
+grouping, pipelined CPU preparation, sample-weighted accumulation, and the
 post-step parameter check. Callers own batch construction and their loss.
 """
 
@@ -13,6 +13,11 @@ from typing import Callable
 
 import numpy as np
 import torch
+
+# Chunks prepared concurrently ahead of consumption. The GPU step outpaces a
+# single preparation worker, so the pipeline holds a few chunks in flight;
+# consumption order is fixed by the packed permutation either way.
+_PREFETCH_DEPTH = 4
 
 
 @dataclass(frozen=True)
@@ -94,8 +99,9 @@ def fit_epoch(
 ) -> dict[str, float | int]:
     """Fit one packed epoch and return sample-weighted statistic means.
 
-    ``prepare(indices)`` runs on the single prefetch worker. ``step(payload)``
-    runs under ``lock`` and returns a per-sample-mean differentiable loss plus
+    ``prepare(indices)`` must be pure; it runs on the prefetch workers, up to
+    ``_PREFETCH_DEPTH`` chunks ahead of consumption. ``step(payload)`` runs
+    under ``lock`` and returns a per-sample-mean differentiable loss plus
     detached scalar statistics. The engine scales each chunk's loss by its
     fraction of the optimizer group before backpropagating.
 
@@ -127,14 +133,16 @@ def fit_epoch(
     stat_sums: dict[str, torch.Tensor] = {}
     total = 0
     fit_step = 0
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        prepped = {k: pool.submit(prepare, chunks[k]) for k in order[:1]}
+    with ThreadPoolExecutor(max_workers=_PREFETCH_DEPTH) as pool:
+        prepped = {
+            k: pool.submit(prepare, chunks[k]) for k in order[:_PREFETCH_DEPTH]
+        }
         consumed = 0
         for group, group_n in groups:
             optimizer.zero_grad(set_to_none=True)
             for k in group:
-                if consumed + 1 < len(order):
-                    nxt = order[consumed + 1]
+                if consumed + _PREFETCH_DEPTH < len(order):
+                    nxt = order[consumed + _PREFETCH_DEPTH]
                     prepped[nxt] = pool.submit(prepare, chunks[nxt])
                 payload = prepped.pop(k).result()
                 consumed += 1

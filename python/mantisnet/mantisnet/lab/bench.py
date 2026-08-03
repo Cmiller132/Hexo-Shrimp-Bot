@@ -451,12 +451,15 @@ def bench_fit(
             )
     else:
         from .corpus import load_corpus
-        from .train import fit_supervised_epoch
+        from .train import fit_supervised_epoch, sample_sizes
 
         frozen = load_corpus(corpus) if isinstance(corpus, (str, Path)) else corpus
         samples = frozen.split_samples(split)
         sample_count = len(samples)
         source = "corpus"
+        # Sizing replays the corpus once per split; production fitting reads
+        # sizes from its buffer, so the replay stays outside the timed epoch.
+        sizes = sample_sizes(frozen, samples)
 
         def run_epoch(epoch_seed):
             return fit_supervised_epoch(
@@ -466,6 +469,7 @@ def bench_fit(
                 split=split,
                 cfg=cfg,
                 rng=np.random.default_rng(epoch_seed),
+                sizes=sizes,
             )
 
     # Preserve the absorbed benchmark's measurement contract: compilation,

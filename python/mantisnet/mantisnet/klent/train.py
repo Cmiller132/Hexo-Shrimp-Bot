@@ -151,7 +151,7 @@ def fit(
     The memory budgets cap what one forward may hold, so chunks accumulate
     sample-weighted gradients until at least ``batch_size`` samples have
     contributed and the optimizer steps once. Each accumulated gradient is
-    the mean over its group. Chunk preparation runs one chunk ahead, and loss
+    the mean over its group. Chunk preparation runs pipelined ahead, and loss
     totals remain on-device until the returned sample-weighted means are read."""
     model.train()
     policy_q = _policy_q_fn(cfg)
