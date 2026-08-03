@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 
 import numpy as np
@@ -12,6 +13,7 @@ from fastapi.testclient import TestClient
 
 from mantisnet import MantisConfig, MantisNet
 from mantisnet.deck.app import create_app
+from mantisnet.deck.service import telemetry_connection
 from mantisnet.klent import telemetry
 from mantisnet.klent.inspect import inspect_position
 from mantisnet.klent.run import _versions, save_checkpoint
@@ -264,3 +266,214 @@ def test_deck_database_refuses_a_version_mismatch(tmp_path):
     with pytest.raises(RuntimeError, match="there are no migrations"):
         with TestClient(create_app(path)):
             pass
+
+
+def test_telemetry_connection_closes_when_its_block_exits(deck_run):
+    """``with sqlite3.connect(...)`` opens a transaction; it does not close.
+
+    The deck served 500s after two days of polling because every query
+    endpoint held its connection open, so this asserts the handle is dead
+    once the block ends rather than merely that the query worked.
+    """
+    _runs, run = deck_run
+    with telemetry_connection(run) as conn:
+        conn.execute("SELECT version FROM schema_version").fetchone()
+    with pytest.raises(sqlite3.ProgrammingError):
+        conn.execute("SELECT version FROM schema_version")
+
+
+def test_repeated_queries_leave_no_connection_open(deck_run, monkeypatch):
+    """One request must not cost a descriptor.
+
+    Counting live connections rather than file descriptors keeps the check
+    meaningful on every platform the suite runs on.
+    """
+    runs, _run = deck_run
+    live: list[sqlite3.Connection] = []
+    real_connect = sqlite3.connect
+
+    def tracking_connect(target, *args, **kwargs):
+        conn = real_connect(target, *args, **kwargs)
+        # The deck's own review database is opened once for the app's life;
+        # only the per-request telemetry handles are under test here.
+        if telemetry.DB_NAME in str(target):
+            live.append(conn)
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
+    requests = 8
+    with TestClient(create_app(runs, device="cpu")) as client:
+        for _ in range(requests):
+            assert client.get("/api/runs/fixture/summary").status_code == 200
+    assert len(live) == requests, (
+        f"expected one telemetry connection per request, got {len(live)}"
+    )
+
+    def closed(conn: sqlite3.Connection) -> bool:
+        try:
+            conn.execute("SELECT 1")
+        except sqlite3.ProgrammingError:
+            return True
+        return False
+
+    assert [c for c in live if not closed(c)] == []
+
+
+def test_a_missing_telemetry_database_still_maps_to_404(deck_run, tmp_path):
+    """Entering the connection inside the request must not cost the status
+    codes: the failure now happens one frame later than it used to."""
+    runs, _run = deck_run
+    (runs / "empty").mkdir()
+    with TestClient(create_app(runs, device="cpu")) as client:
+        response = client.get("/api/runs/empty/summary")
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "telemetry_not_found"
+
+
+def test_iteration_endpoint_merges_dynamic_metrics_and_refuses_collisions(
+    deck_run, tmp_path
+):
+    runs, run = deck_run
+    conn = sqlite3.connect(run / telemetry.DB_NAME)
+    conn.execute(
+        "UPDATE iterations SET metrics_json=? WHERE iteration=0",
+        (json.dumps({"critic_ce": 0.25}),),
+    )
+    conn.commit()
+    conn.close()
+    with TestClient(create_app(runs, tmp_path / "missing", device="cpu")) as client:
+        response = client.get(
+            "/api/runs/fixture/iterations?columns=games,critic_ce"
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == [{"iteration": 0, "games": 3, "critic_ce": 0.25}]
+
+    conn = sqlite3.connect(run / telemetry.DB_NAME)
+    conn.execute(
+        "UPDATE iterations SET metrics_json=? WHERE iteration=0",
+        (json.dumps({"games": 999}),),
+    )
+    conn.commit()
+    conn.close()
+    with TestClient(create_app(runs, tmp_path / "missing", device="cpu")) as client:
+        response = client.get("/api/runs/fixture/iterations?columns=games")
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "invalid_query"
+        assert "collides with a fixed iterations column" in response.text
+
+
+def test_horizon_endpoint_has_known_buckets_and_last_six_default(tmp_path):
+    runs = tmp_path / "runs"
+    run = runs / "horizon"
+    run.mkdir(parents=True)
+    writer = telemetry.open_telemetry(run)
+    writer.begin_run({"iterations": 8}, {"fixture": True}, 0)
+    conn = writer._conn
+    for iteration in range(8):
+        conn.execute(
+            "INSERT INTO iterations (iteration, run, games, plies, metrics_json) "
+            "VALUES (?, 1, 0, 0, '{}')",
+            (iteration,),
+        )
+    for game_id, iteration in ((1, 0), (2, 7)):
+        conn.execute(
+            "INSERT INTO games (game_id, kind, iteration, game_index, winner, "
+            "length, capped, moves) VALUES (?, 'selfplay', ?, ?, 0, 70, 0, ?)",
+            (game_id, iteration, game_id, telemetry.pack_moves([])),
+        )
+    plies = [
+        # The iteration-0 row proves that the default window is iterations 2..7.
+        (1, 69, 0, 9000),
+        # k=1 winner correct; k=2 loser correct; k=10 zero is wrong; k=70 loser wrong.
+        (2, 69, 0, 1000),
+        (2, 68, 1, -2000),
+        (2, 60, 0, 0),
+        (2, 0, 1, 1000),
+    ]
+    conn.executemany(
+        "INSERT INTO plies (game_id, t, mover, moves_remaining, legal_count, "
+        "rank, v_hat, kl, norm_entropy, pi_top1, pi_chosen) "
+        "VALUES (?, ?, ?, 1, 7, 0, ?, 0, 0, 0, 0)",
+        plies,
+    )
+    conn.commit()
+    writer.close()
+    (run / "config.json").write_text(json.dumps({"iterations": 8}), encoding="utf-8")
+
+    with TestClient(create_app(runs, tmp_path / "missing", device="cpu")) as client:
+        default = client.get("/api/runs/horizon/horizon")
+        assert default.status_code == 200, default.text
+        payload = default.json()
+        assert (payload["lo"], payload["hi"]) == (2, 7)
+        by_key = {(row["k_min"], row["outcome"]): row for row in payload["buckets"]}
+        assert by_key[(1, "won")] == {
+            "k_min": 1, "k_max": 4, "bucket": "1–4", "outcome": "won",
+            "count": 1, "sign_accuracy": 1.0, "mean_abs_v_hat": 0.1,
+        }
+        assert by_key[(1, "lost")]["sign_accuracy"] == 1.0
+        assert by_key[(1, "lost")]["mean_abs_v_hat"] == 0.2
+        assert by_key[(9, "won")]["sign_accuracy"] == 0.0
+        assert by_key[(65, "lost")]["sign_accuracy"] == 0.0
+        explicit = client.get("/api/runs/horizon/horizon?lo=0&hi=7").json()
+        explicit_first = next(
+            row for row in explicit["buckets"]
+            if row["k_min"] == 1 and row["outcome"] == "won"
+        )
+        assert explicit_first["count"] == 2
+        assert explicit_first["mean_abs_v_hat"] == pytest.approx(0.5)
+
+
+def _h2h_run(tmp_path):
+    runs = tmp_path / "runs"
+    run = runs / "paired"
+    run.mkdir(parents=True)
+    writer = telemetry.open_telemetry(run)
+    writer.begin_run({"iterations": 1}, {"fixture": True}, 0)
+    conn = writer._conn
+    opponent = writer.opponent("h2h:reference/checkpoint_000100", {})
+    conn.execute(
+        "INSERT INTO eval_matches (match_id, created, source, opponent, iteration, "
+        "games, score, win_rate, capped, elo, elo_lo, elo_hi) "
+        "VALUES (1, '2026-08-03T00:00:00+00:00', 'driver', ?, 1, "
+        "8, 6, .75, 0, 190, 20, 360)",
+        (opponent,),
+    )
+    winners = [(0, 1), (0, 1), (0, 1), (1, 0)]
+    for pair_index, pair_winners in enumerate(winners):
+        for within_pair, winner in enumerate(pair_winners):
+            game_index = pair_index * 2 + within_pair
+            conn.execute(
+                "INSERT INTO games (kind, iteration, match, game_index, winner, "
+                "length, capped, model_seat, opening_len, moves) "
+                "VALUES ('eval', 1, 1, ?, ?, 1, 0, ?, 1, ?)",
+                (game_index, winner, within_pair, telemetry.pack_moves([(0, 0)])),
+            )
+    conn.commit()
+    writer.close()
+    (run / "config.json").write_text(json.dumps({"iterations": 1}), encoding="utf-8")
+    return runs, run
+
+
+def test_h2h_sign_test_is_recomputed_and_unclean_pairs_are_refused(tmp_path):
+    runs, run = _h2h_run(tmp_path)
+    with TestClient(create_app(runs, tmp_path / "missing", device="cpu")) as client:
+        response = client.get("/api/runs/paired/strength")
+        assert response.status_code == 200, response.text
+        row = response.json()[0]
+        assert row["family"] == "h2h"
+        assert row["sign_test_p"] == pytest.approx(0.625)
+        assert row["decisive_pairs"] == 4
+        assert row["pair_counts"] == {
+            "model_both": 3, "split": 0, "reference_both": 1, "capped": 0,
+        }
+
+    conn = sqlite3.connect(run / telemetry.DB_NAME)
+    conn.execute("UPDATE games SET model_seat=0 WHERE match=1 AND game_index=1")
+    conn.commit()
+    conn.close()
+    with TestClient(create_app(runs, tmp_path / "missing", device="cpu")) as client:
+        response = client.get("/api/runs/paired/strength")
+        assert response.status_code == 500
+        assert response.json()["error"]["code"] == "invalid_eval_match"
+        assert "h2h match 1 does not pair cleanly" in response.text
+        assert "expected [0, 1]" in response.text

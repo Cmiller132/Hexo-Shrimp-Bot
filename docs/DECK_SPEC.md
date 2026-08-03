@@ -113,6 +113,21 @@ The FastAPI app and its non-HTTP services implement these seams:
   windows, filters, pagination for game search). Game detail returns the
   unpacked move list plus the game's `plies` rows so the client can replay
   the board and scrub the per-ply scalars without a second round trip.
+  `GET /api/runs/{run}/iterations` also exposes non-schema metrics from each
+  iteration's `metrics_json` object as ordinary row keys. Canonical metrics
+  duplicated in fixed columns must agree with those columns; any other key
+  collision is a 400 rather than an overwrite.
+  `GET /api/runs/{run}/horizon?lo=<iter>&hi=<iter>` returns the fixed
+  `1–4, 5–8, 9–12, 13–16, 17–24, 25–32, 33–48, 49–64, 65+` distance-from-end
+  buckets for decisive, uncapped self-play. Each bucket has eventual-winner
+  and eventual-loser mover rows with count, v̂ sign accuracy, and mean
+  `|v̂|`; omitted bounds select the last six iteration rows. The aggregation
+  and bucket `CASE` are one SQL query over `plies JOIN games`.
+  `GET /api/runs/{run}/strength` classifies `sealbot`, the native seat welcome
+  name `strix-seat`, and `h2h:` opponents. For H2H rows it recomputes the exact
+  two-sided sign test from that match's own pair-major games. It requires
+  consecutive `(2i, 2i+1)` indices, model seats `(0,1)`, and identical recorded
+  opening prefixes; malformed data is a named `invalid_eval_match` error.
 - **SSE.** `GET /api/runs/{run}/events`: typed events
   (`iteration`, `heartbeat`, `eval`, `checkpoint`, `log`, `lifecycle`),
   produced by polling the DB's max iteration (~1 s), the heartbeat file's
@@ -162,9 +177,19 @@ The FastAPI app and its non-HTTP services implement these seams:
 - **Screens:**
   - **Live run** — run selector = API run list (state-badged). Status
     strip + pipeline panel from `status.json` heartbeat; charts from
-    `iteration_series` with a window selector (the five metric tabs in the
-    interface, plus per-iteration seconds); eval panel from the latest
-    `eval_matches` row (CI, Elo, and seat split columns); losses/
+    `iteration_series` with a window selector. The health selector includes
+    `f`, `acting_norm_entropy`, `acting_kl`, `policy_loss`, `q_loss`,
+    `critic_ce`, `won_length_mean`, `first_stone_win_rate`,
+    `v_hat_winner_mean`, `v_hat_loser_mean`, buffer samples, and per-iteration
+    seconds. The Knowledge horizon panel follows iteration telemetry in the
+    main metrics column because it reads critic behavior in the context of the
+    health curves; it selects a recent window and can overlay the previous or
+    first equal-size window. It plots won/lost sign accuracy separately and
+    the combined mean-`|v̂|` curve. The expanded latest-evaluation panel charts
+    one series per opponent with CI/Elo bounds and shows every opponent at the
+    newest evaluation boundary together: SealBot includes depth,
+    `strix-seat` includes win rate and CI, and `h2h:` includes paired Elo
+    bounds and the recomputed sign-test p. Losses/
     diagnostics/hardware panels from `iterations` columns; slot-cohort grid
     binned from `slot_plies` (legend: live ply bands + at-cap); artifact
     timeline from checkpoint files on disk + eval rows + cadence
