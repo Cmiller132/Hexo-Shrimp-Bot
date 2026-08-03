@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient
 
 from mantisnet import MantisConfig, MantisNet
 from mantisnet.deck.app import create_app
-from mantisnet.deck.service import telemetry_connection
+from mantisnet.deck.service import _SNAPSHOT_ROOT, telemetry_connection
 from mantisnet.klent import telemetry
 from mantisnet.klent.inspect import inspect_position
 from mantisnet.klent.run import _versions, save_checkpoint
@@ -295,8 +295,10 @@ def test_repeated_queries_leave_no_connection_open(deck_run, monkeypatch):
     def tracking_connect(target, *args, **kwargs):
         conn = real_connect(target, *args, **kwargs)
         # The deck's own review database is opened once for the app's life;
-        # only the per-request telemetry handles are under test here.
-        if telemetry.DB_NAME in str(target):
+        # only the per-request telemetry handles are under test here. Those
+        # handles target the run's local snapshot, whose file is named after
+        # the run rather than after telemetry.DB_NAME.
+        if telemetry.DB_NAME in str(target) or _SNAPSHOT_ROOT.name in str(target):
             live.append(conn)
         return conn
 
