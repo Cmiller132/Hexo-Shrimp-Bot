@@ -19,6 +19,7 @@ from dataclasses import dataclass, replace
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from . import decoder, message_passing, relay, window_pairs
 from .attention import fused_attention
@@ -264,8 +265,23 @@ class _Block(nn.Module):
         )
         self.drop = nn.Dropout(cfg.dropout)
 
-    def _cell_pass(self, w: Tensor, batch: Batch) -> Tensor:
-        """Update windows through the live-window/empty-cell incidence graph."""
+    def _cell_pass(
+        self,
+        w: Tensor,
+        cell_ptr: Tensor,
+        edge_window: Tensor,
+        edge_class: Tensor,
+        win_ptr: Tensor,
+        edge_wcell: Tensor,
+        cls_ptr: Tensor,
+        edge_ccell: Tensor,
+    ) -> Tensor:
+        """Update windows through the live-window/empty-cell incidence graph.
+
+        Takes the relay tables as explicit tensors — the multi-round path
+        checkpoints this method, and dynamo can only trace the recompute
+        subgraph when every tensor crosses the boundary as an argument.
+        """
         if not self.cell_pass:
             raise RuntimeError("cell pass is disabled for this block")
         assert self.ln_cp_in is not None
@@ -278,15 +294,25 @@ class _Block(nn.Module):
         agg = relay.cell_pass(
             x,
             self.e_cp.weight,
-            batch.relay_cell_ptr,
-            batch.relay_window,
-            batch.relay_class,
-            batch.relay_win_ptr,
-            batch.relay_wcell,
-            batch.relay_cls_ptr,
-            batch.relay_ccell,
+            cell_ptr,
+            edge_window,
+            edge_class,
+            win_ptr,
+            edge_wcell,
+            cls_ptr,
+            edge_ccell,
         )
         return w + self.drop(self.mlp_cp(self.ln_cp_w(w), agg))
+
+    @torch.compiler.disable
+    def _checkpointed_cell_pass(self, w: Tensor, *tables: Tensor) -> Tensor:
+        # Tied weights share parameters, not saved tensors: each extra round
+        # otherwise retains its own sub-block activations, which is what
+        # pushed the rounds arm past physical VRAM. Recompute them in
+        # backward instead. Dynamo cannot trace the checkpoint's recompute
+        # subgraph here (its tracer rejects the lifted frame), so the rounds
+        # run eager inside a graph break and everything around them compiles.
+        return checkpoint(self._cell_pass, w, *tables, use_reentrant=False)
 
     def _window_attention(self, w: Tensor, batch: Batch) -> Tensor:
         """§5.1c: multi-head attention over each window's relation edges.
@@ -351,8 +377,20 @@ class _Block(nn.Module):
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
         if self.cell_pass:
+            tables = (
+                batch.relay_cell_ptr,
+                batch.relay_window,
+                batch.relay_class,
+                batch.relay_win_ptr,
+                batch.relay_wcell,
+                batch.relay_cls_ptr,
+                batch.relay_ccell,
+            )
             for _round in range(cfg.cell_pass_rounds):
-                w = self._cell_pass(w, batch)
+                if cfg.cell_pass_rounds > 1 and torch.is_grad_enabled():
+                    w = self._checkpointed_cell_pass(w, *tables)
+                else:
+                    w = self._cell_pass(w, *tables)
 
         if self.window_attention:
             w = self._window_attention(w, batch)

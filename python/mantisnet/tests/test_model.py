@@ -343,6 +343,51 @@ def test_cell_pass_rounds_iterate_with_tied_weights(positions):
     assert not torch.allclose(out_one.value_logits, out_two.value_logits)
 
 
+def test_extra_rounds_checkpoint_matches_direct_gradients(positions, monkeypatch):
+    # Multi-round training recomputes each round in backward instead of
+    # retaining its activations; the gradients must be the ones the direct
+    # path produces.
+    import mantisnet.model as model_module
+
+    small = dict(
+        h=16,
+        blocks=2,
+        heads=2,
+        value_queries=2,
+        value_bins=5,
+        policy_hidden=16,
+        value_hidden=16,
+        cell_pass=True,
+        cell_pass_rounds=2,
+    )
+    batch = collate([from_position(positions[8])])
+
+    def grads(direct: bool):
+        if direct:
+            monkeypatch.setattr(
+                model_module, "checkpoint", lambda fn, *args, **kw: fn(*args)
+            )
+        else:
+            monkeypatch.undo()
+        torch.manual_seed(5)
+        net = MantisNet(MantisConfig(**small)).train()
+        out = net(batch, 0.2)
+        (out.value_logits.sum() + out.policy_logits.sum()).backward()
+        return {
+            name: None if p.grad is None else p.grad.clone()
+            for name, p in net.named_parameters()
+        }
+
+    checkpointed = grads(direct=False)
+    direct = grads(direct=True)
+    assert checkpointed.keys() == direct.keys()
+    for name in checkpointed:
+        if direct[name] is None:
+            assert checkpointed[name] is None, name
+            continue
+        torch.testing.assert_close(checkpointed[name], direct[name], msg=name)
+
+
 def test_cell_pass_from_default_enables_every_block():
     net = MantisNet(MantisConfig(cell_pass=True))
 
@@ -452,7 +497,16 @@ def test_cell_pass_matches_literal_incidence_reference():
         agg[window] += cells[cell]
     expected = w + block.drop(block.mlp_cp(block.ln_cp_w(w), agg.to(w.dtype)))
 
-    actual = block._cell_pass(w, batch)
+    actual = block._cell_pass(
+        w,
+        batch.relay_cell_ptr,
+        batch.relay_window,
+        batch.relay_class,
+        batch.relay_win_ptr,
+        batch.relay_wcell,
+        batch.relay_cls_ptr,
+        batch.relay_ccell,
+    )
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 

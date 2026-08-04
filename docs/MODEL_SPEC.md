@@ -279,7 +279,10 @@ default `cell_pass_from=0` runs it in every block. `cell_pass_rounds`
 iterates the update within each enabled block using that block's single
 parameter set: window→cell→window hops compound (two rounds let a window
 read windows two shared cells away) while parameters stay fixed, so the
-knob isolates propagation depth from capacity.
+knob isolates propagation depth from capacity. Tied weights do not tie
+saved tensors, so with more than one round training recomputes each
+round's activations in backward rather than retaining them per round —
+memory stays at the single-round footprint.
 
 The builder's decoder incidence triples `(w, joint(a,w), a)` are the bipartite
 graph between every live window `w` and its empty cells `a`. For each triple:
