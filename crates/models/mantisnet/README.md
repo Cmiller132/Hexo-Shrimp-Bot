@@ -27,12 +27,18 @@ The crate root exports:
 
 The public `encoder` module provides:
 
-- `Graph` and `RawBatch`;
+- `Graph`, `RawBatch`, and `PairViews`;
 - `encode_position` and `decode_batch`;
 - `build`, `build_batch`, and `build_batch_prefixes`;
 - `collate`;
 - `WireError`;
 - `NUM_PATTERNS` and `DEC_CLASSES`.
+
+`collate`, `build_batch`, and `build_batch_prefixes` take a `pairs` flag. It
+adds `RawBatch::pairs`, the §5.1c window-pair relation tables in their three CSR
+views, which only a window-attention model reads; without it no pair work
+happens. `decode_batch` never derives them: the container seam's forward does
+not consume them.
 
 `MantisPackage::from_config` accepts:
 
@@ -108,6 +114,9 @@ Python training entry point to operate on checkpoints.
 
 - The Rust encoder is the production encoder and the Python builder is its
   independent parity oracle.
+- The §5.1c pair views are derived per position and offset into the batch, so
+  the two builders agree on each window's edge set but not on the edge order
+  inside a run; the order here is a function of the window identity table.
 - Encoded items are versioned, little-endian, and fully validated before
   allocation and collation.
 - Legal-cell rows are in engine canonical legal order.

@@ -8,7 +8,13 @@ import json
 import pytest
 import torch
 
-from mantisnet.lab.check import _check_batch_parity, run_check, smoke
+from mantisnet import collate, collate_positions, from_position
+from mantisnet.lab.check import (
+    _assert_pairs_equal,
+    _check_batch_parity,
+    run_check,
+    smoke,
+)
 from mantisnet.lab.cohort import CohortCase
 from mantisnet.lab.variants import VARIANTS
 
@@ -49,6 +55,32 @@ def test_contract_battery_passes_for_mantis(monkeypatch):
     assert result["python_rust_positions"] == 1
     assert result["decoder_legal_cells"] > 0
     assert collate_calls > 0
+
+
+def test_contract_battery_cross_checks_the_pair_tables():
+    # A window-attention model declares pairs=True through collate_for, so the
+    # builder comparison has to cover the §5.1c views as well.
+    result = run_check(
+        variant="mantis",
+        model_kw={**_tiny_model_kw(), "window_attention": True},
+        envs=1,
+        steps=4,
+        seed=3,
+        device="cpu",
+        compile=False,
+    )
+    assert result["python_rust_positions"] == 1
+
+
+def test_pair_cross_check_catches_a_moved_edge(positions):
+    cases = positions[:3]
+    rust = collate_positions(cases, pairs=True)
+    python = collate([from_position(p) for p in cases], pairs=True)
+    _assert_pairs_equal(rust, python)
+    python.wa_class = python.wa_class.clone()
+    python.wa_class[0] += 1
+    with pytest.raises(ValueError, match="destination run 0 differs"):
+        _assert_pairs_equal(rust, python)
 
 
 @pytest.mark.parametrize("field", ("q_score", "value_logits"))

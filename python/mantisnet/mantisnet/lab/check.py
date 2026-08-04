@@ -165,6 +165,58 @@ def _check_decoder_coverage(model, cases, device: str, collate_fn) -> int:
     return checked
 
 
+def _runs(ptr, first, second):
+    """Each run of a CSR view as a set of ``(partner, class)`` pairs."""
+    return [
+        set(zip(first[a:b].tolist(), second[a:b].tolist()))
+        for a, b in zip(ptr[:-1].tolist(), ptr[1:].tolist())
+    ]
+
+
+def _assert_pairs_equal(rust, python) -> None:
+    """Compare the §5.1c views per run as sets.
+
+    The two derivations agree on every window's edge set but not on the order
+    inside a run: the Rust builder joins each position on its own and offsets
+    the result, while the Python oracle runs one join over the whole batch. The
+    run boundaries, which are degrees, must still match exactly.
+    """
+    for name in ("wa_ptr", "wa_sptr", "wa_cptr"):
+        if not torch.equal(getattr(rust, name), getattr(python, name)):
+            raise ValueError(f"Rust/Python §5.1c disagreement in {name}")
+    views = (
+        ("destination", "wa_ptr", "wa_src", "wa_class"),
+        ("source", "wa_sptr", "wa_sdst", "wa_scls"),
+    )
+    for view, ptr, partner, cls in views:
+        got = _runs(getattr(rust, ptr), getattr(rust, partner), getattr(rust, cls))
+        want = _runs(getattr(rust, ptr), getattr(python, partner), getattr(python, cls))
+        for window, (a, b) in enumerate(zip(got, want)):
+            if a != b:
+                raise ValueError(
+                    f"Rust/Python §5.1c {view} run {window} differs: "
+                    f"{sorted(a ^ b)[:8]}"
+                )
+    # The class view indexes destination order, which the two disagree on, so
+    # it compares as the edges each class run actually names.
+    got, want = (_class_runs(batch) for batch in (rust, python))
+    for cls, (a, b) in enumerate(zip(got, want)):
+        if a != b:
+            raise ValueError(f"Rust/Python §5.1c class run {cls} names different edges")
+
+
+def _class_runs(batch):
+    """Each class run of a batch as the set of edges its ids name."""
+    dst = torch.repeat_interleave(
+        torch.arange(batch.window_id.shape[0]), batch.wa_ptr[1:] - batch.wa_ptr[:-1]
+    )
+    edges = list(zip(dst.tolist(), batch.wa_src.tolist(), batch.wa_class.tolist()))
+    return [
+        {edges[edge] for edge in batch.wa_cedge[a:b].tolist()}
+        for a, b in zip(batch.wa_cptr[:-1].tolist(), batch.wa_cptr[1:].tolist())
+    ]
+
+
 def _assert_batches_equal(rust, python) -> None:
     shape = (rust.n_pos, rust.max_t, rust.max_w, rust.n_cells)
     expected_shape = (python.n_pos, python.max_t, python.max_w, python.n_cells)
@@ -174,18 +226,25 @@ def _assert_batches_equal(rust, python) -> None:
         a, b = getattr(rust, name), getattr(python, name)
         if a.dtype != b.dtype or not torch.equal(a, b):
             raise ValueError(f"Rust/Python builder disagreement in {name}")
+    if (rust.wa_ptr is None) != (python.wa_ptr is None):
+        raise ValueError("only one of the two builders produced §5.1c pair tables")
+    if rust.wa_ptr is not None:
+        _assert_pairs_equal(rust, python)
 
 
 def _check_builder_agreement(cases, collate_fn) -> int:
-    positions = [case.position for case in cases]
+    batch = _collate_cases(cases, collate_fn)
+    # The declared collator decides whether this arm pays for pair tables; the
+    # oracle then has to derive the same ones to be compared against.
+    pairs = batch.wa_ptr is not None
     _assert_batches_equal(
-        _collate_cases(cases, collate_fn),
-        collate([from_position(p) for p in positions]),
+        batch,
+        collate([from_position(case.position) for case in cases], pairs=pairs),
     )
     for case in cases:
         _assert_batches_equal(
             _collate_cases([case], collate_fn),
-            collate([from_position(case.position)]),
+            collate([from_position(case.position)], pairs=pairs),
         )
     return len(cases)
 

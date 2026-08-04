@@ -393,7 +393,9 @@ class Batch:
     relay_ccell: torch.Tensor  # (E_d,) long: compact edge cells, class order
     # §5.1c window-pair relation tables, derived only on request
     # (``pairs=True``): a model without window_attention never reads them,
-    # and the join is too heavy to run for every arm's collation.
+    # and twenty million edges are too heavy to derive for every arm's
+    # collation. The Rust builder derives them per position; the Python
+    # builder joins the whole batch at once and is their oracle.
     wa_ptr: torch.Tensor | None = None  # (N_w + 1,) long, destination-major
     wa_src: torch.Tensor | None = None  # (E_p,) long: source windows
     wa_class: torch.Tensor | None = None  # (E_p,) long, < WA_CLASSES
@@ -434,6 +436,12 @@ def _relay_fields(
 
 
 def _pair_fields(window_id: torch.Tensor, window_slot: torch.Tensor, max_w: int) -> dict:
+    """The §5.1c views of the Python builder: one join over the whole batch.
+
+    The Rust builder joins per position and offsets the result, so the two
+    derivations agree on each window's edge set without sharing an edge order —
+    which is what makes this one an oracle for it rather than a copy of it.
+    """
     tables = pair_tables(window_id, window_slot // max_w)
     return {
         "wa_ptr": tables.ptr,
@@ -447,21 +455,44 @@ def _pair_fields(window_id: torch.Tensor, window_slot: torch.Tensor, max_w: int)
     }
 
 
+# The §5.1c views `hexo_py.build_batch*` emits under `pairs=True`.
+_RUST_PAIR_FIELDS = (
+    "wa_ptr",
+    "wa_src",
+    "wa_class",
+    "wa_sptr",
+    "wa_sdst",
+    "wa_scls",
+    "wa_cptr",
+    "wa_cedge",
+)
+
+
 def batch_from_arrays(*, pairs: bool = False, **fields) -> Batch:
     """A ``Batch`` from per-tensor arrays, with the derived tables built here.
 
     Both external construction paths land on this one function — the
     ``hexo_py.build_batch*`` array dicts unpacked as kwargs, and the embedded
-    Rust forward calling with torch tensors — so the collation-time relay and
-    pair derivations live in exactly one place. The scalar fields are derived
-    from tensor shapes; callers may also pass them, and a disagreement is
-    refused.
+    Rust forward calling with torch tensors — so the collation-time relay
+    derivation lives in exactly one place. The scalar fields are derived from
+    tensor shapes; callers may also pass them, and a disagreement is refused.
+
+    ``pairs`` describes what the arrays carry rather than requesting work: the
+    §5.1c edge views are the Rust builder's, derived per position where the
+    join is a few hundred windows wide. Arrays and flag disagreeing is a caller
+    fault, not something to paper over by deriving the views a second way.
     """
     scalars = {
         name: int(fields.pop(name))
         for name in ("n_pos", "max_t", "max_w", "n_cells")
         if name in fields
     }
+    supplied = [name for name in _RUST_PAIR_FIELDS if name in fields]
+    if pairs and len(supplied) != len(_RUST_PAIR_FIELDS):
+        missing = sorted(set(_RUST_PAIR_FIELDS) - set(supplied))
+        raise ValueError(f"pairs=True but the §5.1c views {missing} are missing")
+    if not pairs and supplied:
+        raise ValueError(f"§5.1c views {supplied} arrived without pairs=True")
     t = {name: torch.as_tensor(value) for name, value in fields.items()}
     derived = {
         "n_pos": int(t["attn_valid"].shape[0]),
@@ -478,11 +509,6 @@ def batch_from_arrays(*, pairs: bool = False, **fields) -> Batch:
         **_relay_fields(
             t["dec_cell"], t["dec_window"], t["dec_class"], int(t["window_feat"].shape[0])
         ),
-        **(
-            _pair_fields(t["window_id"], t["window_slot"], derived["max_w"])
-            if pairs
-            else {}
-        ),
     )
 
 
@@ -491,11 +517,14 @@ def collate_positions(positions, *, pairs: bool = False) -> Batch:
 
     ``hexo_py.build_batch`` runs in parallel with the GIL released and returns
     the same fields as ``collate([from_position(p) ...])`` under
-    ``MODEL_REPR_VERSION``.
+    ``MODEL_REPR_VERSION`` — except the §5.1c views, where the two derivations
+    agree on each window's edge set but not on the order inside its run.
     """
     import hexo_py
 
-    return batch_from_arrays(pairs=pairs, **hexo_py.build_batch(list(positions)))
+    return batch_from_arrays(
+        pairs=pairs, **hexo_py.build_batch(list(positions), pairs=pairs)
+    )
 
 
 def collate_prefixes(games, ts, *, pairs: bool = False) -> Batch:
@@ -507,7 +536,7 @@ def collate_prefixes(games, ts, *, pairs: bool = False) -> Batch:
     import hexo_py
 
     return batch_from_arrays(
-        pairs=pairs, **hexo_py.build_batch_prefixes(list(games), list(ts))
+        pairs=pairs, **hexo_py.build_batch_prefixes(list(games), list(ts), pairs=pairs)
     )
 
 

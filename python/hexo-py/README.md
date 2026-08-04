@@ -33,11 +33,15 @@ The installed module name is `hexo_py`.
 
 Module functions:
 
-- `build_batch(positions)` builds and collates the shared Rust graph encoding.
-- `build_batch_prefixes(games, ts)` replays each move prefix and collates it.
+- `build_batch(positions, *, pairs=False)` builds and collates the shared Rust
+  graph encoding.
+- `build_batch_prefixes(games, ts, *, pairs=False)` replays each move prefix and
+  collates it.
 
 Both functions return dictionaries of NumPy arrays matching
-`mantisnet.builder.Batch` field names.
+`mantisnet.builder.Batch` field names. `pairs=True` adds the eight `wa_*`
+§5.1c window-pair views, which only a window-attention model reads; without it
+they are absent and no pair work is done.
 
 Module constants:
 
@@ -114,7 +118,8 @@ cargo check --manifest-path python/hexo-py/Cargo.toml
 - Window mask bit `k` describes the cell `k` steps from the window start.
 - Batch construction releases the GIL and uses Rayon for position encoding.
 - Rust batch output must remain exactly equal to the independent Python builder
-  output.
+  output, except the §5.1c pair views, where the two derivations agree on each
+  window's edge set but not on the edge order inside a run.
 - `MODEL_REPR_VERSION` is owned by the Rust MantisNet package.
 - Linux and host-platform Cargo artifacts must use separate target directories.
 - The production package forward boundary is the opposite direction: the
