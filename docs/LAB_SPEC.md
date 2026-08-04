@@ -245,6 +245,7 @@ prefixes replayed through the engine.
 | `profile trunk` | Attribute replicated trunk stages and refuse drift from `model.trunk` |
 | `profile decode` | Attribute eager trunk and cell heads, optional compiled total, and decoder kernels |
 | `profile seam` | Attribute transfer, forward, and composition/return around network evaluation |
+| `profile fit` | Profile a window of real optimizer steps inside the fit engine and bucket kernel self-time by family |
 | `mass` | Measure the loaded family's committed mass, Q/M behavior, and acting-floor sensitivity |
 | `check` | Run D6, batch-parity, decoder-coverage, and applicable Python/Rust builder contracts |
 | `smoke` | Run a tiny synthetic-telemetry freeze, CPU cell, evaluation, and report end to end |

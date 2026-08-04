@@ -161,6 +161,20 @@ def build_parser() -> argparse.ArgumentParser:
         _cohort(mode, checkpoint_required=True)
         mode.add_argument("--iters", type=int, default=5)
 
+    fit_profile = profile_modes.add_parser(
+        "fit", help="profile real optimizer steps in the fit engine"
+    )
+    fit_profile.add_argument("--checkpoint")
+    fit_profile.add_argument("--family")
+    fit_profile.add_argument("--corpus", required=True)
+    fit_profile.add_argument("--split", choices=("train", "val", "test"), default="val")
+    fit_profile.add_argument("--wait", type=int, default=6)
+    fit_profile.add_argument("--warmup", type=int, default=2)
+    fit_profile.add_argument("--active", type=int, default=8)
+    fit_profile.add_argument("--seed", type=int, default=7)
+    _model_kw(fit_profile)
+    _device(fit_profile)
+
     mass = commands.add_parser("mass", help="probe checkpoint-family critic mass")
     _cohort(mass, checkpoint_required=True)
     mass.set_defaults(envs=32, steps=64)
@@ -327,6 +341,8 @@ def main(argv=None) -> None:
         values = vars(args).copy()
         values.pop("command")
         mode = values.pop("profile_mode")
+        if "model_kw" in values:
+            values["model_kw"] = _parse_overrides(parser, values["model_kw"])
         if values.get("corpus"):
             values["corpus"] = _named_path(values["corpus"], Path("runs/corpora"))
         run_profile(mode, **values)

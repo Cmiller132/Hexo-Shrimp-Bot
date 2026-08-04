@@ -7,13 +7,17 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from ..attention import fused_attention
 from ..builder import collate_positions
 from ..klent.train import KlentConfig, _policy_q
+from .bench import _config, _family_fields, _load_or_fresh
 from .cohort import corpus_cohort, selfplay_cohort
+from .corpus import load_corpus
 from .families import family_evaluate, load_checkpoint
+from .train import fit_supervised_epoch, sample_sizes
 
 
 def _sync(device: str) -> None:
@@ -218,6 +222,163 @@ def _profile_activities(device: str):
     return activities
 
 
+# Kernel-name needles for self-time attribution; the first matching bucket
+# claims a row, so the in-repo Triton kernels come before the generic families
+# ("triton_" alone would also claim them).
+_FIT_BUCKETS = {
+    "relay": (
+        "_cell_values_kernel",
+        "_cell_grad_kernel",
+        "_segment_sum_kernel",
+        "_class_partial_kernel",
+    ),
+    "attention": ("_fused_attention",),
+    "gemm": ("gemm", "cutlass", "nvjet", "cublas", "wgrad", "dgrad"),
+    "inductor": ("triton_",),
+    "eager index/eltwise": ("index", "scatter", "gather", "elementwise"),
+    "memcpy": ("memcpy",),
+    "optimizer/copy": ("adam", "multi_tensor", "foreach", "copy", "fill", "cat"),
+}
+
+
+def _row_micros(row, device: str) -> float:
+    if device != "cuda":
+        return row.self_cpu_time_total
+    return row.self_device_time_total
+
+
+def profile_fit(
+    *,
+    checkpoint=None,
+    corpus,
+    split: str = "val",
+    wait: int = 6,
+    warmup: int = 2,
+    active: int = 8,
+    seed: int = 7,
+    device: str = "cpu",
+    compile: bool = False,
+    model_kw: dict | None = None,
+    family: str | None = None,
+) -> dict:
+    """Profile real optimizer steps inside the production fit engine.
+
+    One full warm epoch absorbs compilation, autotuning, and allocator growth;
+    a second epoch then runs with a ``torch.profiler`` window over
+    ``wait + warmup + active`` genuine steps (the epoch itself runs to
+    completion — the window is a slice of it, not a reduced workload). Kernel
+    self-time is bucketed by family so the table has a headline.
+    """
+    if wait < 0 or warmup < 0 or active <= 0:
+        raise ValueError(
+            f"wait and warmup must be nonnegative and active positive, "
+            f"got {wait}, {warmup}, {active}"
+        )
+    cfg = _config(device, compile)
+    model, loaded = _load_or_fresh(
+        checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
+    )
+    if loaded is not None and loaded.family.name != "trinomial-joint":
+        raise ValueError(
+            "profile fit has only the current trinomial training objective; "
+            f"checkpoint family {loaded.family.name!r} is scoreable but its "
+            "historical fitting loss is outside the lab family contract"
+        )
+    frozen = load_corpus(corpus) if isinstance(corpus, (str, Path)) else corpus
+    samples = frozen.split_samples(split)
+    sizes = sample_sizes(frozen, samples)
+    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+
+    def run_epoch(epoch_seed):
+        return fit_supervised_epoch(
+            model,
+            optimizer,
+            frozen,
+            split=split,
+            cfg=cfg,
+            rng=np.random.default_rng(epoch_seed),
+            sizes=sizes,
+        )
+
+    run_epoch(seed)
+    _sync(device)
+
+    profiler = torch.profiler.profile(
+        activities=_profile_activities(device),
+        schedule=torch.profiler.schedule(
+            wait=wait, warmup=warmup, active=active, repeat=1
+        ),
+    )
+    steps = 0
+    original_step = optimizer.step
+
+    def stepping_step(*args, **kwargs):
+        nonlocal steps
+        out = original_step(*args, **kwargs)
+        steps += 1
+        profiler.step()
+        return out
+
+    optimizer.step = stepping_step
+    try:
+        with profiler:
+            run_epoch(seed + 1)
+    finally:
+        optimizer.step = original_step
+    needed = wait + warmup + active
+    if steps < needed:
+        raise ValueError(
+            f"split {split!r} ran {steps} optimizer steps; the schedule needs "
+            f"wait+warmup+active={needed}"
+        )
+
+    averages = profiler.key_averages()
+    buckets = dict.fromkeys(_FIT_BUCKETS, 0.0)
+    other = 0.0
+    for row in averages:
+        # Host-side op rows (aten::mm, mantisnet::cell_pass, ProfilerStep*)
+        # carry their child kernels' device time again; on CUDA bucket only
+        # the device-level rows so the totals add up once. CPU rows nest
+        # properly, and there the op rows are the only rows.
+        if device == "cuda" and (
+            "::" in row.key or row.key.startswith("ProfilerStep")
+        ):
+            continue
+        micros = _row_micros(row, device)
+        if not micros:
+            continue
+        key = row.key.lower()
+        for bucket, needles in _FIT_BUCKETS.items():
+            if any(needle in key for needle in needles):
+                buckets[bucket] += micros
+                break
+        else:
+            other += micros
+    total = sum(buckets.values()) + other
+    report = {
+        "mode": "fit",
+        **_family_fields(loaded),
+        "device": device,
+        "compile": compile,
+        "split": split,
+        "samples": len(samples),
+        "schedule": {"wait": wait, "warmup": warmup, "active": active},
+        "self_time_ms": {
+            **{name: micros / 1e3 for name, micros in buckets.items()},
+            "other": other / 1e3,
+        },
+        "total_ms": total / 1e3,
+        "kernel_profiler": averages.table(
+            sort_by=(
+                "self_cuda_time_total" if device == "cuda" else "self_cpu_time_total"
+            ),
+            row_limit=45,
+        ),
+    }
+    print(json.dumps(report, indent=2))
+    return report
+
+
 def profile_decode(
     *,
     checkpoint,
@@ -382,4 +543,5 @@ def run_profile(mode: str, **kwargs) -> dict:
         "trunk": profile_trunk,
         "decode": profile_decode,
         "seam": profile_seam,
+        "fit": profile_fit,
     }[mode](**kwargs)
