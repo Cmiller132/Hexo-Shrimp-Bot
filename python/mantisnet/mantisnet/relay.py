@@ -18,8 +18,11 @@ CPU, into three views of the same edge set: runs by cell (forward
 aggregation), runs by window (the return gather and ``dx``), and runs by
 class (``d_emb``). Every kernel is then a contiguous segment reduction — no
 atomics, deterministic, one program and one warp per output row, like the
-decoder's aggregation. The backward recomputes ``pre`` in-kernel for the ReLU
-mask instead of storing it, the same trade the fused attention backward makes.
+decoder's aggregation. The one exception is the class gradient: a class run
+can own a large share of the whole edge set, so it is sliced across programs
+into per-slice partials summed in a fixed order. The backward recomputes
+``pre`` in-kernel for the ReLU mask instead of storing it, the same trade the
+fused attention backward makes.
 
 The torch composition over the same tables is the parity reference and serves
 CPU tensors and failed launches.
@@ -44,6 +47,14 @@ except ImportError:
 # most 18 entries, a window at most 5) and fixed geometry keeps symbolic shape
 # changes out of Triton's tuning cache.
 _NUM_WARPS = 1
+
+# Class runs are the hostile layout — tens of thousands of edges can share a
+# class, so ``d_emb`` slices every run across programs, each summing 32-row
+# tiles into its own partial. 64 slices keep the worst run to a few hundred
+# iterations while the (classes * 64, H) fp32 partial stays a few MB.
+_CLASS_SPLITS = 64
+_CLASS_BLOCK_E = 32
+_CLASS_NUM_WARPS = 4
 
 _FAILED_SHAPES: dict[tuple[object, ...], str] = {}
 _FAILED_BACKWARD_SHAPES: dict[tuple[object, ...], str] = {}
@@ -175,6 +186,44 @@ if triton is not None:
             ).to(tl.float32)
         dpre = tl.where(pre > 0, gacc, 0.0)
         tl.store(dpre_ptr + cell * H + offs, dpre, mask=live)
+
+    @triton.jit
+    def _class_partial_kernel(
+        rows_ptr,
+        seg_ptr,
+        payload,
+        partial_ptr,
+        SPLITS: tl.constexpr,
+        H: tl.constexpr,
+        BLOCK_H: tl.constexpr,
+        BLOCK_E: tl.constexpr,
+    ):
+        # One slice of one class run: sum the selected fp32 rows of the slice
+        # into a partial. Slice bounds and the in-slice order are functions of
+        # the tables alone, so the two-stage reduction stays deterministic.
+        cls = tl.program_id(0)
+        part = tl.program_id(1)
+        offs = tl.arange(0, BLOCK_H)
+        live = offs < H
+        start = tl.load(seg_ptr + cls)
+        end = tl.load(seg_ptr + cls + 1)
+        per = (end - start + SPLITS - 1) // SPLITS
+        lo = start + part * per
+        hi = tl.minimum(lo + per, end)
+        acc = tl.zeros([BLOCK_H], dtype=tl.float32)
+        for base in tl.range(lo, hi, BLOCK_E):
+            entries = base + tl.arange(0, BLOCK_E)
+            inside = entries < hi
+            rows = tl.load(payload + entries, mask=inside, other=0)
+            acc += tl.sum(
+                tl.load(
+                    rows_ptr + rows[:, None] * H + offs[None, :],
+                    mask=inside[:, None] & live[None, :],
+                    other=0.0,
+                ),
+                axis=0,
+            )
+        tl.store(partial_ptr + (cls * SPLITS + part) * H + offs, acc, mask=live)
 
     @triton.jit
     def _segment_sum_kernel(
@@ -387,17 +436,21 @@ def _launch_backward(
         BLOCK_H=block_h,
         num_warps=_NUM_WARPS,
     )
-    d_emb = torch.empty(emb.shape, dtype=emb.dtype, device=x.device)
-    _segment_sum_kernel[(emb.shape[0],)](
+    partial = torch.empty(
+        emb.shape[0] * _CLASS_SPLITS, h, dtype=torch.float32, device=x.device
+    )
+    _class_partial_kernel[(emb.shape[0], _CLASS_SPLITS)](
         d_pre,
         cls_ptr,
         edge_ccell,
-        d_emb,
-        *d_emb.stride(),
+        partial,
+        SPLITS=_CLASS_SPLITS,
         H=h,
         BLOCK_H=block_h,
-        num_warps=_NUM_WARPS,
+        BLOCK_E=_CLASS_BLOCK_E,
+        num_warps=_CLASS_NUM_WARPS,
     )
+    d_emb = partial.view(emb.shape[0], _CLASS_SPLITS, h).sum(dim=1).to(emb.dtype)
     return dx, d_emb
 
 
