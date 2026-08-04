@@ -51,6 +51,10 @@ class MantisConfig:
     off_axis_bias: bool = False
     cell_pass: bool = False
     cell_pass_from: int = 0
+    # Iterate the §5.1b relay within each enabled block, tied weights: extra
+    # rounds add propagation depth (window -> cell -> window hops), not
+    # capacity.
+    cell_pass_rounds: int = 1
     # Embed the batch's 93 joint occupied-slot incidence classes directly
     # instead of folding them to the three coarse slot classes (§4.3).
     joint_incidence: bool = False
@@ -68,6 +72,14 @@ class MantisConfig:
         if self.cell_pass_from > 0 and not self.cell_pass:
             raise ValueError(
                 f"cell_pass_from={self.cell_pass_from} requires cell_pass=True"
+            )
+        if self.cell_pass_rounds < 1:
+            raise ValueError(
+                f"cell_pass_rounds={self.cell_pass_rounds} must be at least 1"
+            )
+        if self.cell_pass_rounds > 1 and not self.cell_pass:
+            raise ValueError(
+                f"cell_pass_rounds={self.cell_pass_rounds} requires cell_pass=True"
             )
         if self.off_axis_bias and not self.axis_bias:
             raise ValueError("off_axis_bias requires axis_bias")
@@ -277,7 +289,8 @@ class _Block(nn.Module):
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
         if self.cell_pass:
-            w = self._cell_pass(w, batch)
+            for _round in range(cfg.cell_pass_rounds):
+                w = self._cell_pass(w, batch)
 
         # §5.2: stones aggregate their windows.
         y = self.v(self.ln_sw_w(w))

@@ -296,6 +296,53 @@ def test_cell_pass_from_limits_relay_to_trunk_tail(positions):
         assert torch.isfinite(tensor).all()
 
 
+def test_cell_pass_rounds_requires_cell_pass():
+    with pytest.raises(ValueError, match=r"cell_pass_rounds=2 requires cell_pass=True"):
+        MantisConfig(cell_pass_rounds=2)
+
+
+def test_cell_pass_rounds_must_be_positive():
+    with pytest.raises(ValueError, match=r"cell_pass_rounds=0 must be at least 1"):
+        MantisConfig(cell_pass=True, cell_pass_rounds=0)
+
+
+@torch.no_grad()
+def test_cell_pass_rounds_iterate_with_tied_weights(positions):
+    small = dict(
+        h=16,
+        blocks=2,
+        heads=2,
+        value_queries=2,
+        value_bins=5,
+        policy_hidden=16,
+        value_hidden=16,
+        cell_pass=True,
+    )
+    torch.manual_seed(3)
+    one = MantisNet(MantisConfig(**small)).eval()
+    torch.manual_seed(3)
+    two = MantisNet(MantisConfig(**small, cell_pass_rounds=2)).eval()
+
+    # Tied weights: the second round adds no parameters, so the two models
+    # are parameter-for-parameter identical from the same seed.
+    names_one = [name for name, _parameter in one.named_parameters()]
+    names_two = [name for name, _parameter in two.named_parameters()]
+    assert names_one == names_two
+    assert all(
+        torch.equal(a, b)
+        for (_na, a), (_nb, b) in zip(one.named_parameters(), two.named_parameters())
+    )
+
+    batch = collate([from_position(positions[8])])
+    out_one, out_two = one(batch, 0.2), two(batch, 0.2)
+    for tensor in vars(out_two).values():
+        assert torch.isfinite(tensor).all()
+    # The second hop moves the windows, so equal weights must not give an
+    # equal value readout — otherwise the loop is not actually running. (The
+    # policy head is zero-initialized, so it cannot discriminate here.)
+    assert not torch.allclose(out_one.value_logits, out_two.value_logits)
+
+
 def test_cell_pass_from_default_enables_every_block():
     net = MantisNet(MantisConfig(cell_pass=True))
 

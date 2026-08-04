@@ -274,7 +274,11 @@ magnitude.
 `False` by default and is off in production. When enabled, this step runs
 after §5.1 and before §5.2, so a stone reads fork-aware window embeddings in
 the same block. The relay runs in trunk blocks `cell_pass_from..B-1`; the
-default `cell_pass_from=0` runs it in every block.
+default `cell_pass_from=0` runs it in every block. `cell_pass_rounds`
+iterates the update within each enabled block using that block's single
+parameter set: window→cell→window hops compound (two rounds let a window
+read windows two shared cells away) while parameters stay fixed, so the
+knob isolates propagation depth from capacity.
 
 The builder's decoder incidence triples `(w, joint(a,w), a)` are the bipartite
 graph between every live window `w` and its empty cells `a`. For each triple:
