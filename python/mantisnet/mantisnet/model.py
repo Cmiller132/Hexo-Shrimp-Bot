@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from . import decoder, message_passing
+from . import decoder, message_passing, relay
 from .attention import fused_attention
 from .builder import DEC_CLASSES, NEAREST_BUCKETS, NUM_PATTERNS, Batch
 from .segments import segment_ids, segment_max
@@ -231,19 +231,18 @@ class _Block(nn.Module):
         assert self.mlp_cp is not None
 
         x = self.u_cp(self.ln_cp_in(w))
-        msg = x.index_select(0, batch.dec_window) + self.e_cp(batch.dec_class)
-        cells = torch.zeros(
-            batch.cell_pos.shape[0], w.shape[1], dtype=torch.float32, device=w.device
-        ).index_add_(0, batch.dec_cell, msg.float())
-        cells = F.relu(cells)
-        agg = torch.zeros(
-            w.shape[0], w.shape[1], dtype=torch.float32, device=w.device
-        ).index_add_(
-            0,
-            batch.dec_window,
-            cells.index_select(0, batch.dec_cell),
+        agg = relay.cell_pass(
+            x,
+            self.e_cp.weight,
+            batch.relay_cell_ptr,
+            batch.relay_window,
+            batch.relay_class,
+            batch.relay_win_ptr,
+            batch.relay_wcell,
+            batch.relay_cls_ptr,
+            batch.relay_ccell,
         )
-        return w + self.drop(self.mlp_cp(self.ln_cp_w(w), agg.to(w.dtype)))
+        return w + self.drop(self.mlp_cp(self.ln_cp_w(w), agg))
 
     def forward(
         self, s: Tensor, w: Tensor, g: Tensor, batch: Batch, seq_lens: Tensor

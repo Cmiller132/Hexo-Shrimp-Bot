@@ -287,7 +287,7 @@ signal. The per-cell ReLU is essential—it makes several strong windows meeting
 at one particular cell a nonlinear conjunction rather than reducing the two
 scatters to a linear co-incidence operator. A background cell has no incidence,
 stays zero, and contributes nothing back. The cell activations are transient
-scatter buffers, not persistent empty-cell nodes.
+aggregation buffers, not persistent empty-cell nodes.
 
 ### 5.2 Stone ← windows
 

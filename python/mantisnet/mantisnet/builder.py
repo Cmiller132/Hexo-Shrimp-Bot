@@ -29,6 +29,8 @@ import numpy as np
 import torch
 from hexo_py import MODEL_REPR_VERSION
 
+from .relay import relay_tables
+
 WINDOW_LEN = 6
 # Unit steps of the engine's axes, in canonical order Q, R, QR.
 AXES = np.array([[1, 0], [0, 1], [1, -1]], dtype=np.int64)
@@ -352,6 +354,16 @@ class Batch:
     dec_class: torch.Tensor  # (E_d,) long, < DEC_CLASSES
     bg_cell: torch.Tensor  # (N_bg,) long, global cell index
     bg_bucket: torch.Tensor  # (N_bg,) long
+    # Cell-pass relay (§5.1b): the decoder incidence sorted once at collation
+    # into CSR views — by covered cell (relabelled compactly), by window, and
+    # by class — so the pass runs as contiguous segment reductions.
+    relay_cell_ptr: torch.Tensor  # (covered cells + 1,) long
+    relay_window: torch.Tensor  # (E_d,) long: edge windows, cell order
+    relay_class: torch.Tensor  # (E_d,) long: edge classes, cell order
+    relay_win_ptr: torch.Tensor  # (N_w + 1,) long
+    relay_wcell: torch.Tensor  # (E_d,) long: compact edge cells, window order
+    relay_cls_ptr: torch.Tensor  # (DEC_CLASSES + 1,) long
+    relay_ccell: torch.Tensor  # (E_d,) long: compact edge cells, class order
 
     def to(self, device) -> "Batch":
         """The same batch with every tensor on ``device``."""
@@ -360,6 +372,27 @@ class Batch:
             for name, v in vars(self).items()
         }
         return Batch(**moved)
+
+
+_RELAY_FIELDS = (
+    "relay_cell_ptr",
+    "relay_window",
+    "relay_class",
+    "relay_win_ptr",
+    "relay_wcell",
+    "relay_cls_ptr",
+    "relay_ccell",
+)
+
+
+def _relay_fields(
+    dec_cell: torch.Tensor,
+    dec_window: torch.Tensor,
+    dec_class: torch.Tensor,
+    n_windows: int,
+) -> dict:
+    tables = relay_tables(dec_cell, dec_window, dec_class, n_windows, DEC_CLASSES)
+    return dict(zip(_RELAY_FIELDS, tables))
 
 
 def _batch_from_arrays(raw: dict) -> Batch:
@@ -372,6 +405,9 @@ def _batch_from_arrays(raw: dict) -> Batch:
         max_w=int(t["value_valid"].shape[1]),
         n_cells=int(t["cell_pos"].shape[0]),
         **t,
+        **_relay_fields(
+            t["dec_cell"], t["dec_window"], t["dec_class"], int(t["window_feat"].shape[0])
+        ),
     )
 
 
@@ -428,6 +464,9 @@ def collate(graphs: list[PositionGraph]) -> Batch:
 
     stone_slot = cat([i * max_t + 1 + np.arange(g.n_stones) for i, g in enumerate(graphs)])
     window_slot = cat([i * max_w + 1 + np.arange(g.n_windows) for i, g in enumerate(graphs)])
+    dec_cell = cat([g.dec_cell + cell_off[i] for i, g in enumerate(graphs)])
+    dec_window = cat([g.dec_window + win_off[i] for i, g in enumerate(graphs)])
+    dec_class = cat([g.dec_class for g in graphs])
 
     return Batch(
         n_pos=p,
@@ -447,9 +486,10 @@ def collate(graphs: list[PositionGraph]) -> Batch:
         n_cells=int(cell_off[-1]),
         legal_offsets=torch.from_numpy(cell_off.astype(np.int64)),
         cell_pos=cat([np.full(g.n_legal, i) for i, g in enumerate(graphs)]),
-        dec_cell=cat([g.dec_cell + cell_off[i] for i, g in enumerate(graphs)]),
-        dec_window=cat([g.dec_window + win_off[i] for i, g in enumerate(graphs)]),
-        dec_class=cat([g.dec_class for g in graphs]),
+        dec_cell=dec_cell,
+        dec_window=dec_window,
+        dec_class=dec_class,
         bg_cell=cat([g.bg_cell + cell_off[i] for i, g in enumerate(graphs)]),
         bg_bucket=cat([g.bg_bucket for g in graphs]),
+        **_relay_fields(dec_cell, dec_window, dec_class, int(win_off[-1])),
     )
