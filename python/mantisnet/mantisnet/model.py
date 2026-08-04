@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from . import decoder, message_passing, relay
+from . import decoder, message_passing, relay, window_pairs
 from .attention import fused_attention
 from .builder import (
     DEC_CLASSES,
@@ -30,7 +30,7 @@ from .builder import (
     OCC_FOLD,
     Batch,
 )
-from .segments import segment_ids, segment_max
+from .segments import segment_ids, segment_max, segment_sum
 
 
 @dataclass(frozen=True)
@@ -58,6 +58,9 @@ class MantisConfig:
     # Embed the batch's 93 joint occupied-slot incidence classes directly
     # instead of folding them to the three coarse slot classes (§4.3).
     joint_incidence: bool = False
+    # §5.1c sparse window attention over the typed pair relations; requires
+    # batches collated with ``pairs=True``.
+    window_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
@@ -213,6 +216,24 @@ class _Block(nn.Module):
             self.e_cp = None
             self.ln_cp_w = None
             self.mlp_cp = None
+        # §5.1c window <- windows through typed pair relations.
+        self.window_attention = cfg.window_attention
+        if self.window_attention:
+            self.ln_wa = nn.LayerNorm(h)
+            self.wq_wa = nn.Linear(h, h)
+            self.wk_wa = nn.Linear(h, h)
+            self.wv_wa = nn.Linear(h, h)
+            self.wo_wa = nn.Linear(h, h)
+            self.wa_bias = nn.Parameter(
+                torch.zeros(cfg.heads, window_pairs.WA_CLASSES)
+            )
+        else:
+            self.ln_wa = None
+            self.wq_wa = None
+            self.wk_wa = None
+            self.wv_wa = None
+            self.wo_wa = None
+            self.wa_bias = None
         # §5.2 stone <- windows
         self.ln_sw_w = nn.LayerNorm(h)
         self.ln_sw_s = nn.LayerNorm(h)
@@ -267,6 +288,59 @@ class _Block(nn.Module):
         )
         return w + self.drop(self.mlp_cp(self.ln_cp_w(w), agg))
 
+    def _window_attention(self, w: Tensor, batch: Batch) -> Tensor:
+        """§5.1c: multi-head attention over each window's relation edges.
+
+        Scores and the softmax run in fp32 whatever autocast chose for the
+        projections; the weighted sum accumulates in fp32 and casts once at
+        the output projection.
+        """
+        if not self.window_attention:
+            raise RuntimeError("window attention is disabled for this block")
+        if batch.wa_ptr is None or batch.wa_src is None or batch.wa_class is None:
+            raise RuntimeError(
+                "window attention requires a batch collated with pairs=True"
+            )
+        assert self.ln_wa is not None
+        assert self.wq_wa is not None
+        assert self.wk_wa is not None
+        assert self.wv_wa is not None
+        assert self.wo_wa is not None
+        assert self.wa_bias is not None
+        cfg = self.cfg
+        heads, hd = cfg.heads, cfg.h // cfg.heads
+        n_w = w.shape[0]
+
+        z = self.ln_wa(w)
+        q = self.wq_wa(z).view(n_w, heads, hd)
+        k = self.wk_wa(z).view(n_w, heads, hd)
+        v = self.wv_wa(z).view(n_w, heads, hd)
+
+        dst = segment_ids(batch.wa_ptr)
+        src = batch.wa_src
+        logits = (
+            q.index_select(0, dst).float() * k.index_select(0, src).float()
+        ).sum(-1) / math.sqrt(hd)
+        logits = logits + self.wa_bias.t().index_select(0, batch.wa_class).float()
+
+        # Per-(window, head) segment softmax over the edge list. Every window
+        # has a SELF edge, so no segment is empty.
+        flat_seg = (
+            dst[:, None] * heads + torch.arange(heads, device=w.device)[None, :]
+        ).reshape(-1)
+        flat = logits.reshape(-1)
+        peak = segment_max(flat, flat_seg, n_w * heads)
+        weight = (flat - peak.index_select(0, flat_seg)).exp()
+        denom = segment_sum(weight, flat_seg, n_w * heads)
+        alpha = (weight / denom.index_select(0, flat_seg)).view(-1, heads)
+
+        out = torch.zeros(n_w, heads, hd, dtype=torch.float32, device=w.device)
+        out.index_add_(
+            0, dst, alpha.unsqueeze(-1) * v.index_select(0, src).float()
+        )
+        out = self.wo_wa(out.reshape(n_w, cfg.h).to(z.dtype))
+        return w + self.drop(out)
+
     def forward(
         self, s: Tensor, w: Tensor, g: Tensor, batch: Batch, seq_lens: Tensor
     ) -> tuple[Tensor, Tensor, Tensor]:
@@ -291,6 +365,9 @@ class _Block(nn.Module):
         if self.cell_pass:
             for _round in range(cfg.cell_pass_rounds):
                 w = self._cell_pass(w, batch)
+
+        if self.window_attention:
+            w = self._window_attention(w, batch)
 
         # §5.2: stones aggregate their windows.
         y = self.v(self.ln_sw_w(w))

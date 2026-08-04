@@ -31,6 +31,7 @@ import torch
 from hexo_py import MODEL_REPR_VERSION
 
 from .relay import relay_tables
+from .window_pairs import pair_tables
 
 WINDOW_LEN = 6
 # Unit steps of the engine's axes, in canonical order Q, R, QR.
@@ -390,6 +391,12 @@ class Batch:
     relay_wcell: torch.Tensor  # (E_d,) long: compact edge cells, window order
     relay_cls_ptr: torch.Tensor  # (DEC_CLASSES + 1,) long
     relay_ccell: torch.Tensor  # (E_d,) long: compact edge cells, class order
+    # §5.1c window-pair relation tables, derived only on request
+    # (``pairs=True``): a model without window_attention never reads them,
+    # and the join is too heavy to run for every arm's collation.
+    wa_ptr: torch.Tensor | None = None  # (N_w + 1,) long, destination-major
+    wa_src: torch.Tensor | None = None  # (E_p,) long: source windows
+    wa_class: torch.Tensor | None = None  # (E_p,) long, < WA_CLASSES
 
     def to(self, device) -> "Batch":
         """The same batch with every tensor on ``device``."""
@@ -421,14 +428,20 @@ def _relay_fields(
     return dict(zip(_RELAY_FIELDS, tables))
 
 
-def batch_from_arrays(**fields) -> Batch:
-    """A ``Batch`` from per-tensor arrays, with the relay tables derived here.
+def _pair_fields(window_id: torch.Tensor, window_slot: torch.Tensor, max_w: int) -> dict:
+    ptr, src, cls = pair_tables(window_id, window_slot // max_w)
+    return {"wa_ptr": ptr, "wa_src": src, "wa_class": cls}
+
+
+def batch_from_arrays(*, pairs: bool = False, **fields) -> Batch:
+    """A ``Batch`` from per-tensor arrays, with the derived tables built here.
 
     Both external construction paths land on this one function — the
     ``hexo_py.build_batch*`` array dicts unpacked as kwargs, and the embedded
-    Rust forward calling with torch tensors — so the collation-time relay
-    derivation lives in exactly one place. The scalar fields are derived from
-    tensor shapes; callers may also pass them, and a disagreement is refused.
+    Rust forward calling with torch tensors — so the collation-time relay and
+    pair derivations live in exactly one place. The scalar fields are derived
+    from tensor shapes; callers may also pass them, and a disagreement is
+    refused.
     """
     scalars = {
         name: int(fields.pop(name))
@@ -451,10 +464,15 @@ def batch_from_arrays(**fields) -> Batch:
         **_relay_fields(
             t["dec_cell"], t["dec_window"], t["dec_class"], int(t["window_feat"].shape[0])
         ),
+        **(
+            _pair_fields(t["window_id"], t["window_slot"], derived["max_w"])
+            if pairs
+            else {}
+        ),
     )
 
 
-def collate_positions(positions) -> Batch:
+def collate_positions(positions, *, pairs: bool = False) -> Batch:
     """Build and collate positions with the Rust builder.
 
     ``hexo_py.build_batch`` runs in parallel with the GIL released and returns
@@ -463,10 +481,10 @@ def collate_positions(positions) -> Batch:
     """
     import hexo_py
 
-    return batch_from_arrays(**hexo_py.build_batch(list(positions)))
+    return batch_from_arrays(pairs=pairs, **hexo_py.build_batch(list(positions)))
 
 
-def collate_prefixes(games, ts) -> Batch:
+def collate_prefixes(games, ts, *, pairs: bool = False) -> Batch:
     """Move prefixes to one collated batch: replay + build, in parallel.
 
     Stored fitting positions are move prefixes
@@ -474,10 +492,12 @@ def collate_prefixes(games, ts) -> Batch:
     """
     import hexo_py
 
-    return batch_from_arrays(**hexo_py.build_batch_prefixes(list(games), list(ts)))
+    return batch_from_arrays(
+        pairs=pairs, **hexo_py.build_batch_prefixes(list(games), list(ts))
+    )
 
 
-def collate(graphs: list[PositionGraph]) -> Batch:
+def collate(graphs: list[PositionGraph], *, pairs: bool = False) -> Batch:
     """Concatenate position graphs into one batch (§9)."""
     if not graphs:
         raise ValueError("empty batch")
@@ -507,6 +527,7 @@ def collate(graphs: list[PositionGraph]) -> Batch:
 
     stone_slot = cat([i * max_t + 1 + np.arange(g.n_stones) for i, g in enumerate(graphs)])
     window_slot = cat([i * max_w + 1 + np.arange(g.n_windows) for i, g in enumerate(graphs)])
+    window_id = cat([g.window_id for g in graphs]).view(-1, 3)
     dec_cell = cat([g.dec_cell + cell_off[i] for i, g in enumerate(graphs)])
     dec_window = cat([g.dec_window + win_off[i] for i, g in enumerate(graphs)])
     dec_class = cat([g.dec_class for g in graphs])
@@ -515,7 +536,7 @@ def collate(graphs: list[PositionGraph]) -> Batch:
         n_pos=p,
         stone_own=cat([g.stone_own for g in graphs]),
         window_feat=cat([g.window_feat for g in graphs]),
-        window_id=cat([g.window_id for g in graphs]).view(-1, 3),
+        window_id=window_id,
         moves_idx=torch.tensor([g.moves_remaining - 1 for g in graphs], dtype=torch.long),
         inc_stone=cat([g.inc_stone + stone_off[i] for i, g in enumerate(graphs)]),
         inc_window=cat([g.inc_window + win_off[i] for i, g in enumerate(graphs)]),
@@ -536,4 +557,5 @@ def collate(graphs: list[PositionGraph]) -> Batch:
         bg_cell=cat([g.bg_cell + cell_off[i] for i, g in enumerate(graphs)]),
         bg_bucket=cat([g.bg_bucket for g in graphs]),
         **_relay_fields(dec_cell, dec_window, dec_class, int(win_off[-1])),
+        **(_pair_fields(window_id, window_slot, max_w) if pairs else {}),
     )

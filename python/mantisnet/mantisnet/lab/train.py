@@ -22,6 +22,7 @@ from ..losses import policy_loss, value_loss
 from .corpus import FrozenCorpus, SampleSplit, load_corpus
 from .variants import (
     build_variant,
+    collate_for,
     count_parameters,
     refuse_param_budget,
     variant_spec,
@@ -251,7 +252,7 @@ def fit_supervised_epoch(
     if not len(samples):
         raise ValueError(f"corpus split {split!r} is empty")
     lengths, cells = sizes if sizes is not None else sample_sizes(frozen, samples)
-    collate = variant_spec(variant).collate
+    collate = collate_for(variant_spec(variant), model)
     forward = _supervised_fn(cfg.compile)
     device_type = torch.device(cfg.device).type
 
@@ -328,7 +329,7 @@ def validate_supervised(
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
     )
-    collate = variant_spec(variant).collate
+    collate = collate_for(variant_spec(variant), model)
     forward = _supervised_fn(cfg.compile)
     device_type = torch.device(cfg.device).type
     correct = 0

@@ -61,6 +61,7 @@ group D6, so the whole model is D6-invariant by construction (§8).
 | `axis_bias` | enable the on-axis/off-axis attention-bias ablation | `False` |
 | `cell_pass` | enable the window-to-window shared-empty-cell ablation | `False` |
 | `joint_incidence` | embed the 93 joint incidence classes unfolded | `False` |
+| `window_attention` | enable the §5.1c typed window-pair attention | `False` |
 
 Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
 `DEC_CLASSES = OCC_CLASSES = 93` (§4.3), critic logits = 3, and
@@ -299,6 +300,44 @@ scatters to a linear co-incidence operator. A background cell has no incidence,
 stays zero, and contributes nothing back. The cell activations are transient
 aggregation buffers, not persistent empty-cell nodes.
 
+### 5.1c Window attention over typed pair relations
+
+`MantisConfig.window_attention` is a further independently gated ablation
+axis, `False` by default and off in production. When enabled, it runs after
+§5.1b (after §5.1 when the cell pass is off) and before §5.2, in every
+block.
+
+Sparse multi-head attention over the directed window-pair edges the
+collator derives from the window identities (§9), typed by the two
+game-mechanical relations:
+
+- **Colinear** (11 classes): same line, class `|start offset| − 1` for
+  offsets 1..11 — overlap at 1..5, a gap of at most five cells at 6..11.
+- **Crossing** (36 classes): two non-parallel hex-axis lines meet at exactly
+  one lattice cell; when it lies within five cells of both spans, each
+  side's span parameter folds to `{in0, in1, in2, out1, out2, out3+}` and
+  the class is the ordered product. Each fold is invariant under its own
+  line's reversal, so the class survives the D6 elements that reverse the
+  two parameterizations independently.
+- **SELF** (1 class): a loop per window, so no softmax segment is empty.
+
+Parallel windows are deliberately unrelated: parallel proximity is spatial
+structure, which §5.3 owns.
+
+```
+Z       = LN_wa(W);   Q = W_Q Z,  K = W_K Z,  V = W_V Z    # per head
+s_e     = ( Q_dst(e) · K_src(e) ) / sqrt(H/A)  +  b_a[class(e)]
+α       = softmax of s over each destination's edge list
+W_w     = W_w + W_O ( Σ_{e → w} α_e V_src(e) )
+```
+
+`b` is a per-head bias table over the 48 classes, zero-initialized like the
+§5.3 tables. Scores, the softmax, and the weighted sum are computed in fp32
+under autocast, cast once at `W_O`. Enabling the axis adds 265,984
+parameters at the defaults (four projections, one LayerNorm, and the bias
+table in each of four blocks) — a capacity confound any winning arm must
+clear against a parameter-matched control.
+
 ### 5.2 Stone ← windows
 
 For each stone `i`, over the (≤ 18) windows containing it:
@@ -439,8 +478,10 @@ table, the window table (colour + canonical pattern) with window identities
 incidence list with joint occupied-slot classes, the legal-cell decoder
 table (per-cell window/joint-class lists or background bucket, in engine
 order), and `moves_remaining`. Identities are consumed only through
-reversal-invariant pair relations, never as raw coordinates. All index
-tensors are precomputed by the builder; the forward contains no
+reversal-invariant pair relations, never as raw coordinates; a
+`window_attention` model's batches additionally carry the §5.1c
+pair-relation tables, derived from the identities at collation on request.
+All index tensors are precomputed by the builder; the forward contains no
 data-dependent index discovery.
 
 ---

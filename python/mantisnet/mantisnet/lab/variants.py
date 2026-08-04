@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, fields
+from functools import partial
 from typing import Callable, Mapping, Sequence, get_type_hints
 
 from torch import nn
@@ -121,6 +122,16 @@ def normalize_model_kw(overrides: Mapping[str, object] | None) -> dict[str, obje
             raise ValueError(f"model override {key!r} must be finite, got {value!r}")
         normalized[key] = value
     return normalized
+
+
+def collate_for(spec: VariantSpec, model: nn.Module) -> Collate:
+    """The variant's collator, with §5.1c pair tables when the model reads
+    them — the derivation is heavy enough that other models must not pay
+    for it at every chunk."""
+
+    if model.cfg.window_attention:
+        return partial(spec.collate, pairs=True)
+    return spec.collate
 
 
 def variant_spec(name: str) -> VariantSpec:

@@ -14,7 +14,7 @@ from ..builder import AXES, collate, from_position
 from ..klent import telemetry
 from .cohort import CohortCase, corpus_cohort, selfplay_cohort
 from .families import load_checkpoint
-from .variants import VARIANTS, build_variant, variant_spec
+from .variants import VARIANTS, build_variant, collate_for, variant_spec
 
 
 _BATCH_TENSORS = (
@@ -277,7 +277,7 @@ def run_check(
         **contract_battery(
             model,
             cases,
-            collate_fn=spec.collate,
+            collate_fn=collate_for(spec, model),
             device=device,
             rust_collate=spec.rust_collate,
         ),
