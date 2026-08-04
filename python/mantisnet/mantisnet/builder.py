@@ -397,6 +397,11 @@ class Batch:
     wa_ptr: torch.Tensor | None = None  # (N_w + 1,) long, destination-major
     wa_src: torch.Tensor | None = None  # (E_p,) long: source windows
     wa_class: torch.Tensor | None = None  # (E_p,) long, < WA_CLASSES
+    wa_sptr: torch.Tensor | None = None  # (N_w + 1,) long, source-major
+    wa_sdst: torch.Tensor | None = None  # (E_p,) long: destinations, source order
+    wa_scls: torch.Tensor | None = None  # (E_p,) long: classes, source order
+    wa_cptr: torch.Tensor | None = None  # (WA_CLASSES + 1,) long, class-major
+    wa_cedge: torch.Tensor | None = None  # (E_p,) long: edge ids, class order
 
     def to(self, device) -> "Batch":
         """The same batch with every tensor on ``device``."""
@@ -429,8 +434,17 @@ def _relay_fields(
 
 
 def _pair_fields(window_id: torch.Tensor, window_slot: torch.Tensor, max_w: int) -> dict:
-    ptr, src, cls = pair_tables(window_id, window_slot // max_w)
-    return {"wa_ptr": ptr, "wa_src": src, "wa_class": cls}
+    tables = pair_tables(window_id, window_slot // max_w)
+    return {
+        "wa_ptr": tables.ptr,
+        "wa_src": tables.src,
+        "wa_class": tables.cls,
+        "wa_sptr": tables.sptr,
+        "wa_sdst": tables.sdst,
+        "wa_scls": tables.scls,
+        "wa_cptr": tables.cptr,
+        "wa_cedge": tables.cedge,
+    }
 
 
 def batch_from_arrays(*, pairs: bool = False, **fields) -> Batch:

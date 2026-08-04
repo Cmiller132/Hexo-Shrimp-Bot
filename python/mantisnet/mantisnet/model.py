@@ -291,9 +291,9 @@ class _Block(nn.Module):
     def _window_attention(self, w: Tensor, batch: Batch) -> Tensor:
         """§5.1c: multi-head attention over each window's relation edges.
 
-        The edge-list op runs its scores, softmax, and weighted sum in fp32
-        whatever autocast chose for the projections, and recomputes its
-        gathers in backward rather than retaining per-edge tensors.
+        The edge op runs scores, softmax, and the weighted sum in fp32
+        whatever autocast chose for the projections, saves only the softmax
+        stats, and recomputes every per-edge quantity in backward.
         """
         if not self.window_attention:
             raise RuntimeError("window attention is disabled for this block")
@@ -320,6 +320,11 @@ class _Block(nn.Module):
             batch.wa_ptr,
             batch.wa_src,
             batch.wa_class,
+            batch.wa_sptr,
+            batch.wa_sdst,
+            batch.wa_scls,
+            batch.wa_cptr,
+            batch.wa_cedge,
         )
         out = self.wo_wa(out.reshape(n_w, cfg.h).to(z.dtype))
         return w + self.drop(out)

@@ -76,7 +76,8 @@ def test_pair_tables_match_the_brute_force(positions):
         ids = [tuple(map(int, row)) for row in g.window_id]
         n_w = len(ids)
         window_id = torch.from_numpy(g.window_id)
-        ptr, src, cls = pair_tables(window_id, torch.zeros(n_w, dtype=torch.long))
+        tables = pair_tables(window_id, torch.zeros(n_w, dtype=torch.long))
+        ptr, src, cls = tables.ptr, tables.src, tables.cls
 
         got = set()
         for dst in range(n_w):
@@ -92,6 +93,35 @@ def test_pair_tables_match_the_brute_force(positions):
                 if relation is not None:
                     expected.add((i, j, relation))
         assert got == expected
+
+
+def test_the_three_views_hold_the_same_edges(positions):
+    g = from_position(positions[8])
+    n_w = g.n_windows
+    tables = pair_tables(
+        torch.from_numpy(g.window_id), torch.zeros(n_w, dtype=torch.long)
+    )
+    e = tables.src.shape[0]
+    dst = torch.repeat_interleave(torch.arange(n_w), tables.ptr[1:] - tables.ptr[:-1])
+    forward = set(zip(dst.tolist(), tables.src.tolist(), tables.cls.tolist()))
+
+    source = torch.repeat_interleave(
+        torch.arange(n_w), tables.sptr[1:] - tables.sptr[:-1]
+    )
+    by_source = set(
+        zip(tables.sdst.tolist(), source.tolist(), tables.scls.tolist())
+    )
+    assert by_source == forward
+
+    # The class view is a permutation of destination-order edge ids whose
+    # classes run nondecreasing, with cptr at the class boundaries.
+    assert torch.equal(tables.cedge.sort().values, torch.arange(e))
+    ordered = tables.cls[tables.cedge]
+    assert torch.all(ordered[1:] >= ordered[:-1])
+    counts = torch.bincount(tables.cls, minlength=WA_CLASSES)
+    assert torch.equal(
+        tables.cptr, torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+    )
 
 
 def test_pairs_never_cross_positions(positions):
@@ -128,8 +158,10 @@ def test_pairs_are_opt_in():
     g = from_position(__import__("hexo_py").Position.replay([(0, 0), (1, 0), (0, 1)]))
     plain = collate([g])
     assert plain.wa_ptr is None and plain.wa_src is None and plain.wa_class is None
+    assert plain.wa_sptr is None and plain.wa_cptr is None and plain.wa_cedge is None
     with_pairs = collate([g], pairs=True)
     assert with_pairs.wa_ptr is not None
+    assert with_pairs.wa_sptr is not None and with_pairs.wa_cedge is not None
     # Every window has at least the SELF loop, exactly once.
     counts = with_pairs.wa_ptr[1:] - with_pairs.wa_ptr[:-1]
     assert torch.all(counts >= 1)
@@ -154,6 +186,19 @@ def _naive_attention(q, k, v, bias, ptr, src, cls):
     return out
 
 
+def _wa_tables(batch):
+    return (
+        batch.wa_ptr,
+        batch.wa_src,
+        batch.wa_class,
+        batch.wa_sptr,
+        batch.wa_sdst,
+        batch.wa_scls,
+        batch.wa_cptr,
+        batch.wa_cedge,
+    )
+
+
 def _attention_case(positions, seed: int):
     torch.manual_seed(seed)
     g = from_position(positions[8])
@@ -165,35 +210,98 @@ def _attention_case(positions, seed: int):
         make(g.n_windows, heads, hd),
         make(g.n_windows, heads, hd),
         make(heads, WA_CLASSES),
-        batch.wa_ptr,
-        batch.wa_src,
-        batch.wa_class,
+        _wa_tables(batch),
     )
 
 
 def test_edge_attention_matches_the_naive_oracle(positions):
-    q, k, v, bias, ptr, src, cls = _attention_case(positions, seed=21)
-    got = edge_attention(q, k, v, bias, ptr, src, cls)
-    want = _naive_attention(q, k, v, bias, ptr, src, cls)
+    q, k, v, bias, tables = _attention_case(positions, seed=21)
+    got = edge_attention(q, k, v, bias, *tables)
+    want = _naive_attention(q, k, v, bias, *tables[:3])
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
 
 
 def test_edge_attention_slices_and_gradients_match_the_oracle(positions, monkeypatch):
-    # A tiny slice forces the multi-slice path the real batches take; the
-    # backward re-gathers per slice, so its parity is the recompute proof.
+    # A tiny slice forces the multi-slice path the fallback takes on real
+    # batches; the backward re-derives alpha from the saved stats, so its
+    # parity is the recompute proof.
     monkeypatch.setattr(window_pairs, "_EDGE_SLICE", 3)
-    q, k, v, bias, ptr, src, cls = _attention_case(positions, seed=22)
+    q, k, v, bias, tables = _attention_case(positions, seed=22)
     upstream = torch.randn(q.shape)
 
-    got = edge_attention(q, k, v, bias, ptr, src, cls)
+    got = edge_attention(q, k, v, bias, *tables)
     got_grads = torch.autograd.grad((got * upstream).sum(), (q, k, v, bias))
-    want = _naive_attention(q, k, v, bias, ptr, src, cls)
+    want = _naive_attention(q, k, v, bias, *tables[:3])
     want_grads = torch.autograd.grad((want * upstream).sum(), (q, k, v, bias))
 
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
     for name, a, b in zip(("dq", "dk", "dv", "dbias"), got_grads, want_grads):
         assert torch.isfinite(a).all(), name
         torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
+
+
+_needs_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the fused window attention requires CUDA"
+)
+
+
+@_needs_cuda
+@pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
+def test_fused_kernels_match_the_oracle(positions, dtype):
+    q, k, v, bias, tables = _attention_case(positions, seed=31)
+    device = tuple(t.to("cuda") for t in tables)
+    qd = q.detach().to("cuda").to(dtype).requires_grad_()
+    kd = k.detach().to("cuda").to(dtype).requires_grad_()
+    vd = v.detach().to("cuda").to(dtype).requires_grad_()
+    bd = bias.detach().to("cuda").requires_grad_()
+    upstream = torch.randn(q.shape)
+
+    got = edge_attention(qd, kd, vd, bd, *device)
+    got_grads = torch.autograd.grad(
+        (got * upstream.to("cuda")).sum(), (qd, kd, vd, bd)
+    )
+
+    # The oracle starts from the identical (dtype-rounded) values in fp32.
+    qr = qd.detach().float().cpu().requires_grad_()
+    kr = kd.detach().float().cpu().requires_grad_()
+    vr = vd.detach().float().cpu().requires_grad_()
+    br = bd.detach().cpu().requires_grad_()
+    want = _naive_attention(qr, kr, vr, br, *tables[:3])
+    want_grads = torch.autograd.grad((want * upstream).sum(), (qr, kr, vr, br))
+
+    # dq/dk/dv are stored in the input dtype, so bf16 compares at bf16 grain.
+    loose = dtype is torch.bfloat16
+    torch.testing.assert_close(
+        got.cpu(), want, rtol=1e-2 if loose else 1e-5, atol=1e-2 if loose else 1e-5
+    )
+    for name, a, b in zip(("dq", "dk", "dv", "dbias"), got_grads, want_grads):
+        assert torch.isfinite(a.float()).all(), name
+        torch.testing.assert_close(
+            a.float().cpu(),
+            b.float(),
+            rtol=2e-2 if loose else 1e-4,
+            atol=2e-2 if loose else 1e-4,
+        )
+
+
+@_needs_cuda
+def test_fused_kernels_are_deterministic(positions):
+    q, k, v, bias, tables = _attention_case(positions, seed=32)
+    device = tuple(t.to("cuda") for t in tables)
+    qd = q.detach().to("cuda", torch.bfloat16).requires_grad_()
+    kd = k.detach().to("cuda", torch.bfloat16).requires_grad_()
+    vd = v.detach().to("cuda", torch.bfloat16).requires_grad_()
+    bd = bias.detach().to("cuda").requires_grad_()
+    upstream = torch.randn(q.shape, device="cuda")
+
+    runs = []
+    for _ in range(2):
+        out = edge_attention(qd, kd, vd, bd, *device)
+        runs.append(
+            (out, *torch.autograd.grad((out * upstream).sum(), (qd, kd, vd, bd)))
+        )
+    for name, a, b in zip(("out", "dq", "dk", "dv", "dbias"), runs[0], runs[1]):
+        assert torch.equal(a, b), name
 
 
 def _small_wa_config(**extra) -> MantisConfig:

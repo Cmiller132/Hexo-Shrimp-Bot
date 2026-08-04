@@ -333,10 +333,15 @@ W_w     = W_w + W_O ( Σ_{e → w} α_e V_src(e) )
 
 `b` is a per-head bias table over the 48 classes, zero-initialized like the
 §5.3 tables. Scores, the softmax, and the weighted sum are computed in fp32
-under autocast, cast once at `W_O`. Enabling the axis adds 265,984
-parameters at the defaults (four projections, one LayerNorm, and the bias
-table in each of four blocks) — a capacity confound any winning arm must
-clear against a parameter-matched control.
+under autocast, cast once at `W_O`. On CUDA the op is a pair of fused
+segment kernels: the forward runs each destination's online softmax in
+registers and saves only the per-`(window, head)` max and denominator, and
+the backward recomputes every per-edge quantity from those stats in
+destination-, source-, and class-ordered sweeps — deterministic, atomic-free,
+and nothing of size `(E, H/A)` ever reaches memory. Enabling the axis adds
+265,984 parameters at the defaults (four projections, one LayerNorm, and the
+bias table in each of four blocks) — a capacity confound any winning arm
+must clear against a parameter-matched control.
 
 ### 5.2 Stone ← windows
 
@@ -479,8 +484,9 @@ incidence list with joint occupied-slot classes, the legal-cell decoder
 table (per-cell window/joint-class lists or background bucket, in engine
 order), and `moves_remaining`. Identities are consumed only through
 reversal-invariant pair relations, never as raw coordinates; a
-`window_attention` model's batches additionally carry the §5.1c
-pair-relation tables, derived from the identities at collation on request.
+`window_attention` model's batches additionally carry the §5.1c edge set in
+three CSR views (by destination, source, and class — the relay's layout),
+derived from the identities at collation on request.
 All index tensors are precomputed by the builder; the forward contains no
 data-dependent index discovery.
 
