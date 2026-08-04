@@ -31,7 +31,6 @@ import torch
 from hexo_py import MODEL_REPR_VERSION
 
 from .relay import relay_tables
-from .window_pairs import pair_tables
 
 WINDOW_LEN = 6
 # Unit steps of the engine's axes, in canonical order Q, R, QR.
@@ -391,19 +390,9 @@ class Batch:
     relay_wcell: torch.Tensor  # (E_d,) long: compact edge cells, window order
     relay_cls_ptr: torch.Tensor  # (DEC_CLASSES + 1,) long
     relay_ccell: torch.Tensor  # (E_d,) long: compact edge cells, class order
-    # §5.1c window-pair relation tables, derived only on request
-    # (``pairs=True``): a model without window_attention never reads them,
-    # and twenty million edges are too heavy to derive for every arm's
-    # collation. The Rust builder derives them per position; the Python
-    # builder joins the whole batch at once and is their oracle.
-    wa_ptr: torch.Tensor | None = None  # (N_w + 1,) long, destination-major
-    wa_src: torch.Tensor | None = None  # (E_p,) long: source windows
-    wa_class: torch.Tensor | None = None  # (E_p,) long, < WA_CLASSES
-    wa_sptr: torch.Tensor | None = None  # (N_w + 1,) long, source-major
-    wa_sdst: torch.Tensor | None = None  # (E_p,) long: destinations, source order
-    wa_scls: torch.Tensor | None = None  # (E_p,) long: classes, source order
-    wa_cptr: torch.Tensor | None = None  # (WA_CLASSES + 1,) long, class-major
-    wa_cedge: torch.Tensor | None = None  # (E_p,) long: edge ids, class order
+    # The §5.1c window-pair views are not collated: a window_attention model
+    # derives them on its own device from window_id — the edge views cost
+    # several times more to ship than to derive beside the model.
 
     def to(self, device) -> "Batch":
         """The same batch with every tensor on ``device``."""
@@ -435,40 +424,7 @@ def _relay_fields(
     return dict(zip(_RELAY_FIELDS, tables))
 
 
-def _pair_fields(window_id: torch.Tensor, window_slot: torch.Tensor, max_w: int) -> dict:
-    """The §5.1c views of the Python builder: one join over the whole batch.
-
-    The Rust builder joins per position and offsets the result, so the two
-    derivations agree on each window's edge set without sharing an edge order —
-    which is what makes this one an oracle for it rather than a copy of it.
-    """
-    tables = pair_tables(window_id, window_slot // max_w)
-    return {
-        "wa_ptr": tables.ptr,
-        "wa_src": tables.src,
-        "wa_class": tables.cls,
-        "wa_sptr": tables.sptr,
-        "wa_sdst": tables.sdst,
-        "wa_scls": tables.scls,
-        "wa_cptr": tables.cptr,
-        "wa_cedge": tables.cedge,
-    }
-
-
-# The §5.1c views `hexo_py.build_batch*` emits under `pairs=True`.
-_RUST_PAIR_FIELDS = (
-    "wa_ptr",
-    "wa_src",
-    "wa_class",
-    "wa_sptr",
-    "wa_sdst",
-    "wa_scls",
-    "wa_cptr",
-    "wa_cedge",
-)
-
-
-def batch_from_arrays(*, pairs: bool = False, **fields) -> Batch:
+def batch_from_arrays(**fields) -> Batch:
     """A ``Batch`` from per-tensor arrays, with the derived tables built here.
 
     Both external construction paths land on this one function — the
@@ -476,23 +432,12 @@ def batch_from_arrays(*, pairs: bool = False, **fields) -> Batch:
     Rust forward calling with torch tensors — so the collation-time relay
     derivation lives in exactly one place. The scalar fields are derived from
     tensor shapes; callers may also pass them, and a disagreement is refused.
-
-    ``pairs`` describes what the arrays carry rather than requesting work: the
-    §5.1c edge views are the Rust builder's, derived per position where the
-    join is a few hundred windows wide. Arrays and flag disagreeing is a caller
-    fault, not something to paper over by deriving the views a second way.
     """
     scalars = {
         name: int(fields.pop(name))
         for name in ("n_pos", "max_t", "max_w", "n_cells")
         if name in fields
     }
-    supplied = [name for name in _RUST_PAIR_FIELDS if name in fields]
-    if pairs and len(supplied) != len(_RUST_PAIR_FIELDS):
-        missing = sorted(set(_RUST_PAIR_FIELDS) - set(supplied))
-        raise ValueError(f"pairs=True but the §5.1c views {missing} are missing")
-    if not pairs and supplied:
-        raise ValueError(f"§5.1c views {supplied} arrived without pairs=True")
     t = {name: torch.as_tensor(value) for name, value in fields.items()}
     derived = {
         "n_pos": int(t["attn_valid"].shape[0]),
@@ -512,22 +457,19 @@ def batch_from_arrays(*, pairs: bool = False, **fields) -> Batch:
     )
 
 
-def collate_positions(positions, *, pairs: bool = False) -> Batch:
+def collate_positions(positions) -> Batch:
     """Build and collate positions with the Rust builder.
 
     ``hexo_py.build_batch`` runs in parallel with the GIL released and returns
     the same fields as ``collate([from_position(p) ...])`` under
-    ``MODEL_REPR_VERSION`` — except the §5.1c views, where the two derivations
-    agree on each window's edge set but not on the order inside its run.
+    ``MODEL_REPR_VERSION``.
     """
     import hexo_py
 
-    return batch_from_arrays(
-        pairs=pairs, **hexo_py.build_batch(list(positions), pairs=pairs)
-    )
+    return batch_from_arrays(**hexo_py.build_batch(list(positions)))
 
 
-def collate_prefixes(games, ts, *, pairs: bool = False) -> Batch:
+def collate_prefixes(games, ts) -> Batch:
     """Move prefixes to one collated batch: replay + build, in parallel.
 
     Stored fitting positions are move prefixes
@@ -535,12 +477,10 @@ def collate_prefixes(games, ts, *, pairs: bool = False) -> Batch:
     """
     import hexo_py
 
-    return batch_from_arrays(
-        pairs=pairs, **hexo_py.build_batch_prefixes(list(games), list(ts), pairs=pairs)
-    )
+    return batch_from_arrays(**hexo_py.build_batch_prefixes(list(games), list(ts)))
 
 
-def collate(graphs: list[PositionGraph], *, pairs: bool = False) -> Batch:
+def collate(graphs: list[PositionGraph]) -> Batch:
     """Concatenate position graphs into one batch (§9)."""
     if not graphs:
         raise ValueError("empty batch")
@@ -600,5 +540,4 @@ def collate(graphs: list[PositionGraph], *, pairs: bool = False) -> Batch:
         bg_cell=cat([g.bg_cell + cell_off[i] for i, g in enumerate(graphs)]),
         bg_bucket=cat([g.bg_bucket for g in graphs]),
         **_relay_fields(dec_cell, dec_window, dec_class, int(win_off[-1])),
-        **(_pair_fields(window_id, window_slot, max_w) if pairs else {}),
     )

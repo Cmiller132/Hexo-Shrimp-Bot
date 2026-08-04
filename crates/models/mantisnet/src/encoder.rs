@@ -9,12 +9,6 @@
 //! window-major then slot; the decoder table is legal-cell-major, then axis,
 //! then offset. Positions build in parallel under rayon; assembly into flat
 //! arrays is single-threaded.
-//!
-//! The §5.1c window-pair views are the exception the Python builder does not
-//! mirror ordering for: the two derivations agree on each window's edge *set*,
-//! not on the order inside a run. This one is fixed by the join order here —
-//! SELF loops, then colinear pairs in sorted line order, then crossings in
-//! sorted cell order — and so is a function of the identity table alone.
 
 use hexo_engine as engine;
 use rayon::prelude::*;
@@ -23,8 +17,6 @@ use std::fmt;
 
 const QSHIFT: i64 = 1 << 21;
 const NEAREST_BUCKETS: i64 = 8;
-/// Unit steps of the engine's axes, canonical order Q, R, QR.
-const AXIS_STEPS: [(i64, i64); 3] = [(1, 0), (0, 1), (1, -1)];
 const WIRE_MAGIC: &[u8; 8] = b"MANTIS\x00\x01";
 const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 4 + 4 + 6 * 4;
 
@@ -748,379 +740,6 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
     })
 }
 
-/// §5.1c relation classes: 11 colinear, 36 crossing, and SELF.
-const WA_CLASSES: usize = 48;
-/// The §5.1c SELF class: one loop per window, so every softmax segment is
-/// nonempty. Classes `0..11` are colinear and `11..47` crossing.
-const WA_SELF_CLASS: u8 = 47;
-/// First crossing class, above the eleven colinear offsets.
-const WA_CROSSING_BASE: u8 = 11;
-/// Cells a window claims beyond each end of its six-cell span, matching the
-/// colinear reach of a gap of at most five cells.
-const WA_REACH: i64 = 5;
-/// Largest colinear start offset that still relates two windows.
-const WA_MAX_OFFSET: i64 = 11;
-/// Line cells one window claims: its six span slots plus `WA_REACH` at each end.
-const WA_SPAN: usize = 6 + 2 * WA_REACH as usize;
-
-/// `fold(t)` for every claimed slot, indexed by `t + WA_REACH`: in-span slots
-/// to `min(t, 5 - t)`, out-of-span ones to `2 + min(distance, 3)`.
-///
-/// A board symmetry may reverse either crossing line's slot parameterization
-/// independently, and reversal maps `t` to `5 - t`, which each half of this
-/// table preserves — so the product class `11 + fold(t) * 6 + fold(u)` is
-/// D6-invariant.
-const WA_FOLD: [u8; WA_SPAN] = {
-    let mut table = [0u8; WA_SPAN];
-    let mut slot = 0;
-    while slot < WA_SPAN {
-        let t = slot as i64 - WA_REACH;
-        table[slot] = if t >= 0 && t <= 5 {
-            let mirror = 5 - t;
-            if t < mirror { t as u8 } else { mirror as u8 }
-        } else {
-            let distance = if t < 0 { -t } else { t - 5 };
-            2 + if distance < 3 { distance as u8 } else { 3 }
-        };
-        slot += 1;
-    }
-    table
-};
-
-/// One position's sorted §5.1c join keys, replayable into its directed edges.
-///
-/// Two windows relate in exactly one of two ways, both functions of the
-/// `(axis, start_q, start_r)` triples alone: colinear at signed start offset
-/// `o` with `1 <= |o| <= 11` (class `|o| - 1`), or crossing at the single
-/// lattice cell where their non-parallel lines meet, when that cell lies in
-/// both claimed spans (class `11 + fold(t) * 6 + fold(u)`). Each is a sorted
-/// key join over a couple of hundred windows, so building this is microseconds.
-///
-/// Replaying rather than storing the edges is what keeps twenty million of them
-/// out of memory twice: the counting pass and the filling pass both walk this.
-struct PairJoin {
-    /// `(axis and line key, position along the line, window)`, sorted.
-    along_line: Vec<(i64, i64, u32)>,
-    /// `(claimed cell key, window, claimed slot, axis)`, sorted.
-    claims: Vec<(i64, u32, u8, u8)>,
-    n_w: usize,
-}
-
-impl PairJoin {
-    fn new(window_id: &[i64]) -> Self {
-        let n_w = window_id.len() / 3;
-        let mut along_line: Vec<(i64, i64, u32)> = Vec::with_capacity(n_w);
-        let mut claims: Vec<(i64, u32, u8, u8)> = Vec::with_capacity(n_w * WA_SPAN);
-        for w in 0..n_w {
-            let (axis, q, r) = (window_id[3 * w], window_id[3 * w + 1], window_id[3 * w + 2]);
-            let (line, along) = match axis {
-                0 => (r, q),
-                1 => (q, r),
-                _ => (q + r, q),
-            };
-            along_line.push((axis * QSHIFT + line, along, w as u32));
-            let (dq, dr) = AXIS_STEPS[axis as usize];
-            for slot in 0..WA_SPAN {
-                let t = slot as i64 - WA_REACH;
-                claims.push((
-                    (q + t * dq) * QSHIFT + (r + t * dr),
-                    w as u32,
-                    slot as u8,
-                    axis as u8,
-                ));
-            }
-        }
-        along_line.sort_unstable();
-        claims.sort_unstable();
-        Self {
-            along_line,
-            claims,
-            n_w,
-        }
-    }
-
-    /// Visit every directed edge exactly once, in a fixed order: SELF loops,
-    /// then colinear pairs in sorted line order, then crossings in sorted cell
-    /// order.
-    fn for_each_edge(&self, mut visit: impl FnMut(u32, u32, u8)) {
-        for w in 0..self.n_w as u32 {
-            visit(w, w, WA_SELF_CLASS);
-        }
-
-        // Starts on one line are distinct, so a window's colinear partners are
-        // the next entries in the run until the offset passes eleven.
-        for (index, &(line, along, near)) in self.along_line.iter().enumerate() {
-            for &(other_line, other_along, far) in &self.along_line[index + 1..] {
-                if other_line != line {
-                    break;
-                }
-                let offset = other_along - along;
-                if offset > WA_MAX_OFFSET {
-                    break;
-                }
-                assert!(
-                    offset > 0,
-                    "two windows of one position share an (axis, start) identity"
-                );
-                let class = (offset - 1) as u8;
-                visit(near, far, class);
-                visit(far, near, class);
-            }
-        }
-
-        // Two non-parallel hex-axis lines meet at exactly one lattice cell, so
-        // a run of one cell key yields each directed pair of differing axes
-        // exactly once.
-        let mut start = 0;
-        while start < self.claims.len() {
-            let mut end = start + 1;
-            while end < self.claims.len() && self.claims[end].0 == self.claims[start].0 {
-                end += 1;
-            }
-            for a in start..end {
-                let (_, near, slot_near, axis_near) = self.claims[a];
-                for &(_, far, slot_far, axis_far) in &self.claims[a + 1..end] {
-                    if axis_near == axis_far {
-                        continue;
-                    }
-                    let (fold_near, fold_far) =
-                        (WA_FOLD[slot_near as usize], WA_FOLD[slot_far as usize]);
-                    visit(near, far, WA_CROSSING_BASE + fold_near * 6 + fold_far);
-                    visit(far, near, WA_CROSSING_BASE + fold_far * 6 + fold_near);
-                }
-            }
-            start = end;
-        }
-    }
-}
-
-/// One position's §5.1c join with the run-start tables its edges imply.
-struct PositionPairs {
-    /// Destination-major run starts, `n_w + 1` entries.
-    ptr: Vec<i64>,
-    /// Source-major run starts, `n_w + 1` entries.
-    sptr: Vec<i64>,
-    /// Edges of each relation class, so the class view needs no counting pass.
-    classes: [i64; WA_CLASSES],
-    join: PairJoin,
-}
-
-/// Build one position's join and count its degrees and relation classes.
-fn derive_pairs(window_id: &[i64]) -> PositionPairs {
-    let join = PairJoin::new(window_id);
-    let mut ptr = vec![0i64; join.n_w + 1];
-    let mut sptr = vec![0i64; join.n_w + 1];
-    let mut classes = [0i64; WA_CLASSES];
-    join.for_each_edge(|dst, src, class| {
-        ptr[dst as usize + 1] += 1;
-        sptr[src as usize + 1] += 1;
-        classes[class as usize] += 1;
-    });
-    for w in 0..join.n_w {
-        ptr[w + 1] += ptr[w];
-        sptr[w + 1] += sptr[w];
-    }
-    PositionPairs {
-        ptr,
-        sptr,
-        classes,
-        join,
-    }
-}
-
-/// The four per-position edge-array windows one collation job fills.
-struct PairFill<'a> {
-    src: &'a mut [i64],
-    cls: &'a mut [i64],
-    sdst: &'a mut [i64],
-    scls: &'a mut [i64],
-}
-
-/// Cut the four edge arrays into one job per position's edge run.
-fn split_pair_fills<'a>(
-    src: &'a mut [i64],
-    cls: &'a mut [i64],
-    sdst: &'a mut [i64],
-    scls: &'a mut [i64],
-    lengths: &[usize],
-) -> Vec<PairFill<'a>> {
-    let (mut src, mut cls, mut sdst, mut scls) = (src, cls, sdst, scls);
-    let mut fills = Vec::with_capacity(lengths.len());
-    for &len in lengths {
-        let (src_head, src_rest) = src.split_at_mut(len);
-        let (cls_head, cls_rest) = cls.split_at_mut(len);
-        let (sdst_head, sdst_rest) = sdst.split_at_mut(len);
-        let (scls_head, scls_rest) = scls.split_at_mut(len);
-        fills.push(PairFill {
-            src: src_head,
-            cls: cls_head,
-            sdst: sdst_head,
-            scls: scls_head,
-        });
-        (src, cls, sdst, scls) = (src_rest, cls_rest, sdst_rest, scls_rest);
-    }
-    fills
-}
-
-/// Derive every position's §5.1c edges and concatenate them into one batch.
-///
-/// Each position owns a contiguous edge range, so the destination- and
-/// source-major views are the per-position ones with window indices shifted by
-/// the position's window base and run starts by its edge base — the
-/// offset-concatenation every other index table gets. Derivation and the
-/// concatenating scatter both run in parallel; only the class view, which spans
-/// positions, is a single pass over the concatenated classes.
-fn collate_pairs(graphs: &[Graph]) -> PairViews {
-    let local: Vec<PositionPairs> = graphs
-        .par_iter()
-        .map(|graph| derive_pairs(&graph.window_id))
-        .collect();
-
-    let lengths: Vec<usize> = local
-        .iter()
-        .map(|pairs| pairs.ptr[pairs.join.n_w] as usize)
-        .collect();
-    let edges: usize = lengths.iter().sum();
-    let windows: usize = local.iter().map(|pairs| pairs.join.n_w).sum();
-    let mut views = PairViews {
-        ptr: Vec::with_capacity(windows + 1),
-        src: vec![0; edges],
-        cls: vec![0; edges],
-        sptr: Vec::with_capacity(windows + 1),
-        sdst: vec![0; edges],
-        scls: vec![0; edges],
-        cptr: vec![],
-        cedge: vec![],
-    };
-    views.ptr.push(0);
-    views.sptr.push(0);
-    let mut win_offsets = Vec::with_capacity(local.len());
-    let (mut win_off, mut edge_off) = (0i64, 0i64);
-    for (pairs, &len) in local.iter().zip(&lengths) {
-        views
-            .ptr
-            .extend(pairs.ptr[1..].iter().map(|&e| e + edge_off));
-        views
-            .sptr
-            .extend(pairs.sptr[1..].iter().map(|&e| e + edge_off));
-        win_offsets.push(win_off);
-        win_off += pairs.join.n_w as i64;
-        edge_off += len as i64;
-    }
-
-    let mut fills = split_pair_fills(
-        &mut views.src,
-        &mut views.cls,
-        &mut views.sdst,
-        &mut views.scls,
-        &lengths,
-    );
-    fills
-        .par_iter_mut()
-        .zip(local.par_iter())
-        .zip(win_offsets.par_iter())
-        .for_each(|((fill, pairs), &win_off)| {
-            let mut by_dst: Vec<usize> = pairs.ptr.iter().map(|&e| e as usize).collect();
-            let mut by_src: Vec<usize> = pairs.sptr.iter().map(|&e| e as usize).collect();
-            pairs.join.for_each_edge(|dst, src, class| {
-                let slot = &mut by_dst[dst as usize];
-                fill.src[*slot] = src as i64 + win_off;
-                fill.cls[*slot] = class as i64;
-                *slot += 1;
-                let slot = &mut by_src[src as usize];
-                fill.sdst[*slot] = dst as i64 + win_off;
-                fill.scls[*slot] = class as i64;
-                *slot += 1;
-            });
-        });
-
-    let mut counts = [0i64; WA_CLASSES];
-    for pairs in &local {
-        for (total, count) in counts.iter_mut().zip(&pairs.classes) {
-            *total += count;
-        }
-    }
-    (views.cptr, views.cedge) = class_view(&views.cls, counts);
-    views
-}
-
-/// Class ranges the class view sorts in parallel, balanced by edge count.
-const WA_CLASS_GROUPS: usize = 4;
-
-/// The class-major view of one batch's edge classes: run starts, and the
-/// destination-order edge ids in class order.
-///
-/// A stable counting sort is the whole derivation, but a single scattered pass
-/// over twenty million edges is serial and store-bound. Each job takes a range
-/// of classes instead: its output run is contiguous, so the jobs write disjoint
-/// slices, and the price is re-reading the classes once per range. `counts` is
-/// the batch's class histogram, which the per-position derivation already had.
-fn class_view(cls: &[i64], counts: [i64; WA_CLASSES]) -> (Vec<i64>, Vec<i64>) {
-    let mut cptr = vec![0i64; WA_CLASSES + 1];
-    for class in 0..WA_CLASSES {
-        cptr[class + 1] = cptr[class] + counts[class];
-    }
-
-    let mut bounds = vec![0usize];
-    for group in 1..WA_CLASS_GROUPS {
-        let target = cls.len() as i64 * group as i64 / WA_CLASS_GROUPS as i64;
-        let split = cptr
-            .partition_point(|&start| start < target)
-            .min(WA_CLASSES);
-        if split > *bounds.last().expect("bounds starts nonempty") {
-            bounds.push(split);
-        }
-    }
-    bounds.push(WA_CLASSES);
-
-    let mut cedge = vec![0i64; cls.len()];
-    let mut rest: &mut [i64] = &mut cedge;
-    let mut jobs = Vec::with_capacity(bounds.len() - 1);
-    for range in bounds.windows(2) {
-        let (lo, hi) = (range[0], range[1]);
-        let (head, tail) = rest.split_at_mut((cptr[hi] - cptr[lo]) as usize);
-        jobs.push((lo, hi, head));
-        rest = tail;
-    }
-    jobs.par_iter_mut().for_each(|(lo, hi, out)| {
-        let base = cptr[*lo];
-        let mut cursor: Vec<usize> = cptr[*lo..*hi]
-            .iter()
-            .map(|&start| (start - base) as usize)
-            .collect();
-        for (edge, &class) in cls.iter().enumerate() {
-            let class = class as usize;
-            if (*lo..*hi).contains(&class) {
-                let slot = &mut cursor[class - *lo];
-                out[*slot] = edge as i64;
-                *slot += 1;
-            }
-        }
-    });
-    (cptr, cedge)
-}
-
-/// The §5.1c window-pair edge set in the three CSR views the model reads.
-#[derive(Debug, PartialEq, Eq)]
-pub struct PairViews {
-    /// Destination-major run starts, `N_w + 1` entries.
-    pub ptr: Vec<i64>,
-    /// Source window of each edge, destination order.
-    pub src: Vec<i64>,
-    /// Relation class of each edge, destination order.
-    pub cls: Vec<i64>,
-    /// Source-major run starts, `N_w + 1` entries.
-    pub sptr: Vec<i64>,
-    /// Destination window of each edge, source order.
-    pub sdst: Vec<i64>,
-    /// Relation class of each edge, source order.
-    pub scls: Vec<i64>,
-    /// Class-major run starts, one per relation class plus one.
-    pub cptr: Vec<i64>,
-    /// Destination-order edge id of each edge, class order.
-    pub cedge: Vec<i64>,
-}
-
 /// Everything `mantisnet.builder.Batch` holds, as flat vectors plus shapes.
 #[derive(Debug, PartialEq, Eq)]
 pub struct RawBatch {
@@ -1171,17 +790,10 @@ pub struct RawBatch {
     pub bg_cell: Vec<i64>,
     /// Nearest-stone distance bucket for each background legal cell.
     pub bg_bucket: Vec<i64>,
-    /// The §5.1c window-pair edge views, present only when the caller asked
-    /// for them: only a window-attention model reads them, and deriving them
-    /// for every batch would be most of a collation.
-    pub pairs: Option<PairViews>,
 }
 
 /// Collate position-local graphs into one globally indexed ragged batch.
-///
-/// `pairs` requests the §5.1c window-pair views alongside the batch; without it
-/// no pair work happens at all.
-pub fn collate(graphs: &[Graph], pairs: bool) -> RawBatch {
+pub fn collate(graphs: &[Graph]) -> RawBatch {
     let p = graphs.len();
     let max_t = graphs.iter().map(|g| g.stone_own.len()).max().unwrap_or(0) + 1;
     let max_w = graphs
@@ -1214,7 +826,6 @@ pub fn collate(graphs: &[Graph], pairs: bool) -> RawBatch {
         dec_class: vec![],
         bg_cell: vec![],
         bg_bucket: vec![],
-        pairs: pairs.then(|| collate_pairs(graphs)),
     };
 
     let (mut stone_off, mut win_off, mut cell_off) = (0i64, 0i64, 0i64);
@@ -1266,30 +877,24 @@ pub fn collate(graphs: &[Graph], pairs: bool) -> RawBatch {
 ///
 /// Each input slice must contain exactly one item written by
 /// [`encode_position`]. Unknown representation versions, malformed features
-/// or indices, truncation, and trailing bytes are all refused. The batcher's
-/// forward is the container seam's, which reads no §5.1c pair table, so this
-/// path never derives them.
+/// or indices, truncation, and trailing bytes are all refused.
 pub fn decode_batch<'a>(items: impl IntoIterator<Item = &'a [u8]>) -> Result<RawBatch, WireError> {
     let graphs = items
         .into_iter()
         .enumerate()
         .map(|(item, bytes)| decode_graph(bytes).map_err(|error| error.at_item(item)))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(collate(&graphs, false))
+    Ok(collate(&graphs))
 }
 
 /// Build every position in parallel, then collate.
-pub fn build_batch(positions: &[engine::Position], pairs: bool) -> Result<RawBatch, String> {
+pub fn build_batch(positions: &[engine::Position]) -> Result<RawBatch, String> {
     let graphs: Vec<Graph> = positions.par_iter().map(build).collect::<Result<_, _>>()?;
-    Ok(collate(&graphs, pairs))
+    Ok(collate(&graphs))
 }
 
 /// Replay each game's first `t` placements, then build, in parallel.
-pub fn build_batch_prefixes(
-    games: &[Vec<(i16, i16)>],
-    ts: &[usize],
-    pairs: bool,
-) -> Result<RawBatch, String> {
+pub fn build_batch_prefixes(games: &[Vec<(i16, i16)>], ts: &[usize]) -> Result<RawBatch, String> {
     if games.len() != ts.len() {
         return Err("games and ts must have equal length".into());
     }
@@ -1311,7 +916,7 @@ pub fn build_batch_prefixes(
             build(&pos)
         })
         .collect::<Result<_, _>>()?;
-    Ok(collate(&graphs, pairs))
+    Ok(collate(&graphs))
 }
 
 #[cfg(test)]
@@ -1334,7 +939,7 @@ mod tests {
 
     #[test]
     fn the_opening_batch_has_only_the_token_and_background_cell() {
-        let raw = build_batch(&[engine::Position::new()], false).expect("the opening is live");
+        let raw = build_batch(&[engine::Position::new()]).expect("the opening is live");
 
         assert_eq!(raw.n_pos, 1);
         assert_eq!(raw.max_t, 1);
@@ -1357,7 +962,6 @@ mod tests {
         assert!(raw.dec_class.is_empty());
         assert_eq!(raw.bg_cell, [0]);
         assert_eq!(raw.bg_bucket, [NEAREST_BUCKETS - 1]);
-        assert!(raw.pairs.is_none());
     }
 
     #[test]
@@ -1369,20 +973,18 @@ mod tests {
             .collect();
         let position = engine::Position::replay(&actions).expect("legal fixture");
 
-        let direct = build_batch(&[position], true).expect("live position");
+        let direct = build_batch(&[position]).expect("live position");
         let replayed =
-            build_batch_prefixes(&[moves], &[actions.len()], true).expect("legal prefix fixture");
+            build_batch_prefixes(&[moves], &[actions.len()]).expect("legal prefix fixture");
         assert_eq!(direct, replayed);
     }
 
     #[test]
     fn malformed_prefix_requests_are_refused() {
-        let unequal =
-            build_batch_prefixes(&[vec![(0, 0)]], &[], false).expect_err("lengths must agree");
+        let unequal = build_batch_prefixes(&[vec![(0, 0)]], &[]).expect_err("lengths must agree");
         assert_eq!(unequal, "games and ts must have equal length");
 
-        let too_long =
-            build_batch_prefixes(&[vec![(0, 0)]], &[2], false).expect_err("prefix is too long");
+        let too_long = build_batch_prefixes(&[vec![(0, 0)]], &[2]).expect_err("prefix is too long");
         assert_eq!(too_long, "prefix length 2 exceeds game length 1");
     }
 
@@ -1398,7 +1000,7 @@ mod tests {
 
         let decoded =
             decode_batch(items.iter().map(Vec::as_slice)).expect("encoder output is valid");
-        let direct = build_batch(&positions, false).expect("all positions are live");
+        let direct = build_batch(&positions).expect("all positions are live");
         assert_eq!(decoded, direct);
     }
 
@@ -1411,151 +1013,6 @@ mod tests {
         assert_eq!(&bytes[..prefix.len()], prefix);
         decode_batch(std::iter::once(&bytes[prefix.len()..]))
             .expect("the appended suffix is one complete item");
-    }
-
-    /// The directed §5.1c class of the edge `b -> a`, solved for one pair.
-    ///
-    /// Literal line intersection, no joins: this shares nothing with
-    /// [`derive_pairs`] but the definition.
-    fn oracle_relation(a: [i64; 3], b: [i64; 3]) -> Option<u8> {
-        let (va, vb) = (AXIS_STEPS[a[0] as usize], AXIS_STEPS[b[0] as usize]);
-        let (dq, dr) = (b[1] - a[1], b[2] - a[2]);
-        if a[0] == b[0] {
-            if dq * va.1 != dr * va.0 {
-                return None; // parallel but not on one line
-            }
-            let offset = if va.0 != 0 { dq } else { dr };
-            if !(1..=WA_MAX_OFFSET).contains(&offset.abs()) {
-                return None;
-            }
-            return Some((offset.abs() - 1) as u8);
-        }
-        let det = va.0 * vb.1 - va.1 * vb.0;
-        assert!(det == 1 || det == -1, "hex axis pairs are unimodular");
-        let t = (dq * vb.1 - dr * vb.0) / det;
-        let u = -(va.0 * dr - va.1 * dq) / det;
-        assert_eq!(
-            (a[1] + t * va.0, a[2] + t * va.1),
-            (b[1] + u * vb.0, b[2] + u * vb.1),
-            "the solved slots must name one cell"
-        );
-        let claimed = -WA_REACH..=5 + WA_REACH;
-        if !claimed.contains(&t) || !claimed.contains(&u) {
-            return None;
-        }
-        Some(
-            WA_CROSSING_BASE
-                + WA_FOLD[(t + WA_REACH) as usize] * 6
-                + WA_FOLD[(u + WA_REACH) as usize],
-        )
-    }
-
-    #[test]
-    fn the_crossing_fold_is_invariant_under_line_reversal() {
-        // Reversal sends the span parameter t to 5 - t; each side of a
-        // crossing class folds invariantly on its own, which is what makes the
-        // product class D6-invariant under independent line reversals.
-        for t in -WA_REACH..=5 + WA_REACH {
-            assert_eq!(
-                WA_FOLD[(t + WA_REACH) as usize],
-                WA_FOLD[(5 - t + WA_REACH) as usize]
-            );
-        }
-        let span = WA_REACH as usize;
-        assert_eq!(&WA_FOLD[span..span + 6], &[0, 1, 2, 2, 1, 0]);
-        assert_eq!((WA_FOLD[span - 1], WA_FOLD[0]), (3, 5));
-    }
-
-    #[test]
-    fn pair_views_match_the_pairwise_brute_force() {
-        use std::collections::HashSet;
-
-        let positions = vec![
-            engine::Position::new(),
-            replay(&[(0, 0), (1, 0), (2, 0), (0, 1)]),
-            replay(&[
-                (0, 0),
-                (1, 0),
-                (2, 0),
-                (0, 1),
-                (1, 1),
-                (2, 1),
-                (-3, 2),
-                (4, -2),
-            ]),
-        ];
-        let raw = build_batch(&positions, true).expect("all positions are live");
-        let views = raw.pairs.as_ref().expect("pairs were requested");
-        let n_w = raw.window_feat.len();
-        assert_eq!(views.ptr.len(), n_w + 1);
-        assert_eq!(views.sptr.len(), n_w + 1);
-
-        // Every relation of every ordered window pair inside one position,
-        // plus the SELF loops. Cross-position pairs are never asked for: the
-        // brute force runs per graph, so an edge that left its position would
-        // show up as an extra.
-        let mut expected: HashSet<(usize, usize, u8)> = HashSet::new();
-        let mut base = 0usize;
-        for position in &positions {
-            let graph = build(position).expect("live position");
-            let ids: Vec<[i64; 3]> = graph
-                .window_id
-                .chunks_exact(3)
-                .map(|row| [row[0], row[1], row[2]])
-                .collect();
-            for i in 0..ids.len() {
-                expected.insert((base + i, base + i, WA_SELF_CLASS));
-                for j in 0..ids.len() {
-                    if i != j
-                        && let Some(class) = oracle_relation(ids[i], ids[j])
-                    {
-                        expected.insert((base + i, base + j, class));
-                    }
-                }
-            }
-            base += ids.len();
-        }
-        assert_eq!(base, n_w);
-        assert!(expected.len() > n_w, "the fixture must relate real pairs");
-
-        let mut by_destination = HashSet::new();
-        let mut by_source = HashSet::new();
-        for w in 0..n_w {
-            for edge in views.ptr[w] as usize..views.ptr[w + 1] as usize {
-                by_destination.insert((w, views.src[edge] as usize, views.cls[edge] as u8));
-            }
-            for edge in views.sptr[w] as usize..views.sptr[w + 1] as usize {
-                by_source.insert((views.sdst[edge] as usize, w, views.scls[edge] as u8));
-            }
-        }
-        assert_eq!(by_destination, expected);
-        assert_eq!(by_source, expected);
-        // Set equality alone would hide a duplicated edge.
-        assert_eq!(views.src.len(), expected.len());
-        assert_eq!(views.sdst.len(), expected.len());
-
-        // The class view is a permutation of destination-order edge ids whose
-        // classes run nondecreasing, with cptr at the class boundaries.
-        let mut counts = vec![0i64; WA_CLASSES];
-        for &class in &views.cls {
-            counts[class as usize] += 1;
-        }
-        let mut running = 0;
-        for (class, &count) in counts.iter().enumerate() {
-            assert_eq!(views.cptr[class], running);
-            running += count;
-        }
-        assert_eq!(views.cptr[WA_CLASSES], views.cls.len() as i64);
-        let mut seen = vec![false; views.cedge.len()];
-        for class in 0..WA_CLASSES {
-            for slot in views.cptr[class] as usize..views.cptr[class + 1] as usize {
-                let edge = views.cedge[slot] as usize;
-                assert_eq!(views.cls[edge] as usize, class);
-                assert!(!seen[edge], "edge {edge} appears twice in the class view");
-                seen[edge] = true;
-            }
-        }
-        assert!(seen.iter().all(|&hit| hit));
     }
 
     #[test]

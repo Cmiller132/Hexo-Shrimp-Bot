@@ -188,24 +188,10 @@ impl Position {
 
 /// A collated `RawBatch` as a dict of numpy arrays, keyed by the field names
 /// `mantisnet.builder.Batch` uses.
-///
-/// The `wa_*` §5.1c edge views appear only when the batch was collated with
-/// pairs; the Python collator refuses a `pairs=True` batch that lacks them
-/// rather than deriving them a second way.
-fn raw_to_dict<'py>(py: Python<'py>, mut raw: encoder::RawBatch) -> PyResult<Bound<'py, PyDict>> {
+fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'py, PyDict>> {
     let (p, max_t, max_w) = (raw.n_pos, raw.max_t, raw.max_w);
     let d = PyDict::new(py);
     let n_w = raw.window_feat.len();
-    if let Some(pairs) = raw.pairs.take() {
-        d.set_item("wa_ptr", PyArray1::from_vec(py, pairs.ptr))?;
-        d.set_item("wa_src", PyArray1::from_vec(py, pairs.src))?;
-        d.set_item("wa_class", PyArray1::from_vec(py, pairs.cls))?;
-        d.set_item("wa_sptr", PyArray1::from_vec(py, pairs.sptr))?;
-        d.set_item("wa_sdst", PyArray1::from_vec(py, pairs.sdst))?;
-        d.set_item("wa_scls", PyArray1::from_vec(py, pairs.scls))?;
-        d.set_item("wa_cptr", PyArray1::from_vec(py, pairs.cptr))?;
-        d.set_item("wa_cedge", PyArray1::from_vec(py, pairs.cedge))?;
-    }
     d.set_item("stone_own", PyArray1::from_vec(py, raw.stone_own))?;
     d.set_item("window_feat", PyArray1::from_vec(py, raw.window_feat))?;
     d.set_item(
@@ -243,19 +229,16 @@ fn raw_to_dict<'py>(py: Python<'py>, mut raw: encoder::RawBatch) -> PyResult<Bou
 /// Build a collated MantisNet batch from positions, in parallel.
 ///
 /// The production twin of `mantisnet.builder`'s Python path, held equal to it
-/// field for field by that package's parity tests. `pairs` adds the §5.1c
-/// window-pair edge views, which only a window-attention model reads. Raises
-/// `ValueError` on a terminal position.
+/// field for field by that package's parity tests. Raises `ValueError` on a
+/// terminal position.
 #[pyfunction]
-#[pyo3(signature = (positions, *, pairs = false))]
 fn build_batch<'py>(
     py: Python<'py>,
     positions: Vec<PyRef<'py, Position>>,
-    pairs: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let owned: Vec<engine::Position> = positions.iter().map(|p| p.inner.clone()).collect();
     let raw = py
-        .detach(|| encoder::build_batch(&owned, pairs))
+        .detach(|| encoder::build_batch(&owned))
         .map_err(PyValueError::new_err)?;
     raw_to_dict(py, raw)
 }
@@ -263,15 +246,13 @@ fn build_batch<'py>(
 /// Replay each game's first `ts[i]` placements and build the batch, in
 /// parallel — the fitting path, where a stored position is a move prefix.
 #[pyfunction]
-#[pyo3(signature = (games, ts, *, pairs = false))]
 fn build_batch_prefixes<'py>(
     py: Python<'py>,
     games: Vec<Vec<(i16, i16)>>,
     ts: Vec<usize>,
-    pairs: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let raw = py
-        .detach(|| encoder::build_batch_prefixes(&games, &ts, pairs))
+        .detach(|| encoder::build_batch_prefixes(&games, &ts))
         .map_err(PyValueError::new_err)?;
     raw_to_dict(py, raw)
 }

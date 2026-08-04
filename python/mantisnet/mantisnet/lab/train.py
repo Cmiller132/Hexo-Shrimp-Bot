@@ -1,4 +1,4 @@
-"""Supervised lab-cell fitting through the production model and fit engine."""
+﻿"""Supervised lab-cell fitting through the production model and fit engine."""
 
 from __future__ import annotations
 
@@ -22,7 +22,6 @@ from ..losses import policy_loss, value_loss
 from .corpus import FrozenCorpus, SampleSplit, load_corpus
 from .variants import (
     build_variant,
-    collate_for,
     count_parameters,
     refuse_param_budget,
     variant_spec,
@@ -226,7 +225,7 @@ def _supervised_fn(compile_model: bool):
         if _supervised_heads_compiled is None:
             # Packed chunks span tail-to-full sizes and the AOT cache guards
             # them by size range, so the graph set splits past the stock limit
-            # of 8 — after which every new range runs eager for the rest of
+            # of 8 â€” after which every new range runs eager for the rest of
             # the session. The set converges; give it room.
             torch._dynamo.config.recompile_limit = 64
             _supervised_heads_compiled = torch.compile(_supervised_heads, dynamic=True)
@@ -257,7 +256,7 @@ def fit_supervised_epoch(
     if not len(samples):
         raise ValueError(f"corpus split {split!r} is empty")
     lengths, cells = sizes if sizes is not None else sample_sizes(frozen, samples)
-    collate = collate_for(variant_spec(variant), model)
+    collate = variant_spec(variant).collate
     forward = _supervised_fn(cfg.compile)
     device_type = torch.device(cfg.device).type
 
@@ -334,7 +333,7 @@ def validate_supervised(
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
     )
-    collate = collate_for(variant_spec(variant), model)
+    collate = variant_spec(variant).collate
     forward = _supervised_fn(cfg.compile)
     device_type = torch.device(cfg.device).type
     correct = 0

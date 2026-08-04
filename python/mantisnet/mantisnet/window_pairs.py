@@ -1,10 +1,11 @@
 """Window-pair relation tables and attention for §5.1c.
 
-Like the cell-pass relay tables, these are derived once at collation and the
-forward performs no index discovery. Unlike them, the derivation is opt-in
-(``pairs=True`` on the collators): only a ``window_attention`` model consumes
-the tables, and the join is heavy enough that arms which never read it should
-not pay for it at every chunk.
+Unlike the cell-pass relay tables, these are not collated: a
+``window_attention`` model derives them once per forward on its own device
+from the batch's window identities. The int64 edge views cost several times
+more to ship over PCIe than to derive beside the model, and arms that never
+read them pay nothing. ``pair_tables`` is device-generic — CUDA in the trunk,
+CPU under the oracle tests.
 
 Two windows relate in exactly one of two game-mechanical ways, and both are
 functions of the identity triples ``(axis, start_q, start_r)`` alone:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -124,51 +125,52 @@ def test_the_three_views_hold_the_same_edges(positions):
     )
 
 
+def _batched_tables(graphs):
+    window_id = torch.from_numpy(np.concatenate([g.window_id for g in graphs]))
+    window_pos = torch.repeat_interleave(
+        torch.arange(len(graphs)), torch.tensor([g.n_windows for g in graphs])
+    )
+    return pair_tables(window_id, window_pos)
+
+
 def test_pairs_never_cross_positions(positions):
     graphs = [from_position(pos) for pos in positions if from_position(pos).n_windows]
-    batch = collate(graphs, pairs=True)
+    tables = _batched_tables(graphs)
     # Stack the same graphs as one batch; every edge must stay inside its
     # position's window range.
     offsets = [0]
     for g in graphs:
         offsets.append(offsets[-1] + g.n_windows)
     dst = torch.repeat_interleave(
-        torch.arange(batch.window_id.shape[0]), batch.wa_ptr[1:] - batch.wa_ptr[:-1]
+        torch.arange(offsets[-1]), tables.ptr[1:] - tables.ptr[:-1]
     )
     lo = torch.tensor(offsets[:-1])
     hi = torch.tensor(offsets[1:])
     position = torch.searchsorted(hi, dst, right=True)
-    assert torch.all(batch.wa_src >= lo[position])
-    assert torch.all(batch.wa_src < hi[position])
+    assert torch.all(tables.src >= lo[position])
+    assert torch.all(tables.src < hi[position])
 
     # Single-position tables agree with the batched ones for the first graph,
     # per destination as sets: the join visits edges in a different order when
     # other positions interleave the sort.
-    single = collate([graphs[0]], pairs=True)
+    single = _batched_tables(graphs[:1])
     n0 = graphs[0].n_windows
-    assert torch.equal(single.wa_ptr, batch.wa_ptr[: n0 + 1])
+    assert torch.equal(single.ptr, tables.ptr[: n0 + 1])
     for w in range(n0):
-        a, b = int(batch.wa_ptr[w]), int(batch.wa_ptr[w + 1])
-        got = set(zip(batch.wa_src[a:b].tolist(), batch.wa_class[a:b].tolist()))
-        want = set(zip(single.wa_src[a:b].tolist(), single.wa_class[a:b].tolist()))
+        a, b = int(tables.ptr[w]), int(tables.ptr[w + 1])
+        got = set(zip(tables.src[a:b].tolist(), tables.cls[a:b].tolist()))
+        want = set(zip(single.src[a:b].tolist(), single.cls[a:b].tolist()))
         assert got == want
 
 
-def test_pairs_are_opt_in():
+def test_every_window_carries_exactly_one_self_loop():
     g = from_position(__import__("hexo_py").Position.replay([(0, 0), (1, 0), (0, 1)]))
-    plain = collate([g])
-    assert plain.wa_ptr is None and plain.wa_src is None and plain.wa_class is None
-    assert plain.wa_sptr is None and plain.wa_cptr is None and plain.wa_cedge is None
-    with_pairs = collate([g], pairs=True)
-    assert with_pairs.wa_ptr is not None
-    assert with_pairs.wa_sptr is not None and with_pairs.wa_cedge is not None
-    # Every window has at least the SELF loop, exactly once.
-    counts = with_pairs.wa_ptr[1:] - with_pairs.wa_ptr[:-1]
+    tables = _batched_tables([g])
+    counts = tables.ptr[1:] - tables.ptr[:-1]
     assert torch.all(counts >= 1)
     self_edges = (
-        with_pairs.wa_src
-        == torch.repeat_interleave(torch.arange(g.n_windows), counts)
-    ) & (with_pairs.wa_class == 47)
+        tables.src == torch.repeat_interleave(torch.arange(g.n_windows), counts)
+    ) & (tables.cls == 47)
     assert int(self_edges.sum()) == g.n_windows
 
 
@@ -186,23 +188,10 @@ def _naive_attention(q, k, v, bias, ptr, src, cls):
     return out
 
 
-def _wa_tables(batch):
-    return (
-        batch.wa_ptr,
-        batch.wa_src,
-        batch.wa_class,
-        batch.wa_sptr,
-        batch.wa_sdst,
-        batch.wa_scls,
-        batch.wa_cptr,
-        batch.wa_cedge,
-    )
-
-
 def _attention_case(positions, seed: int):
     torch.manual_seed(seed)
     g = from_position(positions[8])
-    batch = collate([g], pairs=True)
+    tables = _batched_tables([g])
     heads, hd = 2, 8
     make = lambda *shape: torch.randn(*shape, requires_grad=True)  # noqa: E731
     return (
@@ -210,7 +199,7 @@ def _attention_case(positions, seed: int):
         make(g.n_windows, heads, hd),
         make(g.n_windows, heads, hd),
         make(heads, WA_CLASSES),
-        _wa_tables(batch),
+        tables,
     )
 
 
@@ -319,25 +308,17 @@ def _small_wa_config(**extra) -> MantisConfig:
 
 
 @torch.no_grad()
-def test_window_attention_refuses_a_batch_without_pair_tables(positions):
-    net = MantisNet(_small_wa_config()).eval()
-    batch = collate([from_position(positions[6])])
-    with pytest.raises(RuntimeError, match="pairs=True"):
-        net(batch, 0.2)
-
-
-@torch.no_grad()
 def test_window_attention_forward_and_batch_parity(positions):
     torch.manual_seed(11)
     net = MantisNet(_small_wa_config()).eval()
     graphs = [from_position(p) for p in positions]
-    batch = collate(graphs, pairs=True)
+    batch = collate(graphs)
     together = net(batch, 0.2)
     for tensor in vars(together).values():
         assert torch.isfinite(tensor).all()
 
     for i, g in enumerate(graphs):
-        single = net(collate([g], pairs=True), 0.2)
+        single = net(collate([g]), 0.2)
         a, b = int(batch.legal_offsets[i]), int(batch.legal_offsets[i + 1])
         assert torch.allclose(
             together.policy_logits[a:b], single.policy_logits, atol=1e-6
@@ -357,11 +338,11 @@ def test_window_attention_is_d6_invariant(positions, move_lists):
     net = MantisNet(_small_wa_config()).eval()
     for moves in (move_lists[6], move_lists[8]):
         pos = hexo_py.Position.replay(moves)
-        base = net(collate([from_position(pos)], pairs=True), 0.2)
+        base = net(collate([from_position(pos)]), 0.2)
         base_policy = dict(zip(pos.legal_moves(), base.policy_logits.tolist()))
         for transform in telemetry.D6_TRANSFORMS[1:]:
             t_pos = hexo_py.Position.replay([transform(m) for m in moves])
-            got = net(collate([from_position(t_pos)], pairs=True), 0.2)
+            got = net(collate([from_position(t_pos)]), 0.2)
             assert torch.allclose(got.value, base.value, atol=1e-5)
             mapped = dict(zip(t_pos.legal_moves(), got.policy_logits.tolist()))
             for move, logit in base_policy.items():
@@ -371,7 +352,7 @@ def test_window_attention_is_d6_invariant(positions, move_lists):
 def test_window_attention_gradients_reach_every_table(positions):
     torch.manual_seed(13)
     net = MantisNet(_small_wa_config())
-    batch = collate([from_position(positions[8])], pairs=True)
+    batch = collate([from_position(positions[8])])
     out = net(batch, 0.2)
     (out.value_logits.sum() + out.policy_logits.sum()).backward()
     for name in ("wq_wa", "wk_wa", "wv_wa", "wo_wa"):

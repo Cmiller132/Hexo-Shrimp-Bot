@@ -59,8 +59,8 @@ class MantisConfig:
     # Embed the batch's 93 joint occupied-slot incidence classes directly
     # instead of folding them to the three coarse slot classes (§4.3).
     joint_incidence: bool = False
-    # §5.1c sparse window attention over the typed pair relations; requires
-    # batches collated with ``pairs=True``.
+    # §5.1c sparse window attention over the typed pair relations; the trunk
+    # derives the edge views on device from the batch's window identities.
     window_attention: bool = False
 
     def __post_init__(self) -> None:
@@ -314,19 +314,18 @@ class _Block(nn.Module):
         # run eager inside a graph break and everything around them compiles.
         return checkpoint(self._cell_pass, w, *tables, use_reentrant=False)
 
-    def _window_attention(self, w: Tensor, batch: Batch) -> Tensor:
+    def _window_attention(self, w: Tensor, pairs) -> Tensor:
         """§5.1c: multi-head attention over each window's relation edges.
 
         The edge op runs scores, softmax, and the weighted sum in fp32
         whatever autocast chose for the projections, saves only the softmax
-        stats, and recomputes every per-edge quantity in backward.
+        stats, and recomputes every per-edge quantity in backward. ``pairs``
+        is the trunk's per-batch ``PairTables``, derived once on device.
         """
         if not self.window_attention:
             raise RuntimeError("window attention is disabled for this block")
-        if batch.wa_ptr is None or batch.wa_src is None or batch.wa_class is None:
-            raise RuntimeError(
-                "window attention requires a batch collated with pairs=True"
-            )
+        if pairs is None:
+            raise RuntimeError("window attention requires the trunk's pair tables")
         assert self.ln_wa is not None
         assert self.wq_wa is not None
         assert self.wk_wa is not None
@@ -343,20 +342,19 @@ class _Block(nn.Module):
             self.wk_wa(z).view(n_w, heads, hd),
             self.wv_wa(z).view(n_w, heads, hd),
             self.wa_bias,
-            batch.wa_ptr,
-            batch.wa_src,
-            batch.wa_class,
-            batch.wa_sptr,
-            batch.wa_sdst,
-            batch.wa_scls,
-            batch.wa_cptr,
-            batch.wa_cedge,
+            *pairs,
         )
         out = self.wo_wa(out.reshape(n_w, cfg.h).to(z.dtype))
         return w + self.drop(out)
 
     def forward(
-        self, s: Tensor, w: Tensor, g: Tensor, batch: Batch, seq_lens: Tensor
+        self,
+        s: Tensor,
+        w: Tensor,
+        g: Tensor,
+        batch: Batch,
+        seq_lens: Tensor,
+        pairs=None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.cfg
         # Sizes come from tensor shapes, not the Batch's ints: under
@@ -393,7 +391,7 @@ class _Block(nn.Module):
                     w = self._cell_pass(w, *tables)
 
         if self.window_attention:
-            w = self._window_attention(w, batch)
+            w = self._window_attention(w, pairs)
 
         # §5.2: stones aggregate their windows.
         y = self.v(self.ln_sw_w(w))
@@ -514,6 +512,17 @@ class MantisNet(nn.Module):
             nn.init.zeros_(head.out.weight)
             nn.init.zeros_(head.out.bias)
 
+    @torch.compiler.disable
+    def _pair_tables(self, batch: Batch):
+        # §5.1c tables are born on the batch's device from the window
+        # identities: the int64 edge views cost several times more to ship
+        # over PCIe than to derive beside the model, and every block shares
+        # one derivation. The data-dependent sorts cannot trace, so this
+        # runs eager inside a graph break.
+        return window_pairs.pair_tables(
+            batch.window_id, batch.window_slot // batch.max_w
+        )
+
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""
         if not self.cfg.joint_incidence:
@@ -522,9 +531,10 @@ class MantisNet(nn.Module):
         w = self.window_table(batch.window_feat)
         g = self.token_base + self.token_moves(batch.moves_idx)
 
+        pairs = self._pair_tables(batch) if self.cfg.window_attention else None
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         for block in self.blocks:
-            s, w, g = block(s, w, g, batch, seq_lens)
+            s, w, g = block(s, w, g, batch, seq_lens, pairs)
         return self.ln_out(s), self.ln_out(w), self.ln_out(g)
 
     def _decoder_rows(self, w: Tensor, batch: Batch, dtype: torch.dtype) -> Tensor:

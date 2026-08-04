@@ -487,9 +487,10 @@ incidence list with joint occupied-slot classes, the legal-cell decoder
 table (per-cell window/joint-class lists or background bucket, in engine
 order), and `moves_remaining`. Identities are consumed only through
 reversal-invariant pair relations, never as raw coordinates; a
-`window_attention` model's batches additionally carry the §5.1c edge set in
-three CSR views (by destination, source, and class — the relay's layout),
-derived from the identities at collation on request.
+`window_attention` model derives the §5.1c edge set in three CSR views (by
+destination, source, and class — the relay's layout) from the identities on
+its own device, once per forward: the views cost several times more to ship
+to the device than to derive beside the model.
 All index tensors are precomputed by the builder; the forward contains no
 data-dependent index discovery.
 

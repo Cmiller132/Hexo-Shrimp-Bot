@@ -12,8 +12,6 @@ import pytest
 import torch
 
 from mantisnet import collate, collate_positions, collate_prefixes, from_position
-from mantisnet.builder import batch_from_arrays
-from mantisnet.lab.check import _assert_pairs_equal
 
 from .test_klent_returns import FIRST_STONE_WIN
 
@@ -73,46 +71,6 @@ def test_prefix_batch_parity(move_lists):
         [from_position(hexo_py.Position.replay(list(g[:t]))) for g, t in zip(games, ts)]
     )
     _assert_equal(rust, python)
-
-
-def test_pair_table_parity(positions, move_lists):
-    """§5.1c: the same run boundaries, and the same edge set inside each run.
-
-    The Rust builder joins each position on its own and offsets the result; the
-    Python oracle runs one join over the whole batch. Edge order inside a run is
-    therefore each derivation's own, and the sets are the contract.
-    """
-    _assert_pairs_equal(
-        collate_positions(positions, pairs=True),
-        collate([from_position(p) for p in positions], pairs=True),
-    )
-    # Ply zero has no windows at all, and a single position exercises the
-    # collation with one window base rather than several.
-    for pos in [hexo_py.Position(), positions[-1]]:
-        _assert_pairs_equal(
-            collate_positions([pos], pairs=True),
-            collate([from_position(pos)], pairs=True),
-        )
-    games = [m for m in move_lists if m]
-    ts = [len(m) for m in games]
-    _assert_pairs_equal(
-        collate_prefixes(games, ts, pairs=True),
-        collate(
-            [from_position(hexo_py.Position.replay(list(g))) for g in games], pairs=True
-        ),
-    )
-
-
-def test_pair_tables_stay_opt_in(positions):
-    plain = collate_positions(positions[:3])
-    assert plain.wa_ptr is None and plain.wa_cedge is None
-    arrays = hexo_py.build_batch(positions[:3])
-    assert [name for name in arrays if name.startswith("wa_")] == []
-    # The flag describes the arrays; neither direction is quietly repaired.
-    with pytest.raises(ValueError, match="are missing"):
-        batch_from_arrays(pairs=True, **arrays)
-    with pytest.raises(ValueError, match="without pairs=True"):
-        batch_from_arrays(**hexo_py.build_batch(positions[:3], pairs=True))
 
 
 def test_terminal_position_refused():
