@@ -82,6 +82,9 @@ def _policy_q_fn(cfg: KlentConfig):
     if not cfg.compile:
         return _policy_q
     if _policy_q_compiled is None:
+        # Same room as the supervised compile helper: budget-packed chunks
+        # split into more size-range graphs than the stock limit of 8.
+        torch._dynamo.config.recompile_limit = 64
         _policy_q_compiled = torch.compile(_policy_q, dynamic=True)
     return _policy_q_compiled
 

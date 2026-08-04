@@ -224,6 +224,11 @@ def _supervised_fn(compile_model: bool):
         return _supervised_heads
     with _compile_lock:
         if _supervised_heads_compiled is None:
+            # Packed chunks span tail-to-full sizes and the AOT cache guards
+            # them by size range, so the graph set splits past the stock limit
+            # of 8 — after which every new range runs eager for the rest of
+            # the session. The set converges; give it room.
+            torch._dynamo.config.recompile_limit = 64
             _supervised_heads_compiled = torch.compile(_supervised_heads, dynamic=True)
     return _supervised_heads_compiled
 
