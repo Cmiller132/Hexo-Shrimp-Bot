@@ -30,7 +30,7 @@ from .builder import (
     OCC_FOLD,
     Batch,
 )
-from .segments import segment_ids, segment_max, segment_sum
+from .segments import segment_ids, segment_max
 
 
 @dataclass(frozen=True)
@@ -291,9 +291,9 @@ class _Block(nn.Module):
     def _window_attention(self, w: Tensor, batch: Batch) -> Tensor:
         """§5.1c: multi-head attention over each window's relation edges.
 
-        Scores and the softmax run in fp32 whatever autocast chose for the
-        projections; the weighted sum accumulates in fp32 and casts once at
-        the output projection.
+        The edge-list op runs its scores, softmax, and weighted sum in fp32
+        whatever autocast chose for the projections, and recomputes its
+        gathers in backward rather than retaining per-edge tensors.
         """
         if not self.window_attention:
             raise RuntimeError("window attention is disabled for this block")
@@ -312,31 +312,14 @@ class _Block(nn.Module):
         n_w = w.shape[0]
 
         z = self.ln_wa(w)
-        q = self.wq_wa(z).view(n_w, heads, hd)
-        k = self.wk_wa(z).view(n_w, heads, hd)
-        v = self.wv_wa(z).view(n_w, heads, hd)
-
-        dst = segment_ids(batch.wa_ptr)
-        src = batch.wa_src
-        logits = (
-            q.index_select(0, dst).float() * k.index_select(0, src).float()
-        ).sum(-1) / math.sqrt(hd)
-        logits = logits + self.wa_bias.t().index_select(0, batch.wa_class).float()
-
-        # Per-(window, head) segment softmax over the edge list. Every window
-        # has a SELF edge, so no segment is empty.
-        flat_seg = (
-            dst[:, None] * heads + torch.arange(heads, device=w.device)[None, :]
-        ).reshape(-1)
-        flat = logits.reshape(-1)
-        peak = segment_max(flat, flat_seg, n_w * heads)
-        weight = (flat - peak.index_select(0, flat_seg)).exp()
-        denom = segment_sum(weight, flat_seg, n_w * heads)
-        alpha = (weight / denom.index_select(0, flat_seg)).view(-1, heads)
-
-        out = torch.zeros(n_w, heads, hd, dtype=torch.float32, device=w.device)
-        out.index_add_(
-            0, dst, alpha.unsqueeze(-1) * v.index_select(0, src).float()
+        out = window_pairs.edge_attention(
+            self.wq_wa(z).view(n_w, heads, hd),
+            self.wk_wa(z).view(n_w, heads, hd),
+            self.wv_wa(z).view(n_w, heads, hd),
+            self.wa_bias,
+            batch.wa_ptr,
+            batch.wa_src,
+            batch.wa_class,
         )
         out = self.wo_wa(out.reshape(n_w, cfg.h).to(z.dtype))
         return w + self.drop(out)

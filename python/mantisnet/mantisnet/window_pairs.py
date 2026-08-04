@@ -42,6 +42,8 @@ the position index).
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -154,3 +156,190 @@ def pair_tables(window_id: Tensor, window_pos: Tensor) -> tuple[Tensor, Tensor, 
         dst, torch.arange(n_w + 1, device=window_id.device)
     )
     return ptr, src, cls
+
+
+# The §5.1c attention op. Real batches carry tens of millions of directed
+# edges, so nothing of size (E, head_dim) may survive an autograd step:
+# the forward walks the edge list in fixed slices under no_grad and saves
+# only the softmax weights; the backward re-gathers the same slices instead
+# of retaining them — the recompute-over-store trade the relay and the fused
+# attention backward make, here in eager torch. Peak transient memory is a
+# few slice buffers; the persistent extra is alpha, (E, heads) fp32.
+#
+# CUDA `index_add_` accumulation is atomic and therefore nondeterministic in
+# summation order, matching the §5.2 stone scatter's production status. A
+# fused CSR kernel (one program per destination window, online softmax)
+# is the deterministic production shape if the ablation earns it.
+_EDGE_SLICE = 2_000_000
+
+
+def _edge_dst(ptr: Tensor) -> Tensor:
+    n_w = ptr.shape[0] - 1
+    return torch.repeat_interleave(
+        torch.arange(n_w, device=ptr.device), ptr[1:] - ptr[:-1]
+    )
+
+
+def _validate_attention(q, k, v, bias, ptr, src, cls) -> None:
+    if q.ndim != 3 or q.shape != k.shape or q.shape != v.shape:
+        raise ValueError("q, k, v must share shape (N_w, heads, head_dim)")
+    if bias.ndim != 2 or bias.shape[0] != q.shape[1]:
+        raise ValueError("bias must have shape (heads, classes)")
+    if ptr.shape[0] != q.shape[0] + 1:
+        raise ValueError("ptr must have one row per window plus one")
+    if src.shape != cls.shape or src.ndim != 1:
+        raise ValueError("src and cls must be one flat edge list")
+
+
+@torch.library.custom_op("mantisnet::window_attention", mutates_args=())
+def _wa_op(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    bias: Tensor,
+    ptr: Tensor,
+    src: Tensor,
+    cls: Tensor,
+) -> tuple[Tensor, Tensor]:
+    _validate_attention(q, k, v, bias, ptr, src, cls)
+    n_w, heads, hd = q.shape
+    scale = 1.0 / math.sqrt(hd)
+    dst = _edge_dst(ptr)
+    e = src.shape[0]
+
+    score = bias.t().float().index_select(0, cls)  # (E, heads)
+    for a in range(heads):
+        q_a, k_a = q[:, a], k[:, a]
+        for lo in range(0, e, _EDGE_SLICE):
+            sl = slice(lo, min(lo + _EDGE_SLICE, e))
+            score[sl, a] += scale * (
+                q_a.index_select(0, dst[sl]).float()
+                * k_a.index_select(0, src[sl]).float()
+            ).sum(-1)
+
+    # Segment softmax per (destination, head); SELF edges keep every segment
+    # nonempty, so the max identity is never returned.
+    peak = score.new_full((n_w, heads), torch.finfo(torch.float32).min)
+    peak.index_reduce_(0, dst, score, "amax", include_self=True)
+    alpha = (score - peak.index_select(0, dst)).exp_()
+    denom = score.new_zeros((n_w, heads)).index_add_(0, dst, alpha)
+    alpha = alpha / denom.index_select(0, dst)
+
+    out = q.new_zeros((n_w, heads, hd), dtype=torch.float32)
+    for a in range(heads):
+        v_a = v[:, a]
+        for lo in range(0, e, _EDGE_SLICE):
+            sl = slice(lo, min(lo + _EDGE_SLICE, e))
+            out[:, a].index_add_(
+                0,
+                dst[sl],
+                alpha[sl, a, None] * v_a.index_select(0, src[sl]).float(),
+            )
+    return out, alpha
+
+
+@_wa_op.register_fake
+def _(q, k, v, bias, ptr, src, cls):
+    n_w, heads, hd = q.shape
+    out = q.new_empty((n_w, heads, hd), dtype=torch.float32)
+    alpha = q.new_empty((src.shape[0], heads), dtype=torch.float32)
+    return out, alpha
+
+
+@torch.library.custom_op("mantisnet::window_attention_backward", mutates_args=())
+def _wa_backward_op(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    bias: Tensor,
+    ptr: Tensor,
+    src: Tensor,
+    cls: Tensor,
+    alpha: Tensor,
+    grad_out: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    n_w, heads, hd = q.shape
+    scale = 1.0 / math.sqrt(hd)
+    dst = _edge_dst(ptr)
+    e = src.shape[0]
+    go = grad_out.float()
+
+    # dalpha, dv: one sliced sweep re-gathering v and the upstream rows.
+    dalpha = alpha.new_empty((e, heads))
+    dv = torch.zeros((n_w, heads, hd), dtype=torch.float32, device=q.device)
+    for a in range(heads):
+        v_a, go_a = v[:, a], go[:, a]
+        for lo in range(0, e, _EDGE_SLICE):
+            sl = slice(lo, min(lo + _EDGE_SLICE, e))
+            go_rows = go_a.index_select(0, dst[sl])
+            dalpha[sl, a] = (
+                go_rows * v_a.index_select(0, src[sl]).float()
+            ).sum(-1)
+            dv[:, a].index_add_(0, src[sl], alpha[sl, a, None] * go_rows)
+
+    # Softmax backward per segment: dscore = alpha * (dalpha - Σ alpha dalpha).
+    inner = alpha * dalpha
+    total = inner.new_zeros((n_w, heads)).index_add_(0, dst, inner)
+    dscore = alpha * (dalpha - total.index_select(0, dst))
+
+    dbias = torch.zeros(
+        (bias.shape[1], heads), dtype=torch.float32, device=bias.device
+    ).index_add_(0, cls, dscore).t()
+
+    dq = torch.zeros((n_w, heads, hd), dtype=torch.float32, device=q.device)
+    dk = torch.zeros((n_w, heads, hd), dtype=torch.float32, device=q.device)
+    for a in range(heads):
+        q_a, k_a = q[:, a], k[:, a]
+        for lo in range(0, e, _EDGE_SLICE):
+            sl = slice(lo, min(lo + _EDGE_SLICE, e))
+            weight = scale * dscore[sl, a, None]
+            dq[:, a].index_add_(
+                0, dst[sl], weight * k_a.index_select(0, src[sl]).float()
+            )
+            dk[:, a].index_add_(
+                0, src[sl], weight * q_a.index_select(0, dst[sl]).float()
+            )
+    return (
+        dq.to(q.dtype),
+        dk.to(k.dtype),
+        dv.to(v.dtype),
+        dbias.contiguous().to(bias.dtype),
+    )
+
+
+@_wa_backward_op.register_fake
+def _(q, k, v, bias, ptr, src, cls, alpha, grad_out):
+    return (
+        torch.empty_like(q),
+        torch.empty_like(k),
+        torch.empty_like(v),
+        torch.empty_like(bias),
+    )
+
+
+def _wa_setup_context(ctx, inputs, output) -> None:
+    q, k, v, bias, ptr, src, cls = inputs
+    _out, alpha = output
+    ctx.save_for_backward(q, k, v, bias, ptr, src, cls, alpha)
+
+
+def _wa_dispatch_backward(ctx, grad_out, _grad_alpha):
+    dq, dk, dv, dbias = _wa_backward_op(*ctx.saved_tensors, grad_out)
+    return dq, dk, dv, dbias, None, None, None
+
+
+_wa_op.register_autograd(_wa_dispatch_backward, setup_context=_wa_setup_context)
+
+
+def edge_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    bias: Tensor,
+    ptr: Tensor,
+    src: Tensor,
+    cls: Tensor,
+) -> Tensor:
+    """§5.1c attention over the edge list: fp32 ``(N_w, heads, head_dim)``."""
+    out, _alpha = _wa_op(q, k, v, bias, ptr, src, cls)
+    return out

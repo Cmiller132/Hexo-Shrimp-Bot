@@ -7,12 +7,15 @@ derivation and the brute force share nothing but the definition.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 import torch
 
+import mantisnet.window_pairs as window_pairs
 from mantisnet import MantisConfig, MantisNet, collate, from_position
 from mantisnet.builder import AXES
-from mantisnet.window_pairs import WA_CLASSES, pair_tables
+from mantisnet.window_pairs import WA_CLASSES, edge_attention, pair_tables
 
 
 def _fold(t: int) -> int:
@@ -135,6 +138,62 @@ def test_pairs_are_opt_in():
         == torch.repeat_interleave(torch.arange(g.n_windows), counts)
     ) & (with_pairs.wa_class == 47)
     assert int(self_edges.sum()) == g.n_windows
+
+
+def _naive_attention(q, k, v, bias, ptr, src, cls):
+    """Materialized per-edge attention: the oracle the sliced op must match."""
+    n_w, _heads, hd = q.shape
+    dst = torch.repeat_interleave(torch.arange(n_w), ptr[1:] - ptr[:-1])
+    score = (q[dst].float() * k[src].float()).sum(-1) / math.sqrt(hd)
+    score = score + bias.t().float()[cls]
+    out = q.new_zeros(q.shape, dtype=torch.float32)
+    for w in range(n_w):
+        edges = slice(int(ptr[w]), int(ptr[w + 1]))
+        weights = torch.softmax(score[edges], dim=0)  # (degree, heads)
+        out[w] = (weights.unsqueeze(-1) * v[src[edges]].float()).sum(0)
+    return out
+
+
+def _attention_case(positions, seed: int):
+    torch.manual_seed(seed)
+    g = from_position(positions[8])
+    batch = collate([g], pairs=True)
+    heads, hd = 2, 8
+    make = lambda *shape: torch.randn(*shape, requires_grad=True)  # noqa: E731
+    return (
+        make(g.n_windows, heads, hd),
+        make(g.n_windows, heads, hd),
+        make(g.n_windows, heads, hd),
+        make(heads, WA_CLASSES),
+        batch.wa_ptr,
+        batch.wa_src,
+        batch.wa_class,
+    )
+
+
+def test_edge_attention_matches_the_naive_oracle(positions):
+    q, k, v, bias, ptr, src, cls = _attention_case(positions, seed=21)
+    got = edge_attention(q, k, v, bias, ptr, src, cls)
+    want = _naive_attention(q, k, v, bias, ptr, src, cls)
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
+def test_edge_attention_slices_and_gradients_match_the_oracle(positions, monkeypatch):
+    # A tiny slice forces the multi-slice path the real batches take; the
+    # backward re-gathers per slice, so its parity is the recompute proof.
+    monkeypatch.setattr(window_pairs, "_EDGE_SLICE", 3)
+    q, k, v, bias, ptr, src, cls = _attention_case(positions, seed=22)
+    upstream = torch.randn(q.shape)
+
+    got = edge_attention(q, k, v, bias, ptr, src, cls)
+    got_grads = torch.autograd.grad((got * upstream).sum(), (q, k, v, bias))
+    want = _naive_attention(q, k, v, bias, ptr, src, cls)
+    want_grads = torch.autograd.grad((want * upstream).sum(), (q, k, v, bias))
+
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+    for name, a, b in zip(("dq", "dk", "dv", "dbias"), got_grads, want_grads):
+        assert torch.isfinite(a).all(), name
+        torch.testing.assert_close(a, b, rtol=1e-4, atol=1e-5)
 
 
 def _small_wa_config(**extra) -> MantisConfig:
