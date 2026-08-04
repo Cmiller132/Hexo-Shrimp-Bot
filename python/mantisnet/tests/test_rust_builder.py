@@ -18,6 +18,7 @@ from .test_klent_returns import FIRST_STONE_WIN
 _TENSOR_FIELDS = [
     "stone_own",
     "window_feat",
+    "window_id",
     "moves_idx",
     "inc_stone",
     "inc_window",

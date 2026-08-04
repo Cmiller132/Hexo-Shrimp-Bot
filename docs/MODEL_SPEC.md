@@ -60,9 +60,10 @@ group D6, so the whole model is D6-invariant by construction (§8).
 | `DROPOUT` | dropout probability (trunk sub-blocks) | 0.0 |
 | `axis_bias` | enable the on-axis/off-axis attention-bias ablation | `False` |
 | `cell_pass` | enable the window-to-window shared-empty-cell ablation | `False` |
+| `joint_incidence` | embed the 93 joint incidence classes unfolded | `False` |
 
 Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
-slot classes = 3 and `DEC_CLASSES = 93` (§4.3), critic logits = 3, and
+`DEC_CLASSES = OCC_CLASSES = 93` (§4.3), critic logits = 3, and
 `moves_remaining ∈ {1, 2}`.
 
 The default configuration has 1,272,997 parameters: 1,063,648 in the four
@@ -196,33 +197,27 @@ remains symmetry-safe.
 For a legal cell, the hex distance to the nearest stone, clamped to the
 legality radius (8): a table of 8 embeddings of width `H`.
 
-### 4.3 Slot and joint classes
+### 4.3 Joint classes and the incidence fold
 
 A stone or cell occupies slot `s ∈ 0..5` of a window it belongs to. A
 reflection reverses slot order, `s ↔ 5 − s`, so no encoding of a slot may
-distinguish the two. There are two invariants of a pairing, and the model
-uses each where it is the right one.
-
-**Slot class** — `min(s, 5 − s) ∈ {0, 1, 2}` (end / near-end / centre). Used
-for the stone↔window incidence of §5.1 and §5.2, where the pairing's other
-half is a stone the window's own occupancy pattern already accounts for.
-
-**Joint class** — for the legal-cell decoder of §6, the slot class discards
-what the decoder most needs. The reflection acts on the pair
-`(occupancy mask, candidate slot)` *jointly*, sending it to
-`(reverse6(mask), 5 − s)`, so the orbits of that involution are the finest
-reversal-invariant description of where a candidate sits among a window's
-stones. The decoder class is the orbit's rank in ascending `(mask, slot)`
-order, one of
+distinguish the two. The reflection acts on the pair `(occupancy mask, slot)`
+*jointly*, sending it to `(reverse6(mask), 5 − s)`, so the orbits of that
+involution are the finest reversal-invariant description of where a slot
+sits among a window's stones. A class is the orbit's rank in ascending
+`(mask, slot)` order, and the builder classes both pairings this way:
 
 ```
-DEC_CLASSES = 93
+DEC_CLASSES = 93   # empty slots: the legal-cell decoder and the cell pass
+OCC_CLASSES = 93   # occupied slots: the stone↔window incidence
 ```
 
-— the 186 pairs of a nonempty, nonfull mask with an empty slot, folded in
-half: the involution has no fixed point, because no slot is its own mirror.
+Each family is the 186 pairs of a nonempty, nonfull mask with a slot of its
+kind, folded in half: the involution has no fixed point, because no slot is
+its own mirror. The counts match because complementing the mask carries one
+family onto the other and commutes with reversal.
 
-Keying the two halves separately, as `(canonical mask, slot class)`, is
+Keying the two halves separately, as `(canonical mask, min(s, 5 − s))`, is
 coarser and realizes only 75 classes. The 18 it merges are exactly the pairs
 of mirrored slots of a non-palindromic mask — for a lone stone at slot 0, a
 candidate at slot 1 makes a contiguous pair and one at slot 4 a split pair,
@@ -231,11 +226,22 @@ rows summed plus its class counts, two cells with the same live windows and
 the same counts get one row and therefore one logit and one action value
 whatever the weights: the merge is an action alias, not an approximation.
 
+**The incidence fold** — reversal preserves `min(s, 5 − s) ∈ {0, 1, 2}`
+(end / near-end / centre), so every occupied-slot orbit lands on exactly one
+coarse class. By default (`joint_incidence = False`) the model folds the
+batch's incidence classes through that map and embeds three rows in
+`E_ws`/`E_sw`, reproducing the pre-joint incidence encoding bit for bit.
+`MantisConfig.joint_incidence` embeds the 93 orbits directly instead. The
+coarse key aliases the same 18 mirrored-slot pairs as the decoder's — in
+`110001` the lone stone and the pair's outer stone are both "end", so under
+the fold a stone's own state cannot bind to a specific end of a
+non-palindromic pattern.
+
 Class embedding tables of width `H` appear in each place a pairing is
 encoded; each site owns its own table. The policy and action-value decoders
 each own a 93-row joint-class table. Replacing their former three-row tables
-adds 23,040 parameters in the default model. Stone↔window incidence remains
-keyed by the three-row slot class.
+added 23,040 parameters in the default model; `joint_incidence` grows the
+eight per-block incidence tables from three rows to 93, adding 92,160 more.
 
 ---
 
@@ -424,11 +430,14 @@ Positions batch by concatenation with per-position index offsets — stones,
 windows, and one token per position. Message passing never crosses
 positions (indices are per-position by construction); attention is masked
 block-diagonal per position. The builder emits, per position: the stone
-table, the window table (colour + canonical pattern), the stone↔window
-incidence list with slot classes, the legal-cell decoder table
-(per-cell window/joint-class lists or background bucket, in engine order),
-and `moves_remaining`. All index tensors are precomputed by the builder;
-the forward contains no data-dependent index discovery.
+table, the window table (colour + canonical pattern) with window identities
+`(axis, start_q, start_r)` in the position's own frame, the stone↔window
+incidence list with joint occupied-slot classes, the legal-cell decoder
+table (per-cell window/joint-class lists or background bucket, in engine
+order), and `moves_remaining`. Identities are consumed only through
+reversal-invariant pair relations, never as raw coordinates. All index
+tensors are precomputed by the builder; the forward contains no
+data-dependent index discovery.
 
 ---
 
@@ -465,16 +474,18 @@ probabilities), and `value_logits` (`K` raw bin logits). Appendix B defines
 the action-value semantics.
 
 Two version constants govern compatibility. The current model has
-`MODEL_REPR_VERSION = 2`:
+`MODEL_REPR_VERSION = 3`:
 
 - `ACTION_ORDER_VERSION` (engine-owned): a bump invalidates every
   checkpoint, as the policy indexes legal moves by position.
 - `MODEL_REPR_VERSION` (model-owned): covers the builder and every feature
-  encoding in §3–§4 (window liveness rule, pattern canonicalization, slot
-  and joint classes, bucket tables, incidence layout). Any change to these
-  bumps it and invalidates checkpoints. Formats are not backward compatible;
-  there is one builder and one schema per version. Version 2 is the joint
-  decoder class of §4.3; version 1 keyed the decoder by slot class alone.
+  encoding in §3–§4 (window liveness rule, pattern canonicalization, joint
+  classes, bucket tables, incidence layout). Any change to these bumps it
+  and invalidates checkpoints. Formats are not backward compatible; there is
+  one builder and one schema per version. Version 3 carries joint
+  occupied-slot incidence classes and window identities; version 2
+  introduced the joint decoder class of §4.3; version 1 keyed the decoder by
+  slot class alone.
 
 ---
 
@@ -498,12 +509,13 @@ Two version constants govern compatibility. The current model has
 7. If a second forward implementation ever exists, committed random-weight
    parity fixtures with pinned tolerances and provenance-gated
    real-checkpoint fixtures, failing loudly when weights are absent.
-8. **Decoder classes:** the 93 classes are exactly the orbits of the joint
-   reversal — invariant on each orbit, distinct across orbits — with the
-   ranking convention derived independently of the builder's table, since the
-   Rust encoder must agree on it. Separation is asserted where it matters: a
-   pair of legal moves that `(canonical mask, slot class)` gives one decoder
-   row, given two.
+8. **Joint classes:** in both families, the 93 classes are exactly the
+   orbits of the joint reversal — invariant on each orbit, distinct across
+   orbits — with the ranking convention derived independently of the
+   builder's tables, since the Rust encoder must agree on it. The incidence
+   fold lands every orbit on its members' shared coarse class. Separation is
+   asserted where it matters: a pair of legal moves that
+   `(canonical mask, slot class)` gives one decoder row, given two.
 
 ---
 

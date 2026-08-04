@@ -14,7 +14,7 @@ Attention, FFN, and MLP linears keep the framework-default bias (§10).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
@@ -22,7 +22,14 @@ from torch import Tensor, nn
 
 from . import decoder, message_passing, relay
 from .attention import fused_attention
-from .builder import DEC_CLASSES, NEAREST_BUCKETS, NUM_PATTERNS, Batch
+from .builder import (
+    DEC_CLASSES,
+    NEAREST_BUCKETS,
+    NUM_PATTERNS,
+    OCC_CLASSES,
+    OCC_FOLD,
+    Batch,
+)
 from .segments import segment_ids, segment_max
 
 
@@ -44,6 +51,9 @@ class MantisConfig:
     off_axis_bias: bool = False
     cell_pass: bool = False
     cell_pass_from: int = 0
+    # Embed the batch's 93 joint occupied-slot incidence classes directly
+    # instead of folding them to the three coarse slot classes (§4.3).
+    joint_incidence: bool = False
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
@@ -171,11 +181,12 @@ class _Block(nn.Module):
         h = cfg.h
         self.cfg = cfg
         self.cell_pass = cell_pass
+        inc_classes = OCC_CLASSES if cfg.joint_incidence else 3
         # §5.1 window <- stones
         self.ln_ws_s = nn.LayerNorm(h)
         self.ln_ws_w = nn.LayerNorm(h)
         self.u = nn.Linear(h, h, bias=False)
-        self.e_ws = nn.Embedding(3, h)
+        self.e_ws = nn.Embedding(inc_classes, h)
         self.mlp_w = _PairMlp(h, h, h)
         # §5.1b window <- windows through their shared empty cells.
         if self.cell_pass:
@@ -194,7 +205,7 @@ class _Block(nn.Module):
         self.ln_sw_w = nn.LayerNorm(h)
         self.ln_sw_s = nn.LayerNorm(h)
         self.v = nn.Linear(h, h, bias=False)
-        self.e_sw = nn.Embedding(3, h)
+        self.e_sw = nn.Embedding(inc_classes, h)
         self.mlp_s = _PairMlp(h, h, h)
         # §5.3 stone self-attention + token
         self.ln_attn = nn.LayerNorm(h)
@@ -363,6 +374,12 @@ class MantisNet(nn.Module):
         self.register_buffer(
             "bin_centers", torch.linspace(-1.0, 1.0, cfg.value_bins), persistent=False
         )
+        if not cfg.joint_incidence:
+            # The §4.3 fold from the batch's joint occupied-slot classes down
+            # to the three coarse classes this model's incidence tables embed.
+            self.register_buffer(
+                "inc_fold", torch.from_numpy(OCC_FOLD), persistent=False
+            )
 
         self._init_weights()
 
@@ -383,6 +400,8 @@ class MantisNet(nn.Module):
 
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""
+        if not self.cfg.joint_incidence:
+            batch = replace(batch, inc_class=self.inc_fold[batch.inc_class])
         s = self.stone_table(batch.stone_own)
         w = self.window_table(batch.window_feat)
         g = self.token_base + self.token_moves(batch.moves_idx)

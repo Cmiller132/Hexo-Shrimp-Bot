@@ -56,10 +56,6 @@ const PATTERN_RANK: [i8; 64] = {
     rank
 };
 
-const fn slot_class(k: usize) -> i64 {
-    (if k < 3 { k } else { 5 - k }) as i64
-}
-
 /// Number of joint window-occupancy/candidate-slot classes the decoder reads.
 ///
 /// A reflection reverses a window's slot order, so it sends the pair
@@ -69,13 +65,30 @@ const fn slot_class(k: usize) -> i64 {
 /// involution has no fixed point, because no slot is its own mirror.
 pub const DEC_CLASSES: i64 = 93;
 
-/// Decoder class of each `(mask, slot)` pair, indexed `mask * 6 + slot`.
+/// Number of joint window-occupancy/occupied-slot classes stone incidence
+/// carries.
 ///
-/// `-1` where the pair is not one a live window and an empty candidate can form:
-/// the empty and full masks, and any slot the window already occupies. The class
-/// is the orbit's rank in ascending `(mask, slot)` order, which is how the Python
-/// builder ranks it.
-const DEC_CLASS: [i8; 64 * 6] = {
+/// The same involution as [`DEC_CLASSES`], over the pairs whose slot holds a
+/// stone: also 186 pairs, also fixed-point-free, also 93 orbits. The joint
+/// class binds a stone's message to its exact slot in its window's pattern —
+/// the coarse end/near-end/centre fold aliased the two ends of every
+/// non-palindromic window.
+pub const OCC_CLASSES: i64 = 93;
+
+/// Orbit table of `(mask, slot)` pairs under the joint reversal, indexed
+/// `mask * 6 + slot`.
+///
+/// A reflection sends `(mask, slot)` to `(reverse6(mask), 5 - slot)` jointly.
+/// Over the pairs of a nonempty, nonfull mask whose slot bit equals
+/// `occupied`, the entry is the orbit's rank in ascending `(mask, slot)`
+/// order — the ranking convention the Python builder shares — and `-1`
+/// elsewhere. Ascending order reaches each orbit's representative first, so
+/// its rank is assigned there and its partner reads it back: the partner's
+/// slot bit matches this one's, since bit `5 - s` of `rev` is bit `s` of `m`.
+/// One construction serves both class systems: `occupied = false` is the
+/// decoder's empty-candidate table, `occupied = true` the stone incidence's.
+const fn orbit_table(occupied: bool) -> [i8; 64 * 6] {
+    let want = occupied as usize;
     let mut table = [-1i8; 64 * 6];
     let mut next = 0i8;
     let mut m = 1usize;
@@ -88,11 +101,7 @@ const DEC_CLASS: [i8; 64 * 6] = {
         }
         let mut s = 0usize;
         while s < 6 {
-            if (m >> s) & 1 == 0 {
-                // Ascending order reaches each orbit's representative first, so
-                // its rank is assigned there and its partner reads it back. The
-                // partner's slot is empty whenever this one's is, since bit
-                // `5 - s` of `rev` is bit `s` of `m`.
+            if (m >> s) & 1 == want {
                 if m < rev || (m == rev && s <= 5 - s) {
                     table[m * 6 + s] = next;
                     next += 1;
@@ -105,7 +114,13 @@ const DEC_CLASS: [i8; 64 * 6] = {
         m += 1;
     }
     table
-};
+}
+
+/// Decoder class of each `(mask, empty candidate slot)` pair.
+const DEC_CLASS: [i8; 64 * 6] = orbit_table(false);
+
+/// Stone-incidence class of each `(mask, occupied slot)` pair.
+const OCC_CLASS: [i8; 64 * 6] = orbit_table(true);
 
 fn pack(c: engine::HexCoord) -> i64 {
     c.q as i64 * QSHIFT + c.r as i64
@@ -116,6 +131,7 @@ pub struct Graph {
     stone_own: Vec<i64>,
     stone_qr: Vec<[i32; 2]>,
     window_feat: Vec<i64>,
+    window_id: Vec<i64>,
     inc_stone: Vec<i64>,
     inc_window: Vec<i64>,
     inc_class: Vec<i64>,
@@ -189,10 +205,11 @@ impl WireCounts {
 
     fn payload_len(self) -> Option<usize> {
         // stone_own: i64; stone_qr: two i32s. The remaining terms are
-        // respectively one i64, three i64s, three i64s, and two i64s.
+        // respectively four i64s (feature plus identity triple), three i64s,
+        // three i64s, and two i64s.
         self.stones
             .checked_mul(16)?
-            .checked_add(self.windows.checked_mul(8)?)?
+            .checked_add(self.windows.checked_mul(32)?)?
             .checked_add(self.incidences.checked_mul(24)?)?
             .checked_add(self.decoder.checked_mul(24)?)?
             .checked_add(self.background.checked_mul(16)?)
@@ -282,6 +299,7 @@ fn append_i64s(out: &mut Vec<u8>, values: &[i64]) {
 /// stone_own[stones]:i64,
 /// stone_qr[stones][2]:i32,
 /// window_feat[windows]:i64,
+/// window_id[windows][3]:i64,
 /// inc_stone[incidences]:i64, inc_window[incidences]:i64,
 /// inc_class[incidences]:i64,
 /// dec_cell[decoder]:i64, dec_window[decoder]:i64,
@@ -322,6 +340,7 @@ pub fn encode_position(position: &engine::Position, out: &mut Vec<u8>) {
     append_i64s(out, &graph.stone_own);
     append_i32s(out, graph.stone_qr.iter().flatten().copied());
     append_i64s(out, &graph.window_feat);
+    append_i64s(out, &graph.window_id);
     append_i64s(out, &graph.inc_stone);
     append_i64s(out, &graph.inc_window);
     append_i64s(out, &graph.inc_class);
@@ -464,13 +483,26 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
         }
     }
 
+    let window_id = read_i64_vec(
+        &mut reader,
+        counts.windows.checked_mul(3).ok_or_else(|| {
+            WireError::new("window_id length overflows usize".to_string())
+        })?,
+        "window_id",
+    )?;
+    for (index, chunk) in window_id.chunks_exact(3).enumerate() {
+        if !(0..3).contains(&chunk[0]) {
+            return Err(invalid_feature("window_id", index, chunk[0]));
+        }
+    }
+
     let inc_stone = read_i64_vec(&mut reader, counts.incidences, "inc_stone")?;
     let inc_window = read_i64_vec(&mut reader, counts.incidences, "inc_window")?;
     let inc_class = read_i64_vec(&mut reader, counts.incidences, "inc_class")?;
     validate_indices(&inc_stone, counts.stones, "inc_stone")?;
     validate_indices(&inc_window, counts.windows, "inc_window")?;
     for (index, &value) in inc_class.iter().enumerate() {
-        if !(0..=2).contains(&value) {
+        if !(0..OCC_CLASSES).contains(&value) {
             return Err(invalid_feature("inc_class", index, value));
         }
     }
@@ -519,6 +551,7 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
         stone_own,
         stone_qr,
         window_feat,
+        window_id,
         inc_stone,
         inc_window,
         inc_class,
@@ -569,6 +602,7 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
             stone_own,
             stone_qr,
             window_feat: vec![],
+            window_id: vec![],
             inc_stone: vec![],
             inc_window: vec![],
             inc_class: vec![],
@@ -604,6 +638,7 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
     candidates.dedup_by_key(|&mut (key, ..)| key);
 
     let mut window_feat = Vec::new();
+    let mut window_id = Vec::new();
     let mut live_occ = Vec::new();
     let mut live_ref = Vec::new();
     // Sorted, because `candidates` is: the decoder probes it by binary
@@ -619,6 +654,9 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
         let rank = PATTERN_RANK[occ as usize] as i64;
         live_keys.push(key);
         window_feat.push(colour * NUM_PATTERNS + rank);
+        window_id.push(wr.window.axis.index() as i64);
+        window_id.push(wr.window.start.q as i64);
+        window_id.push(wr.window.start.r as i64);
         live_occ.push(occ);
         live_ref.push(wr);
     }
@@ -633,7 +671,9 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
                 let cell = wr.window.cell(k);
                 inc_stone.push(stone_index[&pack(cell)]);
                 inc_window.push(w as i64);
-                inc_class.push(slot_class(k));
+                // Total on set bits by construction: the guard above is the
+                // table's occupancy condition.
+                inc_class.push(OCC_CLASS[occ as usize * 6 + k] as i64);
             }
         }
     }
@@ -685,6 +725,7 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
         stone_own,
         stone_qr,
         window_feat,
+        window_id,
         inc_stone,
         inc_window,
         inc_class,
@@ -711,13 +752,18 @@ pub struct RawBatch {
     pub stone_own: Vec<i64>,
     /// Live-window colour and canonical-pattern features.
     pub window_feat: Vec<i64>,
+    /// Live-window identities as `(axis, start_q, start_r)` triples, flat in
+    /// `(N_w, 3)` row-major layout. Coordinates are position-local; the model
+    /// consumes them only through reversal-invariant pair classes.
+    pub window_id: Vec<i64>,
     /// `moves_remaining - 1` for each position.
     pub moves_idx: Vec<i64>,
     /// Global stone index for each stone-to-window incidence.
     pub inc_stone: Vec<i64>,
     /// Global window index for each stone-to-window incidence.
     pub inc_window: Vec<i64>,
-    /// Reversal-invariant slot class for each stone-to-window incidence.
+    /// Reversal-invariant joint occupancy/slot class for each stone-to-window
+    /// incidence.
     pub inc_class: Vec<i64>,
     /// Flat padded-table slot occupied by each stone.
     pub stone_slot: Vec<i64>,
@@ -762,6 +808,7 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
         max_w,
         stone_own: vec![],
         window_feat: vec![],
+        window_id: vec![],
         moves_idx: Vec::with_capacity(p),
         inc_stone: vec![],
         inc_window: vec![],
@@ -786,6 +833,7 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
         let (ns, nw) = (g.stone_own.len(), g.window_feat.len());
         out.stone_own.extend_from_slice(&g.stone_own);
         out.window_feat.extend_from_slice(&g.window_feat);
+        out.window_id.extend_from_slice(&g.window_id);
         out.moves_idx.push(g.moves_remaining as i64 - 1);
         out.inc_stone
             .extend(g.inc_stone.iter().map(|&s| s + stone_off));
@@ -1037,12 +1085,13 @@ mod tests {
         let position = replay(&[(0, 0)]);
         let graph = build(&position).expect("a one-stone position builds");
         let counts = WireCounts::from_graph(&graph);
-        // dec_class follows stone_own, stone_qr, window_feat, the three incidence
-        // arrays, dec_cell, and dec_window.
+        // dec_class follows stone_own, stone_qr, window_feat, window_id, the
+        // three incidence arrays, dec_cell, and dec_window.
         let offset = WIRE_HEADER_LEN
             + 8 * counts.stones
             + 8 * counts.stones
             + 8 * counts.windows
+            + 8 * 3 * counts.windows
             + 8 * 3 * counts.incidences
             + 8 * 2 * counts.decoder;
 

@@ -156,8 +156,10 @@ def _validate(
 ) -> None:
     if values.ndim != 2:
         raise ValueError("values must have shape (N, H)")
-    if class_weight.ndim != 2 or class_weight.shape != (3, values.shape[1]):
-        raise ValueError("class_weight must have shape (3, H)")
+    # The kernels are generic in the table height: three rows for a stock
+    # model's folded classes, OCC_CLASSES for a joint_incidence one (§4.3).
+    if class_weight.ndim != 2 or class_weight.shape[1] != values.shape[1]:
+        raise ValueError("class_weight must have shape (classes, H)")
     entries = inc_stone.shape
     if inc_stone.ndim != 1 or inc_window.shape != entries or inc_class.shape != entries:
         raise ValueError("inc_stone, inc_window, and inc_class must be one length")

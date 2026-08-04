@@ -8,11 +8,13 @@ run discovery or any reordered incidence table.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 import torch
 
 import mantisnet.message_passing as message_impl
-from mantisnet import collate, from_position
+from mantisnet import OCC_CLASSES, collate, from_position
 from mantisnet.message_passing import (
     aggregate_to_stones,
     aggregate_to_windows,
@@ -121,9 +123,11 @@ def _inputs(n_source: int, source_dtype: torch.dtype, seed: int):
     )
     # This is the production autocast signature: linear projections may be
     # bf16, while nn.Embedding keeps its fp32 weight and lookup result.  The old
-    # add therefore promotes the messages and accumulator to fp32.
+    # add therefore promotes the messages and accumulator to fp32.  The table
+    # spans every joint class a batch can carry; the kernels are generic in its
+    # height, and a stock model folds before reaching them.
     class_weight = torch.randn(
-        (3, _H), device=_DEVICE, dtype=torch.float32, generator=generator
+        (OCC_CLASSES, _H), device=_DEVICE, dtype=torch.float32, generator=generator
     )
     return values, class_weight
 
@@ -202,7 +206,10 @@ def test_stone_scatter_accepts_nonmonotone_destinations_and_zero_degree_rows():
 @pytest.mark.parametrize("direction", ["windows", "stones"])
 def test_source_and_class_gradients_match_the_old_scatter(positions, direction: str):
     batch = _batch_for_case(positions, "ragged")
-    assert set(batch.inc_class.tolist()) == {0, 1, 2}
+    # Enough distinct joint classes that the class-weight gradient rows are a
+    # real scatter, not a degenerate one-row case.
+    assert batch.inc_class.unique().numel() > 3
+    assert int(batch.inc_class.max()) < OCC_CLASSES
     fn, n_source, source, destination, n_dest = _direction(batch, direction)
     base_values, base_class = _inputs(n_source, torch.float32, seed=31)
     generator = torch.Generator(device=_DEVICE).manual_seed(32)
@@ -249,6 +256,9 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
     """
     batch = _batch_for_case(positions, "ragged")
     model = model.to(_DEVICE)
+    # The block consumes the trunk's folded view of the incidence classes
+    # (§4.3); driving it directly means folding here, as `trunk` does.
+    batch = replace(batch, inc_class=model.inc_fold[batch.inc_class])
     block = model.blocks[0]
     seen: set[str] = set()
 

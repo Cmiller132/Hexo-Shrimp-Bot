@@ -191,8 +191,13 @@ impl Position {
 fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'py, PyDict>> {
     let (p, max_t, max_w) = (raw.n_pos, raw.max_t, raw.max_w);
     let d = PyDict::new(py);
+    let n_w = raw.window_feat.len();
     d.set_item("stone_own", PyArray1::from_vec(py, raw.stone_own))?;
     d.set_item("window_feat", PyArray1::from_vec(py, raw.window_feat))?;
+    d.set_item(
+        "window_id",
+        PyArray1::from_vec(py, raw.window_id).reshape([n_w, 3])?,
+    )?;
     d.set_item("moves_idx", PyArray1::from_vec(py, raw.moves_idx))?;
     d.set_item("inc_stone", PyArray1::from_vec(py, raw.inc_stone))?;
     d.set_item("inc_window", PyArray1::from_vec(py, raw.inc_window))?;

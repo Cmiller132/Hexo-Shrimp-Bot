@@ -10,10 +10,17 @@ import hexo_py
 import numpy as np
 import pytest
 
-from mantisnet import NUM_PATTERNS, collate, from_position
-from mantisnet.builder import DEC_CLASSES, _CANON, _PATTERN_RANK, _SLOT_CLASS, AXES
+from mantisnet import NUM_PATTERNS, OCC_CLASSES, collate, from_position
+from mantisnet.builder import DEC_CLASSES, OCC_FOLD, _CANON, _PATTERN_RANK, AXES
 
-from .conftest import JOINT_ORBITS, joint_class, oracle_live_windows, reverse6
+from .conftest import (
+    JOINT_ORBITS,
+    OCC_ORBITS,
+    joint_class,
+    occ_class,
+    oracle_live_windows,
+    reverse6,
+)
 
 
 def test_ninety_three_joint_decoder_classes():
@@ -33,11 +40,44 @@ def test_ninety_three_joint_decoder_classes():
     merged = {}
     for m, s in pairs:
         merged.setdefault(
-            (min(m, reverse6(m)), int(_SLOT_CLASS[s])), set()
+            (min(m, reverse6(m)), min(s, 5 - s)), set()
         ).add(joint_class(m, s))
     assert sum(len(v) - 1 for v in merged.values()) == 18
     assert all(len(v) <= 2 for v in merged.values())
     assert joint_class(0b000001, 1) != joint_class(0b000001, 4)
+
+
+def test_ninety_three_joint_incidence_classes():
+    # The same fold over occupied slots: complementing the mask maps the
+    # decoder's 186 (mask, empty slot) pairs onto these bijectively and
+    # commutes with reversal, so the counts repeat — 93 orbits, and 18 more
+    # classes than the coarse (canonical mask, slot class) key realizes.
+    assert OCC_CLASSES == len(OCC_ORBITS) == 93
+    pairs = [(m, s) for m in range(1, 63) for s in range(6) if (m >> s) & 1]
+    assert len(pairs) == 186
+    assert all(occ_class(m, s) == occ_class(reverse6(m), 5 - s) for m, s in pairs)
+    assert len({occ_class(m, s) for m, s in pairs}) == 93
+    merged = {}
+    for m, s in pairs:
+        merged.setdefault(
+            (min(m, reverse6(m)), min(s, 5 - s)), set()
+        ).add(occ_class(m, s))
+    assert sum(len(v) - 1 for v in merged.values()) == 18
+    assert all(len(v) <= 2 for v in merged.values())
+    # The aliasing the joint classes remove: in 110001 the lone stone and the
+    # pair's outer stone are both "end", and the coarse class cannot say which
+    # end of the pattern a stone's own state binds to.
+    assert occ_class(0b110001, 0) != occ_class(0b110001, 5)
+    assert min(0, 5 - 0) == min(5, 5 - 5) == 0
+
+
+def test_the_incidence_fold_reproduces_the_coarse_slot_class():
+    # The §4.3 fold consumed by stock (joint_incidence=False) models: every
+    # orbit lands exactly on its members' shared min(s, 5 - s), so folded
+    # joint classes reproduce the pre-joint three-class incidence bit for bit.
+    pairs = [(m, s) for m in range(1, 63) for s in range(6) if (m >> s) & 1]
+    assert all(OCC_FOLD[occ_class(m, s)] == min(s, 5 - s) for m, s in pairs)
+    assert sorted(set(OCC_FOLD.tolist())) == [0, 1, 2]
 
 
 def test_thirty_four_canonical_patterns():
@@ -77,7 +117,9 @@ def test_incidence_matches_oracle(positions):
             for k in range(6):
                 if occ >> k & 1:
                     cell = (sq + k * int(AXES[axis, 0]), sr + k * int(AXES[axis, 1]))
-                    expected.add(((axis, sq, sr), cell, int(_SLOT_CLASS[k])))
+                    # The class pairs the window's occupancy — the oracle's
+                    # own, from the engine's walk — with this stone's slot.
+                    expected.add(((axis, sq, sr), cell, occ_class(occ, k)))
         assert built == expected
 
 

@@ -49,8 +49,11 @@ impl ForwardLoader for PythonForwardLoader {
                 .call1((weights, "cpu"))?
                 .unbind();
             let torch = PyModule::import(py, "torch")?.unbind();
+            // The constructor helper, not the bare dataclass: the builder
+            // derives the relay tables from the decoder incidence at
+            // construction, and that derivation lives in one place.
             let batch_type = PyModule::import(py, "mantisnet.builder")?
-                .getattr("Batch")?
+                .getattr("batch_from_arrays")?
                 .unbind();
             Ok(LiveForward {
                 model,
@@ -147,6 +150,14 @@ fn build_batch<'py>(
         "window_feat",
         &batch.window_feat,
         &[batch.window_feat.len()],
+    )?;
+    set_tensor(
+        py,
+        torch,
+        &kwargs,
+        "window_id",
+        &batch.window_id,
+        &[batch.window_feat.len(), 3],
     )?;
     set_tensor(
         py,

@@ -12,7 +12,8 @@ Index conventions this module fixes (each is part of the representation):
   sorted list of the ``NUM_PATTERNS`` canonical 6-bit patterns of 1–5 bits.
 - Decoder class: the rank of the ``(occupancy mask, candidate slot)`` reversal
   orbit in ascending ``(mask, slot)`` order, one of ``DEC_CLASSES``. Stone
-  incidence keeps the coarser reversal-invariant slot class (§4.3).
+  incidence uses the same joint-orbit construction over occupied rather than
+  empty slots, one of ``OCC_CLASSES`` (§4.3).
 - Attention distance bucket: hex distance ``d >= 1`` maps to ``d - 1`` clamped
   to ``D_MAX - 1``; ``SELF`` is ``D_MAX``; ``TOKEN`` is ``D_MAX + 1`` and wins
   over ``SELF`` on the token–token pair.
@@ -63,30 +64,29 @@ NUM_PATTERNS = len(_CANONICAL)
 # count, so this is well-defined per orbit.
 PATTERN_STONES = np.array([bin(int(m)).count("1") for m in _CANONICAL])
 
-# Slot class of slot s in 0..5: min(s, 5 - s) — end / near-end / centre (§4.3).
-_SLOT_CLASS = np.minimum(np.arange(WINDOW_LEN), WINDOW_LEN - 1 - np.arange(WINDOW_LEN))
-
-
-def _decoder_classes() -> np.ndarray:
-    """The (64, 6) table of decoder classes, by window mask and candidate slot.
+def _orbit_classes(occupied: bool) -> np.ndarray:
+    """A (64, 6) table of joint reversal-orbit classes, by mask and slot.
 
     A reflection reverses a window's slot order, so it sends the pair
     ``(mask, slot)`` to ``(reverse6(mask), 5 - slot)`` — *jointly*. The orbits of
     that involution are therefore the finest reversal-invariant description of
-    where a candidate sits among a window's stones (§4.3), and the class is the
-    orbit's rank in ascending ``(mask, slot)`` order.
+    where a slot sits among a window's stones (§4.3), and the class is the
+    orbit's rank in ascending ``(mask, slot)`` order. ``occupied`` selects which
+    slots are classed: the empty ones (the decoder and cell-pass table) or the
+    occupied ones (the stone-incidence table).
 
-    Entries that are not a live window with an empty candidate slot are ``-1``:
-    the empty and full masks, and any slot that already holds a stone. A legal
-    cell is empty by construction, so ``-1`` reaching ``dec_class`` is a builder
-    fault and is refused rather than embedded.
+    Every other entry is ``-1``: the empty and full masks, and any slot whose
+    occupancy bit disagrees with ``occupied``. The builders pair decoder entries
+    with empty slots and incidence entries with occupied ones by construction,
+    so a ``-1`` reaching an index tensor is a builder fault and is refused
+    rather than embedded.
     """
     table = np.full((64, WINDOW_LEN), -1, dtype=np.int64)
     nxt = 0
     for mask in range(1, 63):
         rev = int(_reverse6(np.array(mask))[()])
         for slot in range(WINDOW_LEN):
-            if (mask >> slot) & 1:
+            if bool((mask >> slot) & 1) != occupied:
                 continue
             # Ascending order visits each orbit's representative first, so its
             # rank is assigned there and its partner reads it back.
@@ -98,11 +98,24 @@ def _decoder_classes() -> np.ndarray:
     return table
 
 
-_DEC_CLASS = _decoder_classes()
+_DEC_CLASS = _orbit_classes(occupied=False)
+_OCC_CLASS = _orbit_classes(occupied=True)
 
-# 93: the 186 (nonempty-nonfull mask, empty slot) pairs fold to 186 / 2 orbits —
-# the involution has no fixed point, since no slot equals its own mirror.
+# 93 each: both slot selections give 186 (mask, slot) pairs, folding to
+# 186 / 2 orbits — the involution has no fixed point, since no slot equals
+# its own mirror.
 DEC_CLASSES = int(_DEC_CLASS.max()) + 1
+OCC_CLASSES = int(_OCC_CLASS.max()) + 1
+
+# The stock model's incidence fold: reversal preserves min(s, 5 - s), so each
+# occupied-slot orbit lands on one coarse end / near-end / centre class, and a
+# model that embeds the folded classes reproduces the pre-joint three-class
+# incidence bit for bit (§4.3).
+_occ_mask, _occ_slot = np.nonzero(_OCC_CLASS >= 0)
+OCC_FOLD = np.full(OCC_CLASSES, -1, dtype=np.int64)
+OCC_FOLD[_OCC_CLASS[_occ_mask, _occ_slot]] = np.minimum(
+    _occ_slot, WINDOW_LEN - 1 - _occ_slot
+)
 
 # Coordinate packing: q, r fit i16, so 21 bits of headroom per component is
 # collision-free. Window identity packs the axis into the low two bits.
@@ -123,12 +136,12 @@ class PositionGraph:
     stone_qr: np.ndarray  # (n_s, 2) int64, for the distance buckets only
     # Live windows.
     window_feat: np.ndarray  # (n_w,) int64: colour * NUM_PATTERNS + rank
-    window_id: np.ndarray  # (n_w, 3) int64: (axis, start_q, start_r). Not a
-    # model input — the identity exists for tests and debugging.
-    # Stone <-> window incidence with slot classes.
+    window_id: np.ndarray  # (n_w, 3) int64: (axis, start_q, start_r), consumed
+    # only through reversal-invariant pair classes (§5.1c) and by tests.
+    # Stone <-> window incidence with joint occupied-slot classes.
     inc_stone: np.ndarray  # (e,) int64
     inc_window: np.ndarray  # (e,) int64
-    inc_class: np.ndarray  # (e,) int64 in 0..2
+    inc_class: np.ndarray  # (e,) int64, < OCC_CLASSES
     # Policy decoder table over legal cells, in engine legal order.
     n_legal: int
     dec_cell: np.ndarray  # (e_d,) int64: legal-cell index
@@ -241,12 +254,21 @@ def build(
     window_feat = colour * NUM_PATTERNS + rank
     window_id = np.column_stack([u_axis[live], u_start[live, 0], u_start[live, 1]])
 
-    # Incidence: one entry per occupied slot of each live window.
+    # Incidence: one entry per occupied slot of each live window. The class is
+    # joint in the window's occupancy and the stone's own slot (§4.3), off the
+    # raw mask in slot order — `pattern`, like the decoder classes below.
     l_occupant = occupant[live]  # (n_w, 6)
     w_idx, slot = np.nonzero(l_occupant >= 0)
     inc_stone = l_occupant[w_idx, slot]
     inc_window = w_idx.astype(np.int64)
-    inc_class = _SLOT_CLASS[slot]
+    inc_class = _OCC_CLASS[pattern[w_idx], slot]
+    if inc_class.size and inc_class.min() < 0:
+        bad = int(np.argmin(inc_class))
+        raise ValueError(
+            f"incidence entry {bad} pairs window mask "
+            f"{int(pattern[w_idx[bad]]):06b} with slot {int(slot[bad])}, "
+            f"which that window does not occupy"
+        )
 
     # Decoder table: each legal cell's live windows, by the same 18-candidate
     # walk matched against the live set.
@@ -331,6 +353,10 @@ class Batch:
     # Concatenated entity features.
     stone_own: torch.Tensor  # (N_s,) long
     window_feat: torch.Tensor  # (N_w,) long
+    # Window identities (axis, start_q, start_r), each in its position's own
+    # frame. The model consumes them only through reversal-invariant pair
+    # classes (§5.1c), never as raw coordinates.
+    window_id: torch.Tensor  # (N_w, 3) long
     moves_idx: torch.Tensor  # (P,) long: moves_remaining - 1
     # Incidence, with window/stone indices globally offset.
     inc_stone: torch.Tensor  # (E,) long
@@ -395,15 +421,32 @@ def _relay_fields(
     return dict(zip(_RELAY_FIELDS, tables))
 
 
-def _batch_from_arrays(raw: dict) -> Batch:
-    """A `Batch` from the Rust builder's array dict (same field names)."""
-    t = {name: torch.from_numpy(arr) for name, arr in raw.items()}
-    p, max_t = t["attn_valid"].shape
+def batch_from_arrays(**fields) -> Batch:
+    """A ``Batch`` from per-tensor arrays, with the relay tables derived here.
+
+    Both external construction paths land on this one function — the
+    ``hexo_py.build_batch*`` array dicts unpacked as kwargs, and the embedded
+    Rust forward calling with torch tensors — so the collation-time relay
+    derivation lives in exactly one place. The scalar fields are derived from
+    tensor shapes; callers may also pass them, and a disagreement is refused.
+    """
+    scalars = {
+        name: int(fields.pop(name))
+        for name in ("n_pos", "max_t", "max_w", "n_cells")
+        if name in fields
+    }
+    t = {name: torch.as_tensor(value) for name, value in fields.items()}
+    derived = {
+        "n_pos": int(t["attn_valid"].shape[0]),
+        "max_t": int(t["attn_valid"].shape[1]),
+        "max_w": int(t["value_valid"].shape[1]),
+        "n_cells": int(t["cell_pos"].shape[0]),
+    }
+    for name, value in scalars.items():
+        if value != derived[name]:
+            raise ValueError(f"{name}={value} disagrees with the derived {derived[name]}")
     return Batch(
-        n_pos=int(p),
-        max_t=int(max_t),
-        max_w=int(t["value_valid"].shape[1]),
-        n_cells=int(t["cell_pos"].shape[0]),
+        **derived,
         **t,
         **_relay_fields(
             t["dec_cell"], t["dec_window"], t["dec_class"], int(t["window_feat"].shape[0])
@@ -420,7 +463,7 @@ def collate_positions(positions) -> Batch:
     """
     import hexo_py
 
-    return _batch_from_arrays(hexo_py.build_batch(list(positions)))
+    return batch_from_arrays(**hexo_py.build_batch(list(positions)))
 
 
 def collate_prefixes(games, ts) -> Batch:
@@ -431,7 +474,7 @@ def collate_prefixes(games, ts) -> Batch:
     """
     import hexo_py
 
-    return _batch_from_arrays(hexo_py.build_batch_prefixes(list(games), list(ts)))
+    return batch_from_arrays(**hexo_py.build_batch_prefixes(list(games), list(ts)))
 
 
 def collate(graphs: list[PositionGraph]) -> Batch:
@@ -472,6 +515,7 @@ def collate(graphs: list[PositionGraph]) -> Batch:
         n_pos=p,
         stone_own=cat([g.stone_own for g in graphs]),
         window_feat=cat([g.window_feat for g in graphs]),
+        window_id=cat([g.window_id for g in graphs]).view(-1, 3),
         moves_idx=torch.tensor([g.moves_remaining - 1 for g in graphs], dtype=torch.long),
         inc_stone=cat([g.inc_stone + stone_off[i] for i, g in enumerate(graphs)]),
         inc_window=cat([g.inc_window + win_off[i] for i, g in enumerate(graphs)]),

@@ -20,6 +20,7 @@ from .variants import VARIANTS, build_variant, variant_spec
 _BATCH_TENSORS = (
     "stone_own",
     "window_feat",
+    "window_id",
     "moves_idx",
     "inc_stone",
     "inc_window",

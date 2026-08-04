@@ -305,6 +305,31 @@ def test_cell_pass_from_default_enables_every_block():
     assert any("_cp" in name for name, _parameter in net.blocks[-1].named_parameters())
 
 
+@torch.no_grad()
+def test_joint_incidence_widens_the_per_block_incidence_tables(positions):
+    stock = MantisNet(MantisConfig())
+    joint = MantisNet(MantisConfig(joint_incidence=True))
+
+    for block in stock.blocks:
+        assert block.e_ws.weight.shape[0] == block.e_sw.weight.shape[0] == 3
+    for block in joint.blocks:
+        assert block.e_ws.weight.shape[0] == block.e_sw.weight.shape[0] == 93
+    # Eight per-block tables gain 90 rows of width H each (§4.3).
+    stock_params = sum(parameter.numel() for parameter in stock.parameters())
+    joint_params = sum(parameter.numel() for parameter in joint.parameters())
+    assert joint_params - stock_params == 8 * 90 * 128
+    # The stock model folds and owns the buffer for it; the joint model
+    # embeds the batch's classes directly and has nothing to fold.
+    assert stock.inc_fold.shape == (93,)
+    assert not hasattr(joint, "inc_fold")
+
+    batch = collate([from_position(positions[6])])
+    for net in (stock.eval(), joint.eval()):
+        out = net(batch, 0.2)
+        for tensor in vars(out).values():
+            assert torch.isfinite(tensor).all()
+
+
 def test_off_axis_bias_requires_axis_bias():
     with pytest.raises(ValueError, match="off_axis_bias requires axis_bias"):
         MantisConfig(off_axis_bias=True)

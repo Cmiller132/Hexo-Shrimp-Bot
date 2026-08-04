@@ -67,25 +67,37 @@ def reverse6(mask: int) -> int:
     return int(f"{mask:06b}"[::-1], 2)
 
 
-# The decoder's joint classes (§4.3), derived independently of the builder's
-# table: the orbits of ``(mask, slot)`` under a joint reversal, ranked by sorting
-# the representatives rather than by the builder's ascending scan. Same contract,
+# The joint classes (§4.3), derived independently of the builder's tables: the
+# orbits of ``(mask, slot)`` under a joint reversal, ranked by sorting the
+# representatives rather than by the builder's ascending scan. Same contract,
 # different derivation — including of the ranking convention the Rust encoder
-# shares, which is why this is an oracle and not a restatement.
-JOINT_ORBITS = sorted(
-    {
-        min((mask, slot), (reverse6(mask), 5 - slot))
-        for mask in range(1, 63)
-        for slot in range(6)
-        if not (mask >> slot) & 1
-    }
-)
+# shares, which is why these are oracles and not restatements. ``occupied``
+# selects the decoder's empty-slot orbits or the incidence's occupied-slot ones.
+def _reversal_orbits(occupied: bool) -> list[tuple[int, int]]:
+    return sorted(
+        {
+            min((mask, slot), (reverse6(mask), 5 - slot))
+            for mask in range(1, 63)
+            for slot in range(6)
+            if bool(mask >> slot & 1) == occupied
+        }
+    )
+
+
+JOINT_ORBITS = _reversal_orbits(occupied=False)
+OCC_ORBITS = _reversal_orbits(occupied=True)
 _JOINT_RANK = {pair: rank for rank, pair in enumerate(JOINT_ORBITS)}
+_OCC_RANK = {pair: rank for rank, pair in enumerate(OCC_ORBITS)}
 
 
 def joint_class(occupancy: int, slot: int) -> int:
     """The decoder class of a window occupancy and a candidate's slot in it."""
     return _JOINT_RANK[min((occupancy, slot), (reverse6(occupancy), 5 - slot))]
+
+
+def occ_class(occupancy: int, slot: int) -> int:
+    """The incidence class of a window occupancy and a stone's slot in it."""
+    return _OCC_RANK[min((occupancy, slot), (reverse6(occupancy), 5 - slot))]
 
 
 def oracle_live_windows(pos: hexo_py.Position) -> dict[tuple[int, int, int], tuple[int, int]]:
