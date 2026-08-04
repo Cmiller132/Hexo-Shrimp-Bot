@@ -127,7 +127,10 @@ refuses a nonempty directory and has no resume operation.
 
 The seed is applied with `torch.manual_seed` before model construction and to
 a separate `numpy.random.default_rng` for epoch order. Adam is constructed over
-`model.parameters()` at learning rate `1e-3`. Default epochs and effective
+`model.parameters()` at learning rate `1e-3`. The learning-rate schedule is
+`constant` unless the recipe selects `cosine`, which anneals from the full rate
+at epoch 1 toward zero past the final epoch; the applied rate is recorded in
+each metrics row. Default epochs and effective
 batch size are eight and 4096; attention-pair and legal-cell limits are the
 production `KlentConfig` fit limits. CUDA uses bf16 autocast when requested;
 composition and losses remain fp32. Optional compilation uses one dynamic-shape
@@ -154,7 +157,7 @@ Each cell contains:
 | Artifact | Contract |
 | --- | --- |
 | `config.json` | Variant and normalized overrides, corpus name and SHA, recipe and 1:1:1 loss weights, seed, compatibility versions, parameter count, and lab cell format |
-| `metrics.jsonl` | One flushed strict-JSON row per epoch with three losses, fit steps, seconds, samples/second, and validation metrics |
+| `metrics.jsonl` | One flushed strict-JSON row per epoch with the applied learning rate, three losses, fit steps, seconds, samples/second, and validation metrics |
 | `checkpoint_final.pt` | Model state, variant identity and overrides, corpus SHA, versions, parameter count, and `lab_cell_format: 1` |
 | `scores.json` | §5 metric block for this checkpoint and corpus |
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import hexo_py
@@ -149,6 +150,44 @@ def test_tiny_cell_trains_all_heads_and_writes_complete_artifacts(tmp_path):
 
     with pytest.raises(FileExistsError, match="nonempty"):
         train_cell(corpus, cell, model_kw=TINY_MODEL_KW, epochs=1)
+
+
+def test_cosine_lr_schedule_anneals_and_is_recorded(tmp_path):
+    with pytest.raises(ValueError, match="lr_schedule"):
+        TrainConfig(lr_schedule="linear")
+
+    cfg = TrainConfig(epochs=4, lr=1e-3, lr_schedule="cosine")
+    rates = [cfg.epoch_lr(epoch) for epoch in range(1, 5)]
+    assert rates[0] == pytest.approx(1e-3)
+    assert rates == sorted(rates, reverse=True)
+    assert rates[-1] == pytest.approx(1e-3 * 0.5 * (1 + math.cos(math.pi * 3 / 4)))
+    assert TrainConfig(epochs=4, lr=1e-3).epoch_lr(4) == 1e-3
+
+    corpus = tiny_corpus(tmp_path)
+    cell = tmp_path / "sweep" / "tiny-cosine" / "s0"
+    result = train_cell(
+        corpus,
+        cell,
+        variant="mantis",
+        model_kw=TINY_MODEL_KW,
+        config=TrainConfig(
+            epochs=2,
+            batch_size=12,
+            pair_budget=100_000,
+            cell_budget=100_000,
+            collect_pair_budget=100_000,
+            collect_cell_budget=100_000,
+            lr=1e-3,
+            lr_schedule="cosine",
+            device="cpu",
+            autocast=False,
+            compile=False,
+        ),
+    )
+    rows = result["metrics"]
+    assert [row["lr"] for row in rows] == [pytest.approx(1e-3), pytest.approx(5e-4)]
+    config = json.loads((cell / "config.json").read_text(encoding="utf-8"))
+    assert config["recipe"]["lr_schedule"] == "cosine"
 
 
 def test_parameter_budget_refuses_before_creating_a_cell(tmp_path):

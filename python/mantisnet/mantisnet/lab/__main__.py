@@ -74,6 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument("--cell", help="override the derived cell name")
     train.add_argument("--seeds", type=int, default=3, help="run seeds 0..N-1")
     train.add_argument("--epochs", type=int, default=8)
+    train.add_argument(
+        "--lr-schedule", choices=("constant", "cosine"), default="constant"
+    )
     train.add_argument("--param-budget", type=int)
     train.add_argument("--param-tol", type=float, default=0.02)
     _device(train)
@@ -244,6 +247,7 @@ def main(argv=None) -> None:
                 model_kw=model_kw,
                 seed=seed,
                 epochs=args.epochs,
+                lr_schedule=args.lr_schedule,
                 device=args.device,
                 compile=args.compile,
                 param_budget=args.param_budget,

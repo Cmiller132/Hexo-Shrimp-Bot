@@ -39,6 +39,7 @@ class TrainConfig:
     collect_pair_budget: int = KlentConfig.collect_pair_budget
     collect_cell_budget: int = KlentConfig.collect_cell_budget
     lr: float = KlentConfig.lr
+    lr_schedule: str = "constant"
     device: str = "cpu"
     autocast: bool | None = None
     compile: bool = False
@@ -65,6 +66,18 @@ class TrainConfig:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
         if not math.isfinite(self.lr) or self.lr <= 0:
             raise ValueError(f"lr must be finite and positive, got {self.lr}")
+        if self.lr_schedule not in ("constant", "cosine"):
+            raise ValueError(
+                f"lr_schedule must be 'constant' or 'cosine', got {self.lr_schedule!r}"
+            )
+
+    def epoch_lr(self, epoch: int) -> float:
+        """The learning rate for a 1-based epoch under this recipe."""
+
+        if self.lr_schedule == "constant":
+            return self.lr
+        # Cosine annealing: full lr at epoch 1, approaching zero past the last.
+        return self.lr * 0.5 * (1.0 + math.cos(math.pi * (epoch - 1) / self.epochs))
 
 
 def current_versions() -> dict[str, object]:
@@ -363,6 +376,7 @@ def train_cell(
     seed: int = 0,
     config: TrainConfig | None = None,
     epochs: int | None = None,
+    lr_schedule: str | None = None,
     device: str | None = None,
     compile: bool | None = None,
     param_budget: int | None = None,
@@ -375,6 +389,8 @@ def train_cell(
     updates = asdict(cfg)
     if epochs is not None:
         updates["epochs"] = epochs
+    if lr_schedule is not None:
+        updates["lr_schedule"] = lr_schedule
     if device is not None:
         updates["device"] = device
         updates["autocast"] = torch.device(device).type == "cuda"
@@ -420,6 +436,9 @@ def train_cell(
     rows: list[dict[str, object]] = []
     with (destination / "metrics.jsonl").open("x", encoding="utf-8") as metrics_file:
         for epoch in range(1, cfg.epochs + 1):
+            lr = cfg.epoch_lr(epoch)
+            for group in optimizer.param_groups:
+                group["lr"] = lr
             started = time.perf_counter()
             fit_metrics = fit_supervised_epoch(
                 model,
@@ -443,6 +462,7 @@ def train_cell(
             )
             row = {
                 "epoch": epoch,
+                "lr": lr,
                 **fit_metrics,
                 "seconds": seconds,
                 "samples_per_second": len(train_samples) / seconds,
