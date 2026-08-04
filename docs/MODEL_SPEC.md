@@ -170,6 +170,27 @@ variant functionally identical to stock at initialization. Both hex distance
 and the shared on-axis predicate are D6-invariant, so either table is
 symmetry-safe.
 
+`MantisConfig.off_axis_bias` extends the same ablation one ring outward and
+requires `axis_bias`. A pair is **near-axis** exactly when
+
+```
+min(|dq|, |dr|, |dq + dr|) == 1,
+```
+
+one hex step off an axis line; the on-axis predicate is the `== 0` case of
+the same triple, so the two classes are disjoint. Each block owns a third
+zero-initialized `A × D_MAX` table and the runtime row layout becomes
+
+```
+[ off-axis d=1..D_MAX | SELF | TOKEN | PAD | on-axis d=1..D_MAX | near-axis d=1..D_MAX ].
+```
+
+The same distance clamp and `SELF`/`TOKEN`/`PAD` overrides apply. The
+near-axis row for distance 1 is structurally unreachable (all six neighbours
+are on-axis) and stays zero. The minimum of the coordinate triple is
+D6-invariant for the same reason the maximum (hex distance) is, so the table
+remains symmetry-safe.
+
 ### 4.2 Nearest-stone buckets (background policy path)
 
 For a legal cell, the hex distance to the nearest stone, clamped to the
@@ -246,7 +267,8 @@ magnitude.
 `MantisConfig.cell_pass` enables an independently gated ablation axis. It is
 `False` by default and is off in production. When enabled, this step runs
 after §5.1 and before §5.2, so a stone reads fork-aware window embeddings in
-the same block.
+the same block. The relay runs in trunk blocks `cell_pass_from..B-1`; the
+default `cell_pass_from=0` runs it in every block.
 
 The builder's decoder incidence triples `(w, joint(a,w), a)` are the bipartite
 graph between every live window `w` and its empty cells `a`. For each triple:

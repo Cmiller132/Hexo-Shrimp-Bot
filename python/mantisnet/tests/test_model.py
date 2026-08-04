@@ -258,6 +258,86 @@ def _stock_state_keys(blocks: int) -> set[str]:
     }
 
 
+@pytest.mark.parametrize("cell_pass_from", [-1, 3])
+def test_cell_pass_from_must_name_a_trunk_block(cell_pass_from):
+    with pytest.raises(ValueError, match=r"cell_pass_from=.*blocks=3"):
+        MantisConfig(blocks=3, cell_pass=True, cell_pass_from=cell_pass_from)
+
+
+def test_cell_pass_from_requires_cell_pass():
+    with pytest.raises(ValueError, match=r"cell_pass_from=1 requires cell_pass=True"):
+        MantisConfig(blocks=3, cell_pass_from=1)
+
+
+@torch.no_grad()
+def test_cell_pass_from_limits_relay_to_trunk_tail(positions):
+    cfg = MantisConfig(
+        h=16,
+        blocks=3,
+        heads=2,
+        value_queries=2,
+        value_bins=5,
+        policy_hidden=16,
+        value_hidden=16,
+        cell_pass=True,
+        cell_pass_from=2,
+    )
+    net = MantisNet(cfg).eval()
+
+    for block in net.blocks[:2]:
+        assert block.mlp_cp is None
+        assert not any("_cp" in name for name, _parameter in block.named_parameters())
+    assert net.blocks[2].mlp_cp is not None
+    assert any("_cp" in name for name, _parameter in net.blocks[2].named_parameters())
+
+    batch = collate([from_position(positions[3])])
+    out = net(batch, 0.2)
+    for tensor in vars(out).values():
+        assert torch.isfinite(tensor).all()
+
+
+def test_cell_pass_from_default_enables_every_block():
+    net = MantisNet(MantisConfig(cell_pass=True))
+
+    assert net.blocks[0].mlp_cp is not None
+    assert net.blocks[-1].mlp_cp is not None
+    assert any("_cp" in name for name, _parameter in net.blocks[0].named_parameters())
+    assert any("_cp" in name for name, _parameter in net.blocks[-1].named_parameters())
+
+
+def test_off_axis_bias_requires_axis_bias():
+    with pytest.raises(ValueError, match="off_axis_bias requires axis_bias"):
+        MantisConfig(off_axis_bias=True)
+
+
+@torch.no_grad()
+def test_off_axis_bias_adds_one_zero_table_per_block(positions):
+    cfg = MantisConfig(
+        h=16,
+        blocks=2,
+        heads=2,
+        value_queries=2,
+        value_bins=5,
+        policy_hidden=16,
+        value_hidden=16,
+        axis_bias=True,
+        off_axis_bias=True,
+    )
+    net = MantisNet(cfg).eval()
+
+    for block in net.blocks:
+        assert block.off_axis_bias is not None
+        assert block.off_axis_bias.shape == (2, cfg.d_max)
+        assert torch.equal(
+            block.off_axis_bias, torch.zeros_like(block.off_axis_bias)
+        )
+
+    batch = collate([from_position(positions[3])])
+    out = net(batch, 0.2)
+    for tensor in vars(out).values():
+        assert torch.isfinite(tensor).all()
+
+
 @torch.no_grad()
 def test_cell_pass_matches_literal_incidence_reference():
     # P0's stones occupy two intersecting axes; the remote P1 stones only

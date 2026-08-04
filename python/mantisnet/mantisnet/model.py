@@ -41,13 +41,26 @@ class MantisConfig:
     value_hidden: int = 128  # V_H
     dropout: float = 0.0
     axis_bias: bool = False
+    off_axis_bias: bool = False
     cell_pass: bool = False
+    cell_pass_from: int = 0
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
             raise ValueError(f"H={self.h} must divide into A={self.heads} heads")
         if self.value_bins % 2 == 0:
             raise ValueError(f"K={self.value_bins} must be odd so an exact-zero bin exists")
+        if not 0 <= self.cell_pass_from < self.blocks:
+            raise ValueError(
+                f"cell_pass_from={self.cell_pass_from} must satisfy "
+                f"0 <= cell_pass_from < blocks={self.blocks}"
+            )
+        if self.cell_pass_from > 0 and not self.cell_pass:
+            raise ValueError(
+                f"cell_pass_from={self.cell_pass_from} requires cell_pass=True"
+            )
+        if self.off_axis_bias and not self.axis_bias:
+            raise ValueError("off_axis_bias requires axis_bias")
 
     # Bucket indices of the attention bias table (§4.1): distances 1..D_MAX
     # occupy 0..D_MAX-1, then SELF, then TOKEN. TOKEN wins on the token-token
@@ -153,10 +166,11 @@ class _PairMlp(nn.Module):
 class _Block(nn.Module):
     """One trunk block (§5): window <- stones, stone <- windows, attention."""
 
-    def __init__(self, cfg: MantisConfig) -> None:
+    def __init__(self, cfg: MantisConfig, cell_pass: bool) -> None:
         super().__init__()
         h = cfg.h
         self.cfg = cfg
+        self.cell_pass = cell_pass
         # §5.1 window <- stones
         self.ln_ws_s = nn.LayerNorm(h)
         self.ln_ws_w = nn.LayerNorm(h)
@@ -164,7 +178,7 @@ class _Block(nn.Module):
         self.e_ws = nn.Embedding(3, h)
         self.mlp_w = _PairMlp(h, h, h)
         # §5.1b window <- windows through their shared empty cells.
-        if cfg.cell_pass:
+        if self.cell_pass:
             self.ln_cp_in = nn.LayerNorm(h)
             self.u_cp = nn.Linear(h, h, bias=False)
             self.e_cp = nn.Embedding(DEC_CLASSES, h)
@@ -192,6 +206,14 @@ class _Block(nn.Module):
         self.axis_bias = (
             nn.Parameter(torch.zeros(cfg.heads, cfg.d_max)) if cfg.axis_bias else None
         )
+        # Row 0 (distance 1) is structurally unreachable — every distance-1
+        # pair is on-axis — and stays zero; the table keeps D_MAX columns for
+        # layout uniformity with the on-axis rows.
+        self.off_axis_bias = (
+            nn.Parameter(torch.zeros(cfg.heads, cfg.d_max))
+            if cfg.off_axis_bias
+            else None
+        )
         self.ln_ffn = nn.LayerNorm(h)
         self.ffn = nn.Sequential(
             nn.Linear(h, cfg.ffn_factor * h), nn.ReLU(), nn.Linear(cfg.ffn_factor * h, h)
@@ -200,7 +222,7 @@ class _Block(nn.Module):
 
     def _cell_pass(self, w: Tensor, batch: Batch) -> Tensor:
         """Update windows through the live-window/empty-cell incidence graph."""
-        if not self.cfg.cell_pass:
+        if not self.cell_pass:
             raise RuntimeError("cell pass is disabled for this block")
         assert self.ln_cp_in is not None
         assert self.u_cp is not None
@@ -244,7 +266,7 @@ class _Block(nn.Module):
         )
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
-        if cfg.cell_pass:
+        if self.cell_pass:
             w = self._cell_pass(w, batch)
 
         # §5.2: stones aggregate their windows.
@@ -275,7 +297,14 @@ class _Block(nn.Module):
         # Each position's key loop stops at its live prefix instead of doing
         # quadratic work over padding.
         out = fused_attention(
-            q, k, v, batch.coords, seq_lens, self.dist_bias, self.axis_bias
+            q,
+            k,
+            v,
+            batch.coords,
+            seq_lens,
+            self.dist_bias,
+            self.axis_bias,
+            self.off_axis_bias,
         )
         out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(p * max_t, cfg.h)
         s = s + self.drop(out.index_select(0, batch.stone_slot))
@@ -304,7 +333,13 @@ class MantisNet(nn.Module):
         self.token_base = nn.Parameter(torch.empty(h))
         self.token_moves = nn.Embedding(2, h)  # moves_remaining in {1, 2}
 
-        self.blocks = nn.ModuleList(_Block(cfg) for _ in range(cfg.blocks))
+        self.blocks = nn.ModuleList(
+            _Block(
+                cfg,
+                cell_pass=cfg.cell_pass and index >= cfg.cell_pass_from,
+            )
+            for index in range(cfg.blocks)
+        )
         self.ln_out = nn.LayerNorm(h)  # shared final LN over S, W, g (§5)
 
         # §6 policy decoder. MLP_P([h_a; g]) as a _PairMlp, so the g half of
