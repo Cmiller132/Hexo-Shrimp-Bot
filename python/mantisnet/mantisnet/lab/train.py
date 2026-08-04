@@ -40,6 +40,7 @@ class TrainConfig:
     collect_cell_budget: int = KlentConfig.collect_cell_budget
     lr: float = KlentConfig.lr
     lr_schedule: str = "constant"
+    ema_decay: float = 0.0
     device: str = "cpu"
     autocast: bool | None = None
     compile: bool = False
@@ -69,6 +70,10 @@ class TrainConfig:
         if self.lr_schedule not in ("constant", "cosine"):
             raise ValueError(
                 f"lr_schedule must be 'constant' or 'cosine', got {self.lr_schedule!r}"
+            )
+        if not math.isfinite(self.ema_decay) or not 0.0 <= self.ema_decay < 1.0:
+            raise ValueError(
+                f"ema_decay must be finite and in [0.0, 1.0), got {self.ema_decay}"
             )
 
     def epoch_lr(self, epoch: int) -> float:
@@ -367,6 +372,29 @@ def _write_json(path: Path, value: object) -> None:
     )
 
 
+class _EMAOptimizer:
+    """Update a named fp32 EMA immediately after each optimizer step."""
+
+    def __init__(self, optimizer, parameters, ema, decay: float) -> None:
+        self.optimizer = optimizer
+        self.parameters = parameters
+        self.ema = ema
+        self.decay = decay
+        self.param_groups = optimizer.param_groups
+
+    def zero_grad(self, *args, **kwargs):
+        return self.optimizer.zero_grad(*args, **kwargs)
+
+    @torch.no_grad()
+    def step(self, *args, **kwargs):
+        result = self.optimizer.step(*args, **kwargs)
+        for name, parameter in self.parameters:
+            self.ema[name].mul_(self.decay).add_(
+                parameter, alpha=1.0 - self.decay
+            )
+        return result
+
+
 def train_cell(
     corpus: str | os.PathLike[str] | FrozenCorpus,
     cell_dir: str | os.PathLike[str],
@@ -377,6 +405,7 @@ def train_cell(
     config: TrainConfig | None = None,
     epochs: int | None = None,
     lr_schedule: str | None = None,
+    ema_decay: float | None = None,
     device: str | None = None,
     compile: bool | None = None,
     param_budget: int | None = None,
@@ -391,6 +420,8 @@ def train_cell(
         updates["epochs"] = epochs
     if lr_schedule is not None:
         updates["lr_schedule"] = lr_schedule
+    if ema_decay is not None:
+        updates["ema_decay"] = ema_decay
     if device is not None:
         updates["device"] = device
         updates["autocast"] = torch.device(device).type == "cuda"
@@ -411,6 +442,17 @@ def train_cell(
 
     model = model.to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    ema_parameters = None
+    if cfg.ema_decay > 0:
+        named_parameters = list(model.named_parameters())
+        with torch.no_grad():
+            ema_parameters = {
+                name: parameter.clone().detach().float()
+                for name, parameter in named_parameters
+            }
+        optimizer = _EMAOptimizer(
+            optimizer, named_parameters, ema_parameters, cfg.ema_decay
+        )
     versions = current_versions()
     cell_config = {
         "lab_cell_format": 1,
@@ -486,4 +528,13 @@ def train_cell(
     temporary = checkpoint_path.with_suffix(".tmp")
     torch.save(checkpoint, temporary)
     temporary.replace(checkpoint_path)
+    if ema_parameters is not None:
+        ema_state = model.state_dict()
+        for name, parameter in ema_parameters.items():
+            ema_state[name] = parameter.to(dtype=ema_state[name].dtype)
+        ema_checkpoint = {**checkpoint, "model": ema_state}
+        ema_checkpoint_path = destination / "checkpoint_ema.pt"
+        ema_temporary = ema_checkpoint_path.with_suffix(".tmp")
+        torch.save(ema_checkpoint, ema_temporary)
+        ema_temporary.replace(ema_checkpoint_path)
     return {"model": model, "config": cell_config, "metrics": rows}

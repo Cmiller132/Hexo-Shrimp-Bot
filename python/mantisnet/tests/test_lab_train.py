@@ -190,6 +190,56 @@ def test_cosine_lr_schedule_anneals_and_is_recorded(tmp_path):
     assert config["recipe"]["lr_schedule"] == "cosine"
 
 
+def test_ema_decay_validation():
+    with pytest.raises(ValueError, match="ema_decay"):
+        TrainConfig(ema_decay=1.0)
+    with pytest.raises(ValueError, match="ema_decay"):
+        TrainConfig(ema_decay=-0.1)
+
+
+def test_tiny_cell_writes_ema_checkpoint(tmp_path):
+    corpus = tiny_corpus(tmp_path)
+    cell = tmp_path / "sweep" / "tiny-ema" / "s0"
+    train_cell(
+        corpus,
+        cell,
+        variant="mantis",
+        model_kw=TINY_MODEL_KW,
+        config=TrainConfig(
+            epochs=2,
+            batch_size=12,
+            pair_budget=100_000,
+            cell_budget=100_000,
+            collect_pair_budget=100_000,
+            collect_cell_budget=100_000,
+            lr=1e-3,
+            ema_decay=0.5,
+            device="cpu",
+            autocast=False,
+            compile=False,
+        ),
+    )
+
+    final = torch.load(
+        cell / "checkpoint_final.pt", map_location="cpu", weights_only=False
+    )
+    ema = torch.load(
+        cell / "checkpoint_ema.pt", map_location="cpu", weights_only=False
+    )
+    assert set(ema) == set(final)
+    assert set(ema["model"]) == set(final["model"])
+    assert all(
+        ema["model"][name].dtype == final["model"][name].dtype
+        for name in final["model"]
+    )
+    assert any(
+        not torch.equal(ema["model"][name], final["model"][name])
+        for name in final["model"]
+    )
+    config = json.loads((cell / "config.json").read_text(encoding="utf-8"))
+    assert config["recipe"]["ema_decay"] == 0.5
+
+
 def test_parameter_budget_refuses_before_creating_a_cell(tmp_path):
     model, _overrides, _spec = build_variant("mantis", TINY_MODEL_KW)
     count = count_parameters(model)

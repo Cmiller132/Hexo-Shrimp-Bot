@@ -90,6 +90,7 @@ def _assert_metric_shape(scores, expected_n: int):
 def test_lab_cell_scores_both_value_channels_and_writes_in_place(evaluated):
     corpus, cell, scores, _production_path, _production_out, _production_scores = evaluated
     assert (cell / "scores.json").is_file()
+    assert "ema" not in scores
     assert scores["checkpoint"]["kind"] == "lab_cell"
     assert scores["checkpoint"]["param_count"] > 0
     assert scores["corpus"] == {"name": corpus.name, "sha256": corpus.sha256}
@@ -109,3 +110,30 @@ def test_production_checkpoint_exercises_v_hat_but_never_scores_state_value(eval
 
     with pytest.raises(ValueError, match="--out is required"):
         evaluate_checkpoint(checkpoint, corpus, out=None, device="cpu")
+
+
+def test_evaluate_ema_cell_and_refuse_missing_ema(tmp_path, evaluated):
+    corpus = tiny_corpus(tmp_path)
+    ema_cell = tmp_path / "sweep" / "tiny-ema" / "s0"
+    train_cell(
+        corpus,
+        ema_cell,
+        model_kw=TINY_MODEL_KW,
+        config=TrainConfig(
+            epochs=2,
+            batch_size=12,
+            pair_budget=100_000,
+            cell_budget=100_000,
+            collect_pair_budget=100_000,
+            collect_cell_budget=100_000,
+            ema_decay=0.5,
+            device="cpu",
+        ),
+    )
+    scores = evaluate_cell(ema_cell, corpus, ema=True, device="cpu")
+    assert scores["ema"] is True
+    assert (ema_cell / "scores_ema.json").is_file()
+
+    no_ema_corpus, no_ema_cell, *_rest = evaluated
+    with pytest.raises(FileNotFoundError, match=r"tiny.*without ema_decay"):
+        evaluate_cell(no_ema_cell, no_ema_corpus, ema=True, device="cpu")

@@ -136,6 +136,9 @@ production `KlentConfig` fit limits. CUDA uses bf16 autocast when requested;
 composition and losses remain fp32. Optional compilation uses one dynamic-shape
 graph.
 
+An optional EMA of the weights at decay `ema_decay` is maintained per optimizer
+step and saved beside the final checkpoint.
+
 Every sampled position trains all production heads with equal weight:
 
 1. Policy cross-entropy uses a one-hot vector at stored `rank` across the full
@@ -159,7 +162,9 @@ Each cell contains:
 | `config.json` | Variant and normalized overrides, corpus name and SHA, recipe and 1:1:1 loss weights, seed, compatibility versions, parameter count, and lab cell format |
 | `metrics.jsonl` | One flushed strict-JSON row per epoch with the applied learning rate, three losses, fit steps, seconds, samples/second, and validation metrics |
 | `checkpoint_final.pt` | Model state, variant identity and overrides, corpus SHA, versions, parameter count, and `lab_cell_format: 1` |
+| `checkpoint_ema.pt` | EMA model state in the same checkpoint format; present only when the recipe sets `ema_decay > 0` |
 | `scores.json` | §5 metric block for this checkpoint and corpus |
+| `scores_ema.json` | §5 metric block for the EMA checkpoint; present only when the recipe sets `ema_decay > 0` |
 
 The checkpoint is a lab-cell format, not a production KLENT checkpoint. Lab
 loading reconstructs its registered variant and requires exact identity,

@@ -77,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
     train.add_argument(
         "--lr-schedule", choices=("constant", "cosine"), default="constant"
     )
+    train.add_argument("--ema-decay", type=float, default=0.0)
     train.add_argument("--param-budget", type=int)
     train.add_argument("--param-tol", type=float, default=0.02)
     _device(train)
@@ -88,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--corpus", required=True, help="frozen corpus path or name")
     evaluate.add_argument("--split", choices=("train", "val", "test"), default="test")
     evaluate.add_argument("--out", help="required for a production checkpoint")
+    evaluate.add_argument("--ema", action="store_true")
     evaluate.add_argument("--family", help="explicit checkpoint family when structurally ambiguous")
     evaluate.add_argument("--tau", type=float, default=0.1)
     evaluate.add_argument("--lam", type=float, default=0.01)
@@ -248,6 +250,7 @@ def main(argv=None) -> None:
                 seed=seed,
                 epochs=args.epochs,
                 lr_schedule=args.lr_schedule,
+                ema_decay=args.ema_decay,
                 device=args.device,
                 compile=args.compile,
                 param_budget=args.param_budget,
@@ -279,8 +282,10 @@ def main(argv=None) -> None:
         if args.cell:
             if args.family:
                 parser.error("--family applies only with --checkpoint")
-            result = evaluate_cell(args.cell, corpus, **common)
+            result = evaluate_cell(args.cell, corpus, ema=args.ema, **common)
         else:
+            if args.ema:
+                parser.error("--ema applies only with --cell")
             result = evaluate_checkpoint(
                 args.checkpoint, corpus, out=args.out, family=args.family, **common
             )

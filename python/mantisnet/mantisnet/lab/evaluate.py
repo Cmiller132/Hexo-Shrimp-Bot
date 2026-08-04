@@ -290,6 +290,7 @@ def evaluate_cell(
     cell_dir: str | os.PathLike[str],
     corpus: str | os.PathLike[str] | FrozenCorpus,
     *,
+    ema: bool = False,
     split: str = "test",
     device: str = "cpu",
     autocast: bool | None = None,
@@ -298,11 +299,16 @@ def evaluate_cell(
     lam: float = 0.01,
     mass_floor: float = 0.2,
 ) -> dict[str, object]:
-    """Load a lab cell, score it, and replace ``cell/scores.json``."""
+    """Load a lab cell, score it, and replace its matching scores file."""
 
     cell = Path(cell_dir)
     config_path = cell / "config.json"
-    checkpoint_path = cell / "checkpoint_final.pt"
+    checkpoint_path = cell / ("checkpoint_ema.pt" if ema else "checkpoint_final.pt")
+    if ema and not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"EMA checkpoint missing for lab cell {cell}: "
+            "the cell was trained without ema_decay"
+        )
     config = json.loads(config_path.read_text(encoding="utf-8"))
     if config.get("lab_cell_format") != 1:
         raise ValueError(
@@ -354,6 +360,7 @@ def evaluate_cell(
     )
     scores = {
         "scores_format": 1,
+        **({"ema": True} if ema else {}),
         "variant": variant,
         "model_kw": model_kw,
         "seed": config["seed"],
@@ -364,7 +371,7 @@ def evaluate_cell(
         ),
         **blocks,
     }
-    _write_scores(cell / "scores.json", scores)
+    _write_scores(cell / ("scores_ema.json" if ema else "scores.json"), scores)
     return scores
 
 
