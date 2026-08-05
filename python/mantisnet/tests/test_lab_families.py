@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 from dataclasses import replace
 
 import numpy as np
@@ -212,26 +213,83 @@ def test_infer_config_recovers_a_nondefault_deep_shape_exactly():
     assert infer_config(MantisNet(cfg).state_dict()) == cfg
 
 
+def _write_production(tmp_path, cfg, *, record_config=True, model_config=None):
+    torch.manual_seed(4)
+    state = copy.deepcopy(MantisNet(cfg).state_dict())
+    payload = {"model": state, "versions": _versions(), "iteration": 3}
+    if record_config:
+        payload["model_config"] = (
+            dataclasses.asdict(cfg) if model_config is None else model_config
+        )
+    path = tmp_path / "knobbed.pt"
+    torch.save(payload, path)
+    return path
+
+
 @pytest.mark.parametrize(
-    ("field", "variant_key"),
+    "knobs",
     (
-        ("cell_pass", "blocks.0.e_cp.weight"),
-        ("axis_bias", "blocks.0.axis_bias"),
+        {"axis_bias": True},
+        {"axis_bias": True, "off_axis_bias": True},
+        {"cell_pass": True},
+        {"joint_incidence": True},
+        {"window_attention": True},
+        {
+            "axis_bias": True,
+            "cell_pass": True,
+            "joint_incidence": True,
+            "window_attention": True,
+        },
     ),
 )
-def test_ablation_state_dicts_are_refused_by_family_registry(
-    tmp_path, field, variant_key
-):
-    cfg = replace(TINY, **{field: True})
-    state = _family_state("trinomial-joint", cfg=cfg)
-    assert variant_key in state
+def test_knobbed_production_checkpoints_identify_load_and_run(tmp_path, knobs):
+    cfg = replace(TINY, **knobs)
+    loaded = load_checkpoint(_write_production(tmp_path, cfg), device="cpu")
+    assert loaded.family.name == "trinomial-joint"
+    assert loaded.config == cfg
+    batch = collate_prefixes([[], [(0, 0), (-8, 8)]], [0, 2])
+    output = loaded.model(batch, 0.2)
+    assert output.policy_logits.ndim == output.q_score.ndim == 1
+    assert output.q_values.dtype == output.q_score.dtype == torch.float32
 
-    path = tmp_path / f"{field}.pt"
+
+def test_cell_pass_from_and_rounds_come_back_exactly(tmp_path):
+    cfg = replace(
+        TINY, blocks=2, cell_pass=True, cell_pass_from=1, cell_pass_rounds=2
+    )
+    loaded = load_checkpoint(_write_production(tmp_path, cfg), device="cpu")
+    assert loaded.config == cfg
+
+
+def test_cell_pass_without_recorded_config_is_refused(tmp_path):
+    cfg = replace(TINY, cell_pass=True)
+    path = _write_production(tmp_path, cfg, record_config=False)
+    with pytest.raises(ValueError, match="cell_pass_rounds.*cannot be inferred"):
+        load_checkpoint(path)
+
+
+def test_tensor_backed_knobs_load_without_recorded_config(tmp_path):
+    cfg = replace(TINY, axis_bias=True, window_attention=True)
+    path = _write_production(tmp_path, cfg, record_config=False)
+    assert load_checkpoint(path, device="cpu").config == cfg
+
+
+def test_recorded_config_contradicting_tensors_is_refused(tmp_path):
+    cfg = replace(TINY, axis_bias=True)
+    lying = dataclasses.asdict(replace(cfg, axis_bias=False))
+    path = _write_production(tmp_path, cfg, model_config=lying)
+    with pytest.raises(ValueError, match="does not match the configuration inferred"):
+        load_checkpoint(path)
+
+
+def test_knob_keys_on_only_some_blocks_are_refused(tmp_path):
+    cfg = replace(TINY, blocks=2, axis_bias=True)
+    state = _family_state("trinomial-joint", cfg=cfg)
+    del state["blocks.1.axis_bias"]
+    path = tmp_path / "torn.pt"
     torch.save({"model": state, "versions": _versions(), "iteration": 1}, path)
     with pytest.raises(ValueError, match="not identifiable by the family registry"):
         load_checkpoint(path)
-    with pytest.raises(ValueError, match="does not structurally claim named family"):
-        load_checkpoint(path, family="trinomial-joint")
 
 
 def test_unidentifiable_state_names_registry_and_contract(tmp_path):

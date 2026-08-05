@@ -9,18 +9,19 @@ the complete, explicit compatibility boundary for that job.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Mapping
 
 import torch
 from torch import Tensor, nn
 
-from ..builder import DEC_CLASSES, NEAREST_BUCKETS, NUM_PATTERNS
+from ..builder import DEC_CLASSES, NEAREST_BUCKETS, NUM_PATTERNS, OCC_CLASSES
 from ..klent.graft import _PARENT_ROW
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
 from ..model import MantisConfig, MantisNet, ModelOutput
 from ..segments import segment_ids, segment_max
+from ..window_pairs import WA_CLASSES
 
 
 _SLOT_CLASSES = 3
@@ -209,13 +210,78 @@ _DUEL_KEYS = {
     "mlp_qbase.2.weight", "mlp_qbase.2.bias",
 }
 
+# Trunk-knob parameter groups (MODEL_SPEC ablations that graduated into
+# production models). Each knob is tensor-backed: its presence, first relayed
+# block, and row counts are recoverable from the state dict alone. The one
+# exception, cell_pass_rounds, ties weights across rounds and leaves no
+# tensor trace; it comes from the checkpoint's recorded model_config.
+_CP_SUFFIXES = {
+    "ln_cp_in.weight", "ln_cp_in.bias", "u_cp.weight", "e_cp.weight",
+    "ln_cp_w.weight", "ln_cp_w.bias", "mlp_cp.lin_a.weight",
+    "mlp_cp.lin_a.bias", "mlp_cp.lin_b.weight", "mlp_cp.out.weight",
+    "mlp_cp.out.bias",
+}
+_WA_SUFFIXES = {
+    "ln_wa.weight", "ln_wa.bias", "wq_wa.weight", "wq_wa.bias",
+    "wk_wa.weight", "wk_wa.bias", "wv_wa.weight", "wv_wa.bias",
+    "wo_wa.weight", "wo_wa.bias", "wa_bias",
+}
 
-def _base_keys(blocks: int) -> set[str]:
-    return _COMMON_KEYS | {
+
+@dataclass(frozen=True, slots=True)
+class _Knobs:
+    axis_bias: bool
+    off_axis_bias: bool
+    cell_pass: bool
+    cell_pass_from: int
+    joint_incidence: bool
+    window_attention: bool
+
+
+def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
+    """Read the trunk-knob profile off block tensors.
+
+    Detection uses block 0 (block ``cell_pass_from`` for the relay); the exact
+    key-set comparison in :func:`_claims` is what rejects a dict whose blocks
+    disagree with the detected profile.
+    """
+    relayed = [
+        index
+        for index in range(blocks)
+        if f"blocks.{index}.u_cp.weight" in state_dict
+    ]
+    e_ws = state_dict.get("blocks.0.e_ws.weight")
+    return _Knobs(
+        axis_bias="blocks.0.axis_bias" in state_dict,
+        off_axis_bias="blocks.0.off_axis_bias" in state_dict,
+        cell_pass=bool(relayed),
+        cell_pass_from=relayed[0] if relayed else 0,
+        joint_incidence=(
+            isinstance(e_ws, Tensor)
+            and e_ws.ndim == 2
+            and e_ws.shape[0] == OCC_CLASSES
+        ),
+        window_attention="blocks.0.wa_bias" in state_dict,
+    )
+
+
+def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
+    keys = _COMMON_KEYS | {
         f"blocks.{index}.{suffix}"
         for index in range(blocks)
         for suffix in _BLOCK_SUFFIXES
     }
+    for index in range(blocks):
+        prefix = f"blocks.{index}."
+        if knobs.axis_bias:
+            keys.add(prefix + "axis_bias")
+        if knobs.off_axis_bias:
+            keys.add(prefix + "off_axis_bias")
+        if knobs.window_attention:
+            keys |= {prefix + suffix for suffix in _WA_SUFFIXES}
+        if knobs.cell_pass and index >= knobs.cell_pass_from:
+            keys |= {prefix + suffix for suffix in _CP_SUFFIXES}
+    return keys
 
 
 def _shape(state_dict: Mapping[str, Tensor], key: str) -> tuple[int, ...] | None:
@@ -231,7 +297,10 @@ def _claims(
     extras: set[str] | None = None,
 ) -> bool:
     blocks = _block_count(state_dict)
-    if blocks is None or set(state_dict) != _base_keys(blocks) | (extras or set()):
+    if blocks is None:
+        return False
+    knobs = _knob_profile(state_dict, blocks)
+    if set(state_dict) != _base_keys(blocks, knobs) | (extras or set()):
         return False
     stone = _shape(state_dict, "stone_table.weight")
     readout = _shape(state_dict, "mlp_q.out.weight")
@@ -289,6 +358,7 @@ def _expected_shapes(
         "mlp_v.2.weight": (k, vh), "mlp_v.2.bias": (k,),
     }
     fh = cfg.ffn_factor * h
+    inc_classes = OCC_CLASSES if cfg.joint_incidence else 3
     for index in range(cfg.blocks):
         prefix = f"blocks.{index}."
         for name in (
@@ -299,17 +369,37 @@ def _expected_shapes(
         for name in ("u", "v"):
             shapes[prefix + name + ".weight"] = (h, h)
         for name in ("e_ws", "e_sw"):
-            shapes[prefix + name + ".weight"] = (3, h)
-        for name in ("mlp_w", "mlp_s"):
+            shapes[prefix + name + ".weight"] = (inc_classes, h)
+        pair_mlps = ["mlp_w", "mlp_s"]
+        if cfg.cell_pass and index >= cfg.cell_pass_from:
+            pair_mlps.append("mlp_cp")
+            shapes[prefix + "ln_cp_in.weight"] = (h,)
+            shapes[prefix + "ln_cp_in.bias"] = (h,)
+            shapes[prefix + "ln_cp_w.weight"] = (h,)
+            shapes[prefix + "ln_cp_w.bias"] = (h,)
+            shapes[prefix + "u_cp.weight"] = (h, h)
+            shapes[prefix + "e_cp.weight"] = (DEC_CLASSES, h)
+        for name in pair_mlps:
             shapes[prefix + name + ".lin_a.weight"] = (h, h)
             shapes[prefix + name + ".lin_a.bias"] = (h,)
             shapes[prefix + name + ".lin_b.weight"] = (h, h)
             shapes[prefix + name + ".out.weight"] = (h, h)
             shapes[prefix + name + ".out.bias"] = (h,)
+        if cfg.window_attention:
+            shapes[prefix + "ln_wa.weight"] = (h,)
+            shapes[prefix + "ln_wa.bias"] = (h,)
+            for name in ("wq_wa", "wk_wa", "wv_wa", "wo_wa"):
+                shapes[prefix + name + ".weight"] = (h, h)
+                shapes[prefix + name + ".bias"] = (h,)
+            shapes[prefix + "wa_bias"] = (cfg.heads, WA_CLASSES)
         for name in ("wq", "wk", "wv", "wo"):
             shapes[prefix + name + ".weight"] = (h, h)
             shapes[prefix + name + ".bias"] = (h,)
         shapes[prefix + "dist_bias"] = (cfg.heads, cfg.d_max + 2)
+        if cfg.axis_bias:
+            shapes[prefix + "axis_bias"] = (cfg.heads, cfg.d_max)
+        if cfg.off_axis_bias:
+            shapes[prefix + "off_axis_bias"] = (cfg.heads, cfg.d_max)
         shapes[prefix + "ffn.0.weight"] = (fh, h)
         shapes[prefix + "ffn.0.bias"] = (fh,)
         shapes[prefix + "ffn.2.weight"] = (h, fh)
@@ -318,7 +408,12 @@ def _expected_shapes(
 
 
 def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
-    """Recover every tensor-backed MantisConfig field from a state dict."""
+    """Recover every tensor-backed MantisConfig field from a state dict.
+
+    ``cell_pass_rounds`` is the one field with no tensor trace (rounds tie
+    weights); it comes back at its default of 1, and
+    :func:`load_checkpoint` overlays the checkpoint's recorded model_config.
+    """
 
     stone = _require_tensor(state_dict, "stone_table.weight")
     if stone.ndim != 2 or stone.shape[0] != 2 or stone.shape[1] <= 0:
@@ -387,6 +482,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
             f"tensor 'mlp_v.2.weight' implies even value_bins={value_bins}; an odd width is required"
         )
 
+    knobs = _knob_profile(state_dict, blocks)
     cfg = MantisConfig(
         h=h,
         blocks=blocks,
@@ -398,6 +494,12 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         policy_hidden=policy_hidden,
         value_hidden=value_hidden,
         dropout=0.0,
+        axis_bias=knobs.axis_bias,
+        off_axis_bias=knobs.off_axis_bias,
+        cell_pass=knobs.cell_pass,
+        cell_pass_from=knobs.cell_pass_from,
+        joint_incidence=knobs.joint_incidence,
+        window_attention=knobs.window_attention,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")
@@ -427,11 +529,13 @@ class FamilyEntry:
     reason: str | None = None
 
     def load(
-        self, checkpoint_model_dict: Mapping[str, Tensor], device: str | torch.device
+        self,
+        checkpoint_model_dict: Mapping[str, Tensor],
+        cfg: MantisConfig,
+        device: str | torch.device,
     ) -> nn.Module:
         if not self.scoreable or self.composition is None:
             raise ValueError(_unscoreable_message(self))
-        cfg = infer_config(checkpoint_model_dict)
         state = dict(checkpoint_model_dict)
         if self.table_rows == _SLOT_CLASSES:
             rows = torch.from_numpy(_PARENT_ROW).to(dtype=torch.long)
@@ -579,7 +683,28 @@ def load_checkpoint(
     if not entry.scoreable:
         raise ValueError(_unscoreable_message(entry))
     config = infer_config(state)
-    model = entry.load(state, device)
+    recorded = raw.get("model_config")
+    if recorded is not None:
+        if not isinstance(recorded, Mapping):
+            raise ValueError(
+                f"checkpoint {checkpoint_path} model_config is not a mapping"
+            )
+        recorded_cfg = MantisConfig(**recorded)
+        if replace(recorded_cfg, dropout=0.0, cell_pass_rounds=1) != replace(
+            config, cell_pass_rounds=1
+        ):
+            raise ValueError(
+                f"checkpoint model_config {recorded_cfg} does not match the "
+                f"configuration inferred from its tensors {config}"
+            )
+        config = replace(config, cell_pass_rounds=recorded_cfg.cell_pass_rounds)
+    elif config.cell_pass:
+        raise ValueError(
+            f"checkpoint {checkpoint_path} has cell-pass tensors but no "
+            "recorded model_config; cell_pass_rounds ties weights across "
+            "rounds and cannot be inferred from the state dict"
+        )
+    model = entry.load(state, config, device)
     assert entry.composition is not None
     return LoadedCheckpoint(
         model=model,

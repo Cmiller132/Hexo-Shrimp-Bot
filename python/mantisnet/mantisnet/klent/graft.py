@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import hashlib
 import json
 import random
@@ -667,6 +668,7 @@ def graft(
     converted_model = _converted_state(parent_model)
     converted = {
         "model": {name: converted_model[name] for name in names},
+        "model_config": dataclasses.asdict(model.cfg),
         "optimizer": _remap_adam(checkpoint["optimizer"], parent_model, names),
         "iteration": checkpoint["iteration"],
         "rng_state": copy.deepcopy(checkpoint["rng_state"]),

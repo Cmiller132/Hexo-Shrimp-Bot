@@ -250,9 +250,15 @@ prefixes replayed through the engine.
 | `check` | Run D6, batch-parity, decoder-coverage, and applicable Python/Rust builder contracts |
 | `smoke` | Run a tiny synthetic-telemetry freeze, CPU cell, evaluation, and report end to end |
 
-`check` applies all 11 nonidentity D6 transforms and requires value and mapped
-policy equality at absolute tolerance `1e-5`. Batched versus single inference
-uses `1e-6`. Decoder coverage requires one output per legal cell and identifies
+`check` applies all 11 nonidentity D6 transforms and requires value equality
+at absolute tolerance `1e-5` and mapped policy equality at
+`1e-5 + 5e-6 * |logit|`. Batched versus single inference compares every head
+at `1e-5 + 5e-6 * |x|`. The relative term is sized in fp32 ulps: policy
+logits are unbounded (strong checkpoints reach hundreds, where one ulp is
+~3e-5) and a transformed or re-batched board legitimately reorders every
+scatter accumulation, while bounded heads inherit the absolute noise of the
+logits behind them. A structural symmetry or batch-dependence break sits
+orders of magnitude above either term. Decoder coverage requires one output per legal cell and identifies
 background cells exactly as legal cells belonging to no live window. A variant
 declaring the Rust path must match the independent Python builder field for
 field before it is eligible for training experiments.
@@ -272,10 +278,19 @@ measurement.
 Configuration is inferred from the state-dict tensors, never from current
 defaults: `h`, block count, attention heads and distance clamp, FFN factor,
 policy/value hidden widths, value-query count, and value-bin count all come from
-their corresponding shapes. Dropout is zero for evaluation. Three-row
-slot-class decoder tables are expanded at load time to the 93 joint classes;
-each joint row copies slot class `min(s, 5-s)` of either member of its reversal
-orbit. Native critic readouts are not transformed.
+their corresponding shapes. The trunk knobs that graduated into production
+models are tensor-backed and infer the same way: `axis_bias` and
+`off_axis_bias` from their per-block bias tables, `window_attention` from the
+§5.1c parameter group, `cell_pass` from the §5.1b relay group with
+`cell_pass_from` as the first relayed block, and `joint_incidence` from the
+incidence-embedding row count. A dict whose blocks disagree about a knob does
+not claim any family. `cell_pass_rounds` alone leaves no tensor trace (rounds
+tie weights); it comes from the checkpoint's recorded `model_config`, which,
+when present, must agree with the tensor-inferred configuration on every other
+field, and whose absence refuses cell-pass checkpoints. Dropout is zero for
+evaluation. Three-row slot-class decoder tables are expanded at load time to
+the 93 joint classes; each joint row copies slot class `min(s, 5-s)` of either
+member of its reversal orbit. Native critic readouts are not transformed.
 
 The shipped families and their exact fp32 compositions are:
 
