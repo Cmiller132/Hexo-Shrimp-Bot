@@ -79,6 +79,7 @@ def save_checkpoint(path: Path, model, optimizer, iteration: int, rng) -> None:
     torch.save(
         {
             "model": model.state_dict(),
+            "model_config": dataclasses.asdict(model.cfg),
             "optimizer": optimizer.state_dict(),
             "iteration": iteration,  # iterations completed
             "rng_state": rng.bit_generator.state,
@@ -92,14 +93,15 @@ def save_checkpoint(path: Path, model, optimizer, iteration: int, rng) -> None:
 def load_model(path: Path, device: str = "cpu"):
     """A checkpoint's model half, version-checked.
 
-    The loader constructs the default :class:`MantisConfig`; checkpoints with
-    another shape fail state-dict validation."""
+    The checkpoint records its own :class:`MantisConfig`, so knobbed runs
+    load through every consumer of this path without those consumers knowing
+    the knobs exist."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if ckpt["versions"] != _versions():
         raise ValueError(
             f"checkpoint versions {ckpt['versions']} != this build {_versions()}"
         )
-    model = MantisNet(MantisConfig()).to(device)
+    model = MantisNet(MantisConfig(**ckpt["model_config"])).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model
@@ -109,18 +111,46 @@ def load_checkpoint(path: Path, model, optimizer, rng=None) -> int:
     """Restore into the given model/optimizer/rng; returns iterations done.
 
     ``rng=None`` restores only the model and optimizer for ``--init-from``.
-    Version identifiers must equal those of the running build.
+    Version identifiers and the model configuration must equal the running
+    build's.
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if ckpt["versions"] != _versions():
         raise ValueError(
             f"checkpoint versions {ckpt['versions']} != this build {_versions()}"
         )
+    recorded = ckpt["model_config"]
+    running = dataclasses.asdict(model.cfg)
+    if recorded != running:
+        raise ValueError(
+            f"checkpoint model config {recorded} != this run's {running}"
+        )
     model.load_state_dict(ckpt["model"])
     optimizer.load_state_dict(ckpt["optimizer"])
     if rng is not None:
         rng.bit_generator.state = ckpt["rng_state"]
     return ckpt["iteration"]
+
+
+def load_lab_cell(path: Path, model, model_kw: dict) -> None:
+    """Initialize the model from a supervised lab cell's final checkpoint.
+
+    The cell must be the same build and the same normalized model overrides
+    as this run — a KLENT run started from supervised pretraining carries the
+    trained trunk and critic head, a fresh optimizer, and iteration 0.
+    """
+    cell = torch.load(path, map_location="cpu", weights_only=False)
+    if cell.get("lab_cell_format") != 1:
+        raise ValueError(f"{path} is not a lab cell checkpoint")
+    if cell["versions"] != _versions():
+        raise ValueError(
+            f"lab cell versions {cell['versions']} != this build {_versions()}"
+        )
+    if cell["model_kw"] != model_kw:
+        raise ValueError(
+            f"lab cell model_kw {cell['model_kw']} != this run's {model_kw}"
+        )
+    model.load_state_dict(cell["model"])
 
 
 class _Status:
@@ -439,6 +469,21 @@ def main(argv=None) -> None:
         "--init-from", type=Path, default=None,
         help="fork a fresh run from a checkpoint's model+optimizer (iteration 0, own seed)",
     )
+    ap.add_argument(
+        "--init-lab-cell", type=Path, default=None,
+        help=(
+            "initialize the model from a supervised lab cell's "
+            "checkpoint_final.pt (fresh optimizer, iteration 0); the cell's "
+            "model_kw must equal --model-kw"
+        ),
+    )
+    ap.add_argument(
+        "--model-kw", nargs="*", default=None, metavar="KEY=VALUE",
+        help=(
+            "MantisConfig overrides (for example axis_bias=true); recorded "
+            "in the run config and every checkpoint"
+        ),
+    )
     ap.add_argument("--seed", type=int, default=0, help="the run's RNG seed")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--no-compile", action="store_true")
@@ -466,8 +511,8 @@ def main(argv=None) -> None:
         raise SystemExit(
             "--h2h-pairs must be >= 2: one pair has no paired spread to estimate"
         )
-    if args.resume and args.init_from is not None:
-        raise SystemExit("--resume and --init-from are exclusive")
+    if sum(1 for x in (args.resume, args.init_from, args.init_lab_cell) if x) > 1:
+        raise SystemExit("--resume, --init-from, and --init-lab-cell are exclusive")
 
     seat_participant = None
     if args.eval_seat is not None:
@@ -511,8 +556,14 @@ def main(argv=None) -> None:
     elif out.exists() and any(out.iterdir()):
         raise SystemExit(f"{out} exists and is not empty; use --resume to continue it")
 
+    # Imported here: the lab package reaches back into klent.graft at import
+    # time, so a module-level import would be circular.
+    from ..lab.variants import parse_model_kw
+
     torch.manual_seed(args.seed)
-    model = MantisNet(MantisConfig()).to(cfg.device)
+    model_kw = parse_model_kw(args.model_kw)
+    model_cfg = MantisConfig(**model_kw)
+    model = MantisNet(model_cfg).to(cfg.device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     rng = np.random.default_rng(args.seed)
 
@@ -524,6 +575,9 @@ def main(argv=None) -> None:
         if args.init_from is not None:
             forked = load_checkpoint(args.init_from, model, optimizer)
             print(f"initialized from {args.init_from} ({forked} iterations trained)")
+        if args.init_lab_cell is not None:
+            load_lab_cell(args.init_lab_cell, model, model_kw)
+            print(f"initialized from lab cell {args.init_lab_cell}")
     # The invocation's --lr overrides the value stored in optimizer state.
     for group in optimizer.param_groups:
         group["lr"] = cfg.lr
@@ -531,7 +585,8 @@ def main(argv=None) -> None:
     out.mkdir(parents=True, exist_ok=True)
     config = {
         "klent": dataclasses.asdict(cfg),
-        "model": dataclasses.asdict(MantisConfig()),
+        "model": dataclasses.asdict(model_cfg),
+        "model_kw": model_kw,
         "iterations": args.iterations,
         "checkpoint_every": args.checkpoint_every,
         "eval_every": args.eval_every,
@@ -551,6 +606,7 @@ def main(argv=None) -> None:
         else None,
         "seed": args.seed,
         "init_from": str(args.init_from) if args.init_from else None,
+        "init_lab_cell": str(args.init_lab_cell) if args.init_lab_cell else None,
         "versions": _versions(),
     }
     (out / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -577,8 +633,10 @@ def main(argv=None) -> None:
         else None,
         "starve_limit": args.starve_limit,
         "init_from": str(args.init_from) if args.init_from else None,
+        "init_lab_cell": str(args.init_lab_cell) if args.init_lab_cell else None,
         "seed": args.seed,
         "klent": dataclasses.asdict(cfg),
+        "model_kw": model_kw,
         "versions": _versions(),
     }
     with (out / "invocations.jsonl").open("a", encoding="utf-8") as f:

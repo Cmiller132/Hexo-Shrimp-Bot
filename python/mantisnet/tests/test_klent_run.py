@@ -324,6 +324,8 @@ def test_checkpoint_refuses_version_drift(tmp_path):
 
 def test_two_row_brm_checkpoint_fails_strictly_at_the_named_readout(tmp_path):
     """There is no compatibility shim for the superseded two-row head."""
+    import dataclasses
+
     from mantisnet import MantisConfig, MantisNet
     from mantisnet.klent.run import _versions
 
@@ -335,6 +337,7 @@ def test_two_row_brm_checkpoint_fails_strictly_at_the_named_readout(tmp_path):
     torch.save(
         {
             "model": state,
+            "model_config": dataclasses.asdict(MantisConfig()),
             "optimizer": torch.optim.Adam(model.parameters()).state_dict(),
             "iteration": 1,
             "rng_state": np.random.default_rng(0).bit_generator.state,
@@ -344,6 +347,69 @@ def test_two_row_brm_checkpoint_fails_strictly_at_the_named_readout(tmp_path):
     )
     with pytest.raises(RuntimeError, match="mlp_q.out.(weight|bias)"):
         load_checkpoint(path, model, torch.optim.Adam(model.parameters()))
+
+
+def test_checkpoints_carry_and_enforce_their_model_config(tmp_path):
+    """A knobbed checkpoint reloads at its own shape and refuses another's."""
+    import dataclasses
+
+    from mantisnet import MantisConfig, MantisNet
+    from mantisnet.klent.run import load_model, save_checkpoint
+
+    cfg = MantisConfig(axis_bias=True)
+    model = MantisNet(cfg)
+    path = tmp_path / "knobbed.pt"
+    save_checkpoint(
+        path,
+        model,
+        torch.optim.Adam(model.parameters()),
+        1,
+        np.random.default_rng(0),
+    )
+
+    loaded = load_model(path)
+    assert dataclasses.asdict(loaded.cfg) == dataclasses.asdict(cfg)
+
+    stock = MantisNet(MantisConfig())
+    with pytest.raises(ValueError, match="model config"):
+        load_checkpoint(path, stock, torch.optim.Adam(stock.parameters()))
+
+
+def test_lab_cell_init_validates_format_build_and_model_kw(tmp_path):
+    """The supervised init path refuses everything but an exact-match cell."""
+    from mantisnet import MantisConfig, MantisNet
+    from mantisnet.klent.run import _versions, load_lab_cell
+
+    model_kw = {"axis_bias": True}
+    cell_model = MantisNet(MantisConfig(**model_kw))
+    cell = {
+        "lab_cell_format": 1,
+        "model": cell_model.state_dict(),
+        "variant": "mantis",
+        "model_kw": model_kw,
+        "corpus_sha256": "0" * 64,
+        "versions": _versions(),
+        "param_count": sum(p.numel() for p in cell_model.parameters()),
+    }
+    path = tmp_path / "checkpoint_final.pt"
+    torch.save(cell, path)
+
+    target = MantisNet(MantisConfig(**model_kw))
+    load_lab_cell(path, target, model_kw)
+    for mine, theirs in zip(target.parameters(), cell_model.parameters()):
+        assert torch.equal(mine, theirs)
+
+    with pytest.raises(ValueError, match="model_kw"):
+        load_lab_cell(path, target, {"axis_bias": True, "cell_pass": True})
+
+    torch.save({**cell, "lab_cell_format": 2}, path)
+    with pytest.raises(ValueError, match="not a lab cell"):
+        load_lab_cell(path, target, model_kw)
+
+    stale = {**cell, "versions": {**_versions(), "MODEL_REPR_VERSION": -1}}
+    torch.save(stale, path)
+    with pytest.raises(ValueError, match="versions"):
+        load_lab_cell(path, target, model_kw)
 
 
 def test_h2h_flags_are_validated_before_any_work(tmp_path):
