@@ -413,11 +413,18 @@ def train_cell(
     ema_decay: float | None = None,
     device: str | None = None,
     compile: bool | None = None,
+    cell_budget: int | None = None,
     param_budget: int | None = None,
     param_tol: float = 0.02,
     progress=None,
 ):
-    """Train one fresh variant/seed cell and write its complete artifacts."""
+    """Train one fresh variant/seed cell and write its complete artifacts.
+
+    ``cell_budget`` caps the accumulation micro-chunks, not the optimizer
+    batch: gradients are summed over the same samples either way, so it is
+    an execution/memory knob, not a recipe change. Window-heavy arms use it
+    to keep their edge tables resident instead of paging.
+    """
 
     cfg = config or TrainConfig()
     updates = asdict(cfg)
@@ -432,6 +439,8 @@ def train_cell(
         updates["autocast"] = torch.device(device).type == "cuda"
     if compile is not None:
         updates["compile"] = compile
+    if cell_budget is not None:
+        updates["cell_budget"] = cell_budget
     cfg = TrainConfig(**updates)
     frozen = _as_corpus(corpus)
 

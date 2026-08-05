@@ -78,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr-schedule", choices=("constant", "cosine"), default="constant"
     )
     train.add_argument("--ema-decay", type=float, default=0.0)
+    train.add_argument(
+        "--cell-budget",
+        type=int,
+        help="cap accumulation micro-chunks (memory knob; optimizer batch unchanged)",
+    )
     train.add_argument("--param-budget", type=int)
     train.add_argument("--param-tol", type=float, default=0.02)
     _device(train)
@@ -267,6 +272,7 @@ def main(argv=None) -> None:
                 ema_decay=args.ema_decay,
                 device=args.device,
                 compile=args.compile,
+                cell_budget=args.cell_budget,
                 param_budget=args.param_budget,
                 param_tol=args.param_tol,
             )
