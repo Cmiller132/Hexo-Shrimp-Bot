@@ -21,6 +21,12 @@ services:
       # The deps venv deliberately omits the project (it lives on the
       # mount); module entry points such as mantisnet.lab find it via this path.
       - PYTHONPATH=/workspace/python/mantisnet
+      # glibc grows up to 8*cores arenas under thread churn (fresh prefetch
+      # and collate pools every iteration); freed chunks are retained
+      # per-arena and the trainer's RSS climbed to ~26GB + 16GB swap until
+      # earlyoom killed it (2026-08-05, twice). Two arenas bound the
+      # retention; the run loop's per-iteration malloc_trim returns the rest.
+      - MALLOC_ARENA_MAX=2
     working_dir: /workspace/python/mantisnet
 
   frontend-build:
@@ -52,6 +58,9 @@ services:
       - DECK_FRONTEND_DIST=/workspace/frontend/dist
       - DECK_DEVICE=${DECK_DEVICE:-cuda}
       - DECK_RUN_COMMAND=${DECK_RUN_COMMAND:-}
+      # Same arena bound as the train service: the deck loads checkpoints and
+      # replays telemetry on request and holds its retention forever.
+      - MALLOC_ARENA_MAX=2
     working_dir: /workspace/python/mantisnet
     command: ["/bin/bash", "/workspace/docker/deck-entrypoint.sh"]
 

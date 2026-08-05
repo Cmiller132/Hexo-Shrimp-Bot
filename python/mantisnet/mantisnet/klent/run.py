@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ctypes
 import dataclasses
 import itertools
 import json
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -47,6 +49,21 @@ from .hardware import hardware_sampler
 from .selfplay import Collector, episode_samples
 from .telemetry import open_telemetry
 from .train import KlentConfig, collect_episodes, fit
+
+
+# Each iteration churns gigabytes of short-lived episode, sample, and chunk
+# allocations across freshly spawned prefetch and collate threads. glibc
+# retains those freed chunks in its arenas: the trainer's anonymous memory
+# grew asymptotically to ~26GB RSS + 16GB swap and earlyoom killed the run
+# (2026-08-05, twice). One malloc_trim per committed iteration returns the
+# retained pages to the OS for microseconds of work; MALLOC_ARENA_MAX=2 in
+# the container environment bounds the arena count itself.
+_LIBC = ctypes.CDLL("libc.so.6") if sys.platform == "linux" else None
+
+
+def _trim_allocator() -> None:
+    if _LIBC is not None:
+        _LIBC.malloc_trim(0)
 
 
 def _versions() -> dict:
@@ -304,6 +321,10 @@ def run_training(
             metrics_file.flush()
             # Telemetry receives the same metric event and its source episodes.
             telemetry.write_iteration(row, episodes, hardware.drain())
+            # The iteration's transients are dead past this point; drop the
+            # references so the trim can hand their pages back to the OS.
+            del episodes, samples
+            _trim_allocator()
             status.update(force=True, iteration=done)
             # CHECKPOINT requests a durable artifact at this commit point.
             requested = (out_dir / "CHECKPOINT").exists()
