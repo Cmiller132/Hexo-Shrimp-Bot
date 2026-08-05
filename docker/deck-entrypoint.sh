@@ -3,9 +3,11 @@ set -euo pipefail
 
 cd /workspace/python/mantisnet
 
-if ! python -c 'import hexo_py' >/dev/null 2>&1; then
-  maturin develop --release -m ../hexo-py/Cargo.toml
-fi
+# Unconditional, like the train launchers: an import-only check kept a
+# stale extension alive across representation bumps (the long-lived deck
+# container served MODEL_REPR_VERSION 2 against v3 checkpoints), and cargo
+# makes an up-to-date rebuild cheap.
+maturin develop --release -m ../hexo-py/Cargo.toml
 
 sealbot_root="${SEALBOT_ROOT:-/sealbot}"
 sealbot_variant="${SEALBOT_VARIANT:-current}"
