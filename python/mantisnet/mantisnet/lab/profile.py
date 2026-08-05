@@ -10,8 +10,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .. import message_passing
 from ..attention import fused_attention
 from ..builder import collate_positions
+from ..model import _class_term
 from ..klent.train import KlentConfig, _policy_q
 from .bench import _config, _family_fields, _load_or_fresh
 from .cohort import corpus_cohort, selfplay_cohort
@@ -53,15 +55,21 @@ def _positions(model, loaded, *, corpus, split, envs, steps, seed, device, compi
     )
 
 
-def _replicated_block(block, s, w, g, batch, seq_lens, device, timings):
+def _replicated_block(block, s, w, g, batch, seq_lens, plan, device, timings):
     """Transcribe one ``_Block`` without hooks or model instrumentation."""
     cfg = block.cfg
+    stone_counts, window_counts = plan.stone_counts, plan.window_counts
 
     def window_from_stones():
         nonlocal w
         x = block.u(block.ln_ws_s(s))
-        msg = x.index_select(0, batch.inc_stone) + block.e_ws(batch.inc_class)
-        agg = msg.new_zeros(w.shape[0], cfg.h).index_add_(0, batch.inc_window, msg)
+        msg = x.index_select(0, batch.inc_stone).float()
+        agg = (
+            msg.new_zeros(w.shape[0], cfg.h)
+            .index_add_(0, batch.inc_window, msg)
+            .to(x.dtype)
+        )
+        agg = agg + _class_term(window_counts, block.e_ws.weight, agg.dtype)
         w = w + block.drop(block.mlp_w(block.ln_ws_w(w), agg))
 
     _, dt = _elapsed(device, window_from_stones)
@@ -70,8 +78,9 @@ def _replicated_block(block, s, w, g, batch, seq_lens, device, timings):
     def stone_from_windows():
         nonlocal s
         y = block.v(block.ln_sw_w(w))
-        msg = y.index_select(0, batch.inc_window) + block.e_sw(batch.inc_class)
+        msg = y.index_select(0, batch.inc_window).float()
         agg = msg.new_zeros(s.shape[0], cfg.h).index_add_(0, batch.inc_stone, msg)
+        agg = agg + _class_term(stone_counts, block.e_sw.weight, agg.dtype)
         s = s + block.drop(block.mlp_s(block.ln_sw_s(s), agg))
 
     _, dt = _elapsed(device, stone_from_windows)
@@ -118,6 +127,14 @@ def _replicated_trunk(model, batch, device: str):
     s = model.stone_table(batch.stone_own)
     w = model.window_table(batch.window_feat)
     g = model.token_base + model.token_moves(batch.moves_idx)
+    plan = message_passing.incidence_plan(
+        batch.inc_stone,
+        batch.inc_window,
+        batch.inc_class,
+        s.shape[0],
+        w.shape[0],
+        model.blocks[0].e_ws.num_embeddings,
+    )
     seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
     per_block = []
     for block in model.blocks:
@@ -128,7 +145,7 @@ def _replicated_trunk(model, batch, device: str):
             "ffn": 0.0,
         }
         s, w, g = _replicated_block(
-            block, s, w, g, batch, seq_lens, device, timings
+            block, s, w, g, batch, seq_lens, plan, device, timings
         )
         per_block.append(timings)
     return (model.ln_out(s), model.ln_out(w), model.ln_out(g)), per_block
@@ -258,6 +275,8 @@ def profile_fit(
     seed: int = 7,
     device: str = "cpu",
     compile: bool = False,
+    pair_budget: int | None = None,
+    cell_budget: int | None = None,
     model_kw: dict | None = None,
     family: str | None = None,
 ) -> dict:
@@ -274,7 +293,7 @@ def profile_fit(
             f"wait and warmup must be nonnegative and active positive, "
             f"got {wait}, {warmup}, {active}"
         )
-    cfg = _config(device, compile)
+    cfg = _config(device, compile, pair_budget, cell_budget)
     model, loaded = _load_or_fresh(
         checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
     )

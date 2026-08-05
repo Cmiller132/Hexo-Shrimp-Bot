@@ -86,10 +86,29 @@ _FOLD = torch.tensor(
 # Unit steps of the engine's axes, canonical order Q, R, QR (builder.AXES).
 _AXES = torch.tensor([[1, 0], [0, 1], [1, -1]], dtype=torch.long)
 
+# Class of the reversed edge: colinear and SELF are symmetric, a crossing
+# swaps its two sides' folds. The edge set is closed under reversal, so the
+# source-major view is the destination view through this table — no sort.
+_MIRROR = torch.tensor(
+    list(range(11))
+    + [11 + b * 6 + a for a in range(6) for b in range(6)]
+    + [_SELF],
+    dtype=torch.long,
+)
+
 # Key packing: coordinates are i16-bounded, so 17 bits per component after an
 # offset is collision-free, and the position index rides above them.
 _KOFF = 1 << 16
 _KSPAN = 1 << 17
+
+
+def _segment_pairs(counts: Tensor, slot: Tensor) -> tuple[Tensor, Tensor]:
+    """Enumerate ``(i, j)`` with ``j`` in ``(i, i + counts[i]]`` per element."""
+    first = torch.repeat_interleave(slot, counts)
+    rank = torch.arange(first.shape[0], device=slot.device) - (
+        counts.cumsum(0) - counts
+    ).index_select(0, first)
+    return first, first + 1 + rank
 
 
 class PairTables(NamedTuple):
@@ -116,13 +135,17 @@ def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
     if window_pos.shape != window_id.shape[:1]:
         raise ValueError("window_pos must have one entry per window")
     n_w = window_id.shape[0]
+    device = window_id.device
     axis, sq, sr = window_id.unbind(1)
 
     dsts, srcs, classes = [], [], []
 
-    # Colinear: sort by (position, axis, line, position-on-line); partners sit
-    # within 11 slots of one another, and starts on a line are distinct, so
-    # eleven shifted comparisons enumerate every pair once.
+    # Colinear: sort by (position, axis, line, position-on-line); starts on a
+    # line are distinct, so within a sorted group every pair at most 11 slots
+    # apart is an edge. searchsorted bounds each start's partner run — the
+    # offset cannot escape its group because the position-on-line rides the
+    # low key bits with margin — and the runs enumerate without per-shift
+    # rescans or compaction syncs.
     line = torch.where(axis == 0, sr, torch.where(axis == 1, sq, sq + sr))
     pos_on = torch.where(axis == 1, sr, sq)
     key = ((window_pos * 4 + axis) * _KSPAN + (line + _KOFF)) * _KSPAN + (
@@ -130,48 +153,62 @@ def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
     )
     order = torch.argsort(key)
     skey = key[order]
-    group = skey // _KSPAN
-    spos = skey % _KSPAN
-    for shift in range(1, _MAX_OFFSET + 1):
-        if shift >= n_w:
-            break
-        near, far = order[:-shift], order[shift:]
-        delta = spos[shift:] - spos[:-shift]
-        ok = (group[:-shift] == group[shift:]) & (delta <= _MAX_OFFSET)
-        near, far, cls = near[ok], far[ok], delta[ok] - 1
+    if n_w:
+        slot = torch.arange(n_w, device=device)
+        hi = torch.searchsorted(skey, skey + _MAX_OFFSET, right=True)
+        first, second = _segment_pairs(hi - slot - 1, slot)
+        near = order.index_select(0, first)
+        far = order.index_select(0, second)
+        cls = skey.index_select(0, second) - skey.index_select(0, first) - 1
         dsts.append(torch.cat([near, far]))
         srcs.append(torch.cat([far, near]))
         classes.append(torch.cat([cls, cls]))
 
-    # Crossing: join the claimed line cells. Runs share a (position, cell)
-    # key; a pair with different axes in one run is a crossing within reach.
-    t_ext = torch.arange(-_REACH, 6 + _REACH, device=window_id.device)
-    vec = _AXES.to(window_id.device)[axis]  # (N_w, 2)
+    # Crossing: join the claimed line cells. Windows claiming one
+    # (position, cell) key form a sorted run; every intra-run pair with
+    # different axes is a crossing within reach, and a crossing pair shares
+    # exactly one cell, so segmented pair enumeration yields each directed
+    # edge once — O(cells + pairs), no per-shift rescan of the runs.
+    t_ext = torch.arange(-_REACH, 6 + _REACH, device=device)
+    vec = _AXES.to(device)[axis]  # (N_w, 2)
     cq = sq[:, None] + t_ext[None, :] * vec[:, 0:1]
     cr = sr[:, None] + t_ext[None, :] * vec[:, 1:2]
     span = t_ext.shape[0]
     ckey = (
         (window_pos[:, None] * _KSPAN + (cq + _KOFF)) * _KSPAN + (cr + _KOFF)
     ).reshape(-1)
-    cwin = (
-        torch.arange(n_w, device=window_id.device)[:, None].expand(-1, span).reshape(-1)
-    )
+    cwin = torch.arange(n_w, device=device)[:, None].expand(-1, span).reshape(-1)
     ct = t_ext[None, :].expand(n_w, -1).reshape(-1)
     corder = torch.argsort(ckey)
     rkey = ckey[corder]
     rwin = cwin[corder]
     rt = ct[corder]
     raxis = axis[rwin]
-    fold = _FOLD.to(window_id.device)
-    if rkey.numel():
-        run_lengths = torch.unique_consecutive(rkey, return_counts=True)[1]
-        for shift in range(1, int(run_lengths.max())):
-            ok = (rkey[:-shift] == rkey[shift:]) & (raxis[:-shift] != raxis[shift:])
-            wi, wj = rwin[:-shift][ok], rwin[shift:][ok]
-            fi, fj = fold[rt[:-shift][ok] + _REACH], fold[rt[shift:][ok] + _REACH]
-            dsts.append(torch.cat([wi, wj]))
-            srcs.append(torch.cat([wj, wi]))
-            classes.append(torch.cat([11 + fi * 6 + fj, 11 + fj * 6 + fi]))
+    fold = _FOLD.to(device)
+    n_cells = rkey.shape[0]
+    if n_cells:
+        slot = torch.arange(n_cells, device=device)
+        starts = torch.ones(n_cells, dtype=torch.bool, device=device)
+        starts[1:] = rkey[1:] != rkey[:-1]
+        # Segment bookkeeping per element: my run and its end slot.
+        run = starts.cumsum(0) - 1
+        run_end = run.new_empty(n_cells).scatter_reduce_(
+            0, run, slot + 1, "amax", include_self=False
+        )[run]
+        # first pairs with every later element of its run.
+        first, second = _segment_pairs(run_end - slot - 1, slot)
+        hit = (
+            raxis.index_select(0, first) != raxis.index_select(0, second)
+        ).nonzero().squeeze(1)
+        first = first.index_select(0, hit)
+        second = second.index_select(0, hit)
+        wi = rwin.index_select(0, first)
+        wj = rwin.index_select(0, second)
+        fi = fold[rt.index_select(0, first) + _REACH]
+        fj = fold[rt.index_select(0, second) + _REACH]
+        dsts.append(torch.cat([wi, wj]))
+        srcs.append(torch.cat([wj, wi]))
+        classes.append(torch.cat([11 + fi * 6 + fj, 11 + fj * 6 + fi]))
 
     # SELF.
     loop = torch.arange(n_w, device=window_id.device)
@@ -182,20 +219,66 @@ def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
     dst = torch.cat(dsts)
     src = torch.cat(srcs)
     cls = torch.cat(classes)
-    order = torch.argsort(dst, stable=True)
+    # Window ids fit int32, and radix passes scale with key width.
+    order = torch.argsort(dst.to(torch.int32), stable=True)
     dst, src, cls = dst[order], src[order], cls[order]
     steps = torch.arange(n_w + 1, device=window_id.device)
     ptr = torch.searchsorted(dst, steps)
 
-    sorder = torch.argsort(src, stable=True)
-    sptr = torch.searchsorted(src[sorder], steps)
-    sdst, scls = dst[sorder], cls[sorder]
+    # Reversal closure: window w's outgoing edges are its incoming edges with
+    # the class mirrored, so the source view shares the destination view's
+    # runs and arrays instead of paying a second edge-set sort.
+    sptr = ptr
+    sdst = src
+    scls = _MIRROR.to(device)[cls]
 
-    corder = torch.argsort(cls, stable=True)
+    corder = torch.argsort(cls.to(torch.int32), stable=True)
     cptr = torch.searchsorted(
         cls[corder], torch.arange(WA_CLASSES + 1, device=window_id.device)
     )
     return PairTables(ptr, src, cls, sptr, sdst, scls, cptr, corder)
+
+
+@torch.library.custom_op("mantisnet::pair_tables", mutates_args=())
+def derive_pair_tables(
+    window_id: Tensor, window_pos: Tensor
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """``pair_tables``' distinct tensors as an opaque op for the trunk.
+
+    The joins are data-dependent and cannot trace; as a graph break they
+    would spill the surrounding message passing out of the compiled graph
+    to eager. As a custom op with unbacked edge sizes the derivation sits
+    inside the graph like the attention op it feeds. Custom ops may not
+    return aliases, so the source view's shared ``ptr``/``src`` arrays are
+    reassembled into ``PairTables`` by the caller.
+    """
+    tables = pair_tables(window_id, window_pos)
+    return (
+        tables.ptr,
+        tables.src,
+        tables.cls,
+        tables.scls,
+        tables.cptr,
+        tables.cedge,
+    )
+
+
+@derive_pair_tables.register_fake
+def _(window_id, window_pos):
+    n_w = window_id.shape[0]
+    e = torch.library.get_ctx().new_dynamic_size()
+
+    def edges():
+        return window_id.new_empty((e,), dtype=torch.long)
+
+    return (
+        window_id.new_empty((n_w + 1,), dtype=torch.long),
+        edges(),
+        edges(),
+        edges(),
+        window_id.new_empty((WA_CLASSES + 1,), dtype=torch.long),
+        edges(),
+    )
 
 
 # The eager fallback walks the destination view in fixed slices so nothing of
@@ -205,7 +288,7 @@ _EDGE_SLICE = 2_000_000
 # Kernel launch geometry: segments average a few dozen edges, so one 32-edge
 # tile per iteration; the class gradient is the relay's split-partial shape.
 _WA_BLOCK_E = 32
-_WA_NUM_WARPS = 2
+_WA_NUM_WARPS = 1
 _BIAS_SPLITS = 64
 _BIAS_BLOCK_E = 128
 
@@ -236,8 +319,11 @@ if triton is not None:
     ):
         # One (destination window, head) per program: an online softmax over
         # the destination's edge run, saving only the max and denominator.
-        w = tl.program_id(0)
-        a = tl.program_id(1)
+        # A window's head programs are consecutive, so their gathers of the
+        # same source rows reuse cache lines instead of refetching them.
+        pid = tl.program_id(0)
+        w = pid // HEADS
+        a = pid % HEADS
         offs = tl.arange(0, BLOCK_HD)
         live = offs < HD
         row = (w * HEADS + a) * HD
@@ -301,9 +387,11 @@ if triton is not None:
     ):
         # Destination sweep: recompute alpha from the saved stats, emit the
         # per-edge dscore for the bias gradient, and accumulate dq in
-        # registers — one deterministic pass, no atomics.
-        w = tl.program_id(0)
-        a = tl.program_id(1)
+        # registers — one deterministic pass, no atomics. Head programs of
+        # one window are consecutive for cache-line reuse of their gathers.
+        pid = tl.program_id(0)
+        w = pid // HEADS
+        a = pid % HEADS
         offs = tl.arange(0, BLOCK_HD)
         live = offs < HD
         row = (w * HEADS + a) * HD
@@ -365,9 +453,11 @@ if triton is not None:
         BLOCK_E: tl.constexpr,
     ):
         # Source sweep over the same edges: this program's k and v rows are
-        # fixed, the destinations' rows and stats are gathered per edge.
-        s = tl.program_id(0)
-        a = tl.program_id(1)
+        # fixed, the destinations' rows and stats are gathered per edge. Head
+        # programs of one source are consecutive for cache-line reuse.
+        pid = tl.program_id(0)
+        s = pid // HEADS
+        a = pid % HEADS
         offs = tl.arange(0, BLOCK_HD)
         live = offs < HD
         row = (s * HEADS + a) * HD
@@ -586,7 +676,7 @@ def _launch_forward(q, k, v, bias, ptr, src, cls):
     out = torch.empty((n_w, heads, hd), dtype=torch.float32, device=q.device)
     m = torch.empty((n_w, heads), dtype=torch.float32, device=q.device)
     l = torch.empty((n_w, heads), dtype=torch.float32, device=q.device)
-    _wa_forward_kernel[(n_w, heads)](
+    _wa_forward_kernel[(n_w * heads,)](
         q,
         k,
         v,
@@ -615,7 +705,7 @@ def _launch_backward(q, k, v, bias, tables, m, l, delta, go):
     block_hd = triton.next_power_of_2(hd)
     dq = torch.empty_like(q)
     dscore = torch.empty((src.shape[0], heads), dtype=torch.float32, device=q.device)
-    _wa_dq_kernel[(n_w, heads)](
+    _wa_dq_kernel[(n_w * heads,)](
         q,
         k,
         v,
@@ -639,7 +729,7 @@ def _launch_backward(q, k, v, bias, tables, m, l, delta, go):
     )
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    _wa_dkdv_kernel[(n_w, heads)](
+    _wa_dkdv_kernel[(n_w * heads,)](
         q,
         k,
         v,

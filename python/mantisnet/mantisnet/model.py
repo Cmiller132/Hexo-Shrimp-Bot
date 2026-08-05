@@ -172,6 +172,19 @@ def _mlp(d_in: int, d_hidden: int, d_out: int) -> nn.Sequential:
     return nn.Sequential(nn.Linear(d_in, d_hidden), nn.ReLU(), nn.Linear(d_hidden, d_out))
 
 
+def _class_term(counts: Tensor, weight: Tensor, dtype: torch.dtype) -> Tensor:
+    """A destination's summed slot-class rows, as histogram times table.
+
+    The weight gradient is a dense matmul, not a contended few-row scatter.
+    Under autocast the matmul runs bf16 with fp32 accumulation, so the class
+    rows still sum at full precision; the counts are small integers, exact
+    in every dtype involved.
+    """
+    return (counts @ weight).to(dtype)
+
+
+
+
 class _PairMlp(nn.Module):
     """``MLP([a; b])`` with the concatenation folded away.
 
@@ -354,6 +367,7 @@ class _Block(nn.Module):
         g: Tensor,
         batch: Batch,
         seq_lens: Tensor,
+        plan: message_passing.IncidencePlan,
         pairs=None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.cfg
@@ -362,16 +376,19 @@ class _Block(nn.Module):
         p, max_t = g.shape[0], batch.attn_valid.shape[1]
 
         # §5.1: windows aggregate their stones. Sum, not mean — the count is
-        # signal.
+        # signal. The class term of each pass is a dense ``counts @ table``
+        # whose gradient is another matmul, not a per-entry gather whose
+        # backward scatters into a few rows.
         x = self.u(self.ln_ws_s(s))
         agg = message_passing.aggregate_to_windows(
             x,
-            self.e_ws.weight,
             batch.inc_stone,
             batch.inc_window,
-            batch.inc_class,
+            plan.run_stone,
+            plan.run_window,
             w.shape[0],
         )
+        agg = agg + _class_term(plan.window_counts, self.e_ws.weight, agg.dtype)
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
         if self.cell_pass:
@@ -397,12 +414,13 @@ class _Block(nn.Module):
         y = self.v(self.ln_sw_w(w))
         agg = message_passing.aggregate_to_stones(
             y,
-            self.e_sw.weight,
             batch.inc_stone,
             batch.inc_window,
-            batch.inc_class,
+            plan.run_stone,
+            plan.run_window,
             s.shape[0],
         )
+        agg = agg + _class_term(plan.stone_counts, self.e_sw.weight, agg.dtype)
         s = s + self.drop(self.mlp_s(self.ln_sw_s(s), agg))
 
         # §5.3: attention over [token; stones], block-diagonal per position.
@@ -512,16 +530,18 @@ class MantisNet(nn.Module):
             nn.init.zeros_(head.out.weight)
             nn.init.zeros_(head.out.bias)
 
-    @torch.compiler.disable
     def _pair_tables(self, batch: Batch):
         # §5.1c tables are born on the batch's device from the window
         # identities: the int64 edge views cost several times more to ship
         # over PCIe than to derive beside the model, and every block shares
-        # one derivation. The data-dependent sorts cannot trace, so this
-        # runs eager inside a graph break.
-        return window_pairs.pair_tables(
+        # one derivation. The op is opaque to the compiler — a graph break
+        # here would spill the surrounding message passing to eager. The
+        # source view shares the destination view's arrays (reversal
+        # closure), reassembled here because ops may not return aliases.
+        ptr, src, cls, scls, cptr, cedge = window_pairs.derive_pair_tables(
             batch.window_id, batch.window_slot // batch.max_w
         )
+        return window_pairs.PairTables(ptr, src, cls, ptr, src, scls, cptr, cedge)
 
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""
@@ -531,10 +551,18 @@ class MantisNet(nn.Module):
         w = self.window_table(batch.window_feat)
         g = self.token_base + self.token_moves(batch.moves_idx)
 
+        plan = message_passing.incidence_plan(
+            batch.inc_stone,
+            batch.inc_window,
+            batch.inc_class,
+            s.shape[0],
+            w.shape[0],
+            OCC_CLASSES if self.cfg.joint_incidence else 3,
+        )
         pairs = self._pair_tables(batch) if self.cfg.window_attention else None
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         for block in self.blocks:
-            s, w, g = block(s, w, g, batch, seq_lens, pairs)
+            s, w, g = block(s, w, g, batch, seq_lens, plan, pairs)
         return self.ln_out(s), self.ln_out(w), self.ln_out(g)
 
     def _decoder_rows(self, w: Tensor, batch: Batch, dtype: torch.dtype) -> Tensor:

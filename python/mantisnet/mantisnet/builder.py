@@ -402,6 +402,18 @@ class Batch:
         }
         return Batch(**moved)
 
+    def pin_memory(self) -> "Batch":
+        """The same batch in pinned host memory, so ``to`` is a true async DMA.
+
+        ``non_blocking`` silently degrades to a synchronous staged copy from
+        pageable memory; a prefetch worker pins ahead of the transfer instead.
+        """
+        pinned = {
+            name: (v.pin_memory() if isinstance(v, torch.Tensor) else v)
+            for name, v in vars(self).items()
+        }
+        return Batch(**pinned)
+
 
 _RELAY_FIELDS = (
     "relay_cell_ptr",

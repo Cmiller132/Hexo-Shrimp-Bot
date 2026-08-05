@@ -177,6 +177,8 @@ def build_parser() -> argparse.ArgumentParser:
     fit_profile.add_argument("--warmup", type=int, default=2)
     fit_profile.add_argument("--active", type=int, default=8)
     fit_profile.add_argument("--seed", type=int, default=7)
+    fit_profile.add_argument("--pair-budget", type=int)
+    fit_profile.add_argument("--cell-budget", type=int)
     _model_kw(fit_profile)
     _device(fit_profile)
 

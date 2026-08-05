@@ -1,26 +1,36 @@
 """Fused incidence aggregation for the two trunk message-passing passes.
 
-Both directions consume the builder's one window-major incidence table.  The
-torch formulation is deliberately literal: gather a projected entity row and
-its three-way slot-class row for every incidence, add them, then ``index_add_``
-the messages into their destinations.  It is the CPU implementation, the
-autograd reference, and the fallback for unsupported CUDA signatures.  The
-window pass stores in the projected value's dtype: its consuming autocast
-linear immediately performs the same cast, and a direct segment reduction can
-fold it without allocating an intermediate fp32 table.  The contended stone
-scatter retains the reference's fp32 output so small differences in atomic
-arrival order are not magnified by an early low-precision rounding boundary.
+Both directions consume the builder's one window-major incidence table and
+aggregate projected entity rows alone.  The slot-class term is not part of
+these ops: summing class rows over a destination's entries is that
+destination's class histogram times the class table, so the trunk adds
+``counts @ weight`` — a dense, deterministic matmul whose class gradient is
+another matmul.  Routed through the aggregation it was a per-entry gather
+whose backward scattered every entry's gradient into a three-row table by
+atomics, the same contended-scatter disease the relay's bias table had.
+``incidence_plan`` builds both histograms once per batch; the counts carry
+no gradient, so the scatter that builds them runs outside autograd.
 
-The CUDA window kernel uses the table's stronger ordering contract.  Each live
-window's one-to-six entries are contiguous and slot-ascending, so a program at
-a run head reduces directly into that window without materializing the
-``(E, H)`` message table.  The reverse pass deliberately remains the literal
-torch scatter: Inductor fuses it with the surrounding compiled block more
-effectively than an explicit kernel, even though the explicit kernel is faster
-in isolation.
+The torch formulation is deliberately literal: gather a projected row per
+incidence, then ``index_add_`` into the destinations.  It is the CPU
+implementation, the autograd reference, and the fallback for unsupported CUDA
+signatures.  The window pass stores in the projected value's dtype: its
+consuming autocast linear immediately performs the same cast.  The stone
+direction accumulates in fp32 so a reduction difference is not magnified by
+an early low-precision rounding boundary.
+
+The CUDA path is one run-head kernel serving all four directions.  The
+builder's table is window-major — each live window's one-to-six entries are
+contiguous — and ``incidence_plan`` adds the stone-major permutation, whose
+runs are bounded by the eighteen windows (six offsets, three axes) a stone
+can occupy.  Forward and backward of both passes are then segment reductions
+over one of the two orderings: contiguous, deterministic, and free of the
+contended ``index_add`` scatters the literal formulation lowers to.
 """
 
 from __future__ import annotations
+
+from typing import NamedTuple
 
 import torch
 from torch import Tensor
@@ -34,82 +44,73 @@ except ImportError:
     tl = None
 
 
-# A live window has at most six occupied slots.  Non-terminal model inputs have
-# at most five, but covering all six keeps the kernel correct at the structural
-# boundary without changing its fixed launch geometry.
-_WINDOW_LEN = 6
-_WINDOW_WARPS = 1
+# Run bounds for the two orderings.  A live window has at most six occupied
+# slots (five in non-terminal inputs; six covers the structural boundary).  A
+# stone occupies at most eighteen live windows: six span offsets on each of
+# the three axes.
+_WINDOW_RUN = 6
+_STONE_RUN = 18
+_RUN_WARPS = 1
 
 if triton is not None:
 
     @triton.jit(do_not_specialize_on_alignment=("n_entries",))
-    def _aggregate_to_windows_kernel(
+    def _run_reduce_kernel(
         values_ptr,
-        class_ptr,
-        stone_ptr,
-        window_ptr,
-        inc_class_ptr,
+        gather_ptr,
+        run_ptr,
         out_ptr,
         stride_vr: tl.constexpr,
         stride_vh: tl.constexpr,
-        stride_cr: tl.constexpr,
-        stride_ch: tl.constexpr,
-        stride_is: tl.constexpr,
-        stride_iw: tl.constexpr,
-        stride_ic: tl.constexpr,
+        stride_ig: tl.constexpr,
+        stride_ir: tl.constexpr,
         stride_or: tl.constexpr,
         stride_oh: tl.constexpr,
         n_entries,
         H: tl.constexpr,
         BLOCK_H: tl.constexpr,
-        WINDOW_LEN: tl.constexpr,
+        RUN_LEN: tl.constexpr,
     ):
+        # ``run_ptr`` holds the sorted destination per entry; a program at a
+        # run head gathers its run's ``values`` rows (by ``gather_ptr``) and
+        # reduces them into the destination row without materializing the
+        # (E, H) message table.
         entry = tl.program_id(0)
-        window = tl.load(window_ptr + entry * stride_iw)
+        dest = tl.load(run_ptr + entry * stride_ir)
         previous = tl.load(
-            window_ptr + (entry - 1) * stride_iw,
+            run_ptr + (entry - 1) * stride_ir,
             mask=entry > 0,
             other=-1,
         )
-        run_head = (entry == 0) | (previous != window)
+        run_head = (entry == 0) | (previous != dest)
 
         offs_h = tl.arange(0, BLOCK_H)
         live_h = offs_h < H
         acc = tl.zeros([BLOCK_H], dtype=tl.float32)
 
-        for relative in tl.static_range(0, WINDOW_LEN):
+        for relative in tl.static_range(0, RUN_LEN):
             current = entry + relative
             in_bounds = current < n_entries
-            current_window = tl.load(
-                window_ptr + current * stride_iw,
+            current_dest = tl.load(
+                run_ptr + current * stride_ir,
                 mask=run_head & in_bounds,
                 other=-1,
             )
-            same_window = run_head & in_bounds & (current_window == window)
-            stone = tl.load(
-                stone_ptr + current * stride_is,
-                mask=same_window,
-                other=0,
-            )
-            slot_class = tl.load(
-                inc_class_ptr + current * stride_ic,
-                mask=same_window,
+            same_run = run_head & in_bounds & (current_dest == dest)
+            source = tl.load(
+                gather_ptr + current * stride_ig,
+                mask=same_run,
                 other=0,
             )
             value = tl.load(
-                values_ptr + stone * stride_vr + offs_h * stride_vh,
-                mask=same_window & live_h,
+                values_ptr + source * stride_vr + offs_h * stride_vh,
+                mask=same_run & live_h,
                 other=0.0,
             ).to(tl.float32)
-            class_value = tl.load(
-                class_ptr + slot_class * stride_cr + offs_h * stride_ch,
-                mask=same_window & live_h,
-                other=0.0,
-            ).to(tl.float32)
-            acc += value + class_value
+            acc += value
 
         tl.store(
-            out_ptr + window * stride_or + offs_h * stride_oh,
+            out_ptr + dest * stride_or + offs_h * stride_oh,
             acc,
             mask=run_head & live_h,
         )
@@ -117,144 +118,89 @@ if triton is not None:
 
 def _aggregate_reference(
     values: Tensor,
-    class_weight: Tensor,
     source_index: Tensor,
     dest_index: Tensor,
-    inc_class: Tensor,
     n_dest: int,
+    dtype: torch.dtype,
 ) -> Tensor:
-    """Literal gather/add/scatter formulation for either direction."""
-    messages = values.index_select(0, source_index) + class_weight.index_select(
-        0, inc_class
-    )
-    return messages.new_zeros((n_dest, values.shape[1])).index_add_(
+    """Literal gather/scatter formulation for either direction.
+
+    Accumulation is fp32 with one cast at the output boundary, matching the
+    run kernel's fp32 accumulator and the stone direction's fp32 contract.
+    """
+    messages = values.index_select(0, source_index).float()
+    out = messages.new_zeros((n_dest, values.shape[1])).index_add_(
         0, dest_index, messages
     )
-
-
-def _window_reference_output(
-    values: Tensor,
-    class_weight: Tensor,
-    source_index: Tensor,
-    dest_index: Tensor,
-    inc_class: Tensor,
-    n_dest: int,
-) -> Tensor:
-    out = _aggregate_reference(
-        values, class_weight, source_index, dest_index, inc_class, n_dest
-    )
-    return out.to(values.dtype)
+    return out.to(dtype)
 
 
 def _validate(
     values: Tensor,
-    class_weight: Tensor,
     inc_stone: Tensor,
     inc_window: Tensor,
-    inc_class: Tensor,
+    run_stone: Tensor,
+    run_window: Tensor,
     n_dest: int,
 ) -> None:
     if values.ndim != 2:
         raise ValueError("values must have shape (N, H)")
-    # The kernels are generic in the table height: three rows for a stock
-    # model's folded classes, OCC_CLASSES for a joint_incidence one (§4.3).
-    if class_weight.ndim != 2 or class_weight.shape[1] != values.shape[1]:
-        raise ValueError("class_weight must have shape (classes, H)")
     entries = inc_stone.shape
-    if inc_stone.ndim != 1 or inc_window.shape != entries or inc_class.shape != entries:
-        raise ValueError("inc_stone, inc_window, and inc_class must be one length")
-    indices = (inc_stone, inc_window, inc_class)
+    indices = (inc_stone, inc_window, run_stone, run_window)
+    if inc_stone.ndim != 1 or any(index.shape != entries for index in indices):
+        raise ValueError("the incidence views must be one length")
     if any(index.dtype != torch.int64 for index in indices):
         raise ValueError("incidence tensors must have dtype int64")
     if any(index.device != values.device for index in indices):
         raise ValueError("all incidence inputs must be on the values device")
-    if class_weight.device != values.device:
-        raise ValueError("values and class_weight must be on one device")
-    if not values.is_floating_point() or not class_weight.is_floating_point():
-        raise ValueError("values and class_weight must have floating-point dtype")
+    if not values.is_floating_point():
+        raise ValueError("values must have floating-point dtype")
     if n_dest < 0:
         raise ValueError(f"destination count must be nonnegative, got {n_dest}")
 
 
-def _supported(values: Tensor, class_weight: Tensor, n_dest: int) -> bool:
-    promoted = torch.promote_types(values.dtype, class_weight.dtype)
+def _supported(values: Tensor, n_dest: int) -> bool:
     return (
         triton is not None
         and values.is_cuda
-        and promoted == torch.float32
         and values.dtype in (torch.float16, torch.bfloat16, torch.float32)
-        and class_weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and values.shape[1] > 0
         and n_dest > 0
     )
 
 
-def _launch_to_windows(
+def _launch_runs(
     values: Tensor,
-    class_weight: Tensor,
-    inc_stone: Tensor,
-    inc_window: Tensor,
-    inc_class: Tensor,
-    n_windows: int,
+    gather: Tensor,
+    runs: Tensor,
+    n_dest: int,
+    run_len: int,
+    dtype: torch.dtype,
+    fill_zero: bool,
 ) -> Tensor:
+    """One run-reduction launch.  ``fill_zero`` covers destinations that may
+    own no entries (a stone whose candidate windows are all dead); window
+    destinations are live by construction, so their launches skip the fill."""
     h = values.shape[1]
-    n_entries = inc_stone.shape[0]
-    # Every live window owns a nonempty incidence run, so the run-head programs
-    # overwrite every row.  Avoiding a full zero fill matters at N_w x H scale.
-    out = torch.empty(n_windows, h, dtype=values.dtype, device=values.device)
-    wrap_triton(_aggregate_to_windows_kernel)[(n_entries,)](
+    n_entries = gather.shape[0]
+    empty = torch.zeros if fill_zero else torch.empty
+    out = empty((n_dest, h), dtype=dtype, device=values.device)
+    wrap_triton(_run_reduce_kernel)[(n_entries,)](
         values,
-        class_weight,
-        inc_stone,
-        inc_window,
-        inc_class,
+        gather,
+        runs,
         out,
         *values.stride(),
-        *class_weight.stride(),
-        *inc_stone.stride(),
-        *inc_window.stride(),
-        *inc_class.stride(),
+        *gather.stride(),
+        *runs.stride(),
         *out.stride(),
         n_entries,
         H=h,
         BLOCK_H=triton.next_power_of_2(h),
-        WINDOW_LEN=_WINDOW_LEN,
-        num_warps=_WINDOW_WARPS,
+        RUN_LEN=run_len,
+        num_warps=_RUN_WARPS,
     )
     return out
-
-
-def _dispatch_to_windows(
-    values: Tensor,
-    class_weight: Tensor,
-    inc_stone: Tensor,
-    inc_window: Tensor,
-    inc_class: Tensor,
-    n_dest: int,
-) -> Tensor:
-    _validate(values, class_weight, inc_stone, inc_window, inc_class, n_dest)
-    # An empty launch is invalid in Triton.  The reference also covers every
-    # non-CUDA or unsupported signature.
-    if not _supported(values, class_weight, n_dest) or inc_stone.numel() == 0:
-        return _window_reference_output(
-            values,
-            class_weight,
-            inc_stone,
-            inc_window,
-            inc_class,
-            n_dest,
-        )
-
-    if _aggregate_to_windows_op is None:  # pragma: no cover - implied above
-        raise AssertionError("a supported signature requires Triton")
-    return _aggregate_to_windows_op(
-        values,
-        class_weight,
-        inc_stone,
-        inc_window,
-        inc_class,
-        n_dest,
-    )
 
 
 if triton is not None:
@@ -262,85 +208,181 @@ if triton is not None:
     @triton_op("mantisnet::aggregate_to_windows", mutates_args={})
     def _aggregate_to_windows_op(
         values: Tensor,
-        class_weight: Tensor,
         inc_stone: Tensor,
         inc_window: Tensor,
-        inc_class: Tensor,
+        run_stone: Tensor,
+        run_window: Tensor,
         n_windows: int,
     ) -> Tensor:
-        return _launch_to_windows(
+        return _launch_runs(
             values,
-            class_weight,
             inc_stone,
             inc_window,
-            inc_class,
             n_windows,
+            _WINDOW_RUN,
+            values.dtype,
+            fill_zero=False,
+        )
+
+    @triton_op("mantisnet::aggregate_to_stones", mutates_args={})
+    def _aggregate_to_stones_op(
+        values: Tensor,
+        inc_stone: Tensor,
+        inc_window: Tensor,
+        run_stone: Tensor,
+        run_window: Tensor,
+        n_stones: int,
+    ) -> Tensor:
+        return _launch_runs(
+            values,
+            run_window,
+            run_stone,
+            n_stones,
+            _STONE_RUN,
+            torch.float32,
+            fill_zero=True,
         )
 
 else:  # pragma: no cover - exercised only by installations without Triton
     _aggregate_to_windows_op = None
+    _aggregate_to_stones_op = None
 
 
 def _setup_context(ctx, inputs, output) -> None:
     del output
-    values, class_weight, inc_stone, inc_window, inc_class, _n_dest = inputs
-    ctx.save_for_backward(
-        values, class_weight, inc_stone, inc_window, inc_class
-    )
+    values, inc_stone, inc_window, run_stone, run_window, _n_dest = inputs
+    ctx.save_for_backward(inc_stone, inc_window, run_stone, run_window)
+    ctx.n_source = values.shape[0]
+    ctx.values_dtype = values.dtype
 
 
 def _backward_to_windows(ctx, grad_out: Tensor):
-    values, class_weight, inc_stone, inc_window, inc_class = ctx.saved_tensors
-    reached = grad_out.index_select(0, inc_window)
-    grad_values = torch.zeros_like(values).index_add_(
-        0, inc_stone, reached.to(values.dtype)
+    # A stone row's gradient sums its entries' upstream window rows — the
+    # stone-major run reduction.
+    _inc_stone, _inc_window, run_stone, run_window = ctx.saved_tensors
+    grad = _launch_runs(
+        grad_out.contiguous(),
+        run_window,
+        run_stone,
+        ctx.n_source,
+        _STONE_RUN,
+        ctx.values_dtype,
+        fill_zero=True,
     )
-    grad_class = torch.zeros_like(class_weight).index_add_(
-        0, inc_class, reached.to(class_weight.dtype)
+    return grad, None, None, None, None, None
+
+
+def _backward_to_stones(ctx, grad_out: Tensor):
+    # A window row's gradient sums its entries' upstream stone rows — the
+    # window-major run reduction, on the builder's own ordering.
+    inc_stone, inc_window, _run_stone, _run_window = ctx.saved_tensors
+    grad = _launch_runs(
+        grad_out.contiguous(),
+        inc_stone,
+        inc_window,
+        ctx.n_source,
+        _WINDOW_RUN,
+        ctx.values_dtype,
+        fill_zero=False,
     )
-    return grad_values, grad_class, None, None, None, None
+    return grad, None, None, None, None, None
 
 
 if _aggregate_to_windows_op is not None:
     _aggregate_to_windows_op.register_autograd(
         _backward_to_windows, setup_context=_setup_context
     )
+    _aggregate_to_stones_op.register_autograd(
+        _backward_to_stones, setup_context=_setup_context
+    )
 
 
 def aggregate_to_windows(
     values: Tensor,
-    class_weight: Tensor,
     inc_stone: Tensor,
     inc_window: Tensor,
-    inc_class: Tensor,
+    run_stone: Tensor,
+    run_window: Tensor,
     n_windows: int,
 ) -> Tensor:
-    """Sum projected stone and slot-class rows into live-window rows."""
-    return _dispatch_to_windows(
-        values,
-        class_weight,
-        inc_stone,
-        inc_window,
-        inc_class,
-        n_windows,
+    """Sum projected stone rows into live-window rows."""
+    _validate(values, inc_stone, inc_window, run_stone, run_window, n_windows)
+    # An empty launch is invalid in Triton.  The reference also covers every
+    # non-CUDA or unsupported signature.
+    if not _supported(values, n_windows) or inc_stone.numel() == 0:
+        return _aggregate_reference(
+            values, inc_stone, inc_window, n_windows, values.dtype
+        )
+    return _aggregate_to_windows_op(
+        values, inc_stone, inc_window, run_stone, run_window, n_windows
     )
 
 
 def aggregate_to_stones(
     values: Tensor,
-    class_weight: Tensor,
+    inc_stone: Tensor,
+    inc_window: Tensor,
+    run_stone: Tensor,
+    run_window: Tensor,
+    n_stones: int,
+) -> Tensor:
+    """Sum projected window rows into stone rows, accumulating in fp32."""
+    _validate(values, inc_stone, inc_window, run_stone, run_window, n_stones)
+    if not _supported(values, n_stones) or inc_stone.numel() == 0:
+        return _aggregate_reference(
+            values, inc_window, inc_stone, n_stones, torch.float32
+        )
+    return _aggregate_to_stones_op(
+        values, inc_stone, inc_window, run_stone, run_window, n_stones
+    )
+
+
+class IncidencePlan(NamedTuple):
+    """Per-batch derivations both passes share: histograms and orderings."""
+
+    stone_counts: Tensor  # (N_s, classes) fp32
+    window_counts: Tensor  # (N_w, classes) fp32
+    run_stone: Tensor  # (E,) int64: inc_stone, stone-major stable order
+    run_window: Tensor  # (E,) int64: inc_window in the same order
+
+
+def incidence_plan(
     inc_stone: Tensor,
     inc_window: Tensor,
     inc_class: Tensor,
     n_stones: int,
-) -> Tensor:
-    """Sum projected window and slot-class rows into stone rows."""
-    _validate(values, class_weight, inc_stone, inc_window, inc_class, n_stones)
-    return _aggregate_reference(
-        values,
-        class_weight,
-        inc_window,
-        inc_stone,
-        inc_class,
-        n_stones,
+    n_windows: int,
+    classes: int,
+) -> IncidencePlan:
+    """Both passes' class histograms and the stone-major incidence view.
+
+    ``counts @ class_weight`` is each destination's summed class rows, so the
+    trunk adds the class term as a dense matmul instead of routing it through
+    the aggregation.  The plan is data, not activations: it carries no
+    gradient, and one derivation per batch serves every block's two passes.
+    """
+    if inc_class.shape != inc_stone.shape or inc_class.dtype != torch.int64:
+        raise ValueError("inc_class must be int64 and one length with inc_stone")
+    if classes <= 0:
+        raise ValueError(f"classes must be positive, got {classes}")
+    with torch.no_grad():
+        ones = torch.ones(
+            inc_class.shape[0], dtype=torch.float32, device=inc_class.device
+        )
+        stone_counts = torch.zeros(
+            n_stones * classes, dtype=torch.float32, device=inc_class.device
+        ).index_add_(0, inc_stone * classes + inc_class, ones)
+        window_counts = torch.zeros(
+            n_windows * classes, dtype=torch.float32, device=inc_class.device
+        ).index_add_(0, inc_window * classes + inc_class, ones)
+        # Stone ids fit int32, and radix passes scale with key width; the
+        # stable sort keeps each run in the builder's window-major order.
+        order = torch.argsort(inc_stone.to(torch.int32), stable=True)
+        run_stone = inc_stone.index_select(0, order)
+        run_window = inc_window.index_select(0, order)
+    return IncidencePlan(
+        stone_counts.view(n_stones, classes),
+        window_counts.view(n_windows, classes),
+        run_stone,
+        run_window,
     )

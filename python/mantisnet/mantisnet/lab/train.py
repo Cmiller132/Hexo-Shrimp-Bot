@@ -261,14 +261,25 @@ def fit_supervised_epoch(
     device_type = torch.device(cfg.device).type
 
     def prepare(indices: Sequence[int]):
-        return collate_samples(frozen, samples, indices, collate)
+        batch, target, ranks, z = collate_samples(frozen, samples, indices, collate)
+        if device_type == "cuda":
+            # Pinning on the prefetch worker makes step's transfers truly
+            # async; from pageable memory non_blocking degrades to a staged
+            # copy on the compute thread.
+            return (
+                batch.pin_memory(),
+                target.pin_memory(),
+                ranks.pin_memory(),
+                z.pin_memory(),
+            )
+        return batch, target, ranks, z
 
     def step(payload):
         batch, target, ranks, z = payload
         batch = batch.to(cfg.device)
-        target = target.to(cfg.device)
-        ranks = ranks.to(cfg.device)
-        z = z.to(cfg.device)
+        target = target.to(cfg.device, non_blocking=True)
+        ranks = ranks.to(cfg.device, non_blocking=True)
+        z = z.to(cfg.device, non_blocking=True)
         with torch.autocast(
             device_type, dtype=torch.bfloat16, enabled=cfg.autocast
         ):
