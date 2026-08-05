@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from mantisnet import NUM_PATTERNS, OCC_CLASSES, collate, from_position
-from mantisnet.builder import DEC_CLASSES, OCC_FOLD, _CANON, _PATTERN_RANK, AXES
+from mantisnet.builder import DEC_CLASSES, _CANON, _PATTERN_RANK, AXES
 
 from .conftest import (
     JOINT_ORBITS,
@@ -69,15 +69,6 @@ def test_ninety_three_joint_incidence_classes():
     # end of the pattern a stone's own state binds to.
     assert occ_class(0b110001, 0) != occ_class(0b110001, 5)
     assert min(0, 5 - 0) == min(5, 5 - 5) == 0
-
-
-def test_the_incidence_fold_reproduces_the_coarse_slot_class():
-    # The §4.3 fold consumed by stock (joint_incidence=False) models: every
-    # orbit lands exactly on its members' shared min(s, 5 - s), so folded
-    # joint classes reproduce the pre-joint three-class incidence bit for bit.
-    pairs = [(m, s) for m in range(1, 63) for s in range(6) if (m >> s) & 1]
-    assert all(OCC_FOLD[occ_class(m, s)] == min(s, 5 - s) for m, s in pairs)
-    assert sorted(set(OCC_FOLD.tolist())) == [0, 1, 2]
 
 
 def test_thirty_four_canonical_patterns():

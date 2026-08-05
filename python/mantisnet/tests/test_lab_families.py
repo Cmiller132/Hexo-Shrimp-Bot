@@ -221,69 +221,64 @@ def _write_production(tmp_path, cfg, *, record_config=True, model_config=None):
         payload["model_config"] = (
             dataclasses.asdict(cfg) if model_config is None else model_config
         )
-    path = tmp_path / "knobbed.pt"
+    path = tmp_path / "production.pt"
     torch.save(payload, path)
     return path
 
 
-@pytest.mark.parametrize(
-    "knobs",
-    (
-        {"axis_bias": True},
-        {"axis_bias": True, "off_axis_bias": True},
-        {"cell_pass": True},
-        {"joint_incidence": True},
-        {"window_attention": True},
-        {
-            "axis_bias": True,
-            "cell_pass": True,
-            "joint_incidence": True,
-            "window_attention": True,
-        },
-    ),
-)
-def test_knobbed_production_checkpoints_identify_load_and_run(tmp_path, knobs):
-    cfg = replace(TINY, **knobs)
-    loaded = load_checkpoint(_write_production(tmp_path, cfg), device="cpu")
+def test_legacy_knob_recording_of_the_baked_architecture_loads(tmp_path):
+    from mantisnet.model import LEGACY_BAKED_KNOBS
+
+    cfg = replace(TINY, h=32, policy_hidden=24)
+    legacy = {**dataclasses.asdict(cfg), **LEGACY_BAKED_KNOBS}
+    loaded = load_checkpoint(
+        _write_production(tmp_path, cfg, model_config=legacy), device="cpu"
+    )
     assert loaded.family.name == "trinomial-joint"
     assert loaded.config == cfg
-    batch = collate_prefixes([[], [(0, 0), (-8, 8)]], [0, 2])
-    output = loaded.model(batch, 0.2)
-    assert output.policy_logits.ndim == output.q_score.ndim == 1
-    assert output.q_values.dtype == output.q_score.dtype == torch.float32
 
 
-def test_cell_pass_from_and_rounds_come_back_exactly(tmp_path):
-    cfg = replace(
-        TINY, blocks=2, cell_pass=True, cell_pass_from=1, cell_pass_rounds=2
-    )
-    loaded = load_checkpoint(_write_production(tmp_path, cfg), device="cpu")
-    assert loaded.config == cfg
+def test_legacy_knob_recording_of_another_architecture_refuses(tmp_path):
+    from mantisnet.model import LEGACY_BAKED_KNOBS
 
-
-def test_cell_pass_without_recorded_config_is_refused(tmp_path):
-    cfg = replace(TINY, cell_pass=True)
-    path = _write_production(tmp_path, cfg, record_config=False)
-    with pytest.raises(ValueError, match="cell_pass_rounds.*cannot be inferred"):
+    lying = {
+        **dataclasses.asdict(TINY),
+        **LEGACY_BAKED_KNOBS,
+        "cell_pass_rounds": 2,
+    }
+    path = _write_production(tmp_path, TINY, model_config=lying)
+    with pytest.raises(ValueError, match="no longer implements"):
         load_checkpoint(path)
 
 
-def test_tensor_backed_knobs_load_without_recorded_config(tmp_path):
-    cfg = replace(TINY, axis_bias=True, window_attention=True)
-    path = _write_production(tmp_path, cfg, record_config=False)
-    assert load_checkpoint(path, device="cpu").config == cfg
-
-
 def test_recorded_config_contradicting_tensors_is_refused(tmp_path):
-    cfg = replace(TINY, axis_bias=True)
-    lying = dataclasses.asdict(replace(cfg, axis_bias=False))
-    path = _write_production(tmp_path, cfg, model_config=lying)
+    recorded = dataclasses.asdict(replace(TINY, heads=1, d_max=11))
+    path = _write_production(tmp_path, TINY, model_config=recorded)
     with pytest.raises(ValueError, match="does not match the configuration inferred"):
         load_checkpoint(path)
 
 
-def test_knob_keys_on_only_some_blocks_are_refused(tmp_path):
-    cfg = replace(TINY, blocks=2, axis_bias=True)
+def test_pre_baked_trunk_identifies_and_refuses_with_its_profile(tmp_path):
+    state = _family_state("trinomial-joint")
+    blocks = 1
+    for index in range(blocks):
+        prefix = f"blocks.{index}."
+        for key in list(state):
+            if key.startswith(prefix) and (
+                "_cp" in key or "_wa" in key or key.endswith("wa_bias")
+                or key.endswith("axis_bias")
+            ):
+                del state[key]
+        for key in (prefix + "e_ws.weight", prefix + "e_sw.weight"):
+            state[key] = state[key][:3]
+    path = tmp_path / "preknob.pt"
+    torch.save({"model": state, "versions": _versions(), "iteration": 1}, path)
+    with pytest.raises(ValueError, match="not the baked architecture"):
+        load_checkpoint(path)
+
+
+def test_baked_keys_on_only_some_blocks_are_refused(tmp_path):
+    cfg = replace(TINY, blocks=2)
     state = _family_state("trinomial-joint", cfg=cfg)
     del state["blocks.1.axis_bias"]
     path = tmp_path / "torn.pt"

@@ -107,16 +107,6 @@ _OCC_CLASS = _orbit_classes(occupied=True)
 DEC_CLASSES = int(_DEC_CLASS.max()) + 1
 OCC_CLASSES = int(_OCC_CLASS.max()) + 1
 
-# The stock model's incidence fold: reversal preserves min(s, 5 - s), so each
-# occupied-slot orbit lands on one coarse end / near-end / centre class, and a
-# model that embeds the folded classes reproduces the pre-joint three-class
-# incidence bit for bit (§4.3).
-_occ_mask, _occ_slot = np.nonzero(_OCC_CLASS >= 0)
-OCC_FOLD = np.full(OCC_CLASSES, -1, dtype=np.int64)
-OCC_FOLD[_OCC_CLASS[_occ_mask, _occ_slot]] = np.minimum(
-    _occ_slot, WINDOW_LEN - 1 - _occ_slot
-)
-
 # Coordinate packing: q, r fit i16, so 21 bits of headroom per component is
 # collision-free. Window identity packs the axis into the low two bits.
 _QSHIFT = 1 << 21

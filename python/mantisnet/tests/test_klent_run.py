@@ -350,15 +350,18 @@ def test_two_row_brm_checkpoint_fails_strictly_at_the_named_readout(tmp_path):
 
 
 def test_checkpoints_carry_and_enforce_their_model_config(tmp_path):
-    """A knobbed checkpoint reloads at its own shape and refuses another's."""
+    """A sized checkpoint reloads at its own shape and refuses another's;
+    legacy knob keys recording the baked architecture are accepted, any
+    other knob value refuses."""
     import dataclasses
 
     from mantisnet import MantisConfig, MantisNet
     from mantisnet.klent.run import load_model, save_checkpoint
+    from mantisnet.model import LEGACY_BAKED_KNOBS
 
-    cfg = MantisConfig(axis_bias=True)
+    cfg = MantisConfig(h=64, policy_hidden=64)
     model = MantisNet(cfg)
-    path = tmp_path / "knobbed.pt"
+    path = tmp_path / "sized.pt"
     save_checkpoint(
         path,
         model,
@@ -374,13 +377,25 @@ def test_checkpoints_carry_and_enforce_their_model_config(tmp_path):
     with pytest.raises(ValueError, match="model config"):
         load_checkpoint(path, stock, torch.optim.Adam(stock.parameters()))
 
+    # A knob-era recording of exactly the baked architecture loads.
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ckpt["model_config"] = {**ckpt["model_config"], **LEGACY_BAKED_KNOBS}
+    torch.save(ckpt, path)
+    assert dataclasses.asdict(load_model(path).cfg) == dataclasses.asdict(cfg)
+
+    # Any other knob value names a model this build does not implement.
+    ckpt["model_config"] = {**ckpt["model_config"], "window_attention": False}
+    torch.save(ckpt, path)
+    with pytest.raises(ValueError, match="no longer implements"):
+        load_model(path)
+
 
 def test_lab_cell_init_validates_format_build_and_model_kw(tmp_path):
     """The supervised init path refuses everything but an exact-match cell."""
     from mantisnet import MantisConfig, MantisNet
     from mantisnet.klent.run import _versions, load_lab_cell
 
-    model_kw = {"axis_bias": True}
+    model_kw = {"h": 64, "policy_hidden": 64}
     cell_model = MantisNet(MantisConfig(**model_kw))
     cell = {
         "lab_cell_format": 1,
@@ -400,7 +415,11 @@ def test_lab_cell_init_validates_format_build_and_model_kw(tmp_path):
         assert torch.equal(mine, theirs)
 
     with pytest.raises(ValueError, match="model_kw"):
-        load_lab_cell(path, target, {"axis_bias": True, "cell_pass": True})
+        load_lab_cell(path, target, {"h": 64, "policy_hidden": 64, "heads": 8})
+
+    # Legacy knob keys naming the baked architecture are stripped, not compared.
+    load_lab_cell(path, target, {**model_kw, "axis_bias": True, "cell_pass": True,
+                                 "joint_incidence": True, "window_attention": True})
 
     torch.save({**cell, "lab_cell_format": 2}, path)
     with pytest.raises(ValueError, match="not a lab cell"):

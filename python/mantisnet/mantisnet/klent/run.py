@@ -42,7 +42,7 @@ import torch
 from concurrent.futures import ThreadPoolExecutor
 
 from ..builder import MODEL_REPR_VERSION
-from ..model import MantisConfig, MantisNet
+from ..model import MantisConfig, MantisNet, strip_legacy_knobs
 from .hardware import hardware_sampler
 from .selfplay import Collector, episode_samples
 from .telemetry import open_telemetry
@@ -101,7 +101,9 @@ def load_model(path: Path, device: str = "cpu"):
         raise ValueError(
             f"checkpoint versions {ckpt['versions']} != this build {_versions()}"
         )
-    model = MantisNet(MantisConfig(**ckpt["model_config"])).to(device)
+    model = MantisNet(
+        MantisConfig(**strip_legacy_knobs(ckpt["model_config"]))
+    ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()
     return model
@@ -119,7 +121,7 @@ def load_checkpoint(path: Path, model, optimizer, rng=None) -> int:
         raise ValueError(
             f"checkpoint versions {ckpt['versions']} != this build {_versions()}"
         )
-    recorded = ckpt["model_config"]
+    recorded = strip_legacy_knobs(ckpt["model_config"])
     running = dataclasses.asdict(model.cfg)
     if recorded != running:
         raise ValueError(
@@ -146,7 +148,7 @@ def load_lab_cell(path: Path, model, model_kw: dict) -> None:
         raise ValueError(
             f"lab cell versions {cell['versions']} != this build {_versions()}"
         )
-    if cell["model_kw"] != model_kw:
+    if strip_legacy_knobs(cell["model_kw"]) != strip_legacy_knobs(model_kw):
         raise ValueError(
             f"lab cell model_kw {cell['model_kw']} != this run's {model_kw}"
         )
@@ -480,7 +482,7 @@ def main(argv=None) -> None:
     ap.add_argument(
         "--model-kw", nargs="*", default=None, metavar="KEY=VALUE",
         help=(
-            "MantisConfig overrides (for example axis_bias=true); recorded "
+            "MantisConfig overrides (for example h=160); recorded "
             "in the run config and every checkpoint"
         ),
     )

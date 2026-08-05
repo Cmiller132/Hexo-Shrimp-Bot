@@ -302,7 +302,6 @@ def _small_wa_config(**extra) -> MantisConfig:
         value_bins=5,
         policy_hidden=16,
         value_hidden=16,
-        window_attention=True,
         **extra,
     )
 

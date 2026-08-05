@@ -278,17 +278,16 @@ measurement.
 Configuration is inferred from the state-dict tensors, never from current
 defaults: `h`, block count, attention heads and distance clamp, FFN factor,
 policy/value hidden widths, value-query count, and value-bin count all come from
-their corresponding shapes. The trunk knobs that graduated into production
-models are tensor-backed and infer the same way: `axis_bias` and
-`off_axis_bias` from their per-block bias tables, `window_attention` from the
-§5.1c parameter group, `cell_pass` from the §5.1b relay group with
-`cell_pass_from` as the first relayed block, and `joint_incidence` from the
-incidence-embedding row count. A dict whose blocks disagree about a knob does
-not claim any family. `cell_pass_rounds` alone leaves no tensor trace (rounds
-tie weights); it comes from the checkpoint's recorded `model_config`, which,
-when present, must agree with the tensor-inferred configuration on every other
-field, and whose absence refuses cell-pass checkpoints. Dropout is zero for
-evaluation. Three-row slot-class decoder tables are expanded at load time to
+their corresponding shapes. The dict must carry every baked trunk stage —
+the §5.1b relay and §5.1c attention groups, the per-block axis table, and
+93-row incidence embeddings. The stage profile is still read off the
+tensors, so a checkpoint from the knob era or from before it identifies
+stably and refuses with its actual profile named: such checkpoints are not
+instantiable in this build and must be measured from a build of their era.
+A recorded `model_config`, when present, must agree with the tensor-inferred
+configuration; legacy knob keys recording exactly the baked architecture
+are accepted and stripped, and any other knob value refuses. Dropout is zero
+for evaluation. Three-row slot-class decoder tables are expanded at load time to
 the 93 joint classes; each joint row copies slot class `min(s, 5-s)` of either
 member of its reversal orbit. Native critic readouts are not transformed.
 

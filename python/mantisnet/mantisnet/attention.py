@@ -75,7 +75,6 @@ if triton is not None:
         n_ctx,
         sm_scale,
         D_MAX: tl.constexpr,
-        AXIS_MODE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -177,22 +176,8 @@ if triton is not None:
                     tl.maximum(tl.abs(dr), tl.abs(dq + dr)),
                 )
                 bucket = tl.minimum(tl.maximum(distance, 1), D_MAX) - 1
-                if AXIS_MODE:
-                    on_axis = (dq == 0) | (dr == 0) | (dq + dr == 0)
-                    bucket = tl.where(on_axis, D_MAX + 3 + bucket, bucket)
-                if AXIS_MODE == 2:
-                    # Disjoint from on-axis (min 0 vs 1), so the running
-                    # bucket is still the distance base wherever this hits.
-                    near_axis = (
-                        tl.minimum(
-                            tl.abs(dq),
-                            tl.minimum(tl.abs(dr), tl.abs(dq + dr)),
-                        )
-                        == 1
-                    )
-                    bucket = tl.where(
-                        near_axis, 2 * D_MAX + 3 + bucket, bucket
-                    )
+                on_axis = (dq == 0) | (dr == 0) | (dq + dr == 0)
+                bucket = tl.where(on_axis, D_MAX + 3 + bucket, bucket)
                 bucket = tl.where(
                     offs_m[:, None] == offs_n[None, :],
                     D_MAX,
@@ -341,7 +326,6 @@ if triton is not None:
         n_ctx,
         sm_scale,
         D_MAX: tl.constexpr,
-        AXIS_MODE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -462,26 +446,12 @@ if triton is not None:
                     tl.maximum(tl.abs(coord_r), tl.abs(coord_q + coord_r)),
                 )
                 bucket = tl.minimum(tl.maximum(distance, 1), D_MAX) - 1
-                if AXIS_MODE:
-                    on_axis = (
-                        (coord_q == 0)
-                        | (coord_r == 0)
-                        | (coord_q + coord_r == 0)
-                    )
-                    bucket = tl.where(on_axis, D_MAX + 3 + bucket, bucket)
-                if AXIS_MODE == 2:
-                    near_axis = (
-                        tl.minimum(
-                            tl.abs(coord_q),
-                            tl.minimum(
-                                tl.abs(coord_r), tl.abs(coord_q + coord_r)
-                            ),
-                        )
-                        == 1
-                    )
-                    bucket = tl.where(
-                        near_axis, 2 * D_MAX + 3 + bucket, bucket
-                    )
+                on_axis = (
+                    (coord_q == 0)
+                    | (coord_r == 0)
+                    | (coord_q + coord_r == 0)
+                )
+                bucket = tl.where(on_axis, D_MAX + 3 + bucket, bucket)
                 bucket = tl.where(
                     offs_m[:, None] == offs_n[None, :],
                     D_MAX,
@@ -579,7 +549,6 @@ if triton is not None:
         n_ctx,
         sm_scale,
         D_MAX: tl.constexpr,
-        AXIS_MODE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -704,26 +673,12 @@ if triton is not None:
                     tl.maximum(tl.abs(coord_r), tl.abs(coord_q + coord_r)),
                 )
                 bucket = tl.minimum(tl.maximum(distance, 1), D_MAX) - 1
-                if AXIS_MODE:
-                    on_axis = (
-                        (coord_q == 0)
-                        | (coord_r == 0)
-                        | (coord_q + coord_r == 0)
-                    )
-                    bucket = tl.where(on_axis, D_MAX + 3 + bucket, bucket)
-                if AXIS_MODE == 2:
-                    near_axis = (
-                        tl.minimum(
-                            tl.abs(coord_q),
-                            tl.minimum(
-                                tl.abs(coord_r), tl.abs(coord_q + coord_r)
-                            ),
-                        )
-                        == 1
-                    )
-                    bucket = tl.where(
-                        near_axis, 2 * D_MAX + 3 + bucket, bucket
-                    )
+                on_axis = (
+                    (coord_q == 0)
+                    | (coord_r == 0)
+                    | (coord_q + coord_r == 0)
+                )
+                bucket = tl.where(on_axis, D_MAX + 3 + bucket, bucket)
                 bucket = tl.where(
                     offs_m[:, None] == offs_n[None, :],
                     D_MAX,
@@ -763,36 +718,20 @@ if triton is not None:
             tl.store(dv_ptrs, dv_acc, mask=offs_n[:, None] < n_ctx)
 
 
-def _bias_table(
-    q: Tensor,
-    dist_bias: Tensor,
-    axis_bias: Tensor | None = None,
-    off_axis_bias: Tensor | None = None,
-) -> Tensor:
-    """Cast learned rows once and insert the finite PAD sentinel."""
+def _bias_table(q: Tensor, dist_bias: Tensor, axis_bias: Tensor) -> Tensor:
+    """Cast learned rows once and insert the finite PAD sentinel.
+
+    Layout: distances 1..D_MAX, SELF, TOKEN, PAD, then the on-axis rows
+    1..D_MAX that replace the base distance row for aligned pairs.
+    """
     if dist_bias.ndim != 2 or dist_bias.shape[1] < 3:
         raise ValueError("dist_bias must have shape (A, d_max + 2) with d_max >= 1")
     d_max = dist_bias.shape[1] - 2
-    if axis_bias is not None and axis_bias.shape != (dist_bias.shape[0], d_max):
+    if axis_bias.shape != (dist_bias.shape[0], d_max):
         raise ValueError("axis_bias must have shape (A, d_max)")
-    if off_axis_bias is not None:
-        if axis_bias is None:
-            raise ValueError("off_axis_bias requires axis_bias")
-        if off_axis_bias.shape != (dist_bias.shape[0], d_max):
-            raise ValueError("off_axis_bias must have shape (A, d_max)")
     table = dist_bias.to(q.dtype)
     pad = table.new_full((table.shape[0], 1), _PAD_BIAS)
-    parts = (table, pad)
-    if axis_bias is not None:
-        parts += (axis_bias.to(q.dtype),)
-    if off_axis_bias is not None:
-        parts += (off_axis_bias.to(q.dtype),)
-    return torch.cat(parts, dim=1)
-
-
-def _table_axis_mode(width: int, d_max: int) -> int:
-    """How many extra bias regions the combined table carries past PAD."""
-    return (width - (d_max + 3)) // d_max
+    return torch.cat((table, pad, axis_bias.to(q.dtype)), dim=1)
 
 
 def _bucket_index(
@@ -800,25 +739,14 @@ def _bucket_index(
     seq_lens: Tensor,
     t: int,
     d_max: int,
-    axis_mode: int = 0,
 ):
     """The (P, T, T) bias-bucket index and (P, T) key validity."""
     dq = coords[:, :, None, 0] - coords[:, None, :, 0]
     dr = coords[:, :, None, 1] - coords[:, None, :, 1]
     distance = torch.maximum(dq.abs(), torch.maximum(dr.abs(), (dq + dr).abs()))
     base = distance.clamp(1, d_max) - 1
-    bucket = base
-    if axis_mode:
-        on_axis = (dq == 0) | (dr == 0) | (dq + dr == 0)
-        bucket = torch.where(on_axis, d_max + 3 + base, bucket)
-    if axis_mode == 2:
-        # Disjoint from on-axis: the minimum of the coordinate triple is 1
-        # exactly one hex step off an axis line, and 0 on it.
-        near_axis = (
-            torch.minimum(dq.abs(), torch.minimum(dr.abs(), (dq + dr).abs()))
-            == 1
-        )
-        bucket = torch.where(near_axis, 2 * d_max + 3 + base, bucket)
+    on_axis = (dq == 0) | (dr == 0) | (dq + dr == 0)
+    bucket = torch.where(on_axis, d_max + 3 + base, base)
 
     rows = torch.arange(t, device=coords.device)
     bucket = torch.where(rows[:, None] == rows[None, :], d_max, bucket)
@@ -851,8 +779,11 @@ def _attention_reference_table(
 ) -> Tensor:
     """The dense formulation used by CPU, failed launches, and recompute."""
     _, _, t, _ = q.shape
-    axis_mode = _table_axis_mode(table.shape[1], d_max)
-    bucket, valid = _bucket_index(coords, seq_lens, t, d_max, axis_mode)
+    if table.shape[1] != 2 * d_max + 3:
+        raise ValueError(
+            f"bias table width {table.shape[1]} != 2*d_max+3 = {2 * d_max + 3}"
+        )
+    bucket, valid = _bucket_index(coords, seq_lens, t, d_max)
     mask = table[:, bucket.long()].permute(1, 0, 2, 3)
     return _apply_reference(q, k, v, mask, valid)
 
@@ -864,8 +795,7 @@ def _attention_reference(
     coords: Tensor,
     seq_lens: Tensor,
     dist_bias: Tensor,
-    axis_bias: Tensor | None = None,
-    off_axis_bias: Tensor | None = None,
+    axis_bias: Tensor,
 ) -> Tensor:
     """Reference attention with the checkpoint-compatible bias parameter."""
     d_max = dist_bias.shape[1] - 2
@@ -875,7 +805,7 @@ def _attention_reference(
         v,
         coords,
         seq_lens,
-        _bias_table(q, dist_bias, axis_bias, off_axis_bias),
+        _bias_table(q, dist_bias, axis_bias),
         d_max,
     )
 
@@ -974,7 +904,6 @@ def _launch_triton(
         t,
         1.0 / math.sqrt(head_dim),
         D_MAX=d_max,
-        AXIS_MODE=_table_axis_mode(table.shape[1], d_max),
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
@@ -1048,7 +977,6 @@ def _launch_triton_backward(
         t,
         1.0 / math.sqrt(head_dim),
         D_MAX=d_max,
-        AXIS_MODE=_table_axis_mode(table.shape[1], d_max),
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
@@ -1084,7 +1012,6 @@ def _launch_triton_backward(
         t,
         1.0 / math.sqrt(head_dim),
         D_MAX=d_max,
-        AXIS_MODE=_table_axis_mode(table.shape[1], d_max),
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
@@ -1175,8 +1102,7 @@ def _backward(ctx, grad_out: Tensor):
     q, k, v, coords, seq_lens, table = ctx.saved_tensors
     t = q.shape[2]
     d_max = ctx.d_max
-    axis_mode = _table_axis_mode(table.shape[1], d_max)
-    bucket, valid = _bucket_index(coords, seq_lens, t, d_max, axis_mode)
+    bucket, valid = _bucket_index(coords, seq_lens, t, d_max)
     with torch.enable_grad():
         q_ = q.detach().requires_grad_(True)
         k_ = k.detach().requires_grad_(True)
@@ -1335,8 +1261,7 @@ def fused_attention(
     coords: Tensor,
     seq_lens: Tensor,
     dist_bias: Tensor,
-    axis_bias: Tensor | None = None,
-    off_axis_bias: Tensor | None = None,
+    axis_bias: Tensor,
 ) -> Tensor:
     """Apply fused attention while retaining the checkpoint bias layout."""
     d_max = dist_bias.shape[1] - 2
@@ -1346,7 +1271,7 @@ def fused_attention(
         v,
         coords,
         seq_lens,
-        _bias_table(q, dist_bias, axis_bias, off_axis_bias),
+        _bias_table(q, dist_bias, axis_bias),
         d_max,
     )
     return out

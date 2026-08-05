@@ -298,10 +298,8 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
     """
     batch = _batch_for_case(positions, "ragged")
     model = model.to(_DEVICE)
-    # The block consumes the trunk's folded view of the incidence classes
-    # (§4.3); driving it directly means folding here, as `trunk` does.
-    batch = replace(batch, inc_class=model.inc_fold[batch.inc_class])
     block = model.blocks[0]
+    pairs = model._pair_tables(batch)
     plan = incidence_plan(
         batch.inc_stone,
         batch.inc_window,
@@ -340,11 +338,11 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
             w = model.window_table(batch.window_feat)
             g = model.token_base + model.token_moves(batch.moves_idx)
             seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
-            fast = block(s, w, g, batch, seq_lens, plan)
+            fast = block(s, w, g, batch, seq_lens, plan, pairs)
 
             monkeypatch.setattr(message_impl, "aggregate_to_windows", windows)
             monkeypatch.setattr(message_impl, "aggregate_to_stones", stones)
-            reference = block(s, w, g, batch, seq_lens, plan)
+            reference = block(s, w, g, batch, seq_lens, plan, pairs)
     finally:
         model.to("cpu")
 

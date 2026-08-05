@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -121,9 +120,6 @@ def _replicated_block(block, s, w, g, batch, seq_lens, plan, device, timings):
 
 
 def _replicated_trunk(model, batch, device: str):
-    if not model.cfg.joint_incidence:
-        # Mirror the trunk's §4.3 fold; the drift detector compares against it.
-        batch = replace(batch, inc_class=model.inc_fold[batch.inc_class])
     s = model.stone_table(batch.stone_own)
     w = model.window_table(batch.window_feat)
     g = model.token_base + model.token_moves(batch.moves_idx)

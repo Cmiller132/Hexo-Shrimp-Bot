@@ -294,10 +294,11 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
   `scalar-slot`, `bipolar-slot`, and `factored-slot`; the shape-identical two-row
   slot families require `--family`. `tail-slot` and `duel-slot` are identified
   by name and refused until they have runnable composition-parity evidence.
-- Trunk knobs (axis/off-axis bias, cell pass, joint incidence, window
-  attention) infer structurally from the state dict within each family;
-  `cell_pass_rounds` comes from the checkpoint's recorded `model_config`,
-  which must agree with the tensors on everything else.
+- The baked trunk stages (axis bias, cell pass, joint incidence, window
+  attention) are required in every scoreable state dict; knob-era or
+  pre-knob checkpoints identify and refuse with their profile named. Legacy
+  model_config knob keys recording exactly the baked architecture are
+  accepted and stripped everywhere checkpoints load.
 - Checkpoints contain model state, optimizer state, completed iteration, and
   NumPy RNG state.
 - A fresh run refuses a nonempty output directory.

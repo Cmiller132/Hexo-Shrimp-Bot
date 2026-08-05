@@ -58,17 +58,14 @@ group D6, so the whole model is D6-invariant by construction (§8).
 | `P_H` | policy and action-value decoder MLP hidden width | 128 |
 | `V_H` | value MLP hidden width | 128 |
 | `DROPOUT` | dropout probability (trunk sub-blocks) | 0.0 |
-| `axis_bias` | enable the on-axis/off-axis attention-bias ablation | `False` |
-| `cell_pass` | enable the window-to-window shared-empty-cell ablation | `False` |
-| `joint_incidence` | embed the 93 joint incidence classes unfolded | `False` |
-| `window_attention` | enable the §5.1c typed window-pair attention | `False` |
 
 Fixed constants (not parameters): `WINDOW_LEN = 6` cells per window, 3 axes,
 `DEC_CLASSES = OCC_CLASSES = 93` (§4.3), critic logits = 3, and
 `moves_remaining ∈ {1, 2}`.
 
-The default configuration has 1,272,997 parameters: 1,063,648 in the four
-trunk blocks and 209,349 across input/final parameters and the three heads.
+The default configuration has 1,944,165 parameters; the bulk sits in the
+four trunk blocks, the remainder across input/final parameters and the
+three heads.
 
 ---
 
@@ -148,18 +145,15 @@ runtime for keys beyond a position's live prefix, giving the row layout
 [ d=1..D_MAX | SELF | TOKEN | PAD ]
 ```
 
-`MantisConfig.axis_bias` is an independently gated ablation axis. It is
-`False` by default and is off in production. When true, a pair is **on-axis**
-exactly when
+The bias is axis-aware. A pair is **on-axis** exactly when
 
 ```
 dq == 0  or  dr == 0  or  dq + dr == 0.
 ```
 
 The three geometric axes share one on-axis class; no axis identity is exposed.
-Each block then owns a separate learned `A × D_MAX` `axis_bias` parameter, in
-addition to the unchanged `A × (D_MAX + 2)` stock distance table. Its runtime
-row layout is
+Each block owns a separate learned `A × D_MAX` `axis_bias` parameter, in
+addition to the `A × (D_MAX + 2)` distance table. The runtime row layout is
 
 ```
 [ off-axis d=1..D_MAX | SELF | TOKEN | PAD | on-axis d=1..D_MAX ].
@@ -167,31 +161,9 @@ row layout is
 
 The distance clamp is applied before the on-axis remap. `SELF`, then `TOKEN`,
 then `PAD` override that remap in order, so later cases win and `PAD` remains
-at index `D_MAX + 2`. The axis rows initialize to zero, making the enabled
-variant functionally identical to stock at initialization. Both hex distance
-and the shared on-axis predicate are D6-invariant, so either table is
+at index `D_MAX + 2`. The axis rows initialize to zero. Both hex distance
+and the shared on-axis predicate are D6-invariant, so the table is
 symmetry-safe.
-
-`MantisConfig.off_axis_bias` extends the same ablation one ring outward and
-requires `axis_bias`. A pair is **near-axis** exactly when
-
-```
-min(|dq|, |dr|, |dq + dr|) == 1,
-```
-
-one hex step off an axis line; the on-axis predicate is the `== 0` case of
-the same triple, so the two classes are disjoint. Each block owns a third
-zero-initialized `A × D_MAX` table and the runtime row layout becomes
-
-```
-[ off-axis d=1..D_MAX | SELF | TOKEN | PAD | on-axis d=1..D_MAX | near-axis d=1..D_MAX ].
-```
-
-The same distance clamp and `SELF`/`TOKEN`/`PAD` overrides apply. The
-near-axis row for distance 1 is structurally unreachable (all six neighbours
-are on-axis) and stays zero. The minimum of the coordinate triple is
-D6-invariant for the same reason the maximum (hex distance) is, so the table
-remains symmetry-safe.
 
 ### 4.2 Nearest-stone buckets (background policy path)
 
@@ -227,22 +199,14 @@ rows summed plus its class counts, two cells with the same live windows and
 the same counts get one row and therefore one logit and one action value
 whatever the weights: the merge is an action alias, not an approximation.
 
-**The incidence fold** — reversal preserves `min(s, 5 − s) ∈ {0, 1, 2}`
-(end / near-end / centre), so every occupied-slot orbit lands on exactly one
-coarse class. By default (`joint_incidence = False`) the model folds the
-batch's incidence classes through that map and embeds three rows in
-`E_ws`/`E_sw`, reproducing the pre-joint incidence encoding bit for bit.
-`MantisConfig.joint_incidence` embeds the 93 orbits directly instead. The
-coarse key aliases the same 18 mirrored-slot pairs as the decoder's — in
-`110001` the lone stone and the pair's outer stone are both "end", so under
-the fold a stone's own state cannot bind to a specific end of a
-non-palindromic pattern.
-
 Class embedding tables of width `H` appear in each place a pairing is
 encoded; each site owns its own table. The policy and action-value decoders
-each own a 93-row joint-class table. Replacing their former three-row tables
-added 23,040 parameters in the default model; `joint_incidence` grows the
-eight per-block incidence tables from three rows to 93, adding 92,160 more.
+and the eight per-block incidence tables (`E_ws`/`E_sw`) each embed the 93
+joint classes directly. (Reversal preserves `min(s, 5 − s)`, so a coarse
+three-class fold exists — but it aliases the same 18 mirrored-slot pairs as
+the decoder's, and under it a stone's own state cannot bind to a specific
+end of a non-palindromic pattern; the model therefore embeds the orbits
+unfolded.)
 
 ---
 
@@ -271,18 +235,8 @@ magnitude.
 
 ### 5.1b Window ← windows through shared empty cells
 
-`MantisConfig.cell_pass` enables an independently gated ablation axis. It is
-`False` by default and is off in production. When enabled, this step runs
-after §5.1 and before §5.2, so a stone reads fork-aware window embeddings in
-the same block. The relay runs in trunk blocks `cell_pass_from..B-1`; the
-default `cell_pass_from=0` runs it in every block. `cell_pass_rounds`
-iterates the update within each enabled block using that block's single
-parameter set: window→cell→window hops compound (two rounds let a window
-read windows two shared cells away) while parameters stay fixed, so the
-knob isolates propagation depth from capacity. Tied weights do not tie
-saved tensors, so with more than one round training recomputes each
-round's activations in backward rather than retaining them per round —
-memory stays at the single-round footprint.
+This step runs in every block, after §5.1 and before §5.2, so a stone
+reads fork-aware window embeddings in the same block.
 
 The builder's decoder incidence triples `(w, joint(a,w), a)` are the bipartite
 graph between every live window `w` and its empty cells `a`. For each triple:
@@ -305,12 +259,8 @@ aggregation buffers, not persistent empty-cell nodes.
 
 ### 5.1c Window attention over typed pair relations
 
-`MantisConfig.window_attention` is a further independently gated ablation
-axis, `False` by default and off in production. When enabled, it runs after
-§5.1b (after §5.1 when the cell pass is off) and before §5.2, in every
-block.
-
-Sparse multi-head attention over the directed window-pair edges the
+Runs after §5.1b and before §5.2, in every block: sparse multi-head
+attention over the directed window-pair edges the
 collator derives from the window identities (§9), typed by the two
 game-mechanical relations:
 
@@ -486,8 +436,8 @@ table, the window table (colour + canonical pattern) with window identities
 incidence list with joint occupied-slot classes, the legal-cell decoder
 table (per-cell window/joint-class lists or background bucket, in engine
 order), and `moves_remaining`. Identities are consumed only through
-reversal-invariant pair relations, never as raw coordinates; a
-`window_attention` model derives the §5.1c edge set in three CSR views (by
+reversal-invariant pair relations, never as raw coordinates; the model
+derives the §5.1c edge set in three CSR views (by
 destination, source, and class — the relay's layout) from the identities on
 its own device, once per forward: the views cost several times more to ship
 to the device than to derive beside the model.

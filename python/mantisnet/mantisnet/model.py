@@ -14,12 +14,11 @@ Attention, FFN, and MLP linears keep the framework-default bias (§10).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
 
 from . import decoder, message_passing, relay, window_pairs
 from .attention import fused_attention
@@ -28,7 +27,6 @@ from .builder import (
     NEAREST_BUCKETS,
     NUM_PATTERNS,
     OCC_CLASSES,
-    OCC_FOLD,
     Batch,
 )
 from .segments import segment_ids, segment_max
@@ -48,45 +46,12 @@ class MantisConfig:
     policy_hidden: int = 128  # P_H
     value_hidden: int = 128  # V_H
     dropout: float = 0.0
-    axis_bias: bool = False
-    off_axis_bias: bool = False
-    cell_pass: bool = False
-    cell_pass_from: int = 0
-    # Iterate the §5.1b relay within each enabled block, tied weights: extra
-    # rounds add propagation depth (window -> cell -> window hops), not
-    # capacity.
-    cell_pass_rounds: int = 1
-    # Embed the batch's 93 joint occupied-slot incidence classes directly
-    # instead of folding them to the three coarse slot classes (§4.3).
-    joint_incidence: bool = False
-    # §5.1c sparse window attention over the typed pair relations; the trunk
-    # derives the edge views on device from the batch's window identities.
-    window_attention: bool = False
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
             raise ValueError(f"H={self.h} must divide into A={self.heads} heads")
         if self.value_bins % 2 == 0:
             raise ValueError(f"K={self.value_bins} must be odd so an exact-zero bin exists")
-        if not 0 <= self.cell_pass_from < self.blocks:
-            raise ValueError(
-                f"cell_pass_from={self.cell_pass_from} must satisfy "
-                f"0 <= cell_pass_from < blocks={self.blocks}"
-            )
-        if self.cell_pass_from > 0 and not self.cell_pass:
-            raise ValueError(
-                f"cell_pass_from={self.cell_pass_from} requires cell_pass=True"
-            )
-        if self.cell_pass_rounds < 1:
-            raise ValueError(
-                f"cell_pass_rounds={self.cell_pass_rounds} must be at least 1"
-            )
-        if self.cell_pass_rounds > 1 and not self.cell_pass:
-            raise ValueError(
-                f"cell_pass_rounds={self.cell_pass_rounds} requires cell_pass=True"
-            )
-        if self.off_axis_bias and not self.axis_bias:
-            raise ValueError("off_axis_bias requires axis_bias")
 
     # Bucket indices of the attention bias table (§4.1): distances 1..D_MAX
     # occupy 0..D_MAX-1, then SELF, then TOKEN. TOKEN wins on the token-token
@@ -120,6 +85,36 @@ class ModelOutput:
 # Width of appendix B's categorical action-value readout: the three logits
 # [z_pos, z_neg, z_zero]. Every reader takes the checkpoint shape from here.
 CRITIC_LOGITS = 3
+
+# The trunk stages were config knobs while they were ablations; checkpoints
+# written in that window record the knob fields in their model_config. These
+# are the values that describe the architecture this build bakes in — a
+# recorded config carrying exactly these is this architecture and loads; any
+# other value names a model this build no longer implements.
+LEGACY_BAKED_KNOBS: dict[str, object] = {
+    "axis_bias": True,
+    "off_axis_bias": False,
+    "cell_pass": True,
+    "cell_pass_from": 0,
+    "cell_pass_rounds": 1,
+    "joint_incidence": True,
+    "window_attention": True,
+}
+
+
+def strip_legacy_knobs(recorded: dict) -> dict:
+    """Drop legacy knob keys that match the baked architecture; refuse others."""
+    out = dict(recorded)
+    for key, baked in LEGACY_BAKED_KNOBS.items():
+        if key in out:
+            if out[key] != baked:
+                raise ValueError(
+                    f"recorded model config {key}={out[key]!r} describes an "
+                    f"architecture this build no longer implements "
+                    f"(it bakes in {key}={baked!r})"
+                )
+            del out[key]
+    return out
 
 
 def return_mass(critic_logits: Tensor) -> tuple[Tensor, Tensor]:
@@ -205,54 +200,36 @@ class _PairMlp(nn.Module):
 class _Block(nn.Module):
     """One trunk block (§5): window <- stones, stone <- windows, attention."""
 
-    def __init__(self, cfg: MantisConfig, cell_pass: bool) -> None:
+    def __init__(self, cfg: MantisConfig) -> None:
         super().__init__()
         h = cfg.h
         self.cfg = cfg
-        self.cell_pass = cell_pass
-        inc_classes = OCC_CLASSES if cfg.joint_incidence else 3
         # §5.1 window <- stones
         self.ln_ws_s = nn.LayerNorm(h)
         self.ln_ws_w = nn.LayerNorm(h)
         self.u = nn.Linear(h, h, bias=False)
-        self.e_ws = nn.Embedding(inc_classes, h)
+        self.e_ws = nn.Embedding(OCC_CLASSES, h)
         self.mlp_w = _PairMlp(h, h, h)
         # §5.1b window <- windows through their shared empty cells.
-        if self.cell_pass:
-            self.ln_cp_in = nn.LayerNorm(h)
-            self.u_cp = nn.Linear(h, h, bias=False)
-            self.e_cp = nn.Embedding(DEC_CLASSES, h)
-            self.ln_cp_w = nn.LayerNorm(h)
-            self.mlp_cp = _PairMlp(h, h, h)
-        else:
-            self.ln_cp_in = None
-            self.u_cp = None
-            self.e_cp = None
-            self.ln_cp_w = None
-            self.mlp_cp = None
+        self.ln_cp_in = nn.LayerNorm(h)
+        self.u_cp = nn.Linear(h, h, bias=False)
+        self.e_cp = nn.Embedding(DEC_CLASSES, h)
+        self.ln_cp_w = nn.LayerNorm(h)
+        self.mlp_cp = _PairMlp(h, h, h)
         # §5.1c window <- windows through typed pair relations.
-        self.window_attention = cfg.window_attention
-        if self.window_attention:
-            self.ln_wa = nn.LayerNorm(h)
-            self.wq_wa = nn.Linear(h, h)
-            self.wk_wa = nn.Linear(h, h)
-            self.wv_wa = nn.Linear(h, h)
-            self.wo_wa = nn.Linear(h, h)
-            self.wa_bias = nn.Parameter(
-                torch.zeros(cfg.heads, window_pairs.WA_CLASSES)
-            )
-        else:
-            self.ln_wa = None
-            self.wq_wa = None
-            self.wk_wa = None
-            self.wv_wa = None
-            self.wo_wa = None
-            self.wa_bias = None
+        self.ln_wa = nn.LayerNorm(h)
+        self.wq_wa = nn.Linear(h, h)
+        self.wk_wa = nn.Linear(h, h)
+        self.wv_wa = nn.Linear(h, h)
+        self.wo_wa = nn.Linear(h, h)
+        self.wa_bias = nn.Parameter(
+            torch.zeros(cfg.heads, window_pairs.WA_CLASSES)
+        )
         # §5.2 stone <- windows
         self.ln_sw_w = nn.LayerNorm(h)
         self.ln_sw_s = nn.LayerNorm(h)
         self.v = nn.Linear(h, h, bias=False)
-        self.e_sw = nn.Embedding(inc_classes, h)
+        self.e_sw = nn.Embedding(OCC_CLASSES, h)
         self.mlp_s = _PairMlp(h, h, h)
         # §5.3 stone self-attention + token
         self.ln_attn = nn.LayerNorm(h)
@@ -261,17 +238,7 @@ class _Block(nn.Module):
         self.wv = nn.Linear(h, h)
         self.wo = nn.Linear(h, h)
         self.dist_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.d_max + 2))
-        self.axis_bias = (
-            nn.Parameter(torch.zeros(cfg.heads, cfg.d_max)) if cfg.axis_bias else None
-        )
-        # Row 0 (distance 1) is structurally unreachable — every distance-1
-        # pair is on-axis — and stays zero; the table keeps D_MAX columns for
-        # layout uniformity with the on-axis rows.
-        self.off_axis_bias = (
-            nn.Parameter(torch.zeros(cfg.heads, cfg.d_max))
-            if cfg.off_axis_bias
-            else None
-        )
+        self.axis_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.d_max))
         self.ln_ffn = nn.LayerNorm(h)
         self.ffn = nn.Sequential(
             nn.Linear(h, cfg.ffn_factor * h), nn.ReLU(), nn.Linear(cfg.ffn_factor * h, h)
@@ -289,20 +256,7 @@ class _Block(nn.Module):
         cls_ptr: Tensor,
         edge_ccell: Tensor,
     ) -> Tensor:
-        """Update windows through the live-window/empty-cell incidence graph.
-
-        Takes the relay tables as explicit tensors — the multi-round path
-        checkpoints this method, and dynamo can only trace the recompute
-        subgraph when every tensor crosses the boundary as an argument.
-        """
-        if not self.cell_pass:
-            raise RuntimeError("cell pass is disabled for this block")
-        assert self.ln_cp_in is not None
-        assert self.u_cp is not None
-        assert self.e_cp is not None
-        assert self.ln_cp_w is not None
-        assert self.mlp_cp is not None
-
+        """Update windows through the live-window/empty-cell incidence graph."""
         x = self.u_cp(self.ln_cp_in(w))
         agg = relay.cell_pass(
             x,
@@ -317,16 +271,6 @@ class _Block(nn.Module):
         )
         return w + self.drop(self.mlp_cp(self.ln_cp_w(w), agg))
 
-    @torch.compiler.disable
-    def _checkpointed_cell_pass(self, w: Tensor, *tables: Tensor) -> Tensor:
-        # Tied weights share parameters, not saved tensors: each extra round
-        # otherwise retains its own sub-block activations, which is what
-        # pushed the rounds arm past physical VRAM. Recompute them in
-        # backward instead. Dynamo cannot trace the checkpoint's recompute
-        # subgraph here (its tracer rejects the lifted frame), so the rounds
-        # run eager inside a graph break and everything around them compiles.
-        return checkpoint(self._cell_pass, w, *tables, use_reentrant=False)
-
     def _window_attention(self, w: Tensor, pairs) -> Tensor:
         """§5.1c: multi-head attention over each window's relation edges.
 
@@ -335,16 +279,6 @@ class _Block(nn.Module):
         stats, and recomputes every per-edge quantity in backward. ``pairs``
         is the trunk's per-batch ``PairTables``, derived once on device.
         """
-        if not self.window_attention:
-            raise RuntimeError("window attention is disabled for this block")
-        if pairs is None:
-            raise RuntimeError("window attention requires the trunk's pair tables")
-        assert self.ln_wa is not None
-        assert self.wq_wa is not None
-        assert self.wk_wa is not None
-        assert self.wv_wa is not None
-        assert self.wo_wa is not None
-        assert self.wa_bias is not None
         cfg = self.cfg
         heads, hd = cfg.heads, cfg.h // cfg.heads
         n_w = w.shape[0]
@@ -368,7 +302,7 @@ class _Block(nn.Module):
         batch: Batch,
         seq_lens: Tensor,
         plan: message_passing.IncidencePlan,
-        pairs=None,
+        pairs,
     ) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.cfg
         # Sizes come from tensor shapes, not the Batch's ints: under
@@ -391,24 +325,17 @@ class _Block(nn.Module):
         agg = agg + _class_term(plan.window_counts, self.e_ws.weight, agg.dtype)
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
-        if self.cell_pass:
-            tables = (
-                batch.relay_cell_ptr,
-                batch.relay_window,
-                batch.relay_class,
-                batch.relay_win_ptr,
-                batch.relay_wcell,
-                batch.relay_cls_ptr,
-                batch.relay_ccell,
-            )
-            for _round in range(cfg.cell_pass_rounds):
-                if cfg.cell_pass_rounds > 1 and torch.is_grad_enabled():
-                    w = self._checkpointed_cell_pass(w, *tables)
-                else:
-                    w = self._cell_pass(w, *tables)
-
-        if self.window_attention:
-            w = self._window_attention(w, pairs)
+        w = self._cell_pass(
+            w,
+            batch.relay_cell_ptr,
+            batch.relay_window,
+            batch.relay_class,
+            batch.relay_win_ptr,
+            batch.relay_wcell,
+            batch.relay_cls_ptr,
+            batch.relay_ccell,
+        )
+        w = self._window_attention(w, pairs)
 
         # §5.2: stones aggregate their windows.
         y = self.v(self.ln_sw_w(w))
@@ -446,7 +373,6 @@ class _Block(nn.Module):
             seq_lens,
             self.dist_bias,
             self.axis_bias,
-            self.off_axis_bias,
         )
         out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(p * max_t, cfg.h)
         s = s + self.drop(out.index_select(0, batch.stone_slot))
@@ -475,13 +401,7 @@ class MantisNet(nn.Module):
         self.token_base = nn.Parameter(torch.empty(h))
         self.token_moves = nn.Embedding(2, h)  # moves_remaining in {1, 2}
 
-        self.blocks = nn.ModuleList(
-            _Block(
-                cfg,
-                cell_pass=cfg.cell_pass and index >= cfg.cell_pass_from,
-            )
-            for index in range(cfg.blocks)
-        )
+        self.blocks = nn.ModuleList(_Block(cfg) for _index in range(cfg.blocks))
         self.ln_out = nn.LayerNorm(h)  # shared final LN over S, W, g (§5)
 
         # §6 policy decoder. MLP_P([h_a; g]) as a _PairMlp, so the g half of
@@ -506,12 +426,6 @@ class MantisNet(nn.Module):
         self.register_buffer(
             "bin_centers", torch.linspace(-1.0, 1.0, cfg.value_bins), persistent=False
         )
-        if not cfg.joint_incidence:
-            # The §4.3 fold from the batch's joint occupied-slot classes down
-            # to the three coarse classes this model's incidence tables embed.
-            self.register_buffer(
-                "inc_fold", torch.from_numpy(OCC_FOLD), persistent=False
-            )
 
         self._init_weights()
 
@@ -545,8 +459,6 @@ class MantisNet(nn.Module):
 
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""
-        if not self.cfg.joint_incidence:
-            batch = replace(batch, inc_class=self.inc_fold[batch.inc_class])
         s = self.stone_table(batch.stone_own)
         w = self.window_table(batch.window_feat)
         g = self.token_base + self.token_moves(batch.moves_idx)
@@ -557,9 +469,9 @@ class MantisNet(nn.Module):
             batch.inc_class,
             s.shape[0],
             w.shape[0],
-            OCC_CLASSES if self.cfg.joint_incidence else 3,
+            OCC_CLASSES,
         )
-        pairs = self._pair_tables(batch) if self.cfg.window_attention else None
+        pairs = self._pair_tables(batch)
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         for block in self.blocks:
             s, w, g = block(s, w, g, batch, seq_lens, plan, pairs)

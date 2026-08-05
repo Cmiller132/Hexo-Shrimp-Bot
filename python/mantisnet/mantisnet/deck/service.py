@@ -27,7 +27,7 @@ from ..builder import collate_prefixes
 from ..klent import telemetry
 from ..klent.inspect import inspect_position
 from ..klent.run import _versions
-from ..model import CRITIC_LOGITS, MantisConfig, MantisNet
+from ..model import CRITIC_LOGITS, MantisConfig, MantisNet, strip_legacy_knobs
 
 _RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}\Z")
 
@@ -360,7 +360,7 @@ def _config_from_checkpoint(raw: dict) -> MantisConfig:
             "readout must be converted by mantisnet.klent.graft"
         )
     if "model_config" in raw:
-        return MantisConfig(**raw["model_config"])
+        return MantisConfig(**strip_legacy_knobs(raw["model_config"]))
     blocks = 1 + max(
         [int(k.split(".")[1]) for k in state if k.startswith("blocks.")], default=-1
     )
