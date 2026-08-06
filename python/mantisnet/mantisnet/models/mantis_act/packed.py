@@ -1,0 +1,748 @@
+"""The MantisNet-ACT containers: one position's graph, and a batch of them.
+
+This module owns the ragged plumbing of ``docs/MANTIS_ACT_SPEC.md`` §7, §25 and
+§26 and nothing else. It holds no game logic: no window enumeration, no
+legality, no geometry, and no class table beyond the asserted sizes it borrows
+to bound an index. It knows only that a graph is a set of node families with
+indices between them, and what a valid one looks like.
+
+Index conventions this module fixes:
+
+- Every index in an ``ACTGraph`` is in that position's own frame:
+  ``legal_to_cell_index`` and the cell geometry index cells, ``window_cell_index``
+  indexes cells, ``action_window_index`` indexes windows, and the pair rows index
+  legal actions. ``collate`` shifts each by its family's offset into the batch
+  frame; nothing else renumbers.
+- ``-1`` is the only sentinel and always means "no such entity" — a slot outside
+  the cell scope, a legal action whose cell the scope omits, an action row with
+  no persistent pre-action window, a prospective partner that is not currently
+  legal, a displacement lying on no axis. It survives collation as ``-1``:
+  shifting a sentinel would turn it into
+  a real index into the preceding position's slice, and no shape or dtype check
+  downstream can see that. ``_to_global`` is the single place the distinction is
+  made, and every field that carries a sentinel is declared as such in
+  ``_INDEX_FIELDS``.
+- ``_INDEX_FIELDS`` is one table driving three jobs — ``validate``'s bounds
+  check, ``collate``'s offset arithmetic, and ``collate``'s refusal of any edge
+  whose endpoints land in different positions (§26). A field added to one and
+  not the others is impossible.
+- The CSR offset tensors are ``(position_count + 1,)`` with a leading zero, so
+  position ``p`` owns rows ``offsets[p]:offsets[p + 1]`` of its family.
+
+``validate`` is the loud failure surface for the whole builder stage: builders
+call it before returning a graph, and it raises naming the offending field, row,
+and value rather than letting a malformed table reach an embedding lookup. Class
+codes are bounded by ``pattern_classes``' own asserted counts, never by a number
+restated here; the vocabularies a config can resize — the D6 relation mode's
+orbits, the nearest-stone buckets, the pair evidence kinds — are checked for
+sign only, since their cardinality belongs to the module that emits them.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+import numpy as np
+import torch
+
+from .pattern_classes import (
+    ALL_CELL_WINDOW_REL_CLASSES,
+    ALL_WINDOW_PATTERN_CLASSES,
+    EMPTY,
+    MIXED,
+    OPP_LIVE,
+    OWN_LIVE,
+    POST1_REL_CLASSES,
+)
+
+WINDOW_LEN = 6
+NUM_AXES = 3
+# 3 axes x 6 candidate slots through every legal cell (§19.2).
+POST_ACTION_ROWS = NUM_AXES * WINDOW_LEN
+
+# Three-way placement phase (§13.1). ``moves_remaining`` stays authoritative for
+# the KLENT return sign; this id is a model feature.
+PHASE_OPENING, PHASE_FIRST, PHASE_SECOND = 0, 1, 2
+
+# Telemetry labels for the §9.3 window statuses, keyed by the status value, so
+# a status count cannot be mislabelled by an assumption about their order.
+WINDOW_STATUS_NAMES = {
+    EMPTY: "empty",
+    OWN_LIVE: "own_live",
+    OPP_LIVE: "opp_live",
+    MIXED: "mixed",
+}
+
+SENTINEL = -1
+
+# Node families, and the field whose length defines each one.
+_CELLS, _WINDOWS, _LEGAL, _ADJACENCY, _RADIUS, _PAIR = (
+    "cells",
+    "windows",
+    "legal",
+    "adjacency",
+    "radius",
+    "pair",
+)
+_FAMILY_SIZED_BY = {
+    _CELLS: "cell_occupancy",
+    _WINDOWS: "window_pattern_class",
+    _LEGAL: "legal_to_cell_index",
+    _ADJACENCY: "adjacency_src",
+    _RADIUS: "radius_src",
+    _PAIR: "pair_dst_action",
+}
+
+# Every array field of ``ACTGraph``: dtype and shape, where a string extent
+# names a family and ``None`` is a free feature width.
+_GRAPH_ARRAYS: tuple[tuple[str, type, tuple[object, ...]], ...] = (
+    ("cell_qr", np.int64, (_CELLS, 2)),
+    ("cell_occupancy", np.int64, (_CELLS,)),
+    ("cell_is_legal", np.int64, (_CELLS,)),
+    ("cell_is_occupied", np.int64, (_CELLS,)),
+    ("cell_nearest_bucket", np.int64, (_CELLS,)),
+    ("legal_to_cell_index", np.int64, (_LEGAL,)),
+    ("window_id", np.int64, (_WINDOWS, 3)),
+    ("window_pattern_class", np.int64, (_WINDOWS,)),
+    ("window_status", np.int64, (_WINDOWS,)),
+    ("window_axis", np.int64, (_WINDOWS,)),
+    ("window_numeric", np.float32, (_WINDOWS, None)),
+    ("window_cell_index", np.int64, (_WINDOWS, WINDOW_LEN)),
+    ("window_incidence_class", np.int64, (_WINDOWS, WINDOW_LEN)),
+    ("window_incidence_mask", np.bool_, (_WINDOWS, WINDOW_LEN)),
+    ("adjacency_src", np.int64, (_ADJACENCY,)),
+    ("adjacency_dst", np.int64, (_ADJACENCY,)),
+    ("adjacency_axis", np.int64, (_ADJACENCY,)),
+    ("radius_src", np.int64, (_RADIUS,)),
+    ("radius_dst", np.int64, (_RADIUS,)),
+    ("radius_orbit", np.int64, (_RADIUS,)),
+    ("radius_axis_or_neg1", np.int64, (_RADIUS,)),
+    ("action_window_index", np.int64, (_LEGAL, NUM_AXES, WINDOW_LEN)),
+    ("action_post1_class", np.int64, (_LEGAL, NUM_AXES, WINDOW_LEN)),
+    ("action_pre_status", np.int64, (_LEGAL, NUM_AXES, WINDOW_LEN)),
+    ("action_tactical_numeric", np.float32, (_LEGAL, None)),
+    ("pair_dst_action", np.int64, (_PAIR,)),
+    ("pair_src_action_or_neg1", np.int64, (_PAIR,)),
+    ("pair_axis_or_neg1", np.int64, (_PAIR,)),
+    ("pair_distance", np.int64, (_PAIR,)),
+    ("pair_post2_pattern", np.int64, (_PAIR,)),
+    ("pair_evidence_kind", np.int64, (_PAIR,)),
+    ("pair_src_is_current_legal", np.int64, (_PAIR,)),
+    ("global_numeric", np.float32, (None,)),
+)
+
+# Closed value ranges: ``(field, low, high)``, ``high`` of ``None`` meaning
+# unbounded above. A bound is either fixed by the spec or read from the table
+# the code indexes; a vocabulary a config can resize is left open above.
+_VALUE_RANGES: tuple[tuple[str, int, int | None], ...] = (
+    ("cell_occupancy", 0, 2),  # EMPTY / OWN / OPP relative to the mover (§8.2)
+    ("cell_is_legal", 0, 1),
+    ("cell_is_occupied", 0, 1),
+    # The bucket count is the cell builder's; ``d_max`` and the legal radius
+    # both move it.
+    ("cell_nearest_bucket", 0, None),
+    ("window_pattern_class", 0, ALL_WINDOW_PATTERN_CLASSES - 1),
+    ("window_status", EMPTY, MIXED),
+    ("window_axis", 0, NUM_AXES - 1),
+    ("adjacency_axis", 0, NUM_AXES - 1),
+    # ``d6_relation_mode`` chooses the relation vocabulary (§11.2).
+    ("radius_orbit", 0, None),
+    ("radius_axis_or_neg1", SENTINEL, NUM_AXES - 1),
+    ("action_post1_class", 0, POST1_REL_CLASSES - 1),
+    ("action_pre_status", EMPTY, MIXED),
+    ("pair_axis_or_neg1", SENTINEL, NUM_AXES - 1),
+    # The upper bound is ``pair_max_distance``, which pairs.py owns.
+    ("pair_distance", 1, None),
+    # §20.3 narrows this to the 377 nonempty classes; the table is the 378-row
+    # window pattern table either way.
+    ("pair_post2_pattern", 0, ALL_WINDOW_PATTERN_CLASSES - 1),
+    ("pair_evidence_kind", 0, None),
+    ("pair_src_is_current_legal", 0, 1),
+)
+
+# Fields whose values index another family: ``(field, row family, target
+# family, sentinel allowed)``. The row family is the family the field's rows
+# belong to, which is what makes the §26 cross-position check possible.
+_INDEX_FIELDS: tuple[tuple[str, str, str, bool], ...] = (
+    # The sentinel is the `occupied_only` cell scope of §29, whose node set
+    # holds no empty cell at all, so a legal action has no cell to point at and
+    # the model creates its action state after the trunk.
+    ("legal_to_cell_index", _LEGAL, _CELLS, True),
+    ("window_cell_index", _WINDOWS, _CELLS, True),
+    ("adjacency_src", _ADJACENCY, _CELLS, False),
+    ("adjacency_dst", _ADJACENCY, _CELLS, False),
+    ("radius_src", _RADIUS, _CELLS, False),
+    ("radius_dst", _RADIUS, _CELLS, False),
+    ("action_window_index", _LEGAL, _WINDOWS, True),
+    ("pair_dst_action", _PAIR, _LEGAL, False),
+    ("pair_src_action_or_neg1", _PAIR, _LEGAL, True),
+)
+
+# The packed batch's array fields, in spec §25 order. ``cell_qr`` and
+# ``window_id`` are builder metadata and stay out of the model's input (§7).
+_PACKED_ARRAYS: tuple[str, ...] = (
+    "cell_occupancy",
+    "cell_is_legal",
+    "cell_nearest_bucket",
+    "legal_to_cell_index",
+    "window_pattern_class",
+    "window_status",
+    "window_axis",
+    "window_numeric",
+    "window_cell_index",
+    "window_incidence_class",
+    "window_incidence_mask",
+    "adjacency_src",
+    "adjacency_dst",
+    "adjacency_axis",
+    "radius_src",
+    "radius_dst",
+    "radius_orbit",
+    "radius_axis_or_neg1",
+    "action_window_index",
+    "action_post1_class",
+    "action_pre_status",
+    "action_tactical_numeric",
+    "pair_dst_action",
+    "pair_src_action_or_neg1",
+    "pair_axis_or_neg1",
+    "pair_distance",
+    "pair_post2_pattern",
+    "pair_evidence_kind",
+    "pair_src_is_current_legal",
+)
+
+_INDEX_TARGETS = {name: (target, sentinel) for name, _, target, sentinel in _INDEX_FIELDS}
+
+
+def _lex_steps(columns: tuple[np.ndarray, ...]) -> tuple[np.ndarray, np.ndarray]:
+    """Compare consecutive rows of a lexicographic key, major column first.
+
+    Returns the ``(greater, equal)`` masks of each adjacent pair, so a caller
+    asks for strict ordering with ``greater`` and sorted order with
+    ``greater | equal``.
+    """
+    n = max(len(columns[0]) - 1, 0)
+    greater = np.zeros(n, dtype=bool)
+    equal = np.ones(n, dtype=bool)
+    for column in columns:
+        greater |= equal & (column[1:] > column[:-1])
+        equal &= column[1:] == column[:-1]
+    return greater, equal
+
+
+def _check_sorted(
+    what: str, key: str, columns: tuple[np.ndarray, ...], *, strict: bool
+) -> None:
+    """Refuse a family that is not in its §7 order, naming the first break."""
+    greater, equal = _lex_steps(columns)
+    ordered = greater if strict else greater | equal
+    if bool(ordered.all()):
+        return
+    row = int(np.flatnonzero(~ordered)[0]) + 1
+    before = tuple(int(column[row - 1]) for column in columns)
+    after = tuple(int(column[row]) for column in columns)
+    raise ValueError(
+        f"{what} must be sorted by {key}: row {row} is {after} after {before}"
+    )
+
+
+def _check_range(name: str, values: np.ndarray, low: int, high: int | None) -> None:
+    """Refuse a field carrying a value outside its fixed range."""
+    if values.size == 0:
+        return
+    if int(values.min()) < low:
+        flat = int(values.argmin())
+        raise ValueError(
+            f"{name} must be >= {low}: found {int(values.min())} at flat index {flat}"
+        )
+    if high is not None and int(values.max()) > high:
+        flat = int(values.argmax())
+        raise ValueError(
+            f"{name} must be <= {high}: found {int(values.max())} at flat index {flat}"
+        )
+
+
+def _to_global(name: str, index: np.ndarray, offset: int, *, sentinel: bool) -> np.ndarray:
+    """Shift one position's indices into the batch frame, keeping ``-1`` as ``-1``.
+
+    An offset sentinel reads as a genuine index into the preceding position's
+    slice — in range, wrongly typed, and invisible to every downstream shape and
+    dtype check. The two cases are therefore separate branches here rather than
+    one arithmetic expression, and this is the only place in the module that
+    adds an offset to an index.
+    """
+    if sentinel:
+        missing = index == SENTINEL
+        if index.size and int(index.min()) < SENTINEL:
+            flat = int(index.argmin())
+            raise ValueError(
+                f"{name} allows only {SENTINEL} as a sentinel: found "
+                f"{int(index.min())} at flat index {flat}"
+            )
+        return np.where(missing, SENTINEL, index + offset)
+    if index.size and int(index.min()) < 0:
+        flat = int(index.argmin())
+        raise ValueError(
+            f"{name} carries no sentinel: found {int(index.min())} at flat index {flat}"
+        )
+    return index + offset
+
+
+@dataclass(frozen=True)
+class ACTGraph:
+    """One position's node families and index tables, in numpy (§7, §25).
+
+    Every array is in this position's own frame. The family sizes are read off
+    the arrays rather than stored, so a graph cannot claim a count its tables
+    disagree with. ``cell_qr`` and ``window_id`` are builder metadata for dedup,
+    ordering, tests, and diagnostics; they never reach the model (§7).
+    """
+
+    # Cells (§8), sorted lexicographically by (q, r).
+    cell_qr: np.ndarray  # (n_cells, 2) metadata only
+    cell_occupancy: np.ndarray  # (n_cells,) 0 EMPTY / 1 OWN / 2 OPP
+    cell_is_legal: np.ndarray  # (n_cells,) 0/1
+    cell_is_occupied: np.ndarray  # (n_cells,) 0/1
+    cell_nearest_bucket: np.ndarray  # (n_cells,) clamped nearest-stone bucket
+    # Legal actions (§8.3), in engine order, never sorted. The index is -1
+    # throughout when the cell scope represents no empty cell (§29).
+    legal_to_cell_index: np.ndarray  # (n_legal,)
+    # Persistent windows (§9), sorted by (native_axis, start_q, start_r).
+    window_id: np.ndarray  # (n_windows, 3) metadata only
+    window_pattern_class: np.ndarray  # (n_windows,)
+    window_status: np.ndarray  # (n_windows,) EMPTY/OWN_LIVE/OPP_LIVE/MIXED
+    window_axis: np.ndarray  # (n_windows,) 0..2
+    window_numeric: np.ndarray  # (n_windows, F) float32 normalised counts/runs
+    # Cell<->window incidence (§10). The mask marks the slots whose cell the
+    # scope represents, so it is exactly ``window_cell_index >= 0``.
+    window_cell_index: np.ndarray  # (n_windows, 6), -1 outside the cell scope
+    window_incidence_class: np.ndarray  # (n_windows, 6), -1 where masked out
+    window_incidence_mask: np.ndarray  # (n_windows, 6) bool
+    # Local cell geometry (§15), sorted by (dst, src, relation).
+    adjacency_src: np.ndarray  # (e_adj,)
+    adjacency_dst: np.ndarray  # (e_adj,)
+    adjacency_axis: np.ndarray  # (e_adj,) structural undirected axis
+    radius_src: np.ndarray  # (e_rad,) occupied source
+    radius_dst: np.ndarray  # (e_rad,)
+    radius_orbit: np.ndarray  # (e_rad,) D6 displacement orbit
+    radius_axis_or_neg1: np.ndarray  # (e_rad,) axis route, -1 off-axis
+    # Counterfactual action rows (§19.2): 18 per legal action, dense.
+    action_window_index: np.ndarray  # (n_legal, 3, 6), -1 with no pre-action window
+    action_post1_class: np.ndarray  # (n_legal, 3, 6)
+    action_pre_status: np.ndarray  # (n_legal, 3, 6)
+    action_tactical_numeric: np.ndarray  # (n_legal, T) float32
+    # Same-turn pair evidence (§20.3), sorted by destination action.
+    pair_dst_action: np.ndarray  # (e_pair,)
+    pair_src_action_or_neg1: np.ndarray  # (e_pair,) -1 for a prospective partner
+    pair_axis_or_neg1: np.ndarray  # (e_pair,)
+    pair_distance: np.ndarray  # (e_pair,)
+    pair_post2_pattern: np.ndarray  # (e_pair,)
+    pair_evidence_kind: np.ndarray  # (e_pair,)
+    pair_src_is_current_legal: np.ndarray  # (e_pair,) 0/1
+    # Position scalars (§13).
+    global_numeric: np.ndarray  # (G,) float32
+    moves_remaining: int  # 1 or 2
+    phase_id: int  # OPENING / FIRST / SECOND
+
+    @property
+    def n_cells(self) -> int:
+        return len(self.cell_occupancy)
+
+    @property
+    def n_windows(self) -> int:
+        return len(self.window_pattern_class)
+
+    @property
+    def n_legal(self) -> int:
+        return len(self.legal_to_cell_index)
+
+    @property
+    def n_adjacency(self) -> int:
+        return len(self.adjacency_src)
+
+    @property
+    def n_radius(self) -> int:
+        return len(self.radius_src)
+
+    @property
+    def n_pair(self) -> int:
+        return len(self.pair_dst_action)
+
+    def family_sizes(self) -> dict[str, int]:
+        """Each node family's size, as the index tables must respect it."""
+        return {family: len(getattr(self, field)) for family, field in _FAMILY_SIZED_BY.items()}
+
+    def validate(self) -> None:
+        """Refuse a graph that violates §7 ordering, a shape, or an index bound.
+
+        Builders call this before returning. It raises ``TypeError`` for a wrong
+        container or dtype and ``ValueError`` for everything else, always naming
+        the field and the offending value.
+        """
+        sizes = self.family_sizes()
+
+        for name, dtype, shape in _GRAPH_ARRAYS:
+            array = getattr(self, name)
+            if not isinstance(array, np.ndarray):
+                raise TypeError(f"{name} must be a numpy array, got {type(array).__name__}")
+            if array.dtype != dtype:
+                raise TypeError(f"{name} must be {np.dtype(dtype)}, got {array.dtype}")
+            expected = tuple(sizes[e] if isinstance(e, str) else e for e in shape)
+            if len(array.shape) != len(expected) or any(
+                e is not None and a != e for a, e in zip(array.shape, expected)
+            ):
+                shown = tuple("*" if e is None else e for e in expected)
+                raise ValueError(f"{name} must have shape {shown}, got {array.shape}")
+
+        for name, low, high in _VALUE_RANGES:
+            _check_range(name, getattr(self, name), low, high)
+
+        # A sentinel-bearing field's floor is the sentinel itself, so the same
+        # range check refuses both an out-of-range target and a stray negative
+        # that is not the sentinel.
+        for name, _row_family, target, sentinel in _INDEX_FIELDS:
+            _check_range(
+                name, getattr(self, name), SENTINEL if sentinel else 0, sizes[target] - 1
+            )
+
+        self._check_ordering()
+        self._check_consistency()
+
+    def _check_ordering(self) -> None:
+        """The §7 orders: node families strictly, edges non-strictly."""
+        _check_sorted("cell nodes", "(q, r)", tuple(self.cell_qr.T), strict=True)
+        _check_sorted(
+            "persistent windows",
+            "(native_axis, start_q, start_r)",
+            tuple(self.window_id.T),
+            strict=True,
+        )
+        _check_sorted(
+            "cell adjacency edges",
+            "(dst, src, axis)",
+            (self.adjacency_dst, self.adjacency_src, self.adjacency_axis),
+            strict=False,
+        )
+        _check_sorted(
+            "occupied radius edges",
+            "(dst, src, orbit)",
+            (self.radius_dst, self.radius_src, self.radius_orbit),
+            strict=False,
+        )
+        # The rest of the §7 pair key — partner coordinate and window identity —
+        # is not carried on the row, so only its leading component is checkable
+        # here; pairs.py owns the remainder.
+        _check_sorted(
+            "pair evidence rows",
+            "dst_action",
+            (self.pair_dst_action,),
+            strict=False,
+        )
+
+    def _check_consistency(self) -> None:
+        """Agreements between fields that describe the same fact twice."""
+        occupied = self.cell_occupancy != 0
+        if not np.array_equal(self.cell_is_occupied.astype(bool), occupied):
+            bad = int(np.flatnonzero(self.cell_is_occupied.astype(bool) != occupied)[0])
+            raise ValueError(
+                f"cell_is_occupied disagrees with cell_occupancy at cell {bad}: "
+                f"{int(self.cell_is_occupied[bad])} against occupancy "
+                f"{int(self.cell_occupancy[bad])}"
+            )
+        both = np.flatnonzero((self.cell_is_legal != 0) & occupied)
+        if both.size:
+            raise ValueError(f"cell {int(both[0])} is both legal and occupied")
+        # A cell scope either represents every legal cell or none of them: a
+        # legal cell is empty, so `occupied_only` omits all of them and the
+        # other two hold all of them. A mixture is a half-built node set, which
+        # would leave some actions with a state and some without.
+        named = self.legal_to_cell_index >= 0
+        if named.any() and not named.all():
+            bad = int(np.flatnonzero(~named)[0])
+            raise ValueError(
+                f"legal action {bad} has no cell node while others do: a cell "
+                "scope holds either every legal cell or none of them"
+            )
+        if int(self.cell_is_legal.sum()) != int(named.sum()):
+            raise ValueError(
+                f"{int(self.cell_is_legal.sum())} cells are flagged legal but "
+                f"legal_to_cell_index names {int(named.sum())}"
+            )
+        if named.all() and self.n_legal:
+            if len(np.unique(self.legal_to_cell_index)) != self.n_legal:
+                raise ValueError("legal_to_cell_index must name each legal cell once")
+            if not bool(np.all(self.cell_is_legal[self.legal_to_cell_index])):
+                bad = int(np.flatnonzero(self.cell_is_legal[self.legal_to_cell_index] == 0)[0])
+                raise ValueError(
+                    f"legal action {bad} maps to cell "
+                    f"{int(self.legal_to_cell_index[bad])}, which is not flagged legal"
+                )
+
+        represented = self.window_cell_index >= 0
+        if not np.array_equal(self.window_incidence_mask, represented):
+            row, slot = (self.window_incidence_mask != represented).nonzero()
+            raise ValueError(
+                f"window_incidence_mask disagrees with window_cell_index at "
+                f"window {int(row[0])} slot {int(slot[0])}: mask "
+                f"{bool(self.window_incidence_mask[row[0], slot[0]])} against cell "
+                f"index {int(self.window_cell_index[row[0], slot[0]])}"
+            )
+        unclassed = represented & (self.window_incidence_class < 0)
+        if unclassed.any():
+            rows, slots = unclassed.nonzero()
+            row, slot = int(rows[0]), int(slots[0])
+            raise ValueError(
+                f"window_incidence_class is {int(self.window_incidence_class[row, slot])} "
+                f"at represented window {row} slot {slot}"
+            )
+        _check_range(
+            "window_incidence_class",
+            self.window_incidence_class,
+            SENTINEL,
+            ALL_CELL_WINDOW_REL_CLASSES - 1,
+        )
+
+        if self.moves_remaining not in (1, 2):
+            raise ValueError(f"moves_remaining must be 1 or 2, got {self.moves_remaining}")
+        if self.phase_id not in (PHASE_OPENING, PHASE_FIRST, PHASE_SECOND):
+            raise ValueError(f"phase_id must be 0, 1, or 2, got {self.phase_id}")
+        if (self.phase_id == PHASE_FIRST) != (self.moves_remaining == 2):
+            raise ValueError(
+                f"phase_id {self.phase_id} disagrees with moves_remaining "
+                f"{self.moves_remaining} (§13.1: FIRST means two placements remain)"
+            )
+        stones = int(self.cell_is_occupied.sum())
+        if self.phase_id == PHASE_OPENING and stones:
+            raise ValueError(f"OPENING phase with {stones} occupied cells")
+        if self.phase_id == PHASE_SECOND and not stones:
+            raise ValueError("SECOND phase with an empty board")
+
+
+@dataclass
+class PackedACTBatch:
+    """Many positions' graphs concatenated into one model input (§25, §26).
+
+    Node families are concatenated in graph order and every index is shifted
+    into the batch frame, so no edge crosses a position. The ``(P + 1,)`` CSR
+    offsets give each family's per-position slice; nothing in the forward
+    rediscovers a segment boundary.
+    """
+
+    position_count: int
+    cell_offsets: torch.Tensor  # (P + 1,) long
+    window_offsets: torch.Tensor
+    legal_offsets: torch.Tensor
+    adjacency_offsets: torch.Tensor
+    radius_offsets: torch.Tensor
+    pair_offsets: torch.Tensor
+
+    cell_occupancy: torch.Tensor  # (N_cells,) long
+    cell_is_legal: torch.Tensor
+    cell_nearest_bucket: torch.Tensor
+    legal_to_cell_index: torch.Tensor  # (N_legal,) global cell index
+
+    window_pattern_class: torch.Tensor  # (N_win,) long
+    window_status: torch.Tensor
+    window_axis: torch.Tensor
+    window_numeric: torch.Tensor  # (N_win, F) float32
+    window_cell_index: torch.Tensor  # (N_win, 6) global cell index, -1 allowed
+    window_incidence_class: torch.Tensor  # (N_win, 6)
+    window_incidence_mask: torch.Tensor  # (N_win, 6) bool
+
+    adjacency_src: torch.Tensor  # (E_adj,) global cell index
+    adjacency_dst: torch.Tensor
+    adjacency_axis: torch.Tensor
+
+    radius_src: torch.Tensor  # (E_rad,) global cell index
+    radius_dst: torch.Tensor
+    radius_orbit: torch.Tensor
+    radius_axis_or_neg1: torch.Tensor
+
+    action_window_index: torch.Tensor  # (N_legal, 3, 6) global window index, -1 allowed
+    action_post1_class: torch.Tensor
+    action_pre_status: torch.Tensor
+    action_tactical_numeric: torch.Tensor  # (N_legal, T) float32
+
+    pair_dst_action: torch.Tensor  # (E_pair,) global legal index
+    pair_src_action_or_neg1: torch.Tensor  # (E_pair,) global legal index, -1 allowed
+    pair_axis_or_neg1: torch.Tensor
+    pair_distance: torch.Tensor
+    pair_post2_pattern: torch.Tensor
+    pair_evidence_kind: torch.Tensor
+    pair_src_is_current_legal: torch.Tensor
+
+    phase_id: torch.Tensor  # (P,) long
+    moves_remaining: torch.Tensor  # (P,) long
+    global_numeric: torch.Tensor  # (P, G) float32
+
+    def to(self, device) -> "PackedACTBatch":
+        """The same batch with every tensor on ``device``."""
+        moved = {
+            name: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
+            for name, v in vars(self).items()
+        }
+        return PackedACTBatch(**moved)
+
+    def pin_memory(self) -> "PackedACTBatch":
+        """The same batch in pinned host memory, so ``to`` is a true async DMA.
+
+        ``non_blocking`` silently degrades to a synchronous staged copy from
+        pageable memory; a prefetch worker pins ahead of the transfer instead.
+        """
+        pinned = {
+            name: (v.pin_memory() if isinstance(v, torch.Tensor) else v)
+            for name, v in vars(self).items()
+        }
+        return PackedACTBatch(**pinned)
+
+
+def _offsets(counts: np.ndarray) -> np.ndarray:
+    """A family's ``(P + 1,)`` CSR offsets from its per-position counts."""
+    return np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
+
+
+def _row_positions(offsets: np.ndarray) -> np.ndarray:
+    """The position owning each row of a family."""
+    return np.repeat(np.arange(len(offsets) - 1, dtype=np.int64), np.diff(offsets))
+
+
+def _refuse_crossing(
+    name: str, index: np.ndarray, row_positions: np.ndarray, target_offsets: np.ndarray
+) -> None:
+    """Refuse an index whose target lies in another position (§26, §30.18).
+
+    The check re-derives each endpoint's position from the collated offsets
+    rather than trusting the shift that produced it, so a per-position index
+    that was already out of its own family's range — the way an edge crosses a
+    position in practice — is caught here instead of aliasing silently onto a
+    neighbour's node.
+    """
+    flat = index.reshape(len(row_positions), -1) if index.ndim > 1 else index[:, None]
+    live = flat >= 0
+    target_positions = np.searchsorted(target_offsets, flat, side="right") - 1
+    crossing = live & (target_positions != row_positions[:, None])
+    if not crossing.any():
+        return
+    rows, columns = crossing.nonzero()
+    row, column = int(rows[0]), int(columns[0])
+    raise ValueError(
+        f"{name} crosses a batch position: row {row} of position "
+        f"{int(row_positions[row])} points at {int(flat[row, column])}, which is "
+        f"in position {int(target_positions[row, column])}"
+    )
+
+
+def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
+    """Concatenate position graphs into one packed batch (§25, §26).
+
+    Every index is shifted by its target family's offset, ``-1`` sentinels are
+    preserved, and every shifted index is checked to land inside its own
+    position. Graphs are assumed to have passed ``ACTGraph.validate``; the
+    cross-position check is re-derived here because concatenation is the one
+    step that can turn an out-of-range index into a plausible one.
+    """
+    if not graphs:
+        raise ValueError("empty batch: collate needs at least one position")
+
+    counts = {
+        family: np.array([len(getattr(g, field)) for g in graphs], dtype=np.int64)
+        for family, field in _FAMILY_SIZED_BY.items()
+    }
+    offsets = {family: _offsets(count) for family, count in counts.items()}
+
+    packed: dict[str, torch.Tensor] = {}
+    for name in _PACKED_ARRAYS:
+        target = _INDEX_TARGETS.get(name)
+        parts = []
+        for i, graph in enumerate(graphs):
+            array = getattr(graph, name)
+            if target is not None:
+                family, sentinel = target
+                array = _to_global(name, array, int(offsets[family][i]), sentinel=sentinel)
+            parts.append(array)
+        widths = {part.shape[1:] for part in parts}
+        if len(widths) != 1:
+            raise ValueError(
+                f"{name} has inconsistent feature widths across positions: {widths}"
+            )
+        packed[name] = torch.from_numpy(np.ascontiguousarray(np.concatenate(parts)))
+
+    for name, row_family, target_family, _sentinel in _INDEX_FIELDS:
+        _refuse_crossing(
+            name,
+            packed[name].numpy(),
+            _row_positions(offsets[row_family]),
+            offsets[target_family],
+        )
+
+    global_numeric = np.stack([g.global_numeric for g in graphs])
+    return PackedACTBatch(
+        position_count=len(graphs),
+        cell_offsets=torch.from_numpy(offsets[_CELLS]),
+        window_offsets=torch.from_numpy(offsets[_WINDOWS]),
+        legal_offsets=torch.from_numpy(offsets[_LEGAL]),
+        adjacency_offsets=torch.from_numpy(offsets[_ADJACENCY]),
+        radius_offsets=torch.from_numpy(offsets[_RADIUS]),
+        pair_offsets=torch.from_numpy(offsets[_PAIR]),
+        phase_id=torch.tensor([g.phase_id for g in graphs], dtype=torch.long),
+        moves_remaining=torch.tensor([g.moves_remaining for g in graphs], dtype=torch.long),
+        global_numeric=torch.from_numpy(np.ascontiguousarray(global_numeric)),
+        **packed,
+    )
+
+
+def _segment_counts(offsets: torch.Tensor) -> torch.Tensor:
+    """Per-position row counts of a CSR family."""
+    return offsets[1:] - offsets[:-1]
+
+
+def _segment_sums(offsets: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+    """Per-position sums of a per-row integer quantity."""
+    positions = torch.repeat_interleave(
+        torch.arange(len(offsets) - 1, device=offsets.device), _segment_counts(offsets)
+    )
+    return torch.zeros(len(offsets) - 1, dtype=torch.long, device=offsets.device).index_add_(
+        0, positions, values.long()
+    )
+
+
+def telemetry(batch: PackedACTBatch) -> dict[str, float]:
+    """Per-position mean and max of every §26/§34 packer quantity.
+
+    One pass of segment reductions over the batch's own tensors: exact integer
+    counts, no sampling and no host-side loop over rows. Downstream stages set
+    packer limits from these, so every number is the quantity itself rather than
+    a proxy for it.
+    """
+    windows = _segment_counts(batch.window_offsets)
+    legal = _segment_counts(batch.legal_offsets)
+    quantities = {
+        "cells": _segment_counts(batch.cell_offsets),
+        "windows": windows,
+        "legal_actions": legal,
+        "window_incidences": _segment_sums(
+            batch.window_offsets, batch.window_incidence_mask.sum(dim=1)
+        ),
+        "adjacency_edges": _segment_counts(batch.adjacency_offsets),
+        "radius_edges": _segment_counts(batch.radius_offsets),
+        "pair_rows": _segment_counts(batch.pair_offsets),
+        # Prospective partners are the pair rows whose source cell is not in the
+        # current legal set (§20.2), which is what the second scope adds.
+        "prospective_pair_rows": _segment_sums(
+            batch.pair_offsets, batch.pair_src_is_current_legal == 0
+        ),
+        # Dense by construction: 18 rows per legal action (§19.2).
+        "post_action_rows": legal * POST_ACTION_ROWS,
+    }
+    for status, label in WINDOW_STATUS_NAMES.items():
+        quantities[f"windows_{label}"] = _segment_sums(
+            batch.window_offsets, batch.window_status == status
+        )
+
+    stats: dict[str, float] = {"positions": float(batch.position_count)}
+    for name, counts in quantities.items():
+        stats[f"{name}_mean"] = float(counts.double().mean().item())
+        stats[f"{name}_max"] = float(counts.max().item())
+    return stats

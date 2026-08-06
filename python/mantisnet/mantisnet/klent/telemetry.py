@@ -31,6 +31,10 @@ from pathlib import Path
 
 import numpy as np
 
+# The board's twelve symmetries have one definition; the opening atlas only
+# applies them.
+from ..d6 import D6_TRANSFORMS
+
 # Covers every table, column, and packing below; mismatches are refused on open.
 SCHEMA_VERSION = 3
 
@@ -230,33 +234,6 @@ def unpack_moves(blob: bytes) -> list[tuple[int, int]]:
 
 # --------------------------------------------------------------------------
 # The board's symmetries, for opening aggregation
-
-
-def _d6_transforms():
-    """The 12 symmetries of the board as maps on ``(q, r)``; index 0 is the
-    identity.
-
-    Generators are the 60-degree rotation ``(q, r) -> (-r, q + r)`` and the
-    reflection ``(q, r) -> (r, q)``. Both permute the three window axes and
-    preserve hex distance, legality, and winner.
-    """
-
-    def rot(m):
-        return (-m[1], m[0] + m[1])
-
-    def ref(m):
-        return (m[1], m[0])
-
-    out = []
-    for base in (lambda m: m, ref):
-        f = base
-        for _ in range(6):
-            out.append(f)
-            f = (lambda g: lambda m: rot(g(m)))(f)
-    return out
-
-
-D6_TRANSFORMS = _d6_transforms()
 
 
 def canonical_opening(moves, plies: int | None = None) -> tuple:
