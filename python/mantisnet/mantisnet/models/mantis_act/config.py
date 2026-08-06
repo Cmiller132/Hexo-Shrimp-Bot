@@ -21,11 +21,8 @@ general:
 - axis channels exist exactly when ``d_axis > 0``, and axis latents need them;
 - action-set latents exist exactly when ``num_action_latents > 0``, and
   ``global_mode="none"`` zeroes every latent count;
-- pair messages are enabled exactly when ``pair_scope`` is not ``"none"``;
 - ``occupied_radius <= d_max``: past ``d_max`` a displacement has no orbit
-  class to carry, and the sparse paths emit no such edge (§11.2);
-- ``pair_max_distance <= 5``: two cells further apart than a window's span
-  share no six-cell window, so no pair evidence row could exist (§20.3).
+  class to carry, and the sparse paths emit no such edge (§11.2).
 
 ``architecture_hash`` digests every field except ``dropout`` — under §28 that
 is exactly the set changing a node set, a relation's meaning, a tensor shape,
@@ -42,10 +39,6 @@ from dataclasses import dataclass, fields, replace
 ARCHITECTURE_ID = "mantis_act_v4"
 MANTIS_ACT_REPR_VERSION = 4
 
-# A window spans five steps, so two cells more than five apart lie in no
-# common window and can carry no pair evidence.
-MAX_PAIR_DISTANCE = 5
-
 # The allowed values of every enum-valued field. `architecture_id` is a
 # one-value vocabulary: §28 fixes the id, and a config claiming another
 # architecture would load into this model under a name it does not implement.
@@ -58,14 +51,6 @@ ENUM_VOCABULARIES: dict[str, frozenset[str]] = {
     "incidence_reduce": frozenset({"sum", "mean", "attention"}),
     "global_mode": frozenset({"latents", "none"}),
     "window_window_mode": frozenset({"none", "typed_collinear_crossing"}),
-    "pair_scope": frozenset(
-        {
-            "none",
-            "current_legal_collinear",
-            "post_action_collinear",
-            "post_action_tactical",
-        }
-    ),
     "phase_conditioning": frozenset({"token_only", "film"}),
     "head_separation": frozenset(
         {"single_shared_head", "separate_output_mlps", "private_adapters"}
@@ -106,9 +91,8 @@ class MantisACTConfig:
     windows, window-and-legal cells, axis channels, orbit48 geometry to
     radius 12, relation-gated incidence, four invariant and two axis state
     latents, two action latents, the 18-window counterfactual action encoder,
-    post-action collinear partners, phase FiLM, private policy and critic
-    adapters, the categorical three-class critic, no typed window attention,
-    and no state-value head.
+    phase FiLM, private policy and critic adapters, the categorical three-class
+    critic, no typed window attention, and no state-value head.
     """
 
     architecture_id: str = ARCHITECTURE_ID
@@ -157,9 +141,6 @@ class MantisACTConfig:
 
     # Action modeling
     use_counterfactual_action_windows: bool = True
-    use_action_pair_messages: bool = True
-    pair_scope: str = "post_action_collinear"
-    pair_max_distance: int = MAX_PAIR_DISTANCE
     use_action_set_latents: bool = True
 
     # Phase
@@ -234,12 +215,6 @@ class MantisACTConfig:
                 f"with num_action_latents={self.num_action_latents}: the read and "
                 f"broadcast exist exactly when there are action latents"
             )
-        if self.use_action_pair_messages != (self.pair_scope != "none"):
-            raise ValueError(
-                f"use_action_pair_messages={self.use_action_pair_messages} "
-                f"disagrees with pair_scope={self.pair_scope!r}: partner messages "
-                f'are enabled exactly when the scope is not "none"'
-            )
 
         # An edge past d_max has no orbit class to carry (§11.2).
         if self.occupied_radius > self.d_max:
@@ -252,24 +227,15 @@ class MantisACTConfig:
                 f"occupied_radius={self.occupied_radius} emits no edge; disable "
                 f"use_occupied_radius_edges instead"
             )
-        if not 1 <= self.pair_max_distance <= MAX_PAIR_DISTANCE:
-            raise ValueError(
-                f"pair_max_distance={self.pair_max_distance} must lie in "
-                f"1..{MAX_PAIR_DISTANCE}: cells further apart share no window"
-            )
 
 
 # Every preset of §29 as a delta from `full_act_v4`, so each ablation's intent
-# is its entry. A delta carries the partner fields the invariants demand —
-# turning a component off means removing its parameters, not orphaning them.
+# is its entry. A delta carries every field the invariants tie to the one it
+# names — turning a component off means removing its parameters, not orphaning
+# them.
 PRESET_DELTAS: dict[str, dict[str, object]] = {
     # The full model: §6's defaults are exactly §29's full_act_v4 list.
     "full_act_v4": {},
-    # Same-turn partner evidence off entirely (§20.5).
-    "full_no_pair": {
-        "use_action_pair_messages": False,
-        "pair_scope": "none",
-    },
     # Line direction carried by invariant features alone; no axis parameters
     # are retained (§29).
     "full_no_axis": {
@@ -407,16 +373,7 @@ _SUMMARY_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
             "window_window_mode",
         ),
     ),
-    (
-        "actions",
-        (
-            "use_counterfactual_action_windows",
-            "use_action_pair_messages",
-            "pair_scope",
-            "pair_max_distance",
-            "use_action_set_latents",
-        ),
-    ),
+    ("actions", ("use_counterfactual_action_windows", "use_action_set_latents")),
     ("phase", ("phase_conditioning", "use_three_way_phase")),
     (
         "heads",

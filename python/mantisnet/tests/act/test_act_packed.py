@@ -30,7 +30,7 @@ def _int(*values) -> np.ndarray:
 
 
 def graph_a(**overrides) -> ACTGraph:
-    """Four cells, two windows, two legal actions, three pair rows.
+    """Four cells, two windows, and two legal actions.
 
     Own stone at (0, 0), opponent at (1, 0); the two empty cells are legal. The
     windows are the Q line and the R line through the origin, each represented
@@ -69,13 +69,6 @@ def graph_a(**overrides) -> ACTGraph:
         action_post1_class=np.arange(36, dtype=np.int64).reshape(2, 3, 6),
         action_pre_status=np.zeros((2, 3, 6), dtype=np.int64),
         action_tactical_numeric=np.zeros((2, 4), dtype=np.float32),
-        pair_dst_action=_int(0, 0, 1),
-        pair_src_action_or_neg1=_int(-1, 1, 0),
-        pair_axis_or_neg1=_int(0, 1, -1),
-        pair_distance=_int(1, 2, 3),
-        pair_post2_pattern=_int(10, 11, 12),
-        pair_evidence_kind=_int(0, 1, 0),
-        pair_src_is_current_legal=_int(0, 1, 1),
         global_numeric=np.zeros(5, dtype=np.float32),
         moves_remaining=2,
         phase_id=PHASE_FIRST,
@@ -89,7 +82,7 @@ def graph_a(**overrides) -> ACTGraph:
 
 
 def graph_b(**overrides) -> ACTGraph:
-    """Three cells, one window, two legal actions, and no pair rows at all."""
+    """Three cells, one window, and two legal actions."""
     fields = dict(
         cell_qr=np.array([[0, 0], [0, 1], [2, 3]], dtype=np.int64),
         cell_occupancy=_int(2, 0, 0),
@@ -118,13 +111,6 @@ def graph_b(**overrides) -> ACTGraph:
         action_post1_class=np.arange(36, dtype=np.int64).reshape(2, 3, 6),
         action_pre_status=np.zeros((2, 3, 6), dtype=np.int64),
         action_tactical_numeric=np.zeros((2, 4), dtype=np.float32),
-        pair_dst_action=np.empty(0, dtype=np.int64),
-        pair_src_action_or_neg1=np.empty(0, dtype=np.int64),
-        pair_axis_or_neg1=np.empty(0, dtype=np.int64),
-        pair_distance=np.empty(0, dtype=np.int64),
-        pair_post2_pattern=np.empty(0, dtype=np.int64),
-        pair_evidence_kind=np.empty(0, dtype=np.int64),
-        pair_src_is_current_legal=np.empty(0, dtype=np.int64),
         global_numeric=np.zeros(5, dtype=np.float32),
         moves_remaining=1,
         phase_id=PHASE_SECOND,
@@ -149,14 +135,13 @@ def test_hand_built_graphs_are_valid():
 def test_counts_come_from_the_arrays():
     graph = graph_a()
     assert (graph.n_cells, graph.n_windows, graph.n_legal) == (4, 2, 2)
-    assert (graph.n_adjacency, graph.n_radius, graph.n_pair) == (4, 4, 3)
+    assert (graph.n_adjacency, graph.n_radius) == (4, 4)
     assert graph.family_sizes() == {
         "cells": 4,
         "windows": 2,
         "legal": 2,
         "adjacency": 4,
         "radius": 4,
-        "pair": 3,
     }
 
 
@@ -191,7 +176,6 @@ def test_counts_come_from_the_arrays():
             {"radius_src": _int(0, 0, 2, 2), "radius_orbit": _int(1, 0, 2, 3)},
             "occupied radius edges must be sorted",
         ),
-        ({"pair_dst_action": _int(1, 0, 0)}, "pair evidence rows must be sorted"),
     ],
 )
 def test_validate_rejects_each_ordering_violation(overrides, message):
@@ -216,16 +200,6 @@ def test_validate_rejects_each_ordering_violation(overrides, message):
             {"action_window_index": np.full((2, 3, 6), 2, dtype=np.int64)},
             r"action_window_index must be <= 1",
         ),
-        ({"pair_dst_action": _int(0, 0, 2)}, r"pair_dst_action must be <= 1"),
-        (
-            {"pair_src_action_or_neg1": _int(-1, 1, 5)},
-            r"pair_src_action_or_neg1 must be <= 1",
-        ),
-        ({"pair_dst_action": _int(-1, 0, 1)}, r"pair_dst_action must be >= 0"),
-        (
-            {"pair_src_action_or_neg1": _int(-2, 1, 0)},
-            r"pair_src_action_or_neg1 must be >= -1",
-        ),
         (
             {"window_cell_index": np.full((2, 6), -2, dtype=np.int64)},
             r"window_cell_index must be >= -1",
@@ -247,15 +221,8 @@ def test_validate_rejects_each_out_of_bounds_index(overrides, message):
         ({"window_axis": _int(3, 1)}, r"window_axis must be <= 2"),
         ({"adjacency_axis": _int(1, 0, 1, 3)}, r"adjacency_axis must be <= 2"),
         ({"radius_axis_or_neg1": _int(1, -2, -1, 2)}, r"radius_axis_or_neg1 must be >= -1"),
-        ({"pair_axis_or_neg1": _int(0, 3, -1)}, r"pair_axis_or_neg1 must be <= 2"),
-        ({"pair_distance": _int(0, 2, 3)}, r"pair_distance must be >= 1"),
-        (
-            {"pair_src_is_current_legal": _int(0, 1, 2)},
-            r"pair_src_is_current_legal must be <= 1",
-        ),
         # Class codes are bounded by the tables they index into.
         ({"window_pattern_class": _int(378, 7)}, r"window_pattern_class must be <= 377"),
-        ({"pair_post2_pattern": _int(10, 378, 12)}, r"pair_post2_pattern must be <= 377"),
         (
             {
                 "action_post1_class": replaced(
@@ -346,13 +313,12 @@ def test_collate_offsets_are_the_cumulative_counts():
     assert batch.legal_offsets.tolist() == [0, 2, 4]
     assert batch.adjacency_offsets.tolist() == [0, 4, 6]
     assert batch.radius_offsets.tolist() == [0, 4, 5]
-    assert batch.pair_offsets.tolist() == [0, 3, 3]
 
 
 def test_collate_shifts_every_index_into_the_global_frame():
     a, b = graph_a(), graph_b()
     batch = collate([a, b])
-    cell_offset, window_offset, legal_offset = 4, 2, 2
+    cell_offset, window_offset = 4, 2
 
     assert batch.legal_to_cell_index.tolist() == [3, 1, 1 + cell_offset, 2 + cell_offset]
     assert batch.adjacency_dst.tolist() == [0, 0, 1, 2, 0 + cell_offset, 1 + cell_offset]
@@ -361,14 +327,11 @@ def test_collate_shifts_every_index_into_the_global_frame():
     assert batch.radius_src.tolist() == [0, 2, 0, 2, 0 + cell_offset]
     assert batch.window_cell_index[2].tolist() == [0 + cell_offset, -1, -1, -1, -1, -1]
     assert int(batch.action_window_index[2, 2, 3]) == 0 + window_offset
-    assert batch.pair_dst_action.tolist() == a.pair_dst_action.tolist()
-    assert batch.pair_src_action_or_neg1.tolist() == [-1, 1, 0]
 
-    # The second position's pair family is empty, so its rows cannot mask an
-    # unshifted first position; add a third copy of A to shift real pair rows.
+    # A third position's indices shift by the running total, not by one
+    # position's counts.
     three = collate([b, a, a])
-    assert three.pair_dst_action.tolist() == [2, 2, 3, 4, 4, 5]
-    assert three.pair_src_action_or_neg1.tolist() == [-1, 3, 2, -1, 5, 4]
+    assert three.legal_to_cell_index.tolist() == [1, 2, 6, 4, 10, 8]
 
 
 def test_collate_preserves_minus_one_sentinels():
@@ -377,7 +340,7 @@ def test_collate_preserves_minus_one_sentinels():
     batch = collate([graph_b(), graph_a()])
     a = graph_a()
 
-    for name in ("window_cell_index", "action_window_index", "pair_src_action_or_neg1"):
+    for name in ("window_cell_index", "action_window_index"):
         packed = getattr(batch, name).numpy()
         original = getattr(a, name)
         assert int((packed == -1).sum()) == int(
@@ -391,7 +354,6 @@ def test_collate_preserves_minus_one_sentinels():
     assert batch.window_cell_index[2].tolist() == [3, 4, -1, -1, -1, -1]
     assert int(batch.action_window_index[2, 0, 0]) == 1
     assert int(batch.action_window_index[2, 0, 1]) == -1
-    assert batch.pair_src_action_or_neg1.tolist() == [-1, 3, 2]
 
 
 def test_no_index_crosses_a_batch_position():
@@ -403,7 +365,6 @@ def test_no_index_crosses_a_batch_position():
         "legal": batch.legal_offsets.numpy(),
         "adjacency": batch.adjacency_offsets.numpy(),
         "radius": batch.radius_offsets.numpy(),
-        "pair": batch.pair_offsets.numpy(),
     }
 
     def owner(family, index):
@@ -421,8 +382,6 @@ def test_no_index_crosses_a_batch_position():
         ("radius_src", "radius", "cells"),
         ("radius_dst", "radius", "cells"),
         ("action_window_index", "legal", "windows"),
-        ("pair_dst_action", "pair", "legal"),
-        ("pair_src_action_or_neg1", "pair", "legal"),
     ]
     for name, row_family, target_family in checks:
         values = getattr(batch, name).numpy().reshape(len(rows(row_family)), -1)
@@ -444,10 +403,6 @@ def test_no_index_crosses_a_batch_position():
         (
             [graph_a(radius_src=_int(0, 2, 0, 4)), graph_b()],
             r"radius_src crosses a batch position",
-        ),
-        (
-            [graph_a(pair_dst_action=_int(0, 0, 2)), graph_b()],
-            r"pair_dst_action crosses a batch position",
         ),
         (
             [
@@ -514,7 +469,6 @@ def test_packed_batch_carries_every_spec_field():
         "legal_offsets",
         "adjacency_offsets",
         "radius_offsets",
-        "pair_offsets",
         "cell_occupancy",
         "cell_is_legal",
         "cell_nearest_bucket",
@@ -537,13 +491,6 @@ def test_packed_batch_carries_every_spec_field():
         "action_post1_class",
         "action_pre_status",
         "action_tactical_numeric",
-        "pair_dst_action",
-        "pair_src_action_or_neg1",
-        "pair_axis_or_neg1",
-        "pair_distance",
-        "pair_post2_pattern",
-        "pair_evidence_kind",
-        "pair_src_is_current_legal",
         "phase_id",
         "moves_remaining",
         "global_numeric",
@@ -586,10 +533,6 @@ def test_telemetry_counts_every_budget_exactly():
             "adjacency_edges_max": 4.0,
             "radius_edges_mean": 2.5,
             "radius_edges_max": 4.0,
-            "pair_rows_mean": 1.5,
-            "pair_rows_max": 3.0,
-            "prospective_pair_rows_mean": 0.5,
-            "prospective_pair_rows_max": 1.0,
             "post_action_rows_mean": float(2 * POST_ACTION_ROWS),
             "post_action_rows_max": float(2 * POST_ACTION_ROWS),
             "windows_empty_mean": 0.0,

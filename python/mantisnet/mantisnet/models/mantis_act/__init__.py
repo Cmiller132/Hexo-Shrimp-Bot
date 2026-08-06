@@ -17,8 +17,7 @@ join — three axes by six candidate slots — evaluated counterfactually rather
 than looked up. Cells and windows are joined by an exact joint relation class
 of ``(pattern, slot)``; cells are joined to each other by hex adjacency and by
 displacement edges from every stone within radius twelve, typed by the 48
-exact D6 orbits of that displacement. Same-turn partners add evidence rows to a
-first placement, including cells that only become legal once it lands.
+exact D6 orbits of that displacement.
 
 How that differs from MantisNet at the representation level:
 

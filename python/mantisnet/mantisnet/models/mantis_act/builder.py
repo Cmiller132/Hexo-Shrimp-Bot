@@ -1,11 +1,11 @@
 """The MantisNet-ACT builder: one position to a graph, many to a packed batch.
 
 This module is orchestration and nothing else. Every table it returns comes
-from one of the four representation modules — ``windows``, ``cells``,
-``actions``, ``pairs`` — and its own work is the order they run in, the three
-position-level quantities none of them owns (§13.1's phase, §13.3's global
-scalars, and ``moves_remaining``), and the refusals that belong to the stage as
-a whole rather than to any one part of it.
+from one of the three representation modules — ``windows``, ``cells``,
+``actions`` — and its own work is the order they run in, the three position-level
+quantities none of them owns (§13.1's phase, §13.3's global scalars, and
+``moves_remaining``), and the refusals that belong to the stage as a whole rather
+than to any one part of it.
 
 Index conventions this module fixes:
 
@@ -62,7 +62,6 @@ from .packed import (
     PackedACTBatch,
     collate,
 )
-from .pairs import pair_rows
 from .pattern_classes import MIXED, OPP_LIVE, OWN_LIVE
 from .windows import enumerate_windows
 
@@ -194,16 +193,6 @@ def build_from_arrays(
         else _empty_edges(4)
     )
     tables = action_tables(window_set, stone_qr, stone_own, legal_qr, cfg)
-    rows = pair_rows(
-        window_set,
-        cell_set,
-        stone_qr,
-        stone_own,
-        legal_qr,
-        moves_remaining,
-        phase_id,
-        cfg,
-    )
 
     window_numeric = (
         window_set.numeric
@@ -236,7 +225,6 @@ def build_from_arrays(
         action_post1_class=tables.action_post1_class,
         action_pre_status=tables.action_pre_status,
         action_tactical_numeric=tactical_features(tables, cfg),
-        **vars(rows),
         global_numeric=_global_numeric(
             window_set.status,
             len(stone_qr),

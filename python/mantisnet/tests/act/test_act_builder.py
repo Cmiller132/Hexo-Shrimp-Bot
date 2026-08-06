@@ -56,9 +56,7 @@ from ..conftest import random_moves
 from .test_act_windows import won_position
 
 # Both movers, both stones of a turn, all three phases, and boards from empty
-# to past the depth a real game reaches. 151 is odd, so it is a FIRST-phase
-# position: the partner enumeration only runs there, and it is by far the
-# largest family the builder emits.
+# to past the depth a real game reaches.
 PLIES = (0, 1, 2, 5, 20, 60, 120, 151)
 SEED = 7
 
@@ -75,8 +73,6 @@ BUILDER_FIELDS = (
     "occupied_radius",
     "use_cell_adjacency",
     "use_occupied_radius_edges",
-    "pair_scope",
-    "pair_max_distance",
     "use_window_numeric_features",
     "use_global_numeric_features",
     "use_action_tactical_features",
@@ -87,7 +83,6 @@ BUILDER_FIELDS = (
 # builder-visible setting fails here rather than going unbuilt.
 BUILDER_PRESETS = (
     "full_act_v4",
-    "full_no_pair",
     "full_live_windows",
     "full_action_relevant_windows",
     "full_coarse_geometry",
@@ -106,11 +101,6 @@ MEASURED = {
     120: {"cells": 4365, "windows": 1967, "adjacency": 25592, "radius": 53994, "legal": 4245},
 }
 BAND = 0.25
-
-# Measured pair-row counts of the FIRST-phase positions, where the partner
-# enumeration runs. They are an order of magnitude above every other family,
-# which is the fact a Stage E budget has to be built around.
-MEASURED_PAIR_ROWS = {1: 19_350, 5: 48_874, 151: 387_012}
 
 
 @pytest.fixture(scope="module")
@@ -285,16 +275,6 @@ def test_family_sizes_land_in_their_measured_bands(plies, act_positions):
         )
 
 
-def test_pair_rows_land_in_their_measured_band(act_positions):
-    for plies, measured in MEASURED_PAIR_ROWS.items():
-        graph = build(act_positions[plies], FULL)
-        assert graph.phase_id == PHASE_FIRST
-        assert graph.n_pair == pytest.approx(measured, rel=BAND)
-    # Every other phase emits none at all (§20).
-    for plies in (0, 2, 20, 60, 120):
-        assert build(act_positions[plies], FULL).n_pair == 0
-
-
 def test_the_scopes_change_exactly_what_they_claim(act_positions):
     for plies in (20, 60, 120):
         pos = act_positions[plies]
@@ -354,7 +334,6 @@ def test_the_offsets_slice_each_position_back_out(mixed_batch):
         "legal_offsets": [g.n_legal for g in graphs],
         "adjacency_offsets": [g.n_adjacency for g in graphs],
         "radius_offsets": [g.n_radius for g in graphs],
-        "pair_offsets": [g.n_pair for g in graphs],
     }
     for name, counts in families.items():
         offsets = getattr(batch, name).numpy()
@@ -388,8 +367,6 @@ def test_no_edge_crosses_a_batch_position(mixed_batch):
         ("radius_src", batch.radius_offsets.numpy(), cells),
         ("radius_dst", batch.radius_offsets.numpy(), cells),
         ("action_window_index", legal, windows),
-        ("pair_dst_action", batch.pair_offsets.numpy(), legal),
-        ("pair_src_action_or_neg1", batch.pair_offsets.numpy(), legal),
     )
     for name, row_offsets, target_offsets in checks:
         index = getattr(batch, name).numpy()
@@ -401,10 +378,8 @@ def test_no_edge_crosses_a_batch_position(mixed_batch):
         # The sentinel is not shifted into the previous position's slice.
         assert flat[~present].tolist() == [-1] * int((~present).sum())
 
-    # The batch is only a detector if its positions have different sizes and
-    # its pair rows exist at all.
+    # The batch is only a detector if its positions have different sizes.
     assert len({g.n_cells for g in graphs}) == len(graphs)
-    assert int(batch.pair_offsets[-1]) > 0
 
 
 def test_collate_refuses_an_index_that_would_cross(mixed_batch):

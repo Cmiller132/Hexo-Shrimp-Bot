@@ -501,6 +501,6 @@ def test_a_scope_this_module_does_not_implement_is_refused(positions):
     pos = positions[3]
     stone_qr, stone_own, legal_qr, _ = position_arrays(pos)
     window_set = enumerate_windows(stone_qr, stone_own, legal_qr, CFG)
-    future = SimpleNamespace(window_scope="window_and_pair_relevant")
+    future = SimpleNamespace(window_scope="window_and_threat_relevant")
     with pytest.raises(ValueError, match="unknown window_scope"):
         action_tables(window_set, stone_qr, stone_own, legal_qr, future)

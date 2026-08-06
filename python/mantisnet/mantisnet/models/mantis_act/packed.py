@@ -10,18 +10,15 @@ Index conventions this module fixes:
 
 - Every index in an ``ACTGraph`` is in that position's own frame:
   ``legal_to_cell_index`` and the cell geometry index cells, ``window_cell_index``
-  indexes cells, ``action_window_index`` indexes windows, and the pair rows index
-  legal actions. ``collate`` shifts each by its family's offset into the batch
-  frame; nothing else renumbers.
+  indexes cells, and ``action_window_index`` indexes windows. ``collate`` shifts
+  each by its family's offset into the batch frame; nothing else renumbers.
 - ``-1`` is the only sentinel and always means "no such entity" — a slot outside
   the cell scope, a legal action whose cell the scope omits, an action row with
-  no persistent pre-action window, a prospective partner that is not currently
-  legal, a displacement lying on no axis. It survives collation as ``-1``:
-  shifting a sentinel would turn it into
-  a real index into the preceding position's slice, and no shape or dtype check
-  downstream can see that. ``_to_global`` is the single place the distinction is
-  made, and every field that carries a sentinel is declared as such in
-  ``_INDEX_FIELDS``.
+  no persistent pre-action window, a displacement lying on no axis. It survives
+  collation as ``-1``: shifting a sentinel would turn it into a real index into
+  the preceding position's slice, and no shape or dtype check downstream can see
+  that. ``_to_global`` is the single place the distinction is made, and every
+  field that carries a sentinel is declared as such in ``_INDEX_FIELDS``.
 - ``_INDEX_FIELDS`` is one table driving three jobs — ``validate``'s bounds
   check, ``collate``'s offset arithmetic, and ``collate``'s refusal of any edge
   whose endpoints land in different positions (§26). A field added to one and
@@ -34,8 +31,8 @@ call it before returning a graph, and it raises naming the offending field, row,
 and value rather than letting a malformed table reach an embedding lookup. Class
 codes are bounded by ``pattern_classes``' own asserted counts, never by a number
 restated here; the vocabularies a config can resize — the D6 relation mode's
-orbits, the nearest-stone buckets, the pair evidence kinds — are checked for
-sign only, since their cardinality belongs to the module that emits them.
+orbits, the nearest-stone buckets — are checked for sign only, since their
+cardinality belongs to the module that emits them.
 """
 
 from __future__ import annotations
@@ -77,13 +74,12 @@ WINDOW_STATUS_NAMES = {
 SENTINEL = -1
 
 # Node families, and the field whose length defines each one.
-_CELLS, _WINDOWS, _LEGAL, _ADJACENCY, _RADIUS, _PAIR = (
+_CELLS, _WINDOWS, _LEGAL, _ADJACENCY, _RADIUS = (
     "cells",
     "windows",
     "legal",
     "adjacency",
     "radius",
-    "pair",
 )
 _FAMILY_SIZED_BY = {
     _CELLS: "cell_occupancy",
@@ -91,7 +87,6 @@ _FAMILY_SIZED_BY = {
     _LEGAL: "legal_to_cell_index",
     _ADJACENCY: "adjacency_src",
     _RADIUS: "radius_src",
-    _PAIR: "pair_dst_action",
 }
 
 # Every array field of ``ACTGraph``: dtype and shape, where a string extent
@@ -122,13 +117,6 @@ _GRAPH_ARRAYS: tuple[tuple[str, type, tuple[object, ...]], ...] = (
     ("action_post1_class", np.int64, (_LEGAL, NUM_AXES, WINDOW_LEN)),
     ("action_pre_status", np.int64, (_LEGAL, NUM_AXES, WINDOW_LEN)),
     ("action_tactical_numeric", np.float32, (_LEGAL, None)),
-    ("pair_dst_action", np.int64, (_PAIR,)),
-    ("pair_src_action_or_neg1", np.int64, (_PAIR,)),
-    ("pair_axis_or_neg1", np.int64, (_PAIR,)),
-    ("pair_distance", np.int64, (_PAIR,)),
-    ("pair_post2_pattern", np.int64, (_PAIR,)),
-    ("pair_evidence_kind", np.int64, (_PAIR,)),
-    ("pair_src_is_current_legal", np.int64, (_PAIR,)),
     ("global_numeric", np.float32, (None,)),
 )
 
@@ -151,14 +139,6 @@ _VALUE_RANGES: tuple[tuple[str, int, int | None], ...] = (
     ("radius_axis_or_neg1", SENTINEL, NUM_AXES - 1),
     ("action_post1_class", 0, POST1_REL_CLASSES - 1),
     ("action_pre_status", EMPTY, MIXED),
-    ("pair_axis_or_neg1", SENTINEL, NUM_AXES - 1),
-    # The upper bound is ``pair_max_distance``, which pairs.py owns.
-    ("pair_distance", 1, None),
-    # §20.3 narrows this to the 377 nonempty classes; the table is the 378-row
-    # window pattern table either way.
-    ("pair_post2_pattern", 0, ALL_WINDOW_PATTERN_CLASSES - 1),
-    ("pair_evidence_kind", 0, None),
-    ("pair_src_is_current_legal", 0, 1),
 )
 
 # Fields whose values index another family: ``(field, row family, target
@@ -175,8 +155,6 @@ _INDEX_FIELDS: tuple[tuple[str, str, str, bool], ...] = (
     ("radius_src", _RADIUS, _CELLS, False),
     ("radius_dst", _RADIUS, _CELLS, False),
     ("action_window_index", _LEGAL, _WINDOWS, True),
-    ("pair_dst_action", _PAIR, _LEGAL, False),
-    ("pair_src_action_or_neg1", _PAIR, _LEGAL, True),
 )
 
 # The packed batch's array fields, in spec §25 order. ``cell_qr`` and
@@ -204,13 +182,6 @@ _PACKED_ARRAYS: tuple[str, ...] = (
     "action_post1_class",
     "action_pre_status",
     "action_tactical_numeric",
-    "pair_dst_action",
-    "pair_src_action_or_neg1",
-    "pair_axis_or_neg1",
-    "pair_distance",
-    "pair_post2_pattern",
-    "pair_evidence_kind",
-    "pair_src_is_current_legal",
 )
 
 _INDEX_TARGETS = {name: (target, sentinel) for name, _, target, sentinel in _INDEX_FIELDS}
@@ -333,14 +304,6 @@ class ACTGraph:
     action_post1_class: np.ndarray  # (n_legal, 3, 6)
     action_pre_status: np.ndarray  # (n_legal, 3, 6)
     action_tactical_numeric: np.ndarray  # (n_legal, T) float32
-    # Same-turn pair evidence (§20.3), sorted by destination action.
-    pair_dst_action: np.ndarray  # (e_pair,)
-    pair_src_action_or_neg1: np.ndarray  # (e_pair,) -1 for a prospective partner
-    pair_axis_or_neg1: np.ndarray  # (e_pair,)
-    pair_distance: np.ndarray  # (e_pair,)
-    pair_post2_pattern: np.ndarray  # (e_pair,)
-    pair_evidence_kind: np.ndarray  # (e_pair,)
-    pair_src_is_current_legal: np.ndarray  # (e_pair,) 0/1
     # Position scalars (§13).
     global_numeric: np.ndarray  # (G,) float32
     moves_remaining: int  # 1 or 2
@@ -365,10 +328,6 @@ class ACTGraph:
     @property
     def n_radius(self) -> int:
         return len(self.radius_src)
-
-    @property
-    def n_pair(self) -> int:
-        return len(self.pair_dst_action)
 
     def family_sizes(self) -> dict[str, int]:
         """Each node family's size, as the index tables must respect it."""
@@ -429,15 +388,6 @@ class ACTGraph:
             "occupied radius edges",
             "(dst, src, orbit)",
             (self.radius_dst, self.radius_src, self.radius_orbit),
-            strict=False,
-        )
-        # The rest of the §7 pair key — partner coordinate and window identity —
-        # is not carried on the row, so only its leading component is checkable
-        # here; pairs.py owns the remainder.
-        _check_sorted(
-            "pair evidence rows",
-            "dst_action",
-            (self.pair_dst_action,),
             strict=False,
         )
 
@@ -536,7 +486,6 @@ class PackedACTBatch:
     legal_offsets: torch.Tensor
     adjacency_offsets: torch.Tensor
     radius_offsets: torch.Tensor
-    pair_offsets: torch.Tensor
 
     cell_occupancy: torch.Tensor  # (N_cells,) long
     cell_is_legal: torch.Tensor
@@ -564,14 +513,6 @@ class PackedACTBatch:
     action_post1_class: torch.Tensor
     action_pre_status: torch.Tensor
     action_tactical_numeric: torch.Tensor  # (N_legal, T) float32
-
-    pair_dst_action: torch.Tensor  # (E_pair,) global legal index
-    pair_src_action_or_neg1: torch.Tensor  # (E_pair,) global legal index, -1 allowed
-    pair_axis_or_neg1: torch.Tensor
-    pair_distance: torch.Tensor
-    pair_post2_pattern: torch.Tensor
-    pair_evidence_kind: torch.Tensor
-    pair_src_is_current_legal: torch.Tensor
 
     phase_id: torch.Tensor  # (P,) long
     moves_remaining: torch.Tensor  # (P,) long
@@ -685,7 +626,6 @@ def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
         legal_offsets=torch.from_numpy(offsets[_LEGAL]),
         adjacency_offsets=torch.from_numpy(offsets[_ADJACENCY]),
         radius_offsets=torch.from_numpy(offsets[_RADIUS]),
-        pair_offsets=torch.from_numpy(offsets[_PAIR]),
         phase_id=torch.tensor([g.phase_id for g in graphs], dtype=torch.long),
         moves_remaining=torch.tensor([g.moves_remaining for g in graphs], dtype=torch.long),
         global_numeric=torch.from_numpy(np.ascontiguousarray(global_numeric)),
@@ -727,12 +667,6 @@ def telemetry(batch: PackedACTBatch) -> dict[str, float]:
         ),
         "adjacency_edges": _segment_counts(batch.adjacency_offsets),
         "radius_edges": _segment_counts(batch.radius_offsets),
-        "pair_rows": _segment_counts(batch.pair_offsets),
-        # Prospective partners are the pair rows whose source cell is not in the
-        # current legal set (§20.2), which is what the second scope adds.
-        "prospective_pair_rows": _segment_sums(
-            batch.pair_offsets, batch.pair_src_is_current_legal == 0
-        ),
         # Dense by construction: 18 rows per legal action (§19.2).
         "post_action_rows": legal * POST_ACTION_ROWS,
     }

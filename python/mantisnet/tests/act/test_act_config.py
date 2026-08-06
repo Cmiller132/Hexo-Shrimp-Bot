@@ -3,10 +3,11 @@
 The hash tests mutate fields with ``object.__setattr__`` rather than
 ``dataclasses.replace``. That deliberately bypasses ``__post_init__``: the
 question is whether ``architecture_hash`` reads a field at all, and several
-fields cannot be varied alone through a valid configuration — ``pair_scope``
-drags ``use_action_pair_messages`` with it, and ``architecture_id`` has a
-one-value vocabulary. Bypassing validation is the only way to ask about every
-field the same way, and coverage of every field is the property §28 wants.
+fields cannot be varied alone through a valid configuration —
+``num_action_latents`` drags ``use_action_set_latents`` with it, and
+``architecture_id`` has a one-value vocabulary. Bypassing validation is the only
+way to ask about every field the same way, and coverage of every field is the
+property §28 wants.
 """
 
 from __future__ import annotations
@@ -31,11 +32,10 @@ from mantisnet.models.mantis_act.config import (
     summarise,
 )
 
-# §29 names these fifteen; §16 and §29 require the parameter-matched extra-FFN
+# §29 names these fourteen; §16 and §29 require the parameter-matched extra-FFN
 # control alongside typed window attention.
 SPEC_PRESETS = (
     "full_act_v4",
-    "full_no_pair",
     "full_no_axis",
     "full_live_windows",
     "full_action_relevant_windows",
@@ -153,7 +153,7 @@ def test_enum_field_rejects_an_unknown_value(name):
 def test_every_listed_value_passes_its_own_vocabulary(name):
     """No vocabulary entry is refused by the field it is listed under.
 
-    Some entries still need partner fields moved with them — ``global_mode``
+    Some entries still need companion fields moved with them — ``global_mode``
     of ``"none"`` zeroes every latent count — so the construction may raise.
     It must never raise this field's own "is not one of".
     """
@@ -178,15 +178,9 @@ def test_cross_field_invariants():
     # Action-set latents and their count move together.
     with pytest.raises(ValueError, match="use_action_set_latents"):
         dataclasses.replace(MantisACTConfig(), num_action_latents=0)
-    # Pair messages and pair scope move together.
-    with pytest.raises(ValueError, match="use_action_pair_messages"):
-        dataclasses.replace(MantisACTConfig(), pair_scope="none")
     # No edge past d_max has a relation class.
     with pytest.raises(ValueError, match="occupied_radius"):
         dataclasses.replace(MantisACTConfig(), occupied_radius=13)
-    # No two cells more than five apart share a six-cell window.
-    with pytest.raises(ValueError, match="pair_max_distance"):
-        dataclasses.replace(MantisACTConfig(), pair_max_distance=6)
 
 
 def test_numeric_validation():
