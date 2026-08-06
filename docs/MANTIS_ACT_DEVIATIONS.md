@@ -107,14 +107,19 @@ added with default `"learned_attention"`, the mode §12.5 recommends.
 
 ## §2, §25 — KLENT dispatch seam
 
-§2 and §25 require the external `network_evaluate` interface to be unchanged.
-It is. Internally, `mantisnet/klent/train.py::_policy_q` reaches into
-`model.trunk(batch)` and `model.cell_head_logits(w, g, batch)` — a shape
-contract specific to MantisNet's stone/window trunk that ACT's
-cell/window/action/latent trunk does not have. Both architectures instead expose
+**Not yet implemented; lands with Stage D.** `mantisnet/klent/train.py` is
+still byte-identical to `main`.
+
+§2 and §25 require the external `network_evaluate` interface to be unchanged,
+and it will be. The problem is internal: `klent/train.py::_policy_q` reaches into
+`model.trunk(batch)` and `model.cell_head_logits(w, g, batch)` — a shape contract
+specific to MantisNet's stone/window trunk, which ACT's cell/window/action/latent
+trunk does not have.
+
+The resolution, when the ACT heads exist: both architectures expose
 `policy_q(batch) -> (policy_logits, critic_logits)` and `_policy_q` calls that.
-The change is confined to one private function; every caller of
-`network_evaluate` is unaffected.
+The change is confined to one private function and no caller of
+`network_evaluate` is affected.
 
 ## §9.2, §10.1, §19.2 — the class-count checks raise rather than `assert`
 
