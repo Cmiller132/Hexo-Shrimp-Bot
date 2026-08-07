@@ -1,8 +1,7 @@
 """The Rust batch builder against the Python builder, field for field.
 
 The Python builder is the reference implementation. Every integral tensor
-returned by ``hexo_py.build_batch`` must equal its Python-builder counterpart
-(MODEL_SPEC §12.7).
+returned by ``hexo_py.build_batch`` must equal its Python-builder counterpart.
 """
 
 from __future__ import annotations

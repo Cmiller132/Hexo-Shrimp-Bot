@@ -1,21 +1,9 @@
 """Graft a v2 scalar-tanh checkpoint into the v2 trinomial critic.
 
-Only ``mlp_q.out`` changes. A scalar row ``(W, b)`` becomes positive
-``(W, b)``, negative ``(-W, -b)``, and zero ``(0, -20)``. Therefore
-
-``p_pos - p_neg = tanh(z) / (1 + exp(-20) / (2 cosh(z)))``
-
-and the relative error from the scalar parent's ``tanh(z)`` is at most
-``exp(-20) / 2``. The zero row starts with zero Adam first and second moments,
-so it inherits neither signed row's optimizer direction or variance; the
-scalar entry's step is unchanged. Every other tensor and Adam entry is carried
-by name.
-
-Before either artifact is written, a second source read proves the shared
-tensors bit-for-bit, strict loaders prove both architectures and the remapped
-Adam state, and the fixed 64-position battery bounds max ``|delta Q|`` by
-``1e-5`` and mean improved-policy KL by ``1e-6`` at the requested operating
-point.
+Only ``mlp_q.out`` changes: scalar ``(W, b)`` becomes positive ``(W, b)``,
+negative ``(-W, -b)``, and zero ``(0, -20)``.  Every other tensor and Adam
+entry is carried by name.  The detector verifies bit-exact shared tensors
+and bounds ``|delta Q|`` and improved-policy KL on a fixed battery.
 """
 
 from __future__ import annotations

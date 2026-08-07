@@ -1,12 +1,12 @@
 //! Runtime-independent MantisNet forward boundary.
 //!
-//! This crate owns typed batch and output semantics; the executable supplies the
-//! adapter to its model runtime.
+//! Defines batch and output types; concrete runtime adapters implement
+//! [`Forward`] and [`ForwardLoader`].
 
 use crate::encoder::RawBatch;
 use std::path::Path;
 
-/// A forward/load failure whose concrete source survives the package boundary.
+/// Boxed error type for forward and load operations.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// The two MantisNet cell-head outputs, concatenated by position.
@@ -21,10 +21,10 @@ pub struct RawOutputs {
     pub q_values: Vec<f32>,
 }
 
-/// One live MantisNet module, called once per collated evaluator batch.
+/// One loaded MantisNet module, called once per collated evaluator batch.
 ///
-/// Implementations convert [`RawBatch`] arrays to their runtime and return Rust
-/// vectors; no runtime-specific type crosses this trait.
+/// Implementations convert [`RawBatch`] arrays to runtime tensors and return
+/// plain Rust vectors.
 pub trait Forward: Send {
     /// Run both cell heads for `batch`.
     ///
@@ -34,10 +34,7 @@ pub trait Forward: Send {
     fn forward(&mut self, batch: &RawBatch) -> Result<RawOutputs, BoxError>;
 }
 
-/// Construct a live forward boundary from one package weight file.
-///
-/// Loaders produce a candidate module that can be probe-verified before
-/// publication.
+/// Load a MantisNet checkpoint into a [`Forward`] implementation.
 pub trait ForwardLoader: Send + Sync {
     /// Load `weights`, including all package/runtime version checks.
     fn load(&self, weights: &Path) -> Result<Box<dyn Forward>, BoxError>;

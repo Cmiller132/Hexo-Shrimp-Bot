@@ -1,18 +1,9 @@
 """Store and query run telemetry in ``runs/<name>/telemetry.db``.
 
-The database holds iteration metrics, self-play and evaluation games,
-self-play ply traces, evaluation matches, crossplay, invocation metadata, and
-hardware aggregates. Each self-play ply stores its action rank and five
-quantized scalars: ``v_hat``, KL, normalized entropy, improved-policy maximum,
-and improved-policy probability of the sampled move. It does not store the
-full improved-policy vector. Evaluation games store their move lists but no
-training-time ply trace, regardless of their chooser.
-
-An iteration is committed in one transaction. WAL mode permits concurrent
-readers. ``begin_run`` removes driver-generated rows at and beyond the restored
-iteration before replay, so the database has at most one self-play row per
-``(iteration, game_index)``. Opening a mismatched schema is refused; schema v1
-has an explicit offline ``convert`` command.
+SQLite WAL database holding iteration metrics, self-play games with ply
+traces, evaluation matches, crossplay, invocation metadata, and hardware
+aggregates.  Schema mismatches are refused; schema v1 has an offline
+``convert`` command.
 
 CLI::
 
@@ -774,8 +765,7 @@ def iteration_series(conn, columns, *, iterations=None) -> list[dict]:
         f"{' WHERE ' + where if where else ''} ORDER BY iteration",
         params,
     )
-    # ``iteration`` is part of the metric event too; like the promoted metric
-    # columns, it is deliberately present in both representations.
+    # ``iteration`` appears in both the metric event and the promoted columns.
     fixed_metric_names = {"iteration", *(name for name, _kind in _ITERATION_METRICS)}
     seen_dynamic: set[str] = set()
     out = []

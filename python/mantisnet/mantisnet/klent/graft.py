@@ -1,33 +1,12 @@
 """Apply the joint-class decoder and trinomial critic grafts together.
 
-The parent has three-row slot-class tables in both cell heads and a one-row
-scalar critic readout followed by ``tanh``. This build has 93-row joint-class
-tables and a three-row categorical critic composed as ``p_pos - p_neg``.
-The transforms are disjoint:
-
-* each joint-class row copies the slot-class row it replaces; and
-* ``(W, b)`` becomes positive row ``(W, b)``, negative row ``(-W, -b)``,
-  and zero row ``(0, -20)``. With a vanishing zero outcome this is the
-  softmax gap-``2z`` identity ``p_pos - p_neg = tanh(z)`` up to relative
-  error at most ``exp(-20) / 2``.
-
-The conversion applies both in one state-dict pass and remaps each parameter's
-Adam moments exactly as its transform requires. There is no single-arm mode.
-
-The joint detector compares every untouched tensor with a second read of the
-source file, checks every replicated row bit for bit, and transcribes
-MODEL_SPEC §6 independently to compare the parent slot decode with the expanded
-joint decode bit for bit. The critic detector runs the complete grafted model and
-the parent checkpoint in its own architecture on a separate fixed probe, then
-enforces ``MAX_ABS_DQ`` and ``MAX_MEAN_KL`` at the supplied ``--tau``/``--lam``.
-A failed check writes neither output.
-
-``MODEL_REPR_VERSION`` moves here because the joint decoder changes the model
-representation. Run from ``python/mantisnet``:
+Transforms: each joint-class row copies its parent slot-class row; the scalar
+critic ``(W, b)`` becomes categorical rows ``(W, b)``, ``(-W, -b)``,
+``(0, -20)``.  Adam moments are remapped to match.  The detector verifies
+every untouched tensor, replicated row, and the functional equivalence of the
+grafted model against the parent.
 
     python -m mantisnet.klent.graft OLD.pt NEW.pt --tau T --lam L
-
-The evidence sidecar is derived from ``NEW.pt`` as ``NEW.json``.
 """
 
 from __future__ import annotations
@@ -96,19 +75,13 @@ PROBE_PLIES = (20, 60)
 PROBE_TOP_K = 16
 _PROBE_ATTEMPTS = 100
 
-# The bounds on the model's own folded arithmetic. Preservation itself is exact
-# and checked without a tolerance (``spec_decode_bitwise_equal``); these cover the
-# separate fact that the head GEMM sums a 93-wide class block where the spec sums
-# per-entry embeddings. That reassociation is not the graft's: one unmodified
-# model, decoded both ways over its own tables, measures max |ΔQ| 1.5e-06,
-# max |Δlogit| 1.6e-06, and max operator KL 1.8e-06 on this probe set. The bounds
-# sit just above that, so they fail on a wrong row map and not on fp32.
+# Tolerances for the GEMM reassociation (93-wide class sum vs per-entry).
+# Preservation itself is exact; these cover the folded-arithmetic delta.
 Q_TOLERANCE = 1e-5
 POLICY_TOLERANCE = 1e-4  # raw logits, which are not squashed into [-1, 1]
 KL_TOLERANCE = 1e-5
 
-# The critic arm's stated preservation bounds. These are fixed evidence gates, not
-# tuning parameters.
+# Critic preservation bounds (fixed evidence gates).
 MAX_ABS_DQ = 1e-5
 MAX_MEAN_KL = 1e-6
 PRESERVATION = (
@@ -135,13 +108,7 @@ _ADAM_FIELDS = ("step", "exp_avg", "exp_avg_sq")
 
 
 def parent_row_of_class() -> np.ndarray:
-    """The parent slot-class row each joint class replicates, one per class.
-
-    Well-defined because a reversal orbit's two members are mirrored slots of
-    mirrored masks, and ``min(s, 5 - s)`` is equal on mirrored slots. That is the
-    property the whole conversion rests on, so it is derived here from the
-    builder's table and checked, not assumed.
-    """
+    """The parent slot-class row each joint class replicates, derived and checked."""
     rows = np.full(DEC_CLASSES, -1, dtype=np.int64)
     for mask in range(1, 63):
         for slot in range(WINDOW_LEN):
@@ -269,11 +236,7 @@ def _check_parent_shapes(old_model: dict[str, Any], current: dict[str, Any]) -> 
 
 
 def _shared_digest(state: dict[str, Any], names: list[str]) -> str:
-    """SHA-256 over ``names``' tensors in order — name, dtype, shape, and bytes.
-
-    The fingerprint of the conversion's parent half, so the manifest names the
-    tensors it certifies instead of only asserting that they were checked.
-    """
+    """SHA-256 fingerprint over ``names``' tensors (name, dtype, shape, bytes)."""
     digest = hashlib.sha256()
     for name in names:
         tensor = state[name].detach().cpu().contiguous().flatten()
@@ -287,10 +250,8 @@ def _remap_adam(
 ) -> dict[str, Any]:
     """Remap both transforms' Adam moments onto this build's parameter list.
 
-    Joint-table moments replicate by the same parent-row map as their weights.
-    A scalar readout's first moment maps to ``(+m, -m, 0)`` and its second to
-    ``(v, v, 0)``; the step is unchanged. The zero row therefore begins with
-    no inherited optimizer direction or variance.
+    Joint-table moments replicate by the parent-row map.  Scalar readout:
+    first moment to ``(+m, -m, 0)``, second to ``(v, v, 0)``.
     """
     if not isinstance(saved, dict) or not isinstance(saved.get("state"), dict):
         raise ValueError("checkpoint must contain an Adam optimizer state dict")
@@ -422,20 +383,10 @@ def _spec_scores(
     head: tuple[str, ...],
     classes: Tensor,
 ) -> Tensor:
-    """One cell head's raw scalar per legal cell, from MODEL_SPEC §6.
+    """One cell head's raw scalar per legal cell, from the section 6 decode.
 
-    The formula as the spec writes it — project each window row, add the entry's
-    class embedding, sum a cell's entries, and take the background path from the
-    bucket table. Given the parent's 3-row table and its slot classes it is the
-    parent's decode; given the grafted table and the builder's joint classes it is
-    the child's. Neither is the model's own arithmetic: the sum is over per-entry
-    embeddings rather than a 93-wide coefficient block, and it never builds a
-    folded head matrix.
-
-    Run both ways it is what makes preservation exact rather than approximate.
-    The expansion copies rows, so the two runs add the same embedding to the same
-    window row for every entry, in the same order — the results agree bit for bit
-    or the row map is wrong.
+    Uses the spec's per-entry embedding formula (not the model's folded GEMM),
+    so parent and child runs agree bit for bit when row replication is correct.
     """
     proj, e_class, e_bg, mlp = head
     msg = F.linear(w, state[proj]).index_select(0, batch.dec_window) + state[
@@ -462,8 +413,7 @@ def _segment_kl(new: Tensor, parent: Tensor, offsets: Tensor) -> Tensor:
 
 
 def _q_spread(policy: Tensor, q: Tensor, offsets: Tensor, top_k: int) -> float:
-    """Median over positions of σ(Q) across the policy's top-``top_k``
-    legal cells — the spread the improvement operator actually exponentiates."""
+    """Median over positions of sigma(Q) across the policy's top-``top_k`` cells."""
     spreads = []
     for lo, hi in zip(offsets[:-1].tolist(), offsets[1:].tolist()):
         top = policy[lo:hi].topk(min(top_k, hi - lo)).indices
@@ -571,7 +521,7 @@ def _measure(
         )
         # A separate parent trunk forward prevents a mangled shared tensor from
         # disappearing behind shared activations. Its old decoder is evaluated
-        # by the independent MODEL_SPEC §6 transcription because this build's
+        # by the independent §6 decode transcription because this build's
         # folded coefficient layout is necessarily the 93-class child layout.
         _s, parent_w, parent_g = parent.trunk(batch)
         policy_parent = _spec_scores(

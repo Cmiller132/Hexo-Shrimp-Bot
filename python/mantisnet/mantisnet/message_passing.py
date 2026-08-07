@@ -1,31 +1,13 @@
 """Fused incidence aggregation for the two trunk message-passing passes.
 
-Both directions consume the builder's one window-major incidence table and
-aggregate projected entity rows alone.  The slot-class term is not part of
-these ops: summing class rows over a destination's entries is that
-destination's class histogram times the class table, so the trunk adds
-``counts @ weight`` — a dense, deterministic matmul whose class gradient is
-another matmul.  Routed through the aggregation it was a per-entry gather
-whose backward scattered every entry's gradient into a three-row table by
-atomics, the same contended-scatter disease the relay's bias table had.
-``incidence_plan`` builds both histograms once per batch; the counts carry
-no gradient, so the scatter that builds them runs outside autograd.
+Both directions consume the builder's window-major incidence table and
+aggregate projected entity rows.  The class term is a separate dense matmul
+(``counts @ weight``); ``incidence_plan`` builds the histograms outside
+autograd.  The stone direction accumulates in fp32.
 
-The torch formulation is deliberately literal: gather a projected row per
-incidence, then ``index_add_`` into the destinations.  It is the CPU
-implementation, the autograd reference, and the fallback for unsupported CUDA
-signatures.  The window pass stores in the projected value's dtype: its
-consuming autocast linear immediately performs the same cast.  The stone
-direction accumulates in fp32 so a reduction difference is not magnified by
-an early low-precision rounding boundary.
-
-The CUDA path is one run-head kernel serving all four directions.  The
-builder's table is window-major — each live window's one-to-six entries are
-contiguous — and ``incidence_plan`` adds the stone-major permutation, whose
-runs are bounded by the eighteen windows (six offsets, three axes) a stone
-can occupy.  Forward and backward of both passes are then segment reductions
-over one of the two orderings: contiguous, deterministic, and free of the
-contended ``index_add`` scatters the literal formulation lowers to.
+CUDA: one segment-reduction kernel serving all four directions over
+window-major and stone-major orderings.  CPU: gather + ``index_add_`` parity
+reference.
 """
 
 from __future__ import annotations

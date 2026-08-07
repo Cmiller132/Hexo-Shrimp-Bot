@@ -1,14 +1,4 @@
-"""Collect KLENT self-play through a persistent cohort of environment slots.
-
-Slots advance in lockstep and restart from the empty board when a game ends.
-``Collector.collect`` returns all games completed by the step that reaches its
-quota; unfinished games remain in their slots for the next call. A capped
-episode has no winner and contributes no training samples.
-
-Each ply records the legal rank, improved-policy vector, acting-time v̂, mover,
-phase, and four improved-policy diagnostics. See ``docs/KLENT_FOR_HEXO.md``
-§4.2–§4.3.
-"""
+"""Persistent-slot self-play collector for KLENT (``KLENT_FOR_HEXO.md`` section 4)."""
 
 from __future__ import annotations
 
@@ -29,12 +19,7 @@ Evaluate = Callable[[object], tuple[torch.Tensor, torch.Tensor]]
 
 @dataclass
 class Episode:
-    """One episode from the empty board; per-ply records for every ply.
-
-    Fitting consumes moves, phase, movers, ranks, improved policies, and
-    acting-time v̂. Telemetry additionally consumes KL, normalized entropy,
-    improved-policy maximum, and sampled-move probability.
-    """
+    """One episode from the empty board with per-ply records."""
 
     moves: list = field(default_factory=list)
     winner: int | None = None  # None exactly when the cap hit
@@ -63,10 +48,8 @@ class Sample:
 def _chunk_live(
     positions, live: list[int], pair_budget: int, cell_budget: int, cap: int
 ):
-    """Split ``live`` into consecutive chunks under the memory budgets
-    (attention pairs are ``count × padded_T²``, decoder rows are legal
-    cells) and the position-count ``cap``. Input order is preserved so budget
-    changes do not change RNG draw order. The cap also sets pipeline grain."""
+    """Split ``live`` into consecutive chunks under the memory budgets and
+    the position-count ``cap``."""
     chunks: list[list[int]] = []
     chunk: list[int] = []
     max_t, cells = 0, 0
@@ -90,15 +73,10 @@ def _chunk_live(
 
 
 class Collector:
-    """The persistent self-play cohort: ``envs`` slots that live for the run.
+    """Persistent self-play cohort of ``envs`` slots.
 
-    Each step uses stable stone-count-descending slot order. Collation and
-    forwarding may overlap across chunks; sampling and advancing run in chunk
-    order and consume one uniform per slot per step.
-
-    A ``collect`` call returns at least ``episodes`` finished or capped games:
-    every game ending on the final lockstep step is included. Slots restart
-    immediately; in-flight games persist to the next call.
+    ``collect`` returns at least ``episodes`` completed games; in-flight
+    games persist to the next call.
     """
 
     def __init__(
@@ -129,10 +107,7 @@ class Collector:
         self, evaluate: Evaluate, episodes: int, progress=None
     ) -> tuple[list[Episode], dict]:
         """Step the cohort until ``episodes`` games have ended; return them
-        plus the acting-time means of the ``KLENT_FOR_HEXO.md`` §8 diagnostics.
-
-        ``progress(finished, quota, slot_plies)`` is called after each
-        lockstep barrier and does not receive mutable collection state."""
+        plus the section 8 diagnostics."""
         done: list[Episode] = []
         stats = {"kl": 0.0, "ent": 0.0, "n": 0}
 

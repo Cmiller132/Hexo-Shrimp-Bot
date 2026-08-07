@@ -1,135 +1,119 @@
 # hexo-model-mantisnet
 
-## Purpose
+The Rust-side model runner for MantisNet. This crate owns the position encoder,
+the KLENT policy improvement, checkpoint packaging, and the decision-session
+factory. It does not contain a neural-network runtime; a runtime adapter
+implements the `ForwardLoader` and `Forward` traits to supply Torch (or another
+backend) execution.
 
-`hexo-model-mantisnet` is the Python-free Rust model package for MantisNet.
-It owns the shared position encoder, package configuration, improved evaluator,
-decision sessions, diagnostics, checkpoint semantics, and the abstract forward
-boundary. A runtime supplies Torch execution by implementing `ForwardLoader`
-and `Forward`.
+## Components
 
-## Public surface
+### Position encoder (`encoder`)
 
-The crate root exports:
+Converts an `engine::Position` into the graph representation MantisNet consumes.
+Each position becomes a `Graph` of stones, live windows, stone-to-window
+incidence edges, a decoder table mapping legal cells back to windows, and a
+background-distance table for legal cells that no live window covers. The
+encoder assigns reversal-invariant joint occupancy/slot classes to both incidence
+and decoder edges.
 
-| Item | Contract |
-| --- | --- |
-| `MantisPackage` | `ModelPackage` implementation |
-| `WEIGHTS_FILE` | Sealed Torch checkpoint name, `weights.pt` |
-| `ForwardLoader` | Loads a `Forward` from a checkpoint path |
-| `Forward` | Answers one collated `RawBatch` |
-| `RawOutputs` | Flat policy logits and action values |
-| `BoxError` | Runtime loader and forward error type |
-| `improvement` | `improve_policy`, `ImprovedPolicy`, and `ImprovementError` |
-| `MODEL_REPR_VERSION` | Shared encoder layout and semantics version |
-| `PACKAGE_VERSION` | Package behavior version |
-| `PACKAGE_NAME` | Registry name, `mantisnet` |
+The encoder has three output paths:
 
-The public `encoder` module provides:
+- **`build` / `build_batch` / `build_batch_prefixes`** produce in-memory
+  `Graph` values (the last two in parallel via rayon) and collate them into a
+  `RawBatch`.
+- **`encode_position`** serialises a `Graph` into a versioned little-endian wire
+  format for worker-to-batcher transport.
+- **`decode_batch`** deserialises and validates a sequence of wire items, then
+  collates them into a `RawBatch`.
 
-- `Graph` and `RawBatch`;
-- `encode_position` and `decode_batch`;
-- `build`, `build_batch`, and `build_batch_prefixes`;
-- `collate`;
-- `WireError`;
-- `NUM_PATTERNS` and `DEC_CLASSES`.
+`RawBatch` is the flat, globally-indexed tensor layout the forward boundary
+accepts.
 
-`MantisPackage::from_config` accepts:
+### Forward boundary (`forward`)
 
-```text
-tau=F,lambda=F[,source=PATH]
-```
+Defines the runtime-independent interface between this crate and whatever
+executes the neural network:
 
-Both coefficients are required, finite, and nonnegative, and their sum must be
-positive. `source` is required by `init` and omitted for normal checkpoint
-loads.
+- `Forward` -- runs both cell heads (policy logits and action values) on a
+  `RawBatch` and returns `RawOutputs`.
+- `ForwardLoader` -- constructs a `Forward` from a weight-file path.
+- `BoxError` -- the error type both traits use.
 
-Session variant names are:
+No runtime-specific type crosses these traits.
 
-```text
-policy
-mcts:visits=N,inflight=N,cpuct=F
-gumbel:sims=N,m=N[,temp=F]
-```
+### KLENT improvement (`improvement`)
 
-Variant parameters may appear in any order, each at most once. `sims` and `m`
-are required positive integers. `temp` is optional and defaults to `1.0`; it
-must be a finite, nonnegative `f64`. It scales the root Gumbel vector before
-the vector is added to root log priors, so positive `T` samples the root order
-from `softmax(logits / T)`, `T = 0` is deterministic, and `T = 1` is the
-unscaled Python-compatible draw.
+Implements the closed-form KLENT policy improvement (equation 3 of the model
+specification) in `f32`. `improve_policy` takes one position's raw policy logits
+and action values together with `tau` and `lambda`, and returns `ImprovedPolicy`:
+the improved action probabilities and their expected action value. All inputs are
+validated for finiteness and range before computation.
 
-The forward result contains one policy logit and one scalar action value per
-legal cell, ragged by `RawBatch::legal_offsets`. The evaluator applies the
-configured KLENT improvement and returns canonical priors plus their expected
-action value.
+### Package (`package`)
 
-## Run / test
+`MantisPackage` implements the `hexo-model::ModelPackage` trait, connecting
+MantisNet to the generic container checkpoint lifecycle:
 
-From the repository root:
+- `init` seals a raw Python `.pt` checkpoint into a container directory with a
+  manifest.
+- `load` reads and validates a sealed checkpoint, runs a probe verification, and
+  publishes the loaded forward module.
+- `encoder` / `evaluator` / `self_play_session` / `eval_session` /
+  `variant_session` produce the objects the container runtime calls during play,
+  training data generation, and evaluation.
+- `fit` returns `Unsupported`; production training runs through the Python
+  `mantisnet.klent.run` entry point.
 
-```sh
-cargo test -p hexo-model-mantisnet
-cargo doc -p hexo-model-mantisnet --no-deps
-cargo check -p hexo-model-mantisnet
-```
+Session construction seeds are derived from the loaded checkpoint's probe hash
+and a monotonic serial, mixed through a SplitMix64 finaliser.
 
-Regenerate the improvement fixture from the Python implementation:
+### Evaluator and encoder seam (`seam`)
 
-```sh
-cd python/mantisnet
-uv run python ../../crates/models/mantisnet/tests/fixtures/regenerate_improvement.py
-```
+`MantisEncoder` wraps `encoder::encode_position` behind the `hexo-search::Encoder`
+trait. `MantisEvaluator` holds a mutex-guarded `Forward`, decodes an
+`EncodedBatch` into a `RawBatch`, runs the forward pass, applies KLENT
+improvement to each position's ragged row, and returns `Evaluation` values.
 
-Run all workspace gates:
+### Action selection (`select`)
 
-```sh
-cargo xtask verify
-```
+`ActingPolicy` samples from the improved policy for `PolicySession` and
+optionally records a nine-byte diagnostic payload (version, `v_hat`, entropy).
+`MaxVisits` selects the most-visited root child for `MctsSession`.
 
-The crate is a library package; use `hexo-bot init`, `hexo-bot match`, or the
-Python training entry point to operate on checkpoints.
+### Configuration (`config`)
+
+Parses the two string grammars the container passes into MantisNet:
+
+- Package configuration: `tau=F,lambda=F[,source=PATH]`.
+- Session variants: `policy`, `mcts:visits=N,inflight=N,cpuct=F`,
+  `gumbel:sims=N,m=N[,temp=F]`.
 
 ## Connections
 
-- The architecture and representation contract is
-  [`docs/MODEL_SPEC.md`](../../../docs/MODEL_SPEC.md).
-- The Hexo-specific KLENT contract is
-  [`docs/KLENT_FOR_HEXO.md`](../../../docs/KLENT_FOR_HEXO.md).
-- Measured variants and outcomes are indexed in
-  [`docs/ABLATIONS.md`](../../../docs/ABLATIONS.md).
-- `crates/hexo-model` supplies the package lifecycle and checkpoint manifest.
-- `crates/hexo-search` supplies evaluator and session interfaces.
-- `crates/hexo-bot/src/mantisnet_python.rs` implements the live Torch loader.
-- `python/hexo-py` binds this crate's encoder for Python.
-- `python/mantisnet` owns model weights and production training.
+- **`hexo-engine`** supplies `Position`, `Action`, legal-move iteration, and
+  window queries.
+- **`hexo-model`** supplies `ModelPackage`, `Manifest`, and the checkpoint
+  lifecycle.
+- **`hexo-search`** supplies `Encoder`, `Evaluator`, `DecisionSession`,
+  `PolicySession`, `MctsSession`, `GumbelSession`, and the selection traits.
+- **`crates/hexo-bot/src/mantisnet_python.rs`** implements `ForwardLoader` and
+  `Forward` using the live Torch runtime.
+- **`python/hexo-py`** binds this crate's encoder for use in Python training and
+  parity tests.
+- **`python/mantisnet`** owns model weights, architecture definition, and
+  production KLENT training.
+- **`docs/KLENT_FOR_HEXO.md`** describes the Hexo-specific KLENT training path.
 
-## Invariants & gotchas
+## Files
 
-- The Rust encoder is the production encoder and the Python builder is its
-  independent parity oracle.
-- Encoded items are versioned, little-endian, and fully validated before
-  allocation and collation.
-- Legal-cell rows are in engine canonical legal order.
-- Policy and action-value outputs have identical ragged legal offsets.
-- The action-value head produces one `tanh`-bounded scalar per legal cell.
-- The action-value decoder has its own projection, embeddings, and MLP
-  parameters.
-- The evaluator returns improved priors and their expected action value.
-- Runtime output length mismatches and non-finite values are errors.
-- Runtime forward failures are not replaced with synthetic evaluations.
-- Self-play uses `PolicySession` and records nine-byte diagnostics.
-- Fixed evaluation uses `GumbelSession` with 32 simulations and 16 candidates.
-- Named variants use evaluation selection and do not record self-play
-  diagnostics.
-- A named Gumbel variant defaults `temp` to `1.0` and refuses negative or
-  non-finite values.
-- A sealed checkpoint contains `weights.pt` and `manifest.json`.
-- Manifest package metadata contains the configured `tau` and `lambda`.
-- Load validates metadata, versions, and the evaluator probe before publishing
-  the candidate forward module.
-- A failed load preserves the previously published module.
-- Evaluator access to the live forward is serialized by its mutex.
-- `fit` returns `PackageError::Unsupported`; production training runs through
-  `python -m mantisnet.klent.run`.
-- Encoder meaning or wire-layout changes require `MODEL_REPR_VERSION` review.
+| File | Description |
+| --- | --- |
+| `lib.rs` | Crate root; re-exports the public surface and declares `MODEL_REPR_VERSION`, `PACKAGE_VERSION`, and `PACKAGE_NAME`. |
+| `encoder.rs` | Position-to-graph builder, wire serialisation/deserialisation, batch collation, and the `RawBatch` layout. |
+| `forward.rs` | The `Forward` and `ForwardLoader` traits plus the `RawOutputs` and `BoxError` types. |
+| `improvement.rs` | Closed-form KLENT policy improvement (`improve_policy`, `ImprovedPolicy`, `ImprovementError`). |
+| `package.rs` | `MantisPackage` (`ModelPackage` implementation), checkpoint init/load, session factory, and `WEIGHTS_FILE`. |
+| `seam.rs` | `MantisEncoder` and `MantisEvaluator` adapters bridging the encoder and forward into `hexo-search` traits. |
+| `select.rs` | `ActingPolicy` (policy sampling with optional diagnostics) and `MaxVisits` (MCTS selection). |
+| `config.rs` | Strict parsers for the package configuration and session-variant grammars. |

@@ -92,8 +92,8 @@ npm run lan-relay -- 192.168.68.62 8000 127.0.0.1 8000
 - `python/mantisnet/mantisnet/deck/state.py` owns deck-local persistence.
 - `docker/compose.yaml` builds the SPA and serves it from the `deck` service.
 - `frontend/dist` is the static artifact consumed by the backend.
-- The endpoint and interaction contract is
-  [`docs/DECK_SPEC.md`](../docs/DECK_SPEC.md).
+- The deck is described in
+  [`python/mantisnet/README.md`](../python/mantisnet/README.md).
 
 ## Invariants & gotchas
 

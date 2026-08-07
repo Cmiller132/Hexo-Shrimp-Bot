@@ -49,13 +49,11 @@ _SNAPSHOT_SOURCES: dict[Path, tuple[int, int]] = {}
 def _telemetry_snapshot(path: Path, run_name: str) -> Path:
     """Copy the run's telemetry database to local disk and return the copy.
 
-    In a container the runs root sits on a loosely cached network mount
-    (drvfs 9p on Windows hosts), where SQLite's locking and WAL shared-memory
-    protocols are unreliable: opens fail spuriously whenever the trainer — a
-    different mount client — has recently committed. Queries therefore run
+    The runs root sits on a network mount (drvfs 9p on Windows hosts) where
+    SQLite locking and WAL shared-memory are unreliable, so queries run
     against a local snapshot, refreshed when the source file changes. The
-    trainer checkpoints and truncates the WAL on every commit, so the main
-    file alone is a complete database as of the last commit.
+    trainer truncates the WAL on every commit, so the main file alone is a
+    complete database as of the last commit.
     """
     snap = _SNAPSHOT_ROOT / f"{run_name}.db"
     with _SNAPSHOT_LOCK:
@@ -83,13 +81,9 @@ def telemetry_connection(run_dir: Path) -> Iterator[sqlite3.Connection]:
     """A read-only, schema-checked connection over a local snapshot, closed
     when the block exits.
 
-    A context manager rather than a bare connection because
-    ``with sqlite3.connect(...)`` does not close anything — it opens a
-    transaction and commits or rolls it back, leaving the handle live. Every
-    caller here already wrote ``with``, so a returned connection leaked one
-    descriptor per request until the deck hit its 1024 limit and served 500s
-    for two days' worth of polling. Yielding makes the closing form the only
-    form. The connection targets the run's snapshot, not the source database:
+    ``with sqlite3.connect(...)`` does not close the connection — it manages
+    a transaction and leaves the handle open. Yielding makes the closing
+    form the only form. Targets the run's snapshot, not the source database;
     see ``_telemetry_snapshot`` for why direct opens fail on a drvfs mount.
     """
     path = run_dir / telemetry.DB_NAME

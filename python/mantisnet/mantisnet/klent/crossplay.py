@@ -1,12 +1,7 @@
 """Round-robin referee for independent subprocess seats.
 
-Each participant is an argv launch command plus the checkpoint and variant sent
-in its protocol ``hello``. The referee owns every authoritative
-``hexo_py.Position``, draws shared openings, alternates seats, applies the ply
-cap, checks attestations and legality, and adjudicates outcomes. A participant
-process holds only protocol slots and is never imported here.
-
-Run from ``python/mantisnet``:
+The referee owns all authoritative positions, draws shared openings,
+alternates seats, applies the ply cap, and adjudicates outcomes.
 
     python -m mantisnet.klent.crossplay \
         --participants participants.json --pairs 32 \

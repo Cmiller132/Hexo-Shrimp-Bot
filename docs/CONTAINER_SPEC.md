@@ -2,7 +2,7 @@
 
 This document defines the container, package, evaluator, session, checkpoint,
 record, and process contracts implemented by `hexo-bot` and its supporting
-crates. `hexo-engine` remains governed by `ENGINE_SPEC.md`. Model architecture,
+crates. `hexo-engine` is described in its own `README.md`. Model architecture,
 encoding, and training objectives belong to model packages (§5).
 
 `crates/models/mantisnet` is the network-backed package. Its Rust encoder,

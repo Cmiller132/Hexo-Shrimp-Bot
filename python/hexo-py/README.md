@@ -1,61 +1,66 @@
 # hexo-py
 
-## Purpose
+PyO3 extension crate that exposes the Hexo engine's read and replay surface to
+Python. It provides position management (create, replay, advance, inspect),
+legal-move enumeration in canonical engine order, window geometry queries, and
+batch graph encoding for MantisNet model input. The installed module name is
+`hexo_py`.
 
-`hexo-py` is the PyO3 extension that exposes the engine read/replay surface and
-the shared Rust MantisNet encoder to Python. It permits positions to be created
-empty, replayed, advanced legally, inspected, and collated for model input. It
-does not expose internal board construction or mutable engine storage.
+## Components
 
-## Public surface
+### Position
 
-The installed module name is `hexo_py`.
+A Python wrapper around `hexo_engine::Position`. Positions are created empty or
+by replaying a sequence of `(q, r)` placements. The wrapper exposes:
 
-`hexo_py.Position` provides:
+- **Construction:** `Position()` for the empty board; `Position.replay(moves)`
+  to construct by replaying a placement sequence.
+- **Mutation:** `advance(q, r)` applies one legal placement; `copy()` clones the
+  position.
+- **Stone inspection:** `stones()` returns `(q, r, player)` tuples in canonical
+  order; `stone_count` gives the total.
+- **Legal moves:** `legal_moves()` lists all legal `(q, r)` placements in the
+  engine's canonical action order; `nth_legal(index)` retrieves one by rank;
+  `legal_count` gives the count.
+- **Game state:** `current_player` (0 or 1), `moves_remaining` (derived from the
+  engine's `TurnPhase`), `is_terminal`, `winner` (player index or `None`).
+- **Hashing:** `zobrist` returns the incremental Zobrist hash.
+- **Window geometry:** `windows_through(q, r)` returns the engine's win-window
+  walk as `(axis, start_q, start_r, mask_p0, mask_p1)` tuples, where bit `k` of
+  a mask is the cell `k` steps from the window start along the axis.
 
-| Member | Contract |
-| --- | --- |
-| `Position()` | Empty engine position |
-| `Position.replay(moves)` | Construct by replaying `(q, r)` placements |
-| `advance(q, r)` | Apply one legal placement |
-| `copy()` | Clone the current position |
-| `stones()` | Canonically ordered `(q, r, player)` rows |
-| `legal_moves()` | Canonical `(q, r)` legal-action order |
-| `nth_legal(index)` | Legal move at one canonical rank |
-| `windows_through(q, r)` | Engine window geometry and occupancy masks |
-| `legal_count` | Number of legal actions |
-| `current_player` | Side to move as `0` or `1` |
-| `moves_remaining` | Placements remaining in the current turn |
-| `is_terminal` | Terminal-position flag |
-| `winner` | Winning player or `None` |
-| `stone_count` | Total stones |
-| `zobrist` | Position-only engine hash |
+### Batch builders
 
-Module functions:
+- `build_batch(positions)` encodes a list of positions into the MantisNet graph
+  representation, returning a dictionary of NumPy arrays whose keys match
+  `mantisnet.builder.Batch` field names. Releases the GIL and uses Rayon for
+  parallel encoding.
+- `build_batch_prefixes(games, ts)` replays each game's first `ts[i]` placements
+  and encodes the resulting positions in parallel. This is the fitting path,
+  where stored positions are move prefixes.
 
-- `build_batch(positions)` builds and collates the shared Rust graph encoding.
-- `build_batch_prefixes(games, ts)` replays each move prefix and collates it.
+### Version constants
 
-Both functions return dictionaries of NumPy arrays matching
-`mantisnet.builder.Batch` field names.
+The module re-exports version constants that checkpoints pin:
 
-Module constants:
+- `RULES_VERSION` and `ACTION_ORDER_VERSION` from `hexo-engine`.
+- `LEGAL_RADIUS` from `hexo-engine`.
+- `MODEL_REPR_VERSION` from `hexo-model-mantisnet`.
+- `PROTOCOL_VERSION` from `hexo-runner`, the third version in the container
+  handshake.
 
-- `RULES_VERSION`;
-- `ACTION_ORDER_VERSION`;
-- `LEGAL_RADIUS`;
-- `MODEL_REPR_VERSION`;
-- `PROTOCOL_VERSION`, re-exported from `hexo_runner`. A host orchestrator opens
-  every seat with the three versions of `CONTAINER_SPEC.md` §3.1's handshake;
-  two of them are the engine's, and this is the third, so a Python orchestrator
-  never keeps its own copy of that number.
+## Build
 
-The extension uses `abi3-py312`, so its binary contract targets CPython 3.12
-and later on the same platform.
+The crate has its own Cargo workspace, detached from the root workspace. It is
+built by maturin from the Python side:
 
-## Run / test
+```sh
+cd python/mantisnet
+uv run --with maturin maturin develop --release -m ../hexo-py/Cargo.toml
+```
 
-The normal development path is the parent MantisNet environment:
+The extension uses `abi3-py312`, targeting CPython 3.12 and later. Tests live in
+the MantisNet package:
 
 ```sh
 cd python/mantisnet
@@ -63,23 +68,7 @@ uv sync
 uv run pytest tests/test_rust_builder.py
 ```
 
-Build the extension explicitly with maturin:
-
-```sh
-cd python/mantisnet
-uv run --with maturin maturin develop --release -m ../hexo-py/Cargo.toml
-uv run python -c "import hexo_py; print(hexo_py.RULES_VERSION)"
-```
-
-In the container:
-
-```sh
-maturin develop --release -m ../hexo-py/Cargo.toml
-python -m pytest tests/test_rust_builder.py -q
-```
-
-The crate is detached from the root Cargo workspace, so use its own manifest
-for a direct Rust check:
+A direct Rust check uses the crate's own manifest:
 
 ```sh
 cargo check --manifest-path python/hexo-py/Cargo.toml
@@ -87,35 +76,20 @@ cargo check --manifest-path python/hexo-py/Cargo.toml
 
 ## Connections
 
-- `crates/hexo-engine` supplies the wrapped `Position` and rule versions.
-- `crates/models/mantisnet/src/encoder.rs` supplies the shared graph encoder.
-- `python/mantisnet/mantisnet/builder.py` defines the independent Python parity
-  implementation and `Batch` shape.
-- `python/mantisnet/tests/test_rust_builder.py` compares every emitted array.
-- The representation contract is
-  [`docs/MODEL_SPEC.md`](../../docs/MODEL_SPEC.md).
-- Hexo-specific KLENT state storage is described in
-  [`docs/KLENT_FOR_HEXO.md`](../../docs/KLENT_FOR_HEXO.md).
-- The extension boundary is covered by
-  [`docs/CONTAINER_SPEC.md`](../../docs/CONTAINER_SPEC.md).
+- `crates/hexo-engine` supplies the wrapped `Position` and rule/action-order
+  versions.
+- `crates/models/mantisnet/src/encoder.rs` supplies the graph encoder behind
+  `build_batch` and `build_batch_prefixes`.
+- `crates/hexo-runner` supplies `PROTOCOL_VERSION`.
+- `python/mantisnet/mantisnet/builder.py` defines an independent Python parity
+  implementation; `python/mantisnet/tests/test_rust_builder.py` asserts the two
+  produce identical output.
+- The model architecture is described in `python/mantisnet/README.md`.
 
-## Invariants & gotchas
+## Files
 
-- The crate has its own Cargo workspace and is not built by root workspace
-  commands.
-- The root workspace forbids unsafe code; PyO3-generated extension code requires
-  this detached build boundary.
-- Positions are constructed empty or by replay, never from arbitrary cells.
-- Illegal replay or advance operations raise `ValueError`.
-- Replay errors identify the refused ply.
-- Legal-move arrays use engine canonical action order.
-- `moves_remaining` is derived from engine `TurnPhase`.
-- `windows_through` returns `(axis, start_q, start_r, mask_p0, mask_p1)` rows.
-- Window mask bit `k` describes the cell `k` steps from the window start.
-- Batch construction releases the GIL and uses Rayon for position encoding.
-- Rust batch output must remain exactly equal to the independent Python builder
-  output.
-- `MODEL_REPR_VERSION` is owned by the Rust MantisNet package.
-- Linux and host-platform Cargo artifacts must use separate target directories.
-- The production package forward boundary is the opposite direction: the
-  `hexo-bot` executable embeds Python and is not implemented here.
+| File | Description |
+| --- | --- |
+| `src/lib.rs` | PyO3 module: `Position` wrapper, batch-builder bindings, version exports |
+| `Cargo.toml` | Crate manifest with dependencies on `hexo-engine`, `hexo-model-mantisnet`, `hexo-runner`, PyO3, and numpy |
+| `pyproject.toml` | Python package metadata and maturin build configuration |

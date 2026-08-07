@@ -1,11 +1,7 @@
-"""The closed-form improvement step (``KLENT_FOR_HEXO.md`` §2, paper eq. 3), ragged.
+"""Closed-form policy improvement (``KLENT_FOR_HEXO.md`` section 2, eq. 3).
 
-    π′(a|s) ∝ exp[ (Q̃(s,a) + τ·log π_θ(a|s)) / (τ + λ) ]
-    v̂(s)    = E_{A~π′(·|s)}[ Q(s, A) ]
-
-τ weighs reverse KL to the current policy, and λ weighs entropy of π′. The
-result also contains per-position KL(π′‖π_θ) and entropy normalized by
-log|A_legal| as specified by ``KLENT_FOR_HEXO.md`` §2.1.
+    pi'(a|s)  proportional to  exp[ (Q_score(s,a) + tau * log pi(a|s)) / (tau + lam) ]
+    v_hat(s) = E_{pi'}[ Q(s, A) ]
 """
 
 from __future__ import annotations
@@ -48,9 +44,7 @@ def improved_policy(
     p = offsets.shape[0] - 1
     seg = segment_ids(offsets)
 
-    # At least fp32, so bf16 acting logits do not round π′ and its diagnostics;
-    # float64 when both inputs are, so a caller comparing two improved policies
-    # keeps a difference the operator would otherwise round away.
+    # At least fp32; float64 when inputs are, to preserve comparison precision.
     dtype = torch.promote_types(
         torch.promote_types(
             torch.promote_types(policy_logits.dtype, q_score.dtype), q_value.dtype
@@ -65,13 +59,7 @@ def improved_policy(
     )
     probs = log_improved.exp()
 
-    # Every expectation divides by the segment's own probability mass. π′ sums
-    # to one by definition, but an fp32 segment softmax sums to one only to a
-    # few ulps, and that error is not small where it matters: a lost endgame
-    # position has every legal move at exactly Q = -1, so nothing cancels and
-    # E[Q] inherits the whole of it. Measured at 1.1e-4 outside [-1, 1] on a
-    # 159-ply episode, which is what the λ-return's range check refuses.
-    # Dividing restores |E[Q]| <= max|Q| to a few ulps at any segment width.
+    # Normalize by segment mass to keep |E[Q]| <= max|Q| despite fp32 ulps.
     mass = segment_sum(probs, seg, p)
     v_hat = segment_sum(probs * q, seg, p) / mass
     kl = segment_sum(probs * (log_improved - log_pi), seg, p) / mass

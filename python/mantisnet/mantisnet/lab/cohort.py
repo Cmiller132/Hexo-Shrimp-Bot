@@ -1,10 +1,9 @@
 """Production-shaped position cohorts for lab measurements.
 
-Random playouts are not representative of the workload produced by MantisNet
-self-play: the retired decode probe measured roughly 2,400 legal cells per
-position at random ply 50, versus roughly 540 under real collection.  Every
-benchmark and probe therefore obtains positions either by stepping the real
-``Collector`` or by replaying prefixes from a frozen corpus.
+Positions come from stepping the real ``Collector`` or replaying prefixes
+from a frozen corpus, not random playouts: random play averages roughly
+2,400 legal cells per position at ply 50, versus roughly 540 under real
+collection.
 """
 
 from __future__ import annotations
@@ -47,12 +46,10 @@ def selfplay_cohort(
 ) -> list:
     """Return live positions after ``steps`` real lockstep collector steps.
 
-    ``evaluate`` is the normal production evaluator seam.  When it is absent,
-    ``model`` is wrapped with :func:`network_evaluate`; when both are absent a
-    fresh default MantisNet supplies the acting weights.  The collector resets
-    ended slots exactly as it does in training, so every returned position is
-    live even when a game ended during the requested interval. Contract checks
-    request ``with_prefixes`` to retain the exact history beside each position.
+    Falls back from ``evaluate`` to ``model`` wrapped in
+    :func:`network_evaluate` to a fresh default MantisNet. Ended slots are
+    reset as in training, so every returned position is live.
+    ``with_prefixes`` also returns each position's exact move history.
     """
     if envs <= 0:
         raise ValueError(f"envs must be positive, got {envs}")

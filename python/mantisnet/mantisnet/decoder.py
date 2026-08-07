@@ -1,42 +1,16 @@
-"""The incidence pass both cell heads read.
+"""Shared incidence aggregation for the policy and action-value decoders.
 
-MODEL_SPEC §6's policy decoder and appendix B's action-value decoder walk the
-same table: a legal cell's live windows, the joint class the cell holds in each,
-and — for a cell lying in no live window — its nearest-stone bucket. Only their
-parameters differ. Their per-cell decoder input is
+``aggregate`` builds per-cell coefficient rows from the incidence table;
+``head_matrix`` folds a head's projection, embeddings, and first MLP layer
+into the matrix that reads them.  CUDA: Triton segment reduction; CPU: torch
+``index_add_`` parity reference.
 
-    covered cell:      h[c] = M · Σ_e w[dec_window[e]] + Σ_e e_class[dec_class[e]]
-    background cell:   h[c] = e_bg[bg_bucket[c]]
-
-over the cell's incidence entries ``e``. A linear map commutes with a sum, so
-``M`` can be applied *after* the aggregation rather than under it. Everything
-remaining under the sum is head-independent, and one pass over the incidence
-then serves both heads instead of two.
-
-``aggregate`` returns the coefficients of ``h``, one row per cell:
+Aggregate row layout:
 
     [0, H)            Σ_e w[dec_window[e]]
-    [H, H+93)         how many entries carried each joint class
-    [H+93, H+101)     one-hot of the background bucket, background cells only
-    [H+101, H+128)    zero — the row is rounded to a power of two, which the
-                      kernel's block arange takes and the head GEMM likes
-
-The class block is 93 wide and a cell has at most 18 entries, so it is sparse by
-construction; it is stored dense because that is what lets ``head_matrix`` fold
-the class table into one GEMM.
-
-``head_matrix`` folds a head's projection, embedding tables, and first MLP
-layer into the matrix that reads an aggregate row. Neither function owns
-parameters; both consume parameters owned by ``model`` without changing the
-checkpoint layout.
-
-The background block adds where the spec overwrites. A background cell is by
-construction in no live window, so its window and class coefficients are zero
-and the two agree.
-
-The CUDA path is a Triton segment reduction over the cell-ordered
-``dec_cell`` runs. The torch path uses order-independent ``index_add_`` and
-serves as the parity reference.
+    [H, H+93)         class histogram (entry counts per joint class)
+    [H+93, H+101)     one-hot background bucket (background cells only)
+    [H+101, H+128)    zero padding to a power of two
 """
 
 from __future__ import annotations
@@ -57,7 +31,7 @@ except ImportError:
     tl = None
 
 
-CLASS_SLOTS = DEC_CLASSES  # joint (mask, slot) decoder classes (MODEL_SPEC §4.3)
+CLASS_SLOTS = DEC_CLASSES  # joint (mask, slot) decoder classes
 BG_SLOTS = NEAREST_BUCKETS
 # Rounded up from the 101 coefficients in use, to a power of two: that is what
 # the kernel's block arange takes, and it keeps the head GEMM's K

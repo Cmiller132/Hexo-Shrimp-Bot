@@ -1,16 +1,8 @@
 """Batched Gumbel sequential-halving search for evaluation.
 
-The search extends independent lines rather than retaining a tree. Hexo
-transitions are deterministic, and the evaluation budget is allocated by
-sequential halving. Training does not import this module; KLENT's closed-form
-operator is the training-time policy improvement.
-
-``gumbel_choose`` follows the standard chooser contract
-``choose(positions, rng) -> moves``. A positive-budget call draws one uint64
-child seed per root, in input-position order, then each child generator draws
-Gumbels in the engine's legal-rank order. Consequently a batched call and
-singleton calls made in the same order from an identically seeded parent
-generator are exact RNG peers. Zero-budget argmax draws nothing.
+Independent-line search with sequential halving.  ``gumbel_choose`` follows
+the ``choose(positions, rng) -> moves`` contract.  Per-root child seeds
+make batched and singleton calls RNG-equivalent.
 """
 
 from __future__ import annotations
@@ -99,27 +91,10 @@ def gumbel_choose(
 ):
     """Build a batched Gumbel root-sampling and sequential-halving chooser.
 
-    ``evaluate(batch)`` returns flat CPU ``(policy_logits, q_score, q_value)``
-    tensors in engine legal order. ``tau`` and ``lam`` are the run's KLENT
-    coefficients; every interior line step acts by the same improved policy
-    used during collection. ``sims == 0`` is exactly policy-logit argmax.
-
-    ``rng`` is accepted for construction symmetry with other chooser
-    factories, but the chooser contract's call-time generator is authoritative.
-
-    ``temperature`` scales the root Gumbel vector, which is a temperature in
-    the exact sense: Gumbel is a scale family, so ``T * Gumbel(0, 1)`` is
-    ``Gumbel(0, T)``, and ranking by ``logit + Gumbel(0, T)`` draws the root
-    order from ``softmax(logits / T)``. ``T = 1`` is Gumbel MuZero's and is
-    bit-for-bit the unscaled draw. ``T = 0`` leaves the search deterministic:
-    candidates are the top-*m* logits and the scores carry no noise term. Small
-    positive ``T`` therefore decorrelates repeated games between one pair of
-    models without moving play far from the greedy line.
-
-    The scale is relative to two other quantities and not only to the logits —
-    ``C_VISIT`` and ``C_SCALE`` weigh the searched value against this noise, so
-    ``T`` changes how much a searched line must be worth to overturn the prior
-    order. Matches played at different ``T`` are different measurements.
+    ``evaluate(batch)`` returns flat CPU ``(policy_logits, q_score, q_value)``.
+    ``sims == 0`` is policy-logit argmax.  ``temperature`` scales the root
+    Gumbel vector: ``T * Gumbel(0, 1)`` draws the root order from
+    ``softmax(logits / T)``; ``T = 0`` is deterministic (top-m by logit).
     """
     if sims < 0:
         raise ValueError(f"sims must be >= 0, got {sims}")
@@ -163,8 +138,7 @@ def gumbel_choose(
         )
         root_rngs = [np.random.default_rng(seed) for seed in seeds]
 
-        # Compute the root operator in the shared forward too. Candidate
-        # sampling deliberately uses raw policy logits, as Gumbel MuZero does.
+        # Candidate sampling uses raw policy logits (Gumbel MuZero convention).
         improved_policy(
             root_logits,
             root_score,

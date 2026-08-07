@@ -1,8 +1,6 @@
-"""Strict client for one independent §3.1 subprocess seat.
+"""Client for one independent section 3.1 subprocess seat.
 
-The client owns the JSON-lines transport, wire encodings, response validation,
-and participant launch description shared by crossplay and training-run
-evaluation. It does not own games or adjudicate outcomes.
+Owns the JSON-lines transport, wire encodings, and response validation.
 """
 
 from __future__ import annotations

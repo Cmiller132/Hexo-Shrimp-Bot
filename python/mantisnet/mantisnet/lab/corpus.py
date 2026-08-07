@@ -1,9 +1,8 @@
 """Freeze and load replay-verified supervised corpora.
 
-The source telemetry database is always opened through SQLite's read-only URI
-mode.  Frozen positions remain move-prefix references; callers materialize the
-move lists they need with :meth:`FrozenCorpus.moves_for` while preparing a
-chunk, rather than constructing every prefix when the corpus is loaded.
+Positions are stored as move-prefix references; :meth:`FrozenCorpus.moves_for`
+materializes one game's moves on demand rather than all up front. The source
+telemetry database is opened read-only via SQLite's URI mode.
 """
 
 from __future__ import annotations
@@ -243,9 +242,9 @@ def _split_counts(n_games: int, fractions: tuple[float, float, float]) -> np.nda
         order = np.argsort(-(exact - counts), kind="stable")
         counts[order[:remainder]] += 1
 
-    # Tiny corpora remain useful for smoke tests: when there are enough games,
-    # every requested nonzero split gets one.  The donor is deterministic and
-    # the exact realized counts remain part of the manifest.
+    # When there are enough games, every requested nonzero split gets at
+    # least one. The donor is deterministic and the realized counts are
+    # recorded in the manifest.
     positive = np.flatnonzero(np.asarray(fractions) > 0)
     if n_games >= len(positive):
         for empty in positive[counts[positive] == 0]:

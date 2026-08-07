@@ -1,122 +1,97 @@
 # hexo-model-mock
 
-## Purpose
-
-`hexo-model-mock` is a deterministic, network-free implementation of the
-complete `ModelPackage` boundary. It exercises encoding, evaluation, both
-session modes, diagnostics, checkpoint validation, record reading, and fitting
-without Python or a GPU. Its weights consist of one package salt.
+A deterministic, network-free implementation of the `ModelPackage` trait from
+`hexo-model`. The package exercises the full container surface -- encoding,
+evaluation, session creation, diagnostics, checkpoint lifecycle, record reading,
+and fitting -- without Python, a GPU, or learned parameters. Its entire weight
+state is a single `u64` salt.
 
 ## Public surface
 
-The crate root exports:
+The crate exports two items:
 
-| Item | Contract |
+| Item | Kind |
 | --- | --- |
 | `MockPackage` | Concrete `ModelPackage` implementation |
-| `ENCODER_VERSION` | Mock encoding version |
+| `ENCODER_VERSION` | The version of the encoding format the mock encoder writes |
 
-Construct a package with one required search configuration:
+`MockPackage` is constructed from a configuration string via
+`MockPackage::from_config`. The configuration grammar is `search=<shape>`, where
+a shape is either `policy` or `mcts:visits=N,inflight=N,cpuct=F`.
 
-```rust
-use hexo_model_mock::MockPackage;
+## Components
 
-let policy = MockPackage::from_config("search=policy")?;
-let mcts = MockPackage::from_config(
-    "search=mcts:visits=64,inflight=8,cpuct=1.5"
-)?;
-# let _ = (policy, mcts);
-# Ok::<(), hexo_model::PackageError>(())
-```
+### config
 
-The accepted grammar is:
+Parses the package configuration string and the search-shape syntax. Defines the
+`Search` enum with two variants -- `Policy` (one root evaluation per move) and
+`Mcts` (PUCT with visit budget, in-flight cap, and exploration constant). The
+same search-shape grammar is reused by variant session names, and parse failures
+are classified as either unknown-shape or bad-parameters for distinct error
+reporting paths.
 
-```text
-search=policy
-search=mcts:visits=N,inflight=N,cpuct=F
-```
+### seam
 
-The same bare search shapes are accepted as evaluation variant names:
+Implements `Encoder` and `Evaluator` from `hexo-search`. The encoder
+(`MockEncoder`) writes a twelve-byte item per position: the eight-byte Zobrist
+hash followed by a four-byte legal count, both little-endian. The evaluator
+(`MockEvaluator`) holds the loaded salt and derives normalized priors and a
+bounded value from each encoded item using deterministic mixing. Priors are
+strictly positive and sum to one; values lie strictly inside `(-1, 1)`.
 
-```text
-policy
-mcts:visits=N,inflight=N,cpuct=F
-```
+### select
 
-The private package components are:
+Provides four selector types -- `SelfPlaySearch`, `SelfPlayPolicy`,
+`EvalSearch`, and `EvalPolicy` -- implementing `SelectFromSearch` and
+`SelectFromPolicy` from `hexo-search`. Self-play selectors sample proportional
+to visits or priors and emit diagnostics (a visit table or prior table encoded
+with per-action keys). Evaluation selectors sample proportional to the cube of
+visits or priors and emit no diagnostics. The module also provides
+`session_seed`, which derives a deterministic per-session RNG seed from the
+loaded salt and a monotonic serial.
 
-| Module | Contract |
-| --- | --- |
-| `config` | Strict package and variant grammar |
-| `seam` | Twelve-byte encoder and deterministic evaluator |
-| `select` | Self-play/evaluation selectors and diagnostics |
-| `weights` | Salt format and deterministic mixing |
-| `package` | Lifecycle, sessions, and fit |
+### weights
 
-The encoder stores the position Zobrist hash and legal count. The evaluator
-derives canonical priors and a bounded side-to-move value from the encoded item
-and the loaded salt.
+Defines the checkpoint weight format: a single file `weights.mock` containing
+one little-endian `u64` salt. Provides read/write functions for the weight file,
+the fixed initial salt used by epoch-0 checkpoints, the SplitMix64 finalizer
+(`mix`) used throughout the crate for salt derivation and evaluation, a unit-
+interval conversion (`unit`), and `next_salt` which derives the next epoch's salt
+from the prior salt, epoch number, and training-data digest.
 
-The checkpoint weight file is `weights.mock`, containing one little-endian
-`u64`.
+### package
 
-## Run / test
-
-From the repository root:
-
-```sh
-cargo test -p hexo-model-mock
-cargo doc -p hexo-model-mock --no-deps
-cargo check -p hexo-model-mock
-```
-
-Exercise the package through the container binary:
-
-```sh
-cargo run -p hexo-bot -- init \
-  --package mock \
-  --package-config search=policy \
-  --checkpoint tmp/mock-checkpoint
-```
-
-Run all workspace gates:
-
-```sh
-cargo xtask verify
-```
+Implements `ModelPackage` on `MockPackage`. Tracks the configured search shape,
+the loaded salt (absent until a checkpoint loads), and a session serial counter.
+`init` writes an epoch-0 checkpoint with the fixed initial salt. `load` reads the
+manifest and weight file, validates versions, and recomputes the probe hash
+against the evaluator before publishing the salt. `self_play_session` and
+`eval_session` build sessions from the configured search shape with self-play or
+evaluation selectors respectively. `variant_session` parses the variant name as a
+search shape and builds an evaluation-mode session. `fit` reads record shards,
+replay-verifies every game, accumulates a digest from terminal hashes and ply
+counts, and writes a new checkpoint whose salt is derived from the prior salt,
+epoch, and digest.
 
 ## Connections
 
-- `crates/hexo-model` supplies `ModelPackage`, `Manifest`, and probe hashing.
-- `crates/hexo-search` supplies policy and MCTS sessions and evaluator seams.
-- `crates/hexo-engine` supplies the position hash and legal count.
-- `crates/hexo-records` supplies strict shard reading and replay verification.
-- `crates/hexo-bot/src/registry.rs` registers the package as `mock`.
-- The package obligations are in
-  [`docs/CONTAINER_SPEC.md`](../../../docs/CONTAINER_SPEC.md).
+- `hexo-model` supplies the `ModelPackage` trait, `Manifest`, `PackageError`,
+  and `probe_hash`.
+- `hexo-search` supplies `Encoder`, `Evaluator`, `PolicySession`,
+  `MctsSession`, `DecisionSession`, selector traits, and `SplitMix64`.
+- `hexo-engine` supplies the position type, Zobrist hash, and legal-move
+  enumeration.
+- `hexo-records` supplies `ShardReader` for reading record files and `verify`
+  for replay verification.
+- `hexo-bot` registers this package under the name `mock` in its model registry.
 
-## Invariants & gotchas
+## Files
 
-- Configuration has exactly one `search` key and no default.
-- Whitespace is not trimmed and unknown or repeated fields are errors.
-- MCTS visits and in-flight counts are nonzero.
-- `cpuct` is finite and nonnegative.
-- Sessions cannot be created until a checkpoint has loaded successfully.
-- Each newly created session receives a distinct deterministic seed derived
-  from the loaded salt and session serial.
-- Self-play and evaluation use separate selectors.
-- Self-play samples proportional to priors or visits and writes diagnostics.
-- Evaluation samples using cubed priors or cubed visits and writes no
-  diagnostics.
-- Diagnostics encode either the canonical root prior table or visit table.
-- Diagnostics action keys are engine `ActionId` values.
-- `init` writes a fixed initial salt and an epoch-zero manifest.
-- `load` validates manifest versions and recomputes the evaluator probe before
-  publishing the salt.
-- A failed load preserves the previous salt.
-- `fit` requires at least one decoded game across the supplied shards.
-- Every fitted game is replay-verified before it contributes to the digest.
-- Every shard consumed by `fit` must name the `mock` package.
-- `fit` derives the next salt from prior salt, epoch, game count, position
-  count, and terminal hashes.
-- The package provides no network, tensor dependency, or learned parameters.
+| File | Description |
+| --- | --- |
+| `src/lib.rs` | Crate root; exports `MockPackage` and `ENCODER_VERSION`, declares internal version constants and the registry name |
+| `src/config.rs` | Configuration and search-shape parsing with error classification |
+| `src/seam.rs` | Twelve-byte encoder and deterministic salt-based evaluator |
+| `src/select.rs` | Self-play and evaluation selectors with diagnostics encoding and session seeding |
+| `src/weights.rs` | Salt format, read/write, mixing functions, and epoch derivation |
+| `src/package.rs` | `ModelPackage` implementation: checkpoint lifecycle, sessions, and fitting |

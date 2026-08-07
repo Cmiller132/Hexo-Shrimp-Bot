@@ -290,5 +290,5 @@ def test_baked_keys_on_only_some_blocks_are_refused(tmp_path):
 def test_unidentifiable_state_names_registry_and_contract(tmp_path):
     path = tmp_path / "unknown.pt"
     torch.save({"model": {"mystery": torch.zeros(1)}, "versions": _versions()}, path)
-    with pytest.raises(ValueError, match="family registry.*trinomial-joint.*docs/LAB_SPEC.md"):
+    with pytest.raises(ValueError, match="family registry.*trinomial-joint.*python/mantisnet/README.md"):
         load_checkpoint(path)
