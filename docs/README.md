@@ -5,10 +5,6 @@
 - [`CONTAINER_SPEC.md`](CONTAINER_SPEC.md) defines how packages, evaluators,
   sessions, processes, checkpoints, and records compose. Read it before
   changing container execution or Rust/Python ownership boundaries.
-- [`MANTIS_ACT_SPEC.md`](MANTIS_ACT_SPEC.md) defines the MantisNet-ACT v4
-  architecture.
-- [`MANTIS_ACT_DEVIATIONS.md`](MANTIS_ACT_DEVIATIONS.md) records deviations
-  from the ACT spec encountered during implementation.
 
 ## KLENT references and evidence
 

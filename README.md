@@ -42,7 +42,7 @@ declared in the root `Cargo.toml`.
 
 `mantisnet` contains several subsystems:
 
-- The MantisNet network and its `models/mantis_act` variant (MantisNet-ACT).
+- The MantisNet network.
 - The KLENT self-play training loop (`klent/`).
 - The supervised lab bench (`lab/`) for offline architecture comparison.
 - The control deck (`deck/`) that launches, monitors, and inspects training runs.
@@ -74,7 +74,6 @@ index. Normative specifications:
 
 | Document | Governs |
 | --- | --- |
-| [MANTIS_ACT_SPEC.md](docs/MANTIS_ACT_SPEC.md) | MantisNet-ACT: the v4 architecture |
 | [CONTAINER_SPEC.md](docs/CONTAINER_SPEC.md) | Container crates: packaging, deployment, lifecycle |
 | [KLENT_FOR_HEXO.md](docs/KLENT_FOR_HEXO.md) | KLENT training path for Hexo |
 

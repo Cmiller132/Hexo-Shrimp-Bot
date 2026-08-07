@@ -1,9 +1,8 @@
 # mantisnet
 
-Python 3.12+. The MantisNet package contains two board-game neural network
-architectures (MantisNet and MantisNet-ACT), the KLENT reinforcement-learning
-training loop, a frozen-corpus supervised laboratory harness, and the Shrimp
-Control Deck telemetry dashboard. Algorithm obligations are in
+Python 3.12+. The MantisNet package contains a board-game neural network
+architecture, the KLENT reinforcement-learning training loop, a frozen-corpus
+supervised laboratory harness, and the Shrimp Control Deck telemetry dashboard. Algorithm obligations are in
 `docs/KLENT_FOR_HEXO.md`; measured experiment outcomes are in
 `docs/ABLATIONS.md`.
 
@@ -67,46 +66,6 @@ discovery.
 `MODEL_REPR_VERSION` (model-owned, currently 3) covers the builder and every
 feature encoding. `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing. Either bump invalidates checkpoints.
-
-## The model: MantisNet-ACT
-
-MantisNet-ACT v4 is a second architecture alongside MantisNet. The two share
-the game engine and the KLENT training seam but no modules.
-
-A position becomes a graph of three node families:
-
-- **Cells**: every stone, every legal placement, and every cell of a persistent
-  window. Empty intersections inside live shapes are nodes, so forks and
-  intersections are shared entities.
-- **Windows**: six-cell line segments encoded as ternary patterns (own/opp/
-  empty per slot), quotiented by slot reversal. Mixed windows are ordinary
-  nodes with their own pattern class, not excluded as in MantisNet.
-- **Actions**: legal placements, each encoded from the eighteen windows a stone
-  placed there would join (three axes by six candidate slots), evaluated
-  counterfactually.
-
-Cells and windows are joined by joint relation classes. Cells are joined to
-each other by hex adjacency and by displacement edges from every stone within
-radius twelve, typed by the 48 exact D6 orbits of that displacement.
-
-The model has three stages:
-
-1. **State trunk**: `state_blocks` copies of an eleven-step block over cells,
-   windows, and per-position latents. Relation-gated messages pass between
-   cells and windows; latent tokens read every node, self-mix, and write back,
-   providing board-wide context at linear cost.
-2. **Action encoder**: encodes each legal cell from its eighteen
-   post-placement windows, its cell state from the trunk, and an optional
-   tactical vector. Action-set latents provide inter-action context.
-3. **Action heads**: fork the shared action state into a policy logit and a
-   three-class critic (positive/negative/zero), with configurable separation
-   (private adapters, separate MLPs, or single shared head).
-
-The architecture is exactly D6-equivariant. Every entity carries an invariant
-stream and a three-channel axis stream that permutes under the group. Line
-direction is carried by axis-equivariant channels, never by per-axis
-parameters. Configuration is controlled by `MantisACTConfig`, with named
-presets registered for lab ablations.
 
 ## KLENT training
 
@@ -205,9 +164,8 @@ accumulation, and the post-step parameter check. Callers own batch
 construction, their loss, and -- through `ChunkCost` -- what a chunk of their
 architecture costs.
 
-Each architecture's `chunk_cost` reads the limits naming its own binding
-quantities and ignores the rest: MantisNet's padded attention pairs and legal
-cells; MantisNet-ACT's graph cells plus occupied cells.
+MantisNet's `chunk_cost` reads the limits naming its binding quantities --
+padded attention pairs and legal cells -- and ignores the rest.
 
 ## Laboratory harness
 
@@ -235,9 +193,7 @@ Chunk packing, optimizer grouping, and prefetch are supplied by
 
 The variant registry maps a name to a factory, collation path, configuration
 dataclass, and description. `mantis` is MantisNet with the Rust prefix builder.
-Each named MantisNet-ACT preset is a separate variant with its own collator
-bound to its configuration. Configuration overrides are typed against the
-chosen variant's dataclass.
+Configuration overrides are typed against the chosen variant's dataclass.
 
 ### Evaluation and reports
 
@@ -390,7 +346,6 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 - [`docs/KLENT_PAPER.md`](../../docs/KLENT_PAPER.md) records the source
   algorithm.
 - [`docs/ABLATIONS.md`](../../docs/ABLATIONS.md) owns measured run outcomes.
-- [`docs/MANTIS_ACT_SPEC.md`](../../docs/MANTIS_ACT_SPEC.md) defines MantisNet-ACT.
 - `python/hexo-py` supplies engine positions and the shared Rust encoder.
 - `crates/models/mantisnet` consumes the same checkpoint and encoder semantics
   from the native container.
@@ -449,7 +404,7 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `train.py` | Supervised lab-cell fitting through the production model and fit engine |
 | `evaluate.py` | Packed imitation and outcome-horizon evaluation for lab and KLENT checkpoints |
 | `report.py` | Cross-seed score aggregation with optional paired-difference baselines |
-| `variants.py` | Variant registry: MantisNet and MantisNet-ACT presets with typed config overrides |
+| `variants.py` | Variant registry: MantisNet presets with typed config overrides |
 | `families.py` | Structural checkpoint-family registry, config inference, slot-table expansion |
 | `bench.py` | Benchmarks for building, collection, and fitting |
 | `check.py` | D6 invariance, batch parity, decoder coverage, and builder contract checks |
@@ -466,30 +421,3 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `app.py` | FastAPI routes: REST endpoints, SSE, lifecycle, play sessions, SPA serving |
 | `service.py` | Run registry, inference cache, play sessions, match jobs, child-process management |
 | `state.py` | Deck-owned SQLite persistence: game reviews, probes, presets, match history |
-
-### MantisNet-ACT (`mantisnet/models/mantis_act/`)
-
-| File | Description |
-|---|---|
-| `__init__.py` | Package exports: config, presets, model, builder, containers, class counts |
-| `config.py` | `MantisACTConfig`, named presets, enum vocabularies, architecture hash |
-| `model.py` | `MantisACT` assembled model, `ACTOutput`, checkpoint identity, KLENT seam |
-| `builder.py` | Position-to-graph orchestration: ownership conversion, phase, global scalars |
-| `packed.py` | `ACTGraph` and `PackedACTBatch` containers, collation, validation, chunk cost |
-| `state_trunk.py` | Global state trunk: eleven-step blocks over cells, windows, and latents |
-| `action_encoder.py` | Counterfactual action encoder: eighteen post-placement windows per legal cell |
-| `heads.py` | Policy/critic fork with configurable separation, optional auxiliary heads |
-| `cells.py` | Cell node set, cell-window incidence, adjacency and radius edge enumeration |
-| `windows.py` | Six-cell window enumeration and ternary encoding under scoped persistence |
-| `actions.py` | Counterfactual action tables: eighteen post-placement rows and tactical vector |
-| `equivariant.py` | Equivariant state container, AxisMix, FiLM, LayerScale primitives |
-| `messages.py` | Relation-gated messages over typed sparse edges with fused Triton kernels |
-| `latents.py` | Global state latents and action-set latents: read, self-mix, broadcast |
-| `latent_attention.py` | Flash-style fused segment kernels for latent read and broadcast |
-| `segment_message.py` | Fused relation-gated message as one segment reduction per stream |
-| `post_rows.py` | Fused sentinel-aware gather and encoder for eighteen post-placement rows |
-| `pattern_classes.py` | Ternary window-pattern reversal classes and cell-window relation classes |
-| `symmetry.py` | D6 transforms, axis permutations, orbit relation ids |
-| `diagnostics.py` | Structural alias diagnostic and per-position telemetry |
-| `summary.py` | Parameter-count summary by subsystem |
-| `aux_labels.py` | Deterministic auxiliary labels computed from the board without search |
