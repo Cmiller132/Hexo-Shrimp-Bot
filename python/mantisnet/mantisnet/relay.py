@@ -1,31 +1,16 @@
-"""The §5.1b cell pass: windows exchange state through shared empty cells.
+"""The section 5.1b cell pass: windows exchange state through shared empty cells.
 
-The pass computes, over the decoder incidence (cell, window, class):
+Computes over the decoder incidence (cell, window, class):
 
     pre[c]  = Σ_e x[window(e)] + e_class[class(e)]     over the cell's entries
     val[c]  = ReLU(pre[c])
     agg[w]  = Σ_e val[cell(e)]                         over the window's entries
 
-with fp32 accumulation throughout and the result cast back to ``x``'s dtype.
-A cell that only one live window covers relays that window's own message back
-to it; a cell covered by several is the channel between them. The bipartite
-form is deliberately kept: a cell of degree d mediates d·(d-1) window pairs
-with d edges, so collapsing to direct window-window edges would move ~3x the
-messages on real positions.
-
-The incidence is static per batch, so ``relay_tables`` sorts it once, on the
-CPU, into three views of the same edge set: runs by cell (forward
-aggregation), runs by window (the return gather and ``dx``), and runs by
-class (``d_emb``). Every kernel is then a contiguous segment reduction — no
-atomics, deterministic, one program and one warp per output row, like the
-decoder's aggregation. The one exception is the class gradient: a class run
-can own a large share of the whole edge set, so it is sliced across programs
-into per-slice partials summed in a fixed order. The backward recomputes
-``pre`` in-kernel for the ReLU mask instead of storing it, the same trade the
-fused attention backward makes.
-
-The torch composition over the same tables is the parity reference and serves
-CPU tensors and failed launches.
+with fp32 accumulation, cast back to ``x``'s dtype.  ``relay_tables`` sorts
+the incidence into three views (by cell, by window, by class) for contiguous
+segment reductions.  The class gradient is sliced across programs because
+class runs can be large.  The backward recomputes ``pre`` for the ReLU mask.
+CPU: torch composition over the same tables as the parity reference.
 """
 
 from __future__ import annotations

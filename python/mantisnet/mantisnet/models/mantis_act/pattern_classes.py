@@ -1,42 +1,13 @@
 """Ternary window-pattern reversal classes (§9.2, §10.1, §19.2).
 
-A six-cell line window is read in slot order ``k = 0..5`` along its native
-axis, each slot holding ``0`` empty, ``1`` own, ``2`` opponent relative to the
-side to move; its raw code is ``sum_k v_k * 3**k``, one of ``TERNARY_CODES``. A
-board reflection reverses a window's slot order and nothing else, so the finest
-description of a window the model may see is the quotient of the raw codes by
-``k -> 5 - k``. Every table here is that quotient or a statistic constant on
-it, built once at import from first principles, with each count the spec
-asserts checked against the construction rather than assumed.
+Raw code ``sum_k v_k * 3**k`` for slots ``k = 0..5``. Reflection reverses slot
+order, so every table is the quotient by ``k -> 5 - k``.
 
-Index conventions this module fixes (each is part of the representation):
-
-- Pattern class: the rank of the reversal orbit's representative — the orbit's
-  minimum raw code — in ascending raw order, one of
-  ``ALL_WINDOW_PATTERN_CLASSES``. Class ``0`` is the all-empty pattern, the one
-  class the ``nonempty`` window scope never uses.
-- Cell-window class: the rank of the ``(pattern, slot)`` orbit under the joint
-  involution ``(p, s) -> (reverse(p), 5 - s)``, in ascending ``(code, slot)``
-  order, one of ``ALL_CELL_WINDOW_REL_CLASSES``. §10.1 requires the joint
-  orbit: canonicalizing the pattern separately from a coarse slot descriptor
-  merges relations that differ, which is an exact alias rather than a
-  compression.
-- Post-placement class: the same joint orbit restricted to the pairs a
-  hypothetical own placement can produce — slot ``s`` of the post-placement
-  pattern holds an own stone — ranked among those pairs alone, one of
-  ``POST1_REL_CLASSES``.
-
-``POST1_CLASS[code, slot]`` is ``-1`` wherever ``slot`` does not hold an own
-stone in ``code``: such a pair is not a post-placement state and has no class.
-The action builder indexes the table with the pattern it obtained by writing an
-own stone into ``slot``, so every index it forms is defined by construction,
-and a ``-1`` reaching a relation embedding is a builder fault — the builder
-must refuse it there rather than embed a wrapped-around row.
-
-Reversal permutes a window's slots without changing any slot's value, so the
-status, the three occupancy counts, and both maximum contiguous runs take one
-value across an orbit. They are therefore well defined per class even though
-they are tabulated per raw code; the tests check that equality exhaustively.
+- Pattern class: rank of reversal orbit's minimum raw code, ascending.
+- Cell-window class: joint ``(pattern, slot)`` orbit under
+  ``(p, s) -> (reverse(p), 5 - s)`` (§10.1).
+- Post-placement class: same orbit restricted to slots holding an own stone;
+  ``POST1_CLASS[code, slot]`` is ``-1`` elsewhere.
 """
 
 from __future__ import annotations
@@ -84,13 +55,12 @@ def _orbit_ranks(partner: np.ndarray, valid: np.ndarray) -> tuple[np.ndarray, np
     ``partner`` sends each item's index to the index reversal maps it to, and
     ``valid`` selects the subset being classed. An orbit's representative is
     its minimum index, and its class is that representative's rank among the
-    representatives — the numbering ``mantisnet/builder.py::_orbit_classes``
-    gives the binary case, since ascending order reaches every orbit at its
-    representative first. Items outside ``valid`` get ``-1``.
+    representatives (the same numbering ``mantisnet/builder.py::_orbit_classes``
+    gives the binary case). Items outside ``valid`` get ``-1``.
 
-    Both preconditions are checked rather than documented: an index array that
-    is not an involution, or a subset the involution leaves, would silently
-    produce a table that maps two distinct relations onto one class.
+    Both preconditions are checked: an index array that is not an involution,
+    or a subset the involution leaves, would silently alias two distinct
+    relations onto one class.
     """
     items = np.arange(len(partner), dtype=np.int64)
     if not np.array_equal(partner[partner], items):

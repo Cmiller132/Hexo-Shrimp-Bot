@@ -472,8 +472,8 @@ def bench_fit(
                 sizes=sizes,
             )
 
-    # Preserve the absorbed benchmark's measurement contract: compilation,
-    # autotuning, and first-use allocator work happen outside the timed epoch.
+    # Compilation, autotuning, and first-use allocator work happen outside
+    # the timed epoch.
     run_epoch(seed)
     _sync(device)
     _vram_reset(device)

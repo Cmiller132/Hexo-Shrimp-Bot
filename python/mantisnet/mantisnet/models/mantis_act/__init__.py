@@ -1,49 +1,12 @@
 """MantisNet-ACT v4: an exactly D6-equivariant board and action representation.
 
-``docs/MANTIS_ACT_SPEC.md`` is normative for this package; the section marks
-throughout the modules point into it. This is a second architecture alongside
-MantisNet, not a revision of it: the two share the game, the engine, and the
-KLENT seam, and no module at all.
-
-What the representation is. A position becomes a graph of two persistent node
-families and one derived one. *Cells* are the finite set of coordinates the
-position makes relevant — every stone, every legal placement, and every cell
-of a persistent window, so an empty and currently illegal intersection inside a
-live shape is still a node. *Windows* are the six-cell line segments the board
-actually contains: all of them that hold a stone, encoded as a ternary pattern
-over their six slots quotiented by slot reversal. *Actions* are the legal
-placements, each encoded from the eighteen windows a stone placed there would
-join — three axes by six candidate slots — evaluated counterfactually rather
-than looked up. Cells and windows are joined by an exact joint relation class
-of ``(pattern, slot)``; cells are joined to each other by hex adjacency and by
-displacement edges from every stone within radius twelve, typed by the 48
-exact D6 orbits of that displacement.
-
-How that differs from MantisNet at the representation level:
-
-- MantisNet's nodes are stones and *live* windows — one colour only. A window
-  holding both colours is dead for scoring and is dropped, so a blocked line
-  and an empty line look alike. Here mixed windows are ordinary nodes with
-  their own pattern class and status, and empty cells inside windows are nodes
-  too, which is what lets an intersection or a fork be one shared entity rather
-  than an inference from two window states.
-- MantisNet types its geometry by hex distance plus an on-axis flag. Here a
-  displacement carries the exact class of its D6 orbit, of which there are 48
-  through radius twelve, so two shapes that a distance bucket cannot tell apart
-  are not aliased into one relation.
-- MantisNet describes a legal cell by the live windows through it and, failing
-  that, by its distance to the nearest stone. Here every legal cell is
-  described by what placing a stone there would produce, in all eighteen
-  windows, so a cell in no current window is encoded by its own future rather
-  than by a background alias.
-- Line direction is carried by three axis-equivariant channels that permute
-  under the group, never by per-axis parameters, and nothing in the model sees
-  an absolute coordinate, an absolute axis id, or a move number.
-
-The builder is exact and vectorised, calls the engine only to read a position,
-and refuses terminal states. Class counts are asserted at import: a table with
-the wrong number of orbits would train a silently aliased embedding, which no
-round-trip test can see.
+A position becomes a graph of cells, windows, and legal actions. Cells are
+every stone, every legal placement, and every cell of a persistent window.
+Windows are the six-cell line segments holding a stone, encoded as a ternary
+pattern quotiented by slot reversal. Actions are the legal placements, each
+encoded counterfactually from the eighteen windows a stone placed there would
+join. ``docs/MANTIS_ACT_SPEC.md`` is normative; the section marks throughout
+the modules point into it.
 """
 
 from __future__ import annotations
@@ -61,16 +24,20 @@ from .config import (
     ENUM_VOCABULARIES,
     MANTIS_ACT_REPR_VERSION,
     PRESETS,
+    UNHASHED_FIELDS,
     MantisACTConfig,
     architecture_hash,
     summarise,
 )
+from .model import ACT_CHECKPOINT_FORMAT, ACTOutput, MantisACT, config_from_record
 from .packed import (
+    ACT_GRAPH_CELL_BUDGET,
     PHASE_FIRST,
     PHASE_OPENING,
     PHASE_SECOND,
     POST_ACTION_ROWS,
     WINDOW_LEN,
+    ACTChunkCost,
     ACTGraph,
     PackedACTBatch,
     collate,
@@ -88,6 +55,7 @@ from .pattern_classes import (
     POST1_REL_CLASSES,
     TERNARY_CODES,
 )
+from .summary import ParameterSummary, parameter_summary
 from .symmetry import D6_ORBITS_DMAX12
 
 __all__ = [
@@ -97,8 +65,19 @@ __all__ = [
     "MantisACTConfig",
     "PRESETS",
     "ENUM_VOCABULARIES",
+    "UNHASHED_FIELDS",
     "architecture_hash",
     "summarise",
+    # The assembled model, its output, and its checkpoint identity (§25, §28).
+    # The three stages it composes stay in their own modules: `state_trunk`,
+    # `action_encoder`, and `heads`.
+    "MantisACT",
+    "ACTOutput",
+    "ACT_CHECKPOINT_FORMAT",
+    "config_from_record",
+    # Parameters by subsystem (§6, §32, §34).
+    "ParameterSummary",
+    "parameter_summary",
     # Builder entry points (§7, §26).
     "build",
     "build_from_arrays",
@@ -111,6 +90,9 @@ __all__ = [
     "PackedACTBatch",
     "collate",
     "telemetry",
+    # The §26 packer limit and the law that reads it.
+    "ACTChunkCost",
+    "ACT_GRAPH_CELL_BUDGET",
     "WINDOW_LEN",
     "POST_ACTION_ROWS",
     "PHASE_OPENING",

@@ -1,4 +1,4 @@
-"""Training targets and losses: what the outputs *mean* (MODEL_SPEC §6, §7, §10).
+"""Training targets and losses: what the outputs *mean*.
 
 The model emits raw policy logits and a binned value distribution; this module
 pins the targets they are trained against. Nothing here is used at inference.

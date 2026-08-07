@@ -1,44 +1,19 @@
-"""The mover-change sign and λ-return from ``KLENT_FOR_HEXO.md`` §1.2–§1.3.
-
-The sign follows mover change rather than ply parity. It is read from the
-acted-on position's phase:
-``+1`` exactly at a ``FirstStone`` ply, where the same mover places again.
-``moves_remaining`` carries the phase here: 2 is ``FirstStone``; 1 is
-``Opening`` or ``SecondStone``, both of which hand the turn over.
-
-The recursion consumes completed, won episodes; capped episodes are excluded
-by the caller:
+"""Mover-change signs and lambda-returns (``KLENT_FOR_HEXO.md`` section 1.2-1.3).
 
     G_T = +1
-    G_t = s_t · γ · [ (1 − λ)·v̂_{t+1} + λ·G_{t+1} ]        t < T
-
-γ is the per-ply discount magnitude; ``s_t`` carries the mover-change sign.
-At γ = 1, outcome timing does not change return magnitude. Values below one
-give earlier outcomes larger magnitude.
+    G_t = s_t * gamma * [ (1 - lam) * v_hat_{t+1} + lam * G_{t+1} ]
 """
 
 from __future__ import annotations
 
 import numpy as np
 
-# |v̂| ≤ max_a |Q(a)| ≤ 1 holds in real arithmetic, but v̂ is an fp32 sum over a
-# position's legal cells: a saturated critic puts many of them at exactly ±1,
-# and an fp32 segment softmax sums to one only to a few ulps, so a legitimate
-# v̂ can land just outside the interval — measured at 1.7e-5 over a corpus of
-# 8.7M cells. The slack keeps the range checks below detectors of inputs that
-# are actually wrong rather than of fp32 summation.
+# Tolerance for fp32 segment-softmax summation landing slightly outside [-1, 1].
 _RANGE_SLACK = 1e-4
 
 
 def _refuse_unbounded(x: np.ndarray, name: str) -> None:
-    """Refuse a non-finite or out-of-range array, naming the entry that failed.
-
-    Which condition failed and on which value is the whole diagnostic content of
-    this refusal: a non-finite entry means the network or the operator produced
-    one, while an entry a little outside the interval means the fp32 summation
-    slack was underestimated. A message that cannot tell them apart sends the
-    reader to the wrong place.
-    """
+    """Refuse a non-finite or out-of-range array, naming the entry that failed."""
     finite = np.isfinite(x)
     excess = np.where(finite, np.abs(x) - 1.0, np.inf)
     if finite.all() and excess.max() <= _RANGE_SLACK:
@@ -81,8 +56,6 @@ def lambda_returns(signs: np.ndarray, v_hats, lam_ret: float, gamma: float) -> n
     g[-1] = 1.0
     for t in range(len(v) - 2, -1, -1):
         g[t] = signs[t] * gamma * ((1.0 - lam_ret) * v[t + 1] + lam_ret * g[t + 1])
-    # Bounded inputs and gamma <= 1 bound G by construction, to the same fp32
-    # slack the inputs carry; leaving that interval means the recursion or its
-    # inputs changed incompatibly.
+    # Final range check: G is bounded by the same slack as the inputs.
     _refuse_unbounded(g, "the lambda-return")
     return g

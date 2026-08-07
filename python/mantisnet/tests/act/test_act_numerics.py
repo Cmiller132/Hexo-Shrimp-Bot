@@ -94,11 +94,7 @@ FULL = PRESETS["full_act_v4"]
 # reports for the stages that are not written yet.
 PARAMETER_TARGET = (2_500_000, 4_000_000)
 
-# The one preset the state trunk refuses by construction: §16's typed window
-# attention needs a window-to-window edge family the packed batch does not
-# carry. `test_act_trunk.py` owns that refusal; this file skips the arm.
-BLOCKED_PRESET = "full_with_typed_window_attention"
-TRUNK_PRESETS = tuple(name for name in PRESETS if name != BLOCKED_PRESET)
+TRUNK_PRESETS = tuple(PRESETS)
 
 # The arms §29 and §32 require to remove a subsystem outright. `full_no_pair` is
 # absent from the list because §20 is not implemented at all — see
@@ -376,9 +372,7 @@ def test_a_bf16_accumulation_of_a_real_segment_loses_what_fp32_keeps(batch):
     measures the error of accumulating that many unit-scale terms in each
     precision, so the rule is shown to be load-bearing rather than assumed.
     """
-    counts = messages_module.segment_counts(
-        batch.radius_dst, int(batch.cell_offsets[-1])
-    )
+    counts = torch.bincount(batch.radius_dst, minlength=int(batch.cell_offsets[-1]))
     deepest = int(counts.max())
     assert deepest > 100, deepest
 

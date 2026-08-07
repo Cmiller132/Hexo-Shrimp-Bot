@@ -1,34 +1,8 @@
-"""The model summary §6 and §32 require: parameters by subsystem, and a total.
+"""Parameter summary by subsystem (§6, §32).
 
-§6 asks for "a model-summary function reporting parameters by subsystem"; §32
-requires its total to match ``sum(p.numel())``; §16 needs the parameter cost of
-two arms compared before either is called a matched control; and §34 lists
-"parameters by subsystem" among the figures a run reports. All four are this
-module.
-
-A subsystem is read off the parameter's own path in the module tree rather than
-looked up in a registry of module names. A registry has to be maintained beside
-the model and goes stale silently — a renamed or newly added module quietly
-falls into "other", or worse, into whichever bucket a prefix still matches. Here
-the label is derived:
-
-```text
-blocks.2.incidence.to_windows.wv_inv.weight  ->  blocks.incidence
-latents.passes.0.q_read_inv.weight           ->  latents.passes
-cell_embedding.axis_base                     ->  cell_embedding
-```
-
-that is: drop the parameter's own name, drop the numeric components — a block
-index names a copy of a subsystem, not a subsystem — and keep the first
-``depth`` of what remains. A module that is renamed changes its label; a module
-that is added appears as its own line; no parameter is ever dropped or
-double-counted, and :func:`parameter_summary` asserts exactly that against
-``sum(p.numel())`` before it returns.
-
-Sharing is counted once. ``named_parameters`` deduplicates by identity, so the
-relation tables the state trunk shares across its four blocks are one line at
-their owner's path, and the summary's total is the number of trainable scalars
-the optimiser sees rather than the number of places they are read from.
+Subsystem is derived from the parameter's module-tree path: drop the
+parameter name and numeric indices, keep the first ``depth`` segments.
+The grouped total is asserted against ``sum(p.numel())``.
 """
 
 from __future__ import annotations
@@ -83,11 +57,10 @@ def parameter_summary(
 ) -> ParameterSummary:
     """``module``'s trainable parameters grouped by subsystem (§6, §32).
 
-    Frozen parameters are excluded from both the groups and the total: the
-    summary reports what is being trained. Nothing else is filtered, and the
-    total is checked against ``sum(p.numel())`` over the same set before the
-    result is returned, so a grouping rule that lost or duplicated a parameter
-    raises here instead of reporting a plausible wrong number.
+    Frozen parameters are excluded from both the groups and the total; nothing
+    else is filtered. The total is checked against ``sum(p.numel())`` over the
+    same set before the result is returned, so a grouping rule that lost or
+    duplicated a parameter raises here instead of reporting a wrong number.
     """
     counts: dict[str, int] = {}
     tensors = 0

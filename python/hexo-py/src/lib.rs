@@ -1,12 +1,12 @@
 //! Python bindings for `hexo-engine`: the read surface a model builder needs,
 //! and nothing that could bypass the rules.
 //!
-//! The surface is `MODEL_SPEC.md` §11's input list — stones, legal moves in
-//! canonical order, `moves_remaining` — plus `windows_through`, which exists so
-//! a builder test can check window enumeration against the engine as an
-//! independent oracle (§12.1). Positions are created empty or by replay, never
-//! deserialised: a board-shaped constructor would be a rule-bypass hole, which
-//! is the same argument `ENGINE_SPEC.md` §12 makes for the engine itself.
+//! The surface is the input list — stones, legal moves in canonical order,
+//! `moves_remaining` — plus `windows_through`, which exists so a builder test
+//! can check window enumeration against the engine as an independent oracle.
+//! Positions are created empty or by replay, never deserialised: a board-shaped
+//! constructor would be a rule-bypass hole, which is the same argument the
+//! engine makes for itself.
 
 use hexo_engine as engine;
 use hexo_model_mantisnet::{MODEL_REPR_VERSION, encoder};
@@ -105,7 +105,7 @@ impl Position {
     /// along the axis. Axes are `0 = Q (1,0)`, `1 = R (0,1)`, `2 = QR (1,-1)`.
     ///
     /// This is the engine's own window walk, exposed for the builder-oracle
-    /// test. The builder must not call it (`MODEL_SPEC.md` §12.1).
+    /// test. The builder must not call it — it is the independent oracle.
     fn windows_through(&self, q: i16, r: i16) -> PyResult<Vec<WindowTuple>> {
         let c = engine::HexCoord::new(q, r);
         if !c.is_valid() {

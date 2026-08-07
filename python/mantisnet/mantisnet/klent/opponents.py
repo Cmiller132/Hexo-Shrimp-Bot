@@ -1,13 +1,7 @@
 """Evaluation-opponent contract, SealBot adapter, and native seat adapter.
 
-An opponent provides an identity (``name`` and strength-defining ``config``)
-and ``make_chooser(ply_cap)``. Both in-loop evaluation and offline sweeps use
-this interface.
-
-Chooser objects may expose per-game lifecycle hooks when they maintain
-opponent state. The generic loop merely calls those hooks. SealBot uses them
-for its independent ``HexGame`` oracle and alpha-beta instances; SeatOpponent
-uses them to hold protocol slots and incremental move cursors.
+An opponent provides ``name``, ``config``, and ``make_chooser(ply_cap)``.
+Choosers may expose per-game lifecycle hooks for stateful opponents.
 """
 
 from __future__ import annotations

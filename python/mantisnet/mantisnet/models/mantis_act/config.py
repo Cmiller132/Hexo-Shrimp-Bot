@@ -1,34 +1,11 @@
-"""The MantisNet-ACT v4 configuration, its named presets, and its hash.
+"""MantisNet-ACT v4 configuration, presets, and architecture hash (§6).
 
-``MantisACTConfig`` is ``docs/MANTIS_ACT_SPEC.md`` §6 field for field. Every
-enum-valued field is checked against an explicit vocabulary and every
-cross-field invariant is checked at construction, so a configuration naming a
-model nothing implements is refused where it is written rather than where a
-tensor shape first disagrees.
+``MantisACTConfig`` mirrors §6 field for field. Enum fields are checked
+against explicit vocabularies; cross-field invariants (axis channels iff
+``d_axis > 0``, ``occupied_radius <= d_max``, latent counts under
+``global_mode``) are enforced at construction.
 
-``MANTIS_ACT_REPR_VERSION`` is a constant of this package and deliberately not
-the ``hexo_py.MODEL_REPR_VERSION`` that §28 names. That one is a Rust constant
-gating the legacy encoder's wire format, and every MantisNet checkpoint on disk
-carries it: bumping it would fail their own version check and delete them,
-which §32 and §37.13 forbid. ``4`` is the next repository value after that
-constant's ``3``, and it names this representation only.
-
-Invariants the constructor enforces past the per-field vocabularies. Each
-rejected combination describes a model carrying parameters no forward would
-read, which §29 forbids for the axis case and the house rule forbids in
-general:
-
-- axis channels exist exactly when ``d_axis > 0``, and axis latents need them;
-- action-set latents exist exactly when ``num_action_latents > 0``, and
-  ``global_mode="none"`` zeroes every latent count;
-- ``occupied_radius <= d_max``: past ``d_max`` a displacement has no orbit
-  class to carry, and the sparse paths emit no such edge (§11.2).
-
-``architecture_hash`` digests every field except ``dropout`` — under §28 that
-is exactly the set changing a node set, a relation's meaning, a tensor shape,
-or an output's meaning. It is a text digest of sorted ``field=repr(value)``
-lines, so it is identical in every process: nothing here reads ``hash()``, set
-iteration order, or dict insertion order.
+``architecture_hash`` digests every field except ``dropout`` (§28).
 """
 
 from __future__ import annotations
@@ -40,8 +17,7 @@ ARCHITECTURE_ID = "mantis_act_v4"
 MANTIS_ACT_REPR_VERSION = 4
 
 # The allowed values of every enum-valued field. `architecture_id` is a
-# one-value vocabulary: §28 fixes the id, and a config claiming another
-# architecture would load into this model under a name it does not implement.
+# one-value vocabulary: §28 fixes the id.
 ENUM_VOCABULARIES: dict[str, frozenset[str]] = {
     "architecture_id": frozenset({ARCHITECTURE_ID}),
     "window_scope": frozenset({"live", "nonempty", "action_relevant"}),
@@ -78,9 +54,10 @@ _NON_NEGATIVE_FIELDS = (
     "occupied_radius",
 )
 
-# Dropout is the one field that changes no node set, relation, shape, or
-# output meaning, so it is the one field outside the architecture hash (§28).
-_UNHASHED_FIELDS = frozenset({"dropout"})
+# Dropout changes no node set, relation, shape, or output meaning, so it is
+# the one field outside the architecture hash (§28). Public because a strict
+# checkpoint load compares against exactly this complement.
+UNHASHED_FIELDS = frozenset({"dropout"})
 
 
 @dataclass(frozen=True)
@@ -263,13 +240,13 @@ PRESET_DELTAS: dict[str, dict[str, object]] = {
         "num_action_latents": 0,
         "use_action_set_latents": False,
     },
-    # The old distance plus on/off-axis scheme in place of the 48 orbits.
+    # Distance plus on/off-axis scheme in place of the 48 orbits.
     "full_coarse_geometry": {"d6_relation_mode": "coarse_distance_axis"},
     # Exact orbit classes, but occupied edges only out to radius six (§29).
     "full_radius6": {"occupied_radius": 6},
     # The efficient control against persistent relevant empty cells (§8.1).
     "full_occupied_cells_only": {"cell_scope": "occupied_only"},
-    # The legacy additive incidence message U h + E_r (§14).
+    # Additive incidence message U h + E_r (§14).
     "full_additive_incidence": {"incidence_message": "additive"},
     # One shared action representation before the outputs (§23). Ablation only.
     "full_shared_head": {"head_separation": "single_shared_head"},
@@ -304,17 +281,14 @@ PRESETS: dict[str, MantisACTConfig] = {
 def architecture_hash(cfg: MantisACTConfig) -> str:
     """A stable 16-hex-digit digest of every semantic field of ``cfg`` (§28).
 
-    The digest is taken over the ``field=repr(value)`` lines in sorted field
-    order, so it depends on nothing but the values: not on the declaration
-    order of the dataclass, not on dict or set iteration, and not on the
-    per-process seed of ``hash()``. Two processes reading the same checkpoint
-    therefore agree, which is what makes strict load able to refuse a
-    mismatch.
+    Taken over the ``field=repr(value)`` lines in sorted field order, so it
+    depends only on the values, not on declaration order, dict/set iteration,
+    or the per-process seed of ``hash()``.
     """
     payload = "\n".join(
         f"{f.name}={getattr(cfg, f.name)!r}"
         for f in sorted(fields(cfg), key=lambda f: f.name)
-        if f.name not in _UNHASHED_FIELDS
+        if f.name not in UNHASHED_FIELDS
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -399,12 +373,11 @@ if _MISSING:
 def summarise(cfg: MantisACTConfig) -> str:
     """The resolved configuration as readable text, with its ablations named.
 
-    The header carries the identity a checkpoint records — architecture id,
-    representation version, architecture hash — and the trailing lines name
-    every field that differs from ``full_act_v4``, so a run's log says which
-    arm it is without a diff. ``window_scope="live"`` gets its own line: it is
-    a legal configuration, but it drops the mixed and dead windows that §3 and
-    §38 make part of the full model, and it is silent about it otherwise.
+    The header carries the checkpoint identity (architecture id, representation
+    version, architecture hash); the trailing lines name every field that
+    differs from ``full_act_v4``. ``window_scope="live"`` gets its own line
+    noting it drops the mixed and dead windows the full model represents
+    (§3, §38).
     """
     lines = [
         f"{cfg.architecture_id} repr_version={MANTIS_ACT_REPR_VERSION} "

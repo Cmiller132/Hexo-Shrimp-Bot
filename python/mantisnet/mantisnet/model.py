@@ -28,13 +28,15 @@ from .builder import (
     NUM_PATTERNS,
     OCC_CLASSES,
     Batch,
+    PaddedPairChunkCost,
+    collate_prefixes,
 )
 from .segments import segment_ids, segment_max
 
 
 @dataclass(frozen=True)
 class MantisConfig:
-    """The named parameters of MODEL_SPEC §2, at their suggested defaults."""
+    """The named parameters at their suggested defaults."""
 
     h: int = 128  # H: embedding width, everywhere
     blocks: int = 4  # B
@@ -86,11 +88,8 @@ class ModelOutput:
 # [z_pos, z_neg, z_zero]. Every reader takes the checkpoint shape from here.
 CRITIC_LOGITS = 3
 
-# The trunk stages were config knobs while they were ablations; checkpoints
-# written in that window record the knob fields in their model_config. These
-# are the values that describe the architecture this build bakes in — a
-# recorded config carrying exactly these is this architecture and loads; any
-# other value names a model this build no longer implements.
+# Config knob values that match the baked-in architecture.  A checkpoint
+# whose recorded config carries exactly these loads; any other value is refused.
 LEGACY_BAKED_KNOBS: dict[str, object] = {
     "axis_bias": True,
     "off_axis_bias": False,
@@ -132,12 +131,7 @@ def return_mass(critic_logits: Tensor) -> tuple[Tensor, Tensor]:
 def compose_q(critic_logits: Tensor) -> Tensor:
     """Compose ``(..., 3)`` categorical logits into action values, fp32.
 
-    ``Q = p_pos - p_neg`` is the quantity the λ-return targets and v̂ averages.
-    The categorical simplex makes ``Q`` lie in ``(-1, 1)`` and committed mass
-    ``p_pos + p_neg`` lie in ``(0, 1)`` by construction.
-
-    The function is free-standing because acting composes every legal cell
-    while fitting composes only the taken action, off the same raw logits.
+    ``Q = p_pos - p_neg``, bounded to ``(-1, 1)`` by the categorical simplex.
     """
     p_pos, p_neg = return_mass(critic_logits)
     return p_pos - p_neg
@@ -148,12 +142,8 @@ def compose_acting_q(
 ) -> Tensor:
     """Return Q divided by the position's floored maximum committed mass.
 
-    ``M = p_pos + p_neg = 1 - p_zero`` is structurally in ``(0, 1)``. One
-    positive divisor is shared by every legal cell in a position, so the score
-    preserves Q's order while expressing it in units of the most committed
-    action. Since ``|Q| <= M <= max M``, an unfloored score lies in ``(-1, 1)``;
-    ``mass_floor`` additionally bounds sharpening when all actions put most
-    probability on zero return.
+    ``M = p_pos + p_neg``, shared per position, so the score preserves Q's
+    order.  ``mass_floor`` bounds sharpening when all actions are near zero.
     """
     p_pos, p_neg = return_mass(critic_logits)
     seg = segment_ids(offsets)
@@ -168,13 +158,7 @@ def _mlp(d_in: int, d_hidden: int, d_out: int) -> nn.Sequential:
 
 
 def _class_term(counts: Tensor, weight: Tensor, dtype: torch.dtype) -> Tensor:
-    """A destination's summed slot-class rows, as histogram times table.
-
-    The weight gradient is a dense matmul, not a contended few-row scatter.
-    Under autocast the matmul runs bf16 with fp32 accumulation, so the class
-    rows still sum at full precision; the counts are small integers, exact
-    in every dtype involved.
-    """
+    """A destination's summed slot-class rows, as histogram times table."""
     return (counts @ weight).to(dtype)
 
 
@@ -272,13 +256,7 @@ class _Block(nn.Module):
         return w + self.drop(self.mlp_cp(self.ln_cp_w(w), agg))
 
     def _window_attention(self, w: Tensor, pairs) -> Tensor:
-        """§5.1c: multi-head attention over each window's relation edges.
-
-        The edge op runs scores, softmax, and the weighted sum in fp32
-        whatever autocast chose for the projections, saves only the softmax
-        stats, and recomputes every per-edge quantity in backward. ``pairs``
-        is the trunk's per-batch ``PairTables``, derived once on device.
-        """
+        """Section 5.1c: multi-head attention over each window's relation edges."""
         cfg = self.cfg
         heads, hd = cfg.heads, cfg.h // cfg.heads
         n_w = w.shape[0]
@@ -309,10 +287,7 @@ class _Block(nn.Module):
         # torch.compile they become symbolic, so one graph serves every shape.
         p, max_t = g.shape[0], batch.attn_valid.shape[1]
 
-        # §5.1: windows aggregate their stones. Sum, not mean — the count is
-        # signal. The class term of each pass is a dense ``counts @ table``
-        # whose gradient is another matmul, not a per-entry gather whose
-        # backward scatters into a few rows.
+        # §5.1: windows aggregate their stones (sum, not mean).
         x = self.u(self.ln_ws_s(s))
         agg = message_passing.aggregate_to_windows(
             x,
@@ -445,13 +420,9 @@ class MantisNet(nn.Module):
             nn.init.zeros_(head.out.bias)
 
     def _pair_tables(self, batch: Batch):
-        # §5.1c tables are born on the batch's device from the window
-        # identities: the int64 edge views cost several times more to ship
-        # over PCIe than to derive beside the model, and every block shares
-        # one derivation. The op is opaque to the compiler — a graph break
-        # here would spill the surrounding message passing to eager. The
-        # source view shares the destination view's arrays (reversal
-        # closure), reassembled here because ops may not return aliases.
+        # §5.1c: derive pair tables on-device from window identities.
+        # Source view shares destination arrays (reversal closure),
+        # reassembled here because ops may not return aliases.
         ptr, src, cls, scls, cptr, cedge = window_pairs.derive_pair_tables(
             batch.window_id, batch.window_slot // batch.max_w
         )
@@ -478,11 +449,7 @@ class MantisNet(nn.Module):
         return self.ln_out(s), self.ln_out(w), self.ln_out(g)
 
     def _decoder_rows(self, w: Tensor, batch: Batch, dtype: torch.dtype) -> Tensor:
-        """The pass over the decoder incidence, shared by both cell heads.
-
-        ``dtype`` comes from a head linear the caller has already run, so the
-        aggregation is built in whatever precision autocast chose for the head
-        GEMMs that consume it, without this forward assuming which that is."""
+        """Decoder incidence aggregation shared by both cell heads."""
         return decoder.aggregate(
             w.to(dtype),
             batch.dec_window,
@@ -503,10 +470,7 @@ class MantisNet(nn.Module):
         e_bg: nn.Embedding,
         mlp: _PairMlp,
     ) -> Tensor:
-        """One head's ``(N_cells, d_out)`` readout rows, off the shared
-        aggregation. The head's projection and both its embedding tables live
-        in the matrix that reads an aggregate row; the token half of the MLP
-        runs per position."""
+        """One head's ``(N_cells, d_out)`` readout from the shared aggregation."""
         matrix = decoder.head_matrix(
             lin.weight, e_w.weight, e_bg.weight, mlp.lin_a.weight
         )
@@ -524,13 +488,7 @@ class MantisNet(nn.Module):
     def cell_head_logits(
         self, w: Tensor, g: Tensor, batch: Batch
     ) -> tuple[Tensor, Tensor]:
-        """§6 policy logits ``(N,)`` and categorical logits ``(N, 3)``.
-
-        Both heads use the same parameter-free incidence aggregation and own
-        separate decoder parameters. Fitting takes one categorical score on
-        the selected row; acting composes its score and value from the same
-        logits, so one pass answers both.
-        """
+        """Section 6 policy logits ``(N,)`` and categorical logits ``(N, 3)``."""
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
         rows = self._decoder_rows(w, batch, g_p.dtype)
         return (
@@ -540,6 +498,44 @@ class MantisNet(nn.Module):
             self._cell_scores(
                 rows, g_q, batch, self.q, self.e_qw, self.e_qbg, self.mlp_q
             ),
+        )
+
+    def policy_q(self, batch: Batch) -> tuple[Tensor, Tensor]:
+        """The KLENT pass: section 6 policy logits and appendix B categorical logits."""
+        _s, w, g = self.trunk(batch)
+        return self.cell_head_logits(w, g, batch)
+
+    # §7's binned state value is part of this architecture, so the supervised
+    # recipe's third term and the lab's `state_value` score channel both apply.
+    has_state_value_head = True
+
+    def supervised_heads(
+        self, batch: Batch
+    ) -> tuple[Tensor, Tensor, Tensor | None, Tensor | None]:
+        """Policy logits, critic logits, and section 7 state value in one trunk pass.
+
+        Returns ``(policy, critic, value, value_logits)``.  Architectures
+        without a state-value head return ``None`` for the last two.
+        """
+        _s, w, g = self.trunk(batch)
+        policy_logits, critic_logits = self.cell_head_logits(w, g, batch)
+        value, _value_dist, value_logits = self.value_head(w, g, batch)
+        return policy_logits, critic_logits, value, value_logits
+
+    def collate_prefixes(self, games, ts) -> Batch:
+        """Stored move prefixes as one batch of this architecture's input."""
+        return collate_prefixes(games, ts)
+
+    def chunk_cost(self, stones, legal, budgets) -> PaddedPairChunkCost:
+        """Packing cost over this model's limits.
+
+        ``stones[i]`` is sample ``i``'s ply; ``legal[i]`` its legal-move count.
+        """
+        return PaddedPairChunkCost(
+            [int(s) + 1 for s in stones],
+            legal,
+            budgets.pair_budget,
+            budgets.cell_budget,
         )
 
     def cell_heads(
@@ -557,10 +553,8 @@ class MantisNet(nn.Module):
         )
 
     def value_head(self, w: Tensor, g: Tensor, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
-        """§7: (value, value_dist, value_logits). Multi-query attention
-        readout over [token; windows]. The LN runs on the concatenated rows
-        before padding — row-wise, so identical, and the padded copy is
-        written once."""
+        """Section 7: (value, value_dist, value_logits) via multi-query attention
+        over [token; windows]."""
         cfg = self.cfg
         p, max_w = g.shape[0], batch.value_valid.shape[1]
         rows = g.new_zeros(p * max_w, cfg.h)
@@ -582,8 +576,7 @@ class MantisNet(nn.Module):
         return value, value_dist, v_logits
 
     def forward(self, batch: Batch, mass_floor: float) -> ModelOutput:
-        """Every head. KLENT's loop composes `trunk` with the two heads it
-        trains instead, skipping the value readout it never reads."""
+        """All heads: policy, action-value, and state-value."""
         s_, w, g = self.trunk(batch)
         value, value_dist, value_logits = self.value_head(w, g, batch)
         policy_logits, q_score, q_values = self.cell_heads(w, g, batch, mass_floor)

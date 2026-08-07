@@ -1,14 +1,7 @@
-"""Policy-argmax chooser and the two-chooser match loop.
+"""Policy-argmax chooser and two-chooser match loop.
 
-``argmax_choose`` implements the zero-search policy choice and consumes no
-randomness. ``play_match`` runs any two batched choosers against each other
-over a seat-paired schedule from ``opponents.shared_openings``; evaluation
-against an external opponent uses ``opponents.opponent_match`` instead, because
-that one carries the per-game lifecycle hooks a second rules state needs.
-
-Diversity comes from the schedule's openings, never from the choosers: two
-deterministic choosers from one starting position play one game however many
-times they are asked to. A capped game scores a half-win for each side.
+``argmax_choose``: zero-search policy argmax, no randomness.
+``play_match``: runs two batched choosers over a seat-paired schedule.
 """
 
 from __future__ import annotations
@@ -21,10 +14,7 @@ from ..builder import collate_positions
 
 
 def argmax_choose(model, device: str = "cpu"):
-    """A chooser playing the policy head's argmax over each legal set.
-
-    Choosers are batched — ``choose(positions, rng) -> moves`` — so a match
-    pays one collate and one forward per lockstep step, not per position."""
+    """Batched chooser returning the policy head's argmax over each legal set."""
 
     def choose(positions, _rng):
         batch = collate_positions(positions).to(device)

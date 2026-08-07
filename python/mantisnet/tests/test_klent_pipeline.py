@@ -50,7 +50,8 @@ def test_fit_packing_respects_budgets_and_loses_nothing():
         for t, c in zip(rng.integers(1, 500, 300), rng.integers(1, 8000, 300))
     ]
     cfg = KlentConfig(batch_size=32, pair_budget=2_000_000, cell_budget=30_000)
-    chunks = _pack(samples, rng.permutation(len(samples)), cfg)
+    # The packing law is the model's, so packing needs one; this is MantisNet's.
+    chunks = _pack(_tiny_model(), samples, rng.permutation(len(samples)), cfg)
 
     assert sorted(i for c in chunks for i in c) == list(range(len(samples)))
     for chunk in chunks:

@@ -65,6 +65,17 @@ that matrix records and that no single detector would have shown:
   is caught only by the position law. A suite that inspected the model alone
   would miss it.
 
+Where each detector runs. Detectors 2 and 3 read parameters and modules, so a
+device would tell them nothing. Detector 1 reads arithmetic, and this package's
+arithmetic is not the same code on the two devices: `segment_message` and
+`latent_attention` dispatch to Triton only when their inputs are on CUDA, so a
+host-only run of the position law has never put §31 to a fused kernel at all —
+and a kernel that read a fixed absolute axis channel instead of the row's own
+would pass it. The law therefore runs twice where a device exists, once per
+device, with the fused acceptances counted so a silent fallback to the torch
+reference cannot pass as a device run, and with the same forbidden
+constructions introduced under the kernels.
+
 Positions come from two generators, both engine play.
 
 - **Randomised**: uniformly random legal playouts. Sparse, wide legal halos, few
@@ -97,6 +108,7 @@ from __future__ import annotations
 
 import math
 import random
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 
 import hexo_py
@@ -105,6 +117,7 @@ import pytest
 import torch
 from torch import Tensor, nn
 
+from mantisnet.models.mantis_act import latent_attention, segment_message
 from mantisnet.models.mantis_act.builder import build
 from mantisnet.models.mantis_act.config import PRESETS, MantisACTConfig
 from mantisnet.models.mantis_act.equivariant import (
@@ -485,15 +498,22 @@ def law_deviations(trunk: StateTrunk, sample: Sample) -> dict[str, tuple[float, 
     with torch.no_grad():
         _out, tensors = trunk.debug_forward(sample.batch)
     batch = sample.batch
+    # The correspondences are built on the host and follow the batch, so one
+    # law runs wherever the batch is — which is what puts the fused kernels
+    # under it (§36) instead of only the torch reference.
+    device = batch.cell_offsets.device
     into: dict[str, tuple[float, float]] = {}
+
+    def index(array: np.ndarray) -> Tensor:
+        return torch.from_numpy(array).to(device)
 
     for t in TRANSFORMS:
         permutation = axis_permutation(t)
-        cells = torch.from_numpy(sample.cells[t])
-        windows = torch.from_numpy(sample.windows[t])
-        legal = torch.from_numpy(sample.legal[t])
-        base_legal_cells = torch.from_numpy(sample.graphs[0].legal_to_cell_index)
-        image_legal_cells = torch.from_numpy(sample.graphs[t].legal_to_cell_index)
+        cells = index(sample.cells[t])
+        windows = index(sample.windows[t])
+        legal = index(sample.legal[t])
+        base_legal_cells = index(sample.graphs[0].legal_to_cell_index)
+        image_legal_cells = index(sample.graphs[t].legal_to_cell_index)
 
         for site in trunk.debug_sites():
             family = site.split(".")[1]
@@ -1028,7 +1048,7 @@ _NOT_EXERCISED: dict[str, str] = {
     "RelationGatedMessage": "needs a typed edge family; the route is the thing "
     "under test and only a real board carries it",
     "_RelationTables": "three embedding tables, no axis behaviour",
-    "_PairMLP": "two linears over a concatenation of two *streams*, not channels",
+    "_PairMLP": "one linear over a concatenation of two *streams*, not channels",
     "Linear": "acts on the trailing width; a leaf",
     "LayerNorm": "acts on the trailing width; a leaf",
     "Embedding": "a leaf; its shape is what the structural check reads",
@@ -1397,6 +1417,8 @@ class _ConstantAxisRoute(nn.Module):
             n_src=edges.n_src,
             n_dst=edges.n_dst,
             num_relations=edges.num_relations,
+            dst_sorted=edges.dst_sorted,
+            fully_routed=True,  # every row now routes into channel 0
             name=f"{edges.name} (rerouted)",
         )
         return self.inner(rerouted, source, destination)
@@ -1698,3 +1720,130 @@ def test_the_suite_reports_its_own_coverage(deviations):
         assert any(check.startswith("scalar.") for check in measured)
         # And no comparison was made against an empty tensor.
         assert all(math.isfinite(deviation) for deviation, _ in measured.values())
+
+
+# --------------------------------------------------------------------------
+# The same law on the device, where the fused kernels live (§31, §36)
+#
+# `segment_message` and `latent_attention` both dispatch to Triton only when
+# their inputs are on CUDA, so a suite that runs on the host alone has never
+# put §31 to a fused kernel at all — and a kernel that read a fixed absolute
+# axis channel instead of the row's own would pass it. The device arm is the
+# same three detectors' first one, on the same samples, with the fused
+# acceptances counted so the run cannot be a silent fallback to the reference
+# the CPU arm already covers.
+
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the fused kernels need a CUDA device"
+)
+
+
+@contextmanager
+def counted_fused_dispatch():
+    """Count each kernel family's fused acceptances over the block."""
+    counts = {"segment_message": 0, "latent_attention": 0}
+    modules = {"segment_message": segment_message, "latent_attention": latent_attention}
+    originals = {name: module._supported for name, module in modules.items()}
+
+    def counting(name):
+        def wrapped(*args):
+            accepted = originals[name](*args)
+            counts[name] += int(bool(accepted))
+            return accepted
+
+        return wrapped
+
+    for name, module in modules.items():
+        module._supported = counting(name)
+    try:
+        yield counts
+    finally:
+        for name, module in modules.items():
+            module._supported = originals[name]
+
+
+def on_device(sample: Sample, device: str = "cuda") -> Sample:
+    return replace(sample, batch=sample.batch.to(device))
+
+
+@pytest.fixture(scope="module")
+def cuda_law(samples) -> tuple[dict[str, dict[str, tuple[float, float]]], dict[str, int]]:
+    if not torch.cuda.is_available():
+        pytest.skip("the fused kernels need a CUDA device")
+    trunk = fresh_trunk().cuda()
+    with counted_fused_dispatch() as counts:
+        measured = {
+            sample.name: law_deviations(trunk, on_device(sample)) for sample in samples
+        }
+    return measured, dict(counts)
+
+
+@requires_cuda
+def test_the_position_law_holds_where_the_fused_kernels_run(cuda_law, deviations):
+    """§31 on the device, over every comparison the host arm makes.
+
+    The assertion that this is not the host arm again under another name is the
+    acceptance count: both kernel families must have taken the fused path, and
+    the set of comparisons must be exactly the host arm's, so neither a silent
+    fallback nor a shortened comparison can pass as a device run.
+    """
+    measured, counts = cuda_law
+    assert counts["segment_message"] > 0 and counts["latent_attention"] > 0, counts
+    assert {name: set(checks) for name, checks in measured.items()} == {
+        name: set(checks) for name, checks in deviations.items()
+    }
+    failures = [
+        f"{name}: {failure}"
+        for name, checks in measured.items()
+        for failure in over_budget(checks, "")
+    ]
+    assert not failures, "\n".join(failures)
+
+
+@requires_cuda
+def test_the_device_drift_stays_well_inside_the_budget(cuda_law):
+    """The fused kernels reassociate differently; the slack must still hold."""
+    measured, _counts = cuda_law
+    ratio, where, deviation, allowed = max(
+        (deviation / allowed, f"{name}/{check}", deviation, allowed)
+        for name, checks in measured.items()
+        for check, (deviation, allowed) in checks.items()
+    )
+    assert ratio < 0.5, (
+        f"worst device drift {deviation:.3e} at {where} is {ratio:.0%} of its "
+        f"{allowed:.3e} budget"
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "name", sorted(n for n, m in MUTATIONS.items() if "law" in m.detectors)
+)
+def test_the_position_law_still_catches_each_construction_on_the_device(dense, name):
+    """The device arm's negative control: it is known to be able to fail.
+
+    Every construction the position law catches on the host is introduced into
+    a trunk that then runs on the device, under the fused kernels. A device
+    test that could not fail would be the same defect as the missing device arm
+    itself, one level up.
+    """
+    mutation = MUTATIONS[name]
+    trunk = mutated_trunk(name, MUTATION_MAGNITUDE).cuda()
+    with counted_fused_dispatch() as counts:
+        measured = law_deviations(trunk, on_device(dense))
+    assert counts["segment_message"] > 0 and counts["latent_attention"] > 0, counts
+
+    over = {
+        check: (deviation, allowed)
+        for check, (deviation, allowed) in measured.items()
+        if deviation > allowed
+    }
+    assert over, f"{name} ({mutation.clause}) at {mutation.where} was not caught"
+    deviation, allowed = measured[mutation.first_site]
+    assert deviation > allowed, (
+        f"{name} was caught, but not at {mutation.first_site} where it is "
+        f"planted: {deviation:.3e} <= {allowed:.3e}"
+    )
+    ratio = max(deviation / allowed for deviation, allowed in over.values())
+    assert ratio > 100, f"{name} is only {ratio:.1f}x over the tolerance"

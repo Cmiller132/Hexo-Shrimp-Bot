@@ -1,9 +1,7 @@
 """Checkpoint-family compatibility for the MantisNet laboratory.
 
-Production training deliberately has one current checkpoint format.  The lab
-has a different job: measure historical models without changing their native
-critic readout or guessing how an experimental head behaved.  This module is
-the complete, explicit compatibility boundary for that job.
+Identifies a checkpoint's historical critic format and loads it with its
+native readout, without guessing how an experimental head behaved.
 """
 
 from __future__ import annotations
@@ -210,12 +208,11 @@ _DUEL_KEYS = {
     "mlp_qbase.2.weight", "mlp_qbase.2.bias",
 }
 
-# Trunk-stage parameter groups. The relay (§5.1b), typed window attention
-# (§5.1c), the axis-aware §5.3 bias, and joint incidence classes were config
-# knobs while they were ablations; this build bakes them in. The profile is
-# still read off the state dict so that a checkpoint from the knob era — or
-# from before it — identifies stably and refuses with its actual shape named
-# rather than a key-set mismatch.
+# Trunk-stage parameter groups: the relay (§5.1b), typed window attention
+# (§5.1c), the axis-aware §5.3 bias, and joint incidence classes are baked
+# into this build. The profile is still read off the state dict so an
+# unexpected checkpoint shape refuses with its actual profile named, rather
+# than a key-set mismatch.
 _CP_SUFFIXES = {
     "ln_cp_in.weight", "ln_cp_in.bias", "u_cp.weight", "e_cp.weight",
     "ln_cp_w.weight", "ln_cp_w.bias", "mlp_cp.lin_a.weight",
@@ -483,7 +480,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
             f"state dict trunk profile {knobs} is not the baked architecture "
             f"{_BAKED}; checkpoints predating a baked stage are not "
             "instantiable in this build and must be measured from a build of "
-            "their era (docs/LAB_SPEC.md)"
+            "their era (see python/mantisnet/README.md)"
         )
     cfg = MantisConfig(
         h=h,
@@ -564,7 +561,7 @@ def _entry(
 
 
 _COMPAT_REQUIREMENT = (
-    "docs/LAB_SPEC.md requires a family entry and a composition-parity test "
+    "the lab contract (python/mantisnet/README.md) requires a family entry and a composition-parity test "
     "before checkpoints with a new critic parameterization, decoder key, or head format are scoreable"
 )
 
@@ -667,7 +664,7 @@ def load_checkpoint(
         if not candidates:
             raise ValueError(
                 f"checkpoint is not identifiable by the family registry ({_names()}); "
-                "see docs/LAB_SPEC.md for the compatibility contract"
+                "see python/mantisnet/README.md for the compatibility contract"
             )
         if len(candidates) != 1:
             raise ValueError(

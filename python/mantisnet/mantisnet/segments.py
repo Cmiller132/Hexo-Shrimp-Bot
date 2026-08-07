@@ -1,9 +1,6 @@
 """Segmented reductions over ragged per-position rows.
 
-Model outputs are flat over every legal cell of every position, bounded by a
-(P + 1,) CSR offset tensor. Everything that normalises or reduces within a
-position — the policy loss, KLENT's improvement operator — goes through these
-four helpers, so the ragged arithmetic exists once.
+Flat outputs bounded by a ``(P + 1,)`` CSR offset tensor.
 """
 
 from __future__ import annotations

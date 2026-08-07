@@ -1,14 +1,7 @@
-"""The twelve symmetries of the board, as maps on axial ``(q, r)``.
+"""The twelve D6 symmetries of the hex board, as maps on axial ``(q, r)``.
 
-The group belongs to the game, not to any model: it preserves hex distance,
-legality, the three window axes, and the winner, so every consumer — the
-opening atlas, a representation's relation classes, an equivariance test —
-is describing the same twelve maps. They are defined once here.
-
-Generators are the 60-degree rotation ``(q, r) -> (-r, q + r)`` and the
-reflection ``(q, r) -> (r, q)``. Index ``0`` is the identity.
-
-This module imports nothing, so it is safe to import from anywhere.
+Generators: 60-degree rotation ``(q, r) -> (-r, q + r)`` and reflection
+``(q, r) -> (r, q)``.  Index ``0`` is the identity.
 """
 
 from __future__ import annotations

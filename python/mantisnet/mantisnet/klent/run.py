@@ -1,27 +1,12 @@
-"""Drive KLENT iterations and persist their run artifacts.
+"""Drive KLENT iterations and persist run artifacts.
 
-The run directory contains the current invocation's ``config.json``, an
-append-only ``invocations.jsonl``, append-only iteration events in
-``metrics.jsonl``, queryable ``telemetry.db``, periodic checkpoints, and the
-``status.json`` heartbeat. A resume restores the latest checkpoint; replayed
-iteration numbers can therefore occur in ``metrics.jsonl``, while telemetry
-replaces its replayed tail. Checkpoints contain model, optimizer, training RNG,
-version identifiers, and the count of completed iterations.
-
-``STOP`` requests a checkpoint and clean exit at the next iteration boundary.
-``CHECKPOINT`` requests a checkpoint at that boundary without stopping.
-``--eval-every N`` records one seat-balanced match per configured external
-opponent every ``N`` completed iterations. Evaluation uses Gumbel line search
-when ``--eval-sims`` is positive and raw-policy argmax when it is zero; its RNG
-is separate from training.
-
-Run from python/mantisnet:
+Run directory: ``config.json``, ``invocations.jsonl``, ``metrics.jsonl``,
+``telemetry.db``, periodic checkpoints, and ``status.json`` heartbeat.
+``STOP`` / ``CHECKPOINT`` sentinel files request clean exit / checkpoint at
+the next iteration boundary.
 
     uv run python -m mantisnet.klent.run --out runs/pure-1 \
         --iterations 100 --games 64
-
-Resume after an interruption with `--resume` (the latest checkpoint in the
-run directory is found automatically).
 """
 
 from __future__ import annotations
@@ -51,13 +36,7 @@ from .telemetry import open_telemetry
 from .train import KlentConfig, collect_episodes, fit
 
 
-# Each iteration churns gigabytes of short-lived episode, sample, and chunk
-# allocations across freshly spawned prefetch and collate threads. glibc
-# retains those freed chunks in its arenas: the trainer's anonymous memory
-# grew asymptotically to ~26GB RSS + 16GB swap and earlyoom killed the run
-# (2026-08-05, twice). One malloc_trim per committed iteration returns the
-# retained pages to the OS for microseconds of work; MALLOC_ARENA_MAX=2 in
-# the container environment bounds the arena count itself.
+# Release glibc arena pages after each iteration to prevent unbounded RSS.
 _LIBC = ctypes.CDLL("libc.so.6") if sys.platform == "linux" else None
 
 
@@ -108,11 +87,7 @@ def save_checkpoint(path: Path, model, optimizer, iteration: int, rng) -> None:
 
 
 def load_model(path: Path, device: str = "cpu"):
-    """A checkpoint's model half, version-checked.
-
-    The checkpoint records its own :class:`MantisConfig`, so knobbed runs
-    load through every consumer of this path without those consumers knowing
-    the knobs exist."""
+    """Load a checkpoint's model, version-checked."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if ckpt["versions"] != _versions():
         raise ValueError(
@@ -129,9 +104,7 @@ def load_model(path: Path, device: str = "cpu"):
 def load_checkpoint(path: Path, model, optimizer, rng=None) -> int:
     """Restore into the given model/optimizer/rng; returns iterations done.
 
-    ``rng=None`` restores only the model and optimizer for ``--init-from``.
-    Version identifiers and the model configuration must equal the running
-    build's.
+    ``rng=None`` restores only the model and optimizer (for ``--init-from``).
     """
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     if ckpt["versions"] != _versions():
@@ -152,12 +125,7 @@ def load_checkpoint(path: Path, model, optimizer, rng=None) -> int:
 
 
 def load_lab_cell(path: Path, model, model_kw: dict) -> None:
-    """Initialize the model from a supervised lab cell's final checkpoint.
-
-    The cell must be the same build and the same normalized model overrides
-    as this run — a KLENT run started from supervised pretraining carries the
-    trained trunk and critic head, a fresh optimizer, and iteration 0.
-    """
+    """Initialize the model from a supervised lab cell's final checkpoint."""
     cell = torch.load(path, map_location="cpu", weights_only=False)
     if cell.get("lab_cell_format") != 1:
         raise ValueError(f"{path} is not a lab cell checkpoint")
@@ -173,16 +141,7 @@ def load_lab_cell(path: Path, model, model_kw: dict) -> None:
 
 
 class _Status:
-    """The run's heartbeat: ``runs/<name>/status.json``, atomically replaced
-    (write then rename) at most once a second.
-
-    The format is the deck's contract (docs/DECK_SPEC.md): ``updated`` (UTC
-    ISO), ``iteration`` (last committed), and one entry per lane — ``collect``
-    ``{iteration, finished, quota, steps, slot_plies}``, ``fit``
-    ``{iteration, chunk, chunks}``, ``eval`` ``{iteration}`` — each ``null``
-    while that lane is idle. The lock serializes reports from the collection
-    worker and driver. Heartbeat writes do not consume training RNG state.
-    """
+    """Run heartbeat: ``status.json``, atomically replaced at most once per second."""
 
     def __init__(self, out_dir: Path):
         self.path = out_dir / "status.json"
@@ -219,24 +178,11 @@ def run_training(
     evaluate_fn=None,
     starve_limit: int = 10,
 ) -> None:
-    """Run the pipelined collect, fit, evaluate, and commit loop.
+    """Run the pipelined collect/fit/evaluate/commit loop.
 
-    While iteration ``i`` fits on the main thread, iteration ``i+1`` collects
-    through a snapshot taken before fit ``i``. Collection owns a separate RNG
-    stream. Resume restores the training RNG but starts with empty collection
-    slots; in-flight episodes are not checkpointed.
-
-    ``evaluate_fn(model, done, telemetry) -> dict`` runs every ``eval_every``
-    completed iterations. Its fields join that iteration's metric event, and
-    it records match detail through the supplied telemetry writer.
-
-    ``starve_limit`` stops after that many consecutive iterations with fewer
-    buffer samples than the game quota and writes a checkpoint first. Zero
-    disables this guard.
-
-    ``status.json`` and the ``STOP`` and ``CHECKPOINT`` sentinel files form the
-    live process interface. Sentinels are checked and consumed once per
-    committed iteration.
+    Collection for iteration ``i+1`` runs on a snapshot while iteration ``i``
+    fits.  ``evaluate_fn`` runs every ``eval_every`` iterations.
+    ``starve_limit`` stops after that many consecutive under-quota iterations.
     """
     starved = 0
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -321,8 +267,7 @@ def run_training(
             metrics_file.flush()
             # Telemetry receives the same metric event and its source episodes.
             telemetry.write_iteration(row, episodes, hardware.drain())
-            # The iteration's transients are dead past this point; drop the
-            # references so the trim can hand their pages back to the OS.
+            # Drop transient references before the allocator trim.
             del episodes, samples
             _trim_allocator()
             status.update(force=True, iteration=done)

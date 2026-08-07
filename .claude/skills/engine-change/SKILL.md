@@ -1,33 +1,14 @@
 ---
 name: engine-change
-description: Read before changing crates/hexo-engine — the rule machine, grid storage, growth policy, Zobrist hashing, window/win detection, the legal-move ordering, or undo. Explains which ENGINE_SPEC.md section is normative for what, which invariant tier catches which class of bug, and when a golden-vector failure means bump the version rather than re-baseline. Not needed for hexo-runner or docs-only work.
+description: Read before changing crates/hexo-engine — the rule machine, grid storage, growth policy, Zobrist hashing, window/win detection, the legal-move ordering, or undo. Explains which invariant tier catches which class of bug and when a golden-vector failure means bump the version rather than re-baseline. Not needed for hexo-runner or docs-only work.
 ---
 
 # Changing hexo-engine
 
-`docs/ENGINE_SPEC.md` is normative. Read the section that governs
-what you are changing, not the whole file. Where code and spec disagree, that is
-a finding to raise — not a discrepancy to resolve quietly in either direction.
-
-## Which section governs what
-
-| Changing | Section |
-| --- | --- |
-| Public types, their fields, their derives | §3 |
-| A public function's contract or error precedence | §4, and §3.7 for the precedence table |
-| What is stored vs. derived, `covered`, the empty position | §5.1–§5.3 |
-| Arena growth, recentring, `MAX_GRID_CELLS` | §5.5 |
-| Window geometry, `windows_through`, win detection | §6 |
-| The delta, `undo`, the undo floor | §7 |
-| Zobrist keys, mixing, what the hash covers | §8 |
-| `legal_rank` / `nth_legal` ordering | §9 |
-| Which invariant is checked where, and in what order | §10 |
-| What a change obliges you to test | §11 |
-| Why a design went this way rather than the obvious way | §13, one line each |
-
-§5.6 ("Where this design is wrong, and the guard rails") and §12 ("Deliberately
-omitted from the MVP") exist so that a known gap is not rediscovered as a bug.
-Check both before proposing a fix for something that looks missing.
+`crates/hexo-engine/README.md` is the normative reference for the engine. Read
+the section that governs what you are changing. Where code and README disagree,
+that is a finding to raise — not a discrepancy to resolve quietly in either
+direction.
 
 ## The invariant tiers, and why they are not redundant
 

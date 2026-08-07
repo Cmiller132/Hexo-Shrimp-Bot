@@ -1,48 +1,11 @@
-"""The MantisNet-ACT builder: one position to a graph, many to a packed batch.
+"""MantisNet-ACT builder: position to graph, batch to packed batch.
 
-This module is orchestration and nothing else. Every table it returns comes
-from one of the three representation modules — ``windows``, ``cells``,
-``actions`` — and its own work is the order they run in, the three position-level
-quantities none of them owns (§13.1's phase, §13.3's global scalars, and
-``moves_remaining``), and the refusals that belong to the stage as a whole rather
-than to any one part of it.
+Orchestrates ``windows``, ``cells``, and ``actions``, adding phase (§13.1),
+global scalars (§13.3), and ``moves_remaining``. Stone ownership is converted
+here: ``stone_own`` is ``0`` for the mover, ``1`` for the opponent.
 
-Index conventions this module fixes:
-
-- Stone ownership: callers hand in the engine's absolute player ids together
-  with the side to move, and every module downstream takes ``stone_own``, ``0``
-  for the mover's stones and ``1`` for the opponent's. The conversion happens
-  here, once, so no representation module ever sees an absolute seat and the
-  colours cannot be relative to two different sides in two tables of one graph.
-- Phase (§13.1): ``FIRST`` is ``moves_remaining == 2``; with one placement left
-  the board decides, empty being ``OPENING`` and nonempty ``SECOND``.
-  ``moves_remaining`` stays authoritative for the KLENT return sign, and the
-  phase id is a model feature derived from it (§2).
-- Global scalars: ``GLOBAL_NUMERIC_NAMES`` in that order (§13.3). Counts enter
-  as ``log1p`` and shares as fractions of their own total, so no entry depends
-  on the board's origin, on the move number, or on any history.
-
-Which config fields this module reads, and which it leaves to the model.
-``use_cell_adjacency`` and ``use_occupied_radius_edges`` decide whether an edge
-family exists at all, so a disabled family is absent rather than emitted and
-ignored. ``use_global_numeric_features`` and ``use_window_numeric_features``
-decide whether their feature block has any width, which is how ``actions.py``
-already treats the tactical vector: a disabled block contributes exactly
-nothing rather than a learned constant on a column of zeros. Everything else
-that names how a stage behaves rather than whether its rows exist —
-``route_on_axis_radius_messages``, ``use_three_way_phase``,
-``use_counterfactual_action_windows`` — gates a computation the model performs
-over a table whose shape §25 fixes at ``[num_legal, 3, 6]`` or a per-edge
-column, so the builder emits that table under every configuration and the
-model decides what to read.
-
-Terminal positions are refused, matching ``mantisnet/builder.py``'s contract:
-a state with no legal move is never evaluated or bootstrapped (§2), so a
-builder that encoded one would be feeding the trainer a state it must not see.
-The refusal is stated here as well as inside the modules that can detect it
-from their own inputs, because an empty legal list reaches this function before
-any of them run, and a completed six-in-a-row reaches ``windows.py`` before
-``actions.py`` can see it.
+Config flags decide whether each edge family and feature block exists.
+Terminal positions are refused (§2).
 """
 
 from __future__ import annotations
@@ -89,10 +52,8 @@ def _empty_edges(columns: int) -> tuple[np.ndarray, ...]:
 def _fraction(count: int, total: int) -> float:
     """A share of a total, and zero when there is nothing to share.
 
-    The stoneless opening and the windowless early board both make a
-    denominator zero. Zero is the honest reading — no stone is the mover's when
-    there are no stones — and the count it divides is carried separately, so
-    the pair cannot be mistaken for a real ratio of one.
+    The stoneless opening and the windowless early board both make the
+    denominator zero; the count itself is carried separately.
     """
     return count / total if total else 0.0
 
@@ -143,15 +104,13 @@ def build_from_arrays(
     ``stone_qr`` is ``(n_stones, 2)`` and ``stone_owner`` ``(n_stones,)`` in the
     engine's absolute seats; ``mover`` is the side to move, against which the
     seats become the mover-relative colours every table downstream carries.
-    ``legal_qr`` is ``(n_legal, 2)`` in engine legal order, which is preserved
-    and never sorted: output row ``j`` is ``legal_moves[j]`` (§8.3).
+    ``legal_qr`` is ``(n_legal, 2)`` in engine legal order, preserved and never
+    sorted: output row ``j`` is ``legal_moves[j]`` (§8.3).
 
-    Raises ``ValueError`` for a terminal position — an empty legal list here,
-    or a completed six-in-a-row inside ``windows.py`` — for a ``mover`` or a
-    seat that is not a player, for a ``moves_remaining`` outside ``1..2``, and
-    for every malformed input the stages below name themselves. The graph is
-    validated before it is returned, so a table that violates §7's ordering or
-    an index bound fails here rather than at an embedding lookup.
+    Raises ``ValueError`` for a terminal position, for a ``mover`` or seat that
+    is not a player, for a ``moves_remaining`` outside ``1..2``, and for every
+    malformed input the stages below name themselves. The graph is validated
+    before it is returned.
     """
     stone_qr = np.asarray(stone_qr, dtype=np.int64).reshape(-1, 2)
     stone_owner = np.asarray(stone_owner, dtype=np.int64).reshape(-1)
@@ -199,7 +158,7 @@ def build_from_arrays(
         if cfg.use_window_numeric_features
         else np.zeros((window_set.n_windows, 0), dtype=np.float32)
     )
-    graph = ACTGraph(
+    return ACTGraph(
         cell_qr=cell_set.qr,
         cell_occupancy=cell_set.occupancy,
         cell_is_legal=cell_set.is_legal,
@@ -235,19 +194,14 @@ def build_from_arrays(
         moves_remaining=moves_remaining,
         phase_id=phase_id,
     )
-    graph.validate()
-    return graph
 
 
 def build(position, cfg: MantisACTConfig) -> ACTGraph:
     """Build one graph from a ``hexo_py.Position``. Terminal positions raise.
 
-    The engine is read for the position's contents and for nothing else: its
-    stone list, its legal-move list in engine order, the side to move, and the
-    placements left in the turn. No stage below asks it what a window holds,
-    which cells are legal after a hypothetical placement, or whether a
-    placement wins, so the engine remains the independent oracle those stages
-    are tested against (§30).
+    Reads only the position's stone list, legal-move list, side to move, and
+    placements left in the turn — nothing else, so the engine remains the
+    independent oracle the stages below are tested against (§30).
     """
     if position.is_terminal:
         raise ValueError("terminal position: the builder refuses it")
@@ -276,10 +230,8 @@ def collate_prefixes(
     """Replay ``games[i][:ts[i]]`` and collate the resulting positions.
 
     Stored fitting positions are move prefixes (``docs/KLENT_FOR_HEXO.md``
-    §4.3), so a batch is named by a game and a length rather than by a board.
-    A length past the end of its game is a caller error and raises; a prefix
-    whose position is terminal is refused by :func:`build`, which is the same
-    refusal §2 makes of the trainer.
+    §4.3). A length past the end of its game raises; a prefix whose position
+    is terminal is refused by :func:`build`.
     """
     import hexo_py
 

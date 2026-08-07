@@ -9,11 +9,14 @@ offset that is applied to the wrong family, or not applied at all, visible.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 import torch
 
 from mantisnet.models.mantis_act.packed import (
+    _refuse_crossing,
     PHASE_FIRST,
     PHASE_OPENING,
     PHASE_SECOND,
@@ -128,8 +131,10 @@ def replaced(array: np.ndarray, index, value) -> np.ndarray:
 
 
 def test_hand_built_graphs_are_valid():
-    graph_a().validate()
-    graph_b().validate()
+    # Construction is the gate, so these two lines are the assertion: a fixture
+    # that stopped satisfying §7 could not be built at all.
+    graph_a()
+    graph_b()
 
 
 def test_counts_come_from_the_arrays():
@@ -180,7 +185,7 @@ def test_counts_come_from_the_arrays():
 )
 def test_validate_rejects_each_ordering_violation(overrides, message):
     with pytest.raises(ValueError, match=message):
-        graph_a(**overrides).validate()
+        graph_a(**overrides)
 
 
 # Each case puts one index out of the family it points into.
@@ -204,11 +209,15 @@ def test_validate_rejects_each_ordering_violation(overrides, message):
             {"window_cell_index": np.full((2, 6), -2, dtype=np.int64)},
             r"window_cell_index must be >= -1",
         ),
+        # A field with no sentinel gets zero for a floor, so `-1` is refused
+        # here rather than surviving to be shifted into the previous position's
+        # slice by `collate`.
+        ({"adjacency_dst": _int(-1, 0, 1, 2)}, r"adjacency_dst must be >= 0"),
     ],
 )
 def test_validate_rejects_each_out_of_bounds_index(overrides, message):
     with pytest.raises(ValueError, match=message):
-        graph_a(**overrides).validate()
+        graph_a(**overrides)
 
 
 @pytest.mark.parametrize(
@@ -217,6 +226,14 @@ def test_validate_rejects_each_out_of_bounds_index(overrides, message):
         ({"cell_occupancy": _int(1, 0, 3, 0)}, r"cell_occupancy must be <= 2"),
         ({"cell_is_legal": _int(0, 2, 0, 1)}, r"cell_is_legal must be <= 1"),
         ({"cell_nearest_bucket": _int(0, -1, 0, 1)}, r"cell_nearest_bucket must be >= 0"),
+        # The ceiling is the §8.2 bucket vocabulary, closed here rather than
+        # left to whichever helper emitted the column: an unbounded value walks
+        # straight into `CellEmbedding.nearest` as an unnamed IndexError on the
+        # host and an uncatchable device-side assert on CUDA.
+        (
+            {"cell_nearest_bucket": _int(0, 9999, 0, 1)},
+            r"cell_nearest_bucket must be <= 9",
+        ),
         ({"window_status": _int(4, 1)}, r"window_status must be <= 3"),
         ({"window_axis": _int(3, 1)}, r"window_axis must be <= 2"),
         ({"adjacency_axis": _int(1, 0, 1, 3)}, r"adjacency_axis must be <= 2"),
@@ -243,22 +260,22 @@ def test_validate_rejects_each_out_of_bounds_index(overrides, message):
 )
 def test_validate_rejects_each_out_of_range_enum(overrides, message):
     with pytest.raises(ValueError, match=message):
-        graph_a(**overrides).validate()
+        graph_a(**overrides)
 
 
 def test_validate_rejects_a_wrong_dtype():
     with pytest.raises(TypeError, match=r"cell_occupancy must be int64, got int32"):
-        graph_a(cell_occupancy=np.array([1, 0, 2, 0], dtype=np.int32)).validate()
+        graph_a(cell_occupancy=np.array([1, 0, 2, 0], dtype=np.int32))
 
 
 def test_validate_rejects_a_wrong_shape():
     with pytest.raises(ValueError, match=r"window_cell_index must have shape \(2, 6\)"):
-        graph_a(window_cell_index=np.zeros((2, 5), dtype=np.int64)).validate()
+        graph_a(window_cell_index=np.zeros((2, 5), dtype=np.int64))
 
 
 def test_validate_rejects_a_scalar_field_that_is_not_an_array():
     with pytest.raises(TypeError, match=r"global_numeric must be a numpy array"):
-        graph_a(global_numeric=[0.0] * 5).validate()
+        graph_a(global_numeric=[0.0] * 5)
 
 
 @pytest.mark.parametrize(
@@ -283,26 +300,39 @@ def test_validate_rejects_a_scalar_field_that_is_not_an_array():
         ({"moves_remaining": 3}, r"moves_remaining must be 1 or 2"),
         ({"phase_id": 7}, r"phase_id must be 0, 1, or 2"),
         ({"phase_id": PHASE_SECOND}, r"disagrees with moves_remaining"),
+        # §15.2's edges run from stones. An empty source produces a relation of
+        # `2 * orbit + 0` that is in range and means something the position does
+        # not contain, which no shape, dtype, index bound, or round trip can
+        # see: cell 1 is empty in graph_a.
+        (
+            {"radius_src": _int(1, 2, 0, 2)},
+            r"radius edge 0 has source cell 1, which is empty",
+        ),
     ],
 )
 def test_validate_rejects_each_internal_disagreement(overrides, message):
     with pytest.raises(ValueError, match=message):
-        graph_a(**overrides).validate()
+        graph_a(**overrides)
 
 
 def test_validate_rejects_an_opening_phase_with_stones():
     with pytest.raises(ValueError, match=r"OPENING phase with 1 occupied cells"):
-        graph_b(phase_id=PHASE_OPENING).validate()
+        graph_b(phase_id=PHASE_OPENING)
 
 
 def test_validate_rejects_a_second_phase_with_an_empty_board():
-    empty = graph_b(
-        cell_occupancy=_int(0, 0, 0),
-        cell_is_occupied=_int(0, 0, 0),
-        cell_is_legal=_int(0, 1, 1),
-    )
     with pytest.raises(ValueError, match=r"SECOND phase with an empty board"):
-        empty.validate()
+        graph_b(
+            cell_occupancy=_int(0, 0, 0),
+            cell_is_occupied=_int(0, 0, 0),
+            cell_is_legal=_int(0, 1, 1),
+            # No stone means no radius edge either: §15.2's sources are occupied
+            # cells, which `_check_consistency` refuses to see empty.
+            radius_dst=_int(),
+            radius_src=_int(),
+            radius_orbit=_int(),
+            radius_axis_or_neg1=_int(),
+        )
 
 
 def test_collate_offsets_are_the_cumulative_counts():
@@ -392,49 +422,46 @@ def test_no_index_crosses_a_batch_position():
         ), name
 
 
-@pytest.mark.parametrize(
-    "graphs, message",
-    [
-        # An index one past its own family lands in the next position.
-        (
-            [graph_a(adjacency_dst=_int(0, 0, 1, 4)), graph_b()],
-            r"adjacency_dst crosses a batch position",
-        ),
-        (
-            [graph_a(radius_src=_int(0, 2, 0, 4)), graph_b()],
-            r"radius_src crosses a batch position",
-        ),
-        (
-            [
-                graph_a(action_window_index=np.full((2, 3, 6), 2, dtype=np.int64)),
-                graph_b(),
-            ],
-            r"action_window_index crosses a batch position",
-        ),
-        (
-            [graph_a(legal_to_cell_index=_int(3, 4)), graph_b()],
-            r"legal_to_cell_index crosses a batch position",
-        ),
-        # And one past the last position's family lands outside the batch.
-        (
-            [graph_a(), graph_b(adjacency_dst=_int(0, 3))],
-            r"adjacency_dst crosses a batch position",
-        ),
-    ],
-)
-def test_collate_refuses_an_edge_that_crosses_a_position(graphs, message):
-    with pytest.raises(ValueError, match=message):
-        collate(graphs)
+def test_the_cross_position_check_catches_a_shift_by_the_wrong_family():
+    """What `_refuse_crossing` is for, now that no graph can arrive malformed.
+
+    Every index is inside its own family's range before the shift — that is
+    `_INDEX_FIELDS`, run at construction — so a *correct* shift by that
+    family's own offsets can only land inside the row's own position. The fault
+    left for this check is collation's own arithmetic: an offset taken from the
+    wrong family. It applies and un-applies identically, every value stays in
+    range for the batch, and only the row's own position says it is wrong.
+    """
+    a, b = graph_a(), graph_b()
+    batch = collate([a, b])
+    cells = batch.cell_offsets.numpy()
+    windows = batch.window_offsets.numpy()
+    assert cells[1] != windows[1], "the two families must offset differently"
+    rows = np.repeat([0, 1], [a.n_adjacency, b.n_adjacency])
+
+    wrong = np.concatenate([a.adjacency_dst, b.adjacency_dst + windows[1]])
+    with pytest.raises(ValueError, match=r"adjacency_dst crosses a batch position"):
+        _refuse_crossing("adjacency_dst", wrong, rows, cells)
+
+    right = np.concatenate([a.adjacency_dst, b.adjacency_dst + cells[1]])
+    _refuse_crossing("adjacency_dst", right, rows, cells)
 
 
-def test_collate_refuses_a_sentinel_other_than_minus_one():
-    with pytest.raises(ValueError, match=r"window_cell_index allows only -1 as a sentinel"):
-        collate([graph_b(), graph_a(window_cell_index=np.full((2, 6), -2, dtype=np.int64))])
+def test_a_graph_cannot_reach_collate_unvalidated():
+    """The contract `collate` rests on, tested where it is enforced.
 
-
-def test_collate_refuses_a_negative_where_no_sentinel_is_allowed():
-    with pytest.raises(ValueError, match=r"adjacency_dst carries no sentinel"):
-        collate([graph_b(), graph_a(adjacency_dst=_int(-1, 0, 1, 2))])
+    Collation re-checks no dtype, shape or value range, which is sound only
+    because there is no way to hold an unvalidated ``ACTGraph``: the gate runs
+    from ``__post_init__``, so the builder, a keyword construction and
+    ``dataclasses.replace`` all pass it. Every ``test_validate_rejects_*``
+    above is therefore a statement about construction, and which producer made
+    a graph — something `collate` cannot see — stops mattering.
+    """
+    good = graph_a()
+    with pytest.raises(ValueError, match=r"cell_is_legal must be <= 1"):
+        replace(good, cell_is_legal=_int(0, 2, 0, 1))
+    with pytest.raises(ValueError, match=r"window_cell_index must be >= -1"):
+        replace(good, window_cell_index=np.full((2, 6), -2, dtype=np.int64))
 
 
 def test_collate_refuses_an_empty_batch():
@@ -460,9 +487,15 @@ def test_collate_keeps_the_packed_dtypes():
 
 
 def test_packed_batch_carries_every_spec_field():
-    """The §25 names plus the CSR offsets, so downstream stages can bind them."""
+    """The §25 names plus the CSR offsets, so downstream stages can bind them.
+
+    ``window_id`` is the one name past §25's list: §16's typed window↔window
+    edges are a join of the window identities, and joining them beside the model
+    is what keeps the edges themselves off the bus.
+    """
     present = set(vars(collate([graph_a()])))
     assert {
+        "window_id",
         "position_count",
         "cell_offsets",
         "window_offsets",
@@ -494,7 +527,30 @@ def test_packed_batch_carries_every_spec_field():
         "phase_id",
         "moves_remaining",
         "global_numeric",
+        "radius_orbit_bound",
     } == present
+
+
+def test_collate_records_the_batch_s_own_orbit_ceiling():
+    """§11.2's vocabulary is a configuration choice, so the packer records it.
+
+    `_VALUE_RANGES` leaves `radius_orbit` open above deliberately — the
+    cardinality belongs to the module that emits it — and the model still has to
+    refuse a batch built for a wider relation space than its own. Taking the
+    ceiling here, in numpy, is what lets that comparison be between two
+    host-side integers instead of a read back off the device.
+    """
+    batch = collate([graph_a(), graph_b()])
+    assert int(batch.radius_orbit.max()) == 5
+    assert batch.radius_orbit_bound == 6
+
+    # A batch with no radius edge at all has no ceiling to state, and 0 is
+    # below every vocabulary, so it refuses nothing.
+    empty = graph_b(
+        radius_dst=_int(), radius_src=_int(), radius_orbit=_int(),
+        radius_axis_or_neg1=_int(),
+    )
+    assert collate([empty]).radius_orbit_bound == 0
 
 
 def test_batch_moves_to_a_device():

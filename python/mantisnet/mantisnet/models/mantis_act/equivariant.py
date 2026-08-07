@@ -1,58 +1,15 @@
-"""The equivariant state container and the primitives that act on it (§12, §13.2).
+"""Equivariant state container and primitives (§12, §13.2).
 
-Every cell, window, action, and latent in this architecture carries the same
-pair of streams:
+Every entity carries ``h_inv [..., d_inv]`` and ``h_axis [..., 3, d_axis]``.
+Under board transform ``g`` with axis permutation ``pi_g``:
+``h_inv'(T_g(i)) = h_inv(i)``, ``h_axis'(T_g(i), pi_g(a)) = h_axis(i, a)``.
 
-```text
-h_inv:  [..., d_inv]
-h_axis: [..., 3, d_axis]
-```
+Axis-stream parameters act on the trailing width only; cross-channel
+quantities (``sum_b u_b``, ``mean_a phi(u_a)``) are symmetric and invariant.
+Numerics follow §27 (fp32 params, bf16 autocast, fp32 softmax).
 
-and for a board transform ``g`` with node map ``T_g`` and induced axis
-permutation ``pi_g`` (:func:`mantis_act.symmetry.axis_permutation`) the whole
-model must satisfy the representation law of §12.1:
-
-```text
-h_inv'(T_g(i))           = h_inv(i)
-h_axis'(T_g(i), pi_g(a)) = h_axis(i, a)
-```
-
-The node map is the builder's business; the axis permutation is this module's.
-Everything here is written so that permuting the three axis channels of the
-input permutes the three axis channels of the output and leaves the invariant
-stream alone — the tests check this on all six channel permutations and on the
-twelve the group actually induces, and they check it again on a deliberately
-broken variant so the check is known to be able to fail.
-
-What makes each module equivariant, since §12.2's forbidden constructions are
-easy to write by accident:
-
-- Every parameter that touches the axis stream acts on the trailing width
-  alone. One ``nn.Linear(d_axis, ...)`` applied to a ``(..., 3, d_axis)``
-  tensor *is* the same map applied independently to all three channels, which
-  is §12.3's first allowance. There is no parameter anywhere in this module
-  whose leading dimension is the axis channel: no per-axis bias, no per-axis
-  norm, no ``Embedding(3, ...)``.
-- The only quantities crossing between channels are ``sum_b u_b`` and
-  ``mean_a phi(u_a)``, both symmetric functions of the channel set, so both are
-  invariant under a permutation; §12.4's ``other_a = (total - u_a) / 2``
-  recovers a per-channel term from an invariant one and therefore permutes with
-  ``a``.
-- The invariant stream reaches the axis stream only through one projection
-  broadcast identically to all three channels.
-
-Numerics follow §27: parameters are fp32, the modules run under bf16 autocast,
-softmax is computed at no less than fp32, embeddings and latent bases are
-initialised ``N(0, 0.02)``, LayerScale at ``layer_scale_init``, and FiLM at
-exact identity so a fresh model's phase conditioning is a no-op.
-
-``d_axis == 0`` is the ``full_no_axis`` arm of §29, which requires that no
-unused axis parameter is retained. It is represented by ``axis=None`` rather
-than a zero-width tensor: :class:`AxisMix` then holds no parameters at all,
-:class:`EquivariantNorm`, :class:`EquivariantResidual` and
-:class:`EquivariantFFN` build no axis half, and :class:`AxisPool` refuses to be
-constructed, because pooling an absent stream is a caller's bug rather than a
-degenerate case with a sensible answer.
+``d_axis == 0`` is the ``full_no_axis`` arm of §29: ``axis=None`` throughout,
+no axis parameters or norms.
 """
 
 from __future__ import annotations
@@ -61,6 +18,7 @@ from dataclasses import dataclass
 from typing import Sequence
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .config import MantisACTConfig
@@ -103,11 +61,10 @@ def activation_module(name: str) -> nn.Module:
 def at_least_fp32(tensor: Tensor) -> Tensor:
     """Promote a reduced-precision tensor to fp32, leaving fp32/fp64 alone.
 
-    §27 requires every softmax and every segment reduction in fp32. Under bf16
-    autocast that is a promotion; for an fp64 reference or gradient check a
-    literal ``.float()`` would be a *demotion*, which is the opposite of what
-    the rule is for. This is the package's one promotion helper: `messages` and
-    `latents` reach for it too, so "at least fp32" means one thing everywhere.
+    §27 requires every softmax and every segment reduction in fp32. A literal
+    ``.float()`` would demote an fp64 reference tensor; this promotes only
+    where needed. The package's one promotion helper, shared with `messages`
+    and `latents`.
     """
     return tensor.to(torch.promote_types(tensor.dtype, torch.float32))
 
@@ -151,19 +108,13 @@ class EquivariantState:
     """One entity family's ``(h_inv, h_axis)`` pair (§12.1).
 
     ``inv`` is ``(..., d_inv)`` and ``axis`` is ``(..., 3, d_axis)`` over the
-    same leading shape, same dtype, and same device. Every one of those
-    agreements is checked here, so a state assembled from a mismatched pair
-    fails where it is built rather than inside whichever module first
-    broadcasts it into a plausible wrong shape.
+    same leading shape, dtype, and device; every agreement is checked here.
 
     ``axis=None`` is the ``full_no_axis`` model of §29: the axis half is
-    genuinely absent. A zero-width axis tensor is refused, because it would let
-    axis-shaped parameters and axis-shaped code survive in an arm that is
-    supposed to have neither.
+    genuinely absent. A zero-width axis tensor is refused.
 
     Instances are immutable; ``dataclasses.replace`` re-runs every check.
-    Equality is identity: the fields are tensors, and an elementwise ``==``
-    masquerading as a state comparison is a trap rather than a convenience.
+    Equality is identity.
     """
 
     inv: Tensor
@@ -271,7 +222,7 @@ class LayerScale(nn.Module):
     """A learned per-width residual gain, initialised ``layer_scale_init`` (§27).
 
     On an axis stream the gain has width ``d_axis`` and broadcasts over the
-    channel dimension, so all three channels are scaled by the same vector — a
+    channel dimension, so all three channels are scaled by the same vector: a
     per-channel gain would be a per-absolute-axis parameter (§12.2).
     """
 
@@ -293,13 +244,12 @@ class LayerScale(nn.Module):
 class EquivariantNorm(nn.Module):
     """The LayerNorm pair for one entity type's two streams (§18, §27).
 
-    §18 requires a norm per entity type *and* stream, so one instance belongs
-    to one stream pair of one entity family and is never shared with another;
-    the trunk holds as many of these as it has (entity, site) combinations.
+    One instance belongs to one stream pair of one entity family; the trunk
+    holds as many of these as it has (entity, site) combinations.
 
     The axis norm holds a single set of ``d_axis`` parameters applied
-    independently to all three channels. Three sets, one per channel, would be
-    §12.2's forbidden per-absolute-axis norm.
+    independently to all three channels — three sets, one per channel, would
+    be §12.2's forbidden per-absolute-axis norm.
     """
 
     def __init__(self, cfg: MantisACTConfig) -> None:
@@ -430,27 +380,21 @@ class AxisMix(nn.Module):
     h_inv       += layer_scale_inv * MLP_inv([LN_inv(h_inv), axis_summary])
     ```
 
-    Both residual branches read the pre-update state — the second reads
-    ``h_inv``, which the first does not touch, and ``u_a``, which is taken from
-    ``x`` before its own update — so the two are computed from one set of
-    norms.
+    Both residual branches read the pre-update state, so the two are computed
+    from one set of norms.
 
-    Why it is equivariant. Apply a channel permutation ``pi`` to the input.
-    ``LN_axis`` is one shared map, so ``u`` permutes with it; ``total`` is a sum
-    over the whole channel set and is therefore unchanged; ``other_a`` is built
-    from ``total`` and ``u_a`` and so permutes; the invariant term is the same
-    vector for every channel; ``MLP_axis`` is one shared map, so ``delta``
-    permutes, and the axis update permutes. ``axis_summary`` is a mean over the
-    whole channel set of one shared ``phi_axis`` and is therefore unchanged, so
-    the invariant update is unchanged. That is exactly the §12.1 law.
+    Equivariant because: ``LN_axis`` is one shared map, so ``u`` permutes with
+    a channel permutation; ``total`` is a sum over the whole channel set and
+    is unchanged; ``other_a`` is built from ``total`` and ``u_a`` and so
+    permutes; ``MLP_axis`` is one shared map, so ``delta`` and the axis update
+    permute; ``axis_summary`` is a mean over the whole channel set and is
+    unchanged, so the invariant update is unchanged (§12.1).
 
     The concatenation is of ``[self, others, invariant]``, never of channels
-    ``0/1/2`` in a fixed order, which is what §12.2 forbids: no absolute axis id
-    reaches any parameter here.
+    ``0/1/2`` in a fixed order (§12.2's forbidden per-absolute-axis parameter).
 
-    Under ``d_axis == 0`` (§29 ``full_no_axis``) there is no cross-channel
-    communication to perform and the module holds no parameters at all; §18's
-    "AxisMix + FFN" stage degenerates to the FFN alone in that arm.
+    Under ``d_axis == 0`` (§29 ``full_no_axis``) the module holds no
+    parameters; §18's "AxisMix + FFN" stage degenerates to the FFN alone.
     """
 
     def __init__(self, cfg: MantisACTConfig) -> None:
@@ -518,21 +462,18 @@ class AxisPool(nn.Module):
     pool     = sum_a weight_a * x_a
     ```
 
-    The learned pool is invariant **precisely because the scores and the
-    channels permute together**: ``Wa``, ``w``, and the broadcast invariant term
-    are shared over ``a``, so a channel permutation carries ``score_a`` to
-    ``score_pi(a)`` exactly as it carries ``x_a`` to ``x_pi(a)``. The softmax is
-    taken over the whole channel set, so the weights permute with the scores,
-    and ``sum_a weight_a * x_a`` pairs each weight with the channel it was
-    computed from whatever order they are in. A per-channel score bias would
-    break the pairing, and that is the negative control the tests use.
+    The learned pool is invariant because the scores and the channels permute
+    together: ``Wa``, ``w``, and the broadcast invariant term are shared over
+    ``a``, so a channel permutation carries ``score_a`` to ``score_pi(a)``
+    exactly as it carries ``x_a`` to ``x_pi(a)``, and ``sum_a weight_a * x_a``
+    pairs each weight with the channel it was computed from regardless of
+    order.
 
     The softmax runs at no less than fp32 (§27). This is the pooling every
-    invariant consumer of an axis stream uses — the head pool of §12.5, the
-    symmetric pool §17.2 and §17.3 require for invariant/axis communication.
+    invariant consumer of an axis stream uses — the head pool of §12.5, and
+    the symmetric pool §17.2/§17.3 need for invariant/axis communication.
 
-    It refuses to be built without an axis stream: §29 ``full_no_axis`` keeps no
-    unused axis parameters, so a caller under that arm must not construct one.
+    Refuses to be built without an axis stream (§29 ``full_no_axis``).
     """
 
     def __init__(self, cfg: MantisACTConfig, hidden: int | None = None) -> None:
@@ -583,21 +524,17 @@ class PhaseFiLM(nn.Module):
     h = scale * h + bias
     ```
 
-    with separate invariant and axis projections and one axis ``(scale, bias)``
-    pair shared across the three channels, so the modulation is a channel-shared
-    affine map and commutes with any channel permutation.
+    Separate invariant and axis projections, with one axis ``(scale, bias)``
+    pair shared across the three channels, so the modulation commutes with any
+    channel permutation.
 
     The final projections are zero-initialised and the scale is read as
-    ``1 + delta``, so a fresh model's FiLM is exactly the identity — not
-    approximately, bitwise — and phase conditioning starts as a no-op that
-    training can turn on (§27).
+    ``1 + delta``, so a fresh model's FiLM is exactly the identity (§27).
 
     The phase id is the authoritative three-way id of §13.1 and enters only
-    here, as a model feature. Nothing downstream of this module sees it, and in
-    particular the KLENT return sign still reads ``moves_remaining``.
-    ``use_three_way_phase=False`` folds OPENING and SECOND onto one embedding
-    row while keeping the same input vocabulary, so the caller never has to
-    recode the id it was given.
+    here. Nothing downstream sees it; the KLENT return sign still reads
+    ``moves_remaining``. ``use_three_way_phase=False`` folds OPENING and
+    SECOND onto one embedding row while keeping the same input vocabulary.
     """
 
     def __init__(self, cfg: MantisACTConfig, d_phase: int | None = None) -> None:
@@ -630,17 +567,24 @@ class PhaseFiLM(nn.Module):
                 nn.init.zeros_(projection.bias)
 
     def _rows(self, phase_id: Tensor, leading: tuple[int, ...]) -> Tensor:
+        """This FiLM's embedding row for every entity, from §13.1's phase id.
+
+        The values are validated upstream: ``batch.phase_id`` is built at
+        `packed.py:692` from per-graph ``ACTGraph.phase_id``, which
+        `packed.py:491-502` refuses unless it is 0, 1, or 2 and agrees with
+        ``moves_remaining`` and the occupied-cell count. That gate runs from
+        ``__post_init__`` (`packed.py:324-325`), so it applies regardless of
+        which builder produced the graph.
+
+        What is enforced here is that the selection cannot alias: advanced
+        indexing wraps a negative subscript, so ``phase_row[phase_id]`` would
+        silently answer ``-1`` with the last phase's row. ``index_select``
+        bounds-checks in both directions instead, with no synchronisation cost.
+        """
         if phase_id.dtype != torch.long:
             raise ValueError(
                 f"phase_id must be int64, got dtype {phase_id.dtype}"
             )
-        if phase_id.numel():
-            low, high = int(phase_id.min()), int(phase_id.max())
-            if low < 0 or high >= len(PHASE_IDS):
-                raise ValueError(
-                    f"phase_id values must lie in 0..{len(PHASE_IDS) - 1}, got "
-                    f"a range of {low}..{high}"
-                )
         try:
             broadcast = tuple(torch.broadcast_shapes(phase_id.shape, leading))
         except RuntimeError:
@@ -650,13 +594,44 @@ class PhaseFiLM(nn.Module):
                 f"phase_id of shape {tuple(phase_id.shape)} does not broadcast "
                 f"onto the state's entity shape {leading}"
             )
-        return self.phase_row[phase_id]
+        index = phase_id.reshape(-1)
+        try:
+            flat = self.phase_row.index_select(0, index)
+        except IndexError as exc:
+            raise ValueError(
+                f"phase_id values must lie in 0..{len(PHASE_IDS) - 1}, got a "
+                f"range of {int(index.min())}..{int(index.max())}"
+            ) from exc
+        return flat.view(phase_id.shape)
+
+    def _selector(self, rows: Tensor, dtype: torch.dtype) -> Tensor:
+        """A one-hot row picker over this FiLM's phase vocabulary.
+
+        Selecting a class table's row per entity by matmul rather than by
+        gather avoids `embedding_dense_backward`'s index sort and contended
+        scatter: ``one_hot @ table`` backward is ``one_hot.T @ grad``, a plain
+        matmul over a two- or three-column operand.
+
+        The one-hot is exact in every floating dtype: each output element is
+        one ``1.0`` times a table entry plus zeros.
+
+        ``rows`` is in range by construction: it is a row of ``phase_row``,
+        which `_rows` selects with ``index_select`` (bounds-checked).
+        """
+        return F.one_hot(rows, self.embed.num_embeddings).to(dtype)
 
     def forward(self, state: EquivariantState, phase_id: Tensor) -> EquivariantState:
         rows = self._rows(phase_id, state.leading_shape)
-        code = self.phase_mlp(self.embed(rows))
 
-        scale, bias = self.to_inv(code).chunk(2, dim=-1)
+        # The modulation is a function of the phase class alone (at most three
+        # classes, §13.1), so `embed -> phase_mlp -> to_inv/to_axis` is
+        # evaluated on the vocabulary once rather than per entity; only the
+        # row selection and the affine run per entity.
+        code = self.phase_mlp(self.embed.weight)
+        inv_table = self.to_inv(code)
+        selector = self._selector(rows, inv_table.dtype)
+
+        scale, bias = (selector @ inv_table).chunk(2, dim=-1)
         inv = (1 + scale) * state.inv + bias
         if state.axis is None:
             return EquivariantState(inv)
@@ -665,7 +640,7 @@ class PhaseFiLM(nn.Module):
                 "this FiLM was built without an axis projection but received a "
                 "state with an axis stream"
             )
-        axis_scale, axis_bias = self.to_axis(code).chunk(2, dim=-1)
+        axis_scale, axis_bias = (selector @ self.to_axis(code)).chunk(2, dim=-1)
         axis = (1 + axis_scale).unsqueeze(-2) * state.axis + axis_bias.unsqueeze(-2)
         return EquivariantState(inv, axis)
 

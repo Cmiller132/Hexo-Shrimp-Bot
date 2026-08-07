@@ -149,9 +149,6 @@ def test_every_preset_builds_and_validates_at_every_depth(preset, act_positions)
     cfg = PRESETS[preset]
     for plies, pos in act_positions.items():
         graph = build(pos, cfg)
-        # `build` validates before returning; validating again here means a
-        # test that only calls the constructor cannot pass by accident.
-        graph.validate()
         assert graph.n_legal == pos.legal_count, f"{preset} at ply {plies}"
         assert graph.moves_remaining == pos.moves_remaining
         assert int(graph.cell_is_occupied.sum()) == (
@@ -382,16 +379,24 @@ def test_no_edge_crosses_a_batch_position(mixed_batch):
     assert len({g.n_cells for g in graphs}) == len(graphs)
 
 
-def test_collate_refuses_an_index_that_would_cross(mixed_batch):
+def test_an_index_that_would_cross_a_position_never_reaches_collation(mixed_batch):
+    """Where the crossing fault is actually stopped, on a real built graph.
+
+    One past its own family's last cell is the *next* position's first cell
+    once the offsets are applied — plausible after concatenation and invisible
+    to every shape and dtype check downstream. It never gets that far: the
+    graph refuses it at construction against its own family's size, which is
+    the stronger statement of the two because it does not depend on what else
+    happens to be in the batch.
+    """
     _positions, graphs, _batch = mixed_batch
-    leading, trailing = graphs[-2], graphs[-1]
-    # One past the last cell of its own position, which is the first cell of
-    # the next one after the offsets are applied — the way an edge crosses in
-    # practice, and the one form of it that concatenation makes plausible.
+    leading = graphs[-2]
     crossing = leading.adjacency_dst.copy()
     crossing[0] = leading.n_cells
-    with pytest.raises(ValueError, match="adjacency_dst crosses a batch position"):
-        collate([replace(leading, adjacency_dst=crossing), trailing])
+    with pytest.raises(
+        ValueError, match=rf"adjacency_dst must be <= {leading.n_cells - 1}"
+    ):
+        replace(leading, adjacency_dst=crossing)
 
 
 def test_collate_positions_and_collate_prefixes_agree(act_moves, act_positions):

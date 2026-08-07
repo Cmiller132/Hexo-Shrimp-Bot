@@ -54,8 +54,7 @@ impl MantisPackage {
     }
 
     fn metadata(&self) -> serde_json::Value {
-        // Serialize through the shortest f32 decimal so manifest round trips
-        // preserve numeric equality.
+        // Round-trip through f32 decimal to preserve numeric equality in manifests.
         let tau: f64 = self
             .config
             .tau
@@ -172,7 +171,7 @@ impl ModelPackage for MantisPackage {
             source,
         })?;
 
-        // Probe the checkpoint copy through the evaluator used by normal loads.
+        // Probe the sealed checkpoint.
         let candidate = self.candidate(&weights)?;
         let manifest = Manifest::new(
             PACKAGE_NAME,
@@ -205,7 +204,6 @@ impl ModelPackage for MantisPackage {
             });
         }
 
-        // Publish only after all validation and probe checks succeed.
         self.loaded = Some(candidate);
         Ok(manifest)
     }

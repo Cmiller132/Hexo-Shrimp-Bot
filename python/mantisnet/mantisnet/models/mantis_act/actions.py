@@ -1,46 +1,12 @@
-"""The counterfactual legal-action tables of §19 and their tactical vector.
+"""Counterfactual legal-action tables and the tactical vector (§19).
 
-A legal action is encoded from the eighteen windows a stone placed there would
-join — three axes by six candidate slots — and from nothing else. The tables
-are dense: all eighteen rows exist for every legal action, including one lying
-in no nonempty window, which is what retires the old representation's
-nearest-distance background alias (§19.2).
+Each legal action is encoded from eighteen windows (3 axes x 6 slots) a stone
+placed there would join. Action row ``[action, axis, k]``: the window starts
+at ``a - k * AXES[axis]``, post-placement code is ``pre_code + 3**k``.
 
-Index conventions this module fixes (each is part of the representation):
-
-- Action row: ``[action, axis, k]``, with ``axis`` indexing :data:`AXES` and
-  ``k`` the candidate slot — the slot the action cell occupies in that row's
-  window. The row's window therefore starts at ``a - k * AXES[axis]`` and its
-  slot ``j`` is the cell ``a + (j - k) * AXES[axis]``. The eighteen
-  ``(axis, start)`` pairs are distinct, so the eighteen rows of one action name
-  eighteen different windows.
-- Pre-placement code: the row's window's raw ternary code on the current board,
-  whether or not that window is a persistent node. It is read off the board and
-  not off the window set because ``window_scope`` decides what is persisted and
-  must not also decide what a window's state is: under ``live`` a mixed
-  pre-window is absent from the node set and still has counts and a status the
-  action has to see.
-- Post-placement code: the pre-placement code with slot ``k`` set to own, which
-  is ``pre_code + 3 ** k`` exactly because a legal cell is empty, so slot ``k``
-  of the pre-code is zero. That arithmetic is the whole derivation — no
-  successor board is built — which is why :data:`POST1_CLASS` is indexed with
-  the same ``k`` the code was written at and why ``test_act_actions.py`` checks
-  the result against a board that really carries the stone (§30.14). A
-  slot-to-power mapping off by one produces a legal code and a legal class and
-  is invisible to every round trip.
-
-``action_window_index`` is ``-1`` wherever the row's window is not a persistent
-node, and the model substitutes its learned pre-empty-window state there.
-``action_post1_class`` is never ``-1``: slot ``k`` holds an own stone in every
-post-placement code by construction, and those pairs are exactly the ones
-:data:`POST1_CLASS` classes.
-
-Which rows may be ``-1`` follows from ``window_scope`` alone — every window in
-these tables passes through the legal cell ``a``, so ``action_relevant``
-persists all eighteen, ``nonempty`` persists those with a stone, and ``live``
-those with one colour's stones. That prediction is checked against the window
-set rather than read off it: a window the scope requires and the node set lacks
-would otherwise silently train the pre-empty state on a window that exists.
+``action_window_index`` is ``-1`` where the row's window is not persistent;
+the model substitutes a learned pre-empty-window state there.
+``action_post1_class`` is never ``-1``.
 """
 
 from __future__ import annotations
@@ -68,9 +34,7 @@ _OWN, _OPP = 1, 2
 _SLOTS = np.arange(WINDOW_LEN, dtype=np.int64)
 _POWERS = 3**_SLOTS
 
-# The code of a window of six own stones: the placement that produces one wins,
-# since six in a row is the win condition and every window containing the new
-# stone is a row of these tables.
+# The ternary code of a window of six own stones (six in a row wins).
 _ALL_OWN_CODE = int((_OWN * _POWERS).sum())
 
 # The cells one action's rows can reach along one axis: five steps either way,
@@ -83,8 +47,8 @@ _LINE_OFFSETS = np.arange(-_LINE_ORIGIN, _LINE_ORIGIN + 1, dtype=np.int64)
 _SLOT_TO_LINE = _SLOTS[None, :] - _SLOTS[:, None] + _LINE_ORIGIN
 
 # Coordinate packing: q and r fit i16, so 21 bits per component is
-# collision-free. Only the stone lookup uses it; window identities are located
-# by ``WindowSet.index_of``, whose packing is that module's business.
+# collision-free. Only the stone lookup uses this; window identities are
+# located by ``WindowSet.index_of``.
 _R_SPAN = 1 << 21
 
 # The §19.3 vector, in the order the spec lists its fields. Counts over an
@@ -148,10 +112,8 @@ def _board_occupancy(
 ) -> np.ndarray:
     """Ternary occupancy of ``(..., 2)`` cells: 0 empty, 1 own, 2 opponent.
 
-    ``stone_own`` carries ``windows.py``'s convention — ``0`` the mover's stone
-    and ``1`` the opponent's — because the builder hands one array to both, and
-    two modules reading one array with opposite polarities would each produce
-    valid codes and valid classes for the wrong side. Any other value raises.
+    ``stone_own`` follows ``windows.py``'s convention: ``0`` the mover's stone,
+    ``1`` the opponent's. Any other value raises.
     """
     stone_own = np.asarray(stone_own, dtype=np.int64).reshape(-1)
     if len(stone_own) != len(stone_qr):
@@ -315,27 +277,19 @@ def tactical_features(tables: ActionTables, cfg: MantisACTConfig) -> np.ndarray:
     Every field is a function of the current state and the hypothetical
     placement, with no search: the eighteen pre- and post-placement codes carry
     the local terms, and the two board-level threat counts are broadcast to
-    every action. Disabled, the vector has width zero, so the model contributes
-    exactly nothing rather than a learned constant (§32).
+    every action. Disabled, the vector has width zero (§32).
 
-    Two readings the spec's field list leaves to the implementation, both
-    chosen so the field carries signal:
+    Two readings not fixed by the spec's field list:
 
-    - A five- or four-window counts only when the window holds one colour. A
-      six-cell line already holding both colours can never be completed, so
-      counting its stones would rank dead shapes alongside live threats.
-    - "nonempty post-windows" counts the rows whose window held a stone
-      *before* the placement. Every post-placement window contains the new
-      stone, so the post-placement reading is the constant eighteen; the
-      pre-placement one is how connected the action is, which is the fact the
-      retired background alias used to carry.
+    - A five- or four-window count only counts a window holding one colour: a
+      window already holding both colours can never be completed.
+    - "nonempty post-windows" counts rows whose window held a stone *before*
+      the placement, since every post-placement window trivially holds one.
 
-    A live opponent four or five has at most two empty cells, each within five
-    steps of one of that window's own stones and so inside the legal radius, so
-    every such window appears among some legal action's rows. The board-level
-    counts are the distinct windows over the whole table, counted by persistent
-    window index — a one-colour nonempty window is a node under every scope, so
-    the scope check in :func:`action_tables` has already refused a ``-1`` there.
+    A live opponent four or five has at most two empty cells within the legal
+    radius, so every such window appears among some legal action's rows. The
+    board-level counts are the distinct windows over the whole table, counted
+    by persistent window index.
     """
     if not cfg.use_action_tactical_features:
         return np.zeros((tables.n_legal, 0), dtype=np.float32)

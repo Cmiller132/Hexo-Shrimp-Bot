@@ -146,10 +146,9 @@ def _opponent_family(name: str) -> str:
 def _h2h_sign_readout(conn, match: dict) -> dict:
     """Rebuild one H2H sign test from its seat-swapped game pairs.
 
-    Pair order, model seats, and shared opening are structural data, not hints.
-    A malformed match is refused with its id so an operator can identify the
-    corrupt boundary. Capped pairs are valid but non-decisions, matching the
-    head-to-head instrument's own statistical contract.
+    A malformed match is refused with its id. Capped pairs are valid but
+    non-decisive, matching the head-to-head instrument's statistical
+    contract.
     """
     match_id = match["match_id"]
 
@@ -420,10 +419,9 @@ def create_app(
     def conn_for(request: Request, run: str):
         """The run's telemetry for the duration of one request.
 
-        A context manager, not a connection: the endpoints below already say
-        ``with``, and handing them a bare connection is what leaked a
-        descriptor per request. Entering happens inside the stack so a missing
-        or unreadable database still maps to its status code.
+        Yields a connection rather than returning one, since entering happens
+        inside the stack: a missing or unreadable database still maps to its
+        status code.
         """
         with ExitStack() as stack:
             try:

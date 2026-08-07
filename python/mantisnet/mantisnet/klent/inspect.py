@@ -1,11 +1,4 @@
-"""Inspect a model's policy and scalar action values at one move prefix.
-
-Telemetry stores five per-ply scalars but not the full improved policy.
-``inspect_position`` computes the supplied model's current result using the
-Rust prefix builder and training-time improvement operator. This is a
-recomputation, not an acting-policy record; numerical agreement depends on the
-supplied actor weights, ``tau``/``lam``, device, and inference precision.
-"""
+"""Inspect a model's policy and action values at one move prefix."""
 
 from __future__ import annotations
 

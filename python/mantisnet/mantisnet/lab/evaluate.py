@@ -1,4 +1,4 @@
-﻿"""Packed imitation and outcome-horizon evaluation for lab and KLENT weights."""
+"""Packed imitation and outcome-horizon evaluation for lab and KLENT weights."""
 
 from __future__ import annotations
 
@@ -12,18 +12,25 @@ from typing import Mapping
 import numpy as np
 import torch
 
+from ..fitloop import FitBudgets
 from ..klent.improve import improved_policy
-from ..klent.train import KlentConfig, _gpu_lock
+from ..klent.train import _gpu_lock
 from ..model import compose_acting_q, compose_q
 from .families import Composition, load_checkpoint
 from .corpus import FrozenCorpus
 from .train import (
+    TrainConfig,
     _as_corpus,
     current_versions,
-    pack_inference_indices,
+    pack_inference_chunks,
     sample_sizes,
 )
 from .variants import build_variant, count_parameters, variant_spec
+
+
+# Evaluation runs no gradient, so it packs under the same collection limits
+# validation does; the recipe owns them and states each architecture's.
+COLLECTION_BUDGETS: FitBudgets = TrainConfig().collect_budgets()
 
 
 # (label, inclusive lower bound, inclusive upper bound or None).
@@ -107,10 +114,17 @@ def _horizon_block(
     return block
 
 
-def _evaluation_heads(model, batch, include_state_value: bool):
-    _stones, windows, token = model.trunk(batch)
-    policy, critic = model.cell_head_logits(windows, token, batch)
-    value = model.value_head(windows, token, batch)[0] if include_state_value else None
+def _evaluation_heads(model, batch, score_state_value: bool):
+    """Policy and critic logits, plus the state value when it is being scored.
+
+    Neither architecture is named here since both answer these methods over
+    their own trunk. The value readout is skipped entirely, not run and
+    discarded, when the state-value channel is not scored.
+    """
+    if not score_state_value:
+        policy, critic = model.policy_q(batch)
+        return policy, critic, None
+    policy, critic, value, _value_logits = model.supervised_heads(batch)
     return policy, critic, value
 
 
@@ -128,11 +142,16 @@ def evaluate_model(
     tau: float = 0.1,
     lam: float = 0.01,
     mass_floor: float = 0.2,
-    pair_budget: int = KlentConfig.collect_pair_budget,
-    cell_budget: int = KlentConfig.collect_cell_budget,
+    budgets: FitBudgets = COLLECTION_BUDGETS,
     composition: Composition | None = None,
 ) -> dict[str, object]:
-    """Return metric blocks for an already-loaded model, without writing."""
+    """Return metric blocks for an already-loaded model, without writing.
+
+    ``include_state_value`` is the caller's intent; the architecture decides
+    whether it holds a state-value head at all, and the channel is scored
+    only when both agree. The critic channel is `v_hat`, composed from
+    action-value logits.
+    """
 
     if tau < 0 or lam < 0 or tau + lam <= 0:
         raise ValueError(f"need tau, lam >= 0 with positive sum, got ({tau}, {lam})")
@@ -142,13 +161,9 @@ def evaluate_model(
     samples = frozen.split_samples(split)
     if not len(samples):
         raise ValueError(f"corpus split {split!r} is empty")
-    lengths, cells = sample_sizes(frozen, samples)
-    chunks = pack_inference_indices(
-        lengths,
-        cells,
-        pair_budget=pair_budget,
-        cell_budget=cell_budget,
-    )
+    stones, cells = sample_sizes(frozen, samples)
+    chunks = pack_inference_chunks(model, stones, cells, budgets)
+    score_state_value = include_state_value and model.has_state_value_head
     collate = variant_spec(variant).collate
     device_type = torch.device(device).type
     expected_autocast = device_type == "cuda"
@@ -160,7 +175,7 @@ def evaluate_model(
     use_autocast = expected_autocast
 
     def forward(current_model, batch):
-        return _evaluation_heads(current_model, batch, include_state_value)
+        return _evaluation_heads(current_model, batch, score_state_value)
 
     if compile:
         forward = torch.compile(forward, dynamic=True)
@@ -169,7 +184,7 @@ def evaluate_model(
     top1 = np.zeros(n, dtype=bool)
     top3 = np.zeros(n, dtype=bool)
     v_hat_prediction = np.empty(n, dtype=np.float32)
-    state_prediction = np.empty(n, dtype=np.float32) if include_state_value else None
+    state_prediction = np.empty(n, dtype=np.float32) if score_state_value else None
     model.eval()
     for indices in chunks:
         games = [frozen.moves_for(int(samples.game[index])) for index in indices]
@@ -238,7 +253,7 @@ def evaluate_model(
             "tau": tau,
             "lam": lam,
             "mass_floor": mass_floor,
-            "state_value_scored": include_state_value,
+            "state_value_scored": score_state_value,
             "autocast": use_autocast,
             "compile": compile,
             "composition": (

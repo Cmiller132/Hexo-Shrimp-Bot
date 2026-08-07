@@ -1,27 +1,8 @@
-"""Paired head-to-head between two checkpoints, from any two run directories.
+"""Paired head-to-head between two checkpoints.
 
-Two independent SealBot scores cannot resolve a small difference: each carries
-its own binomial noise plus whatever the opponent's openings and seat draws did
-to it, so 64 games a side leave about eight percentage points unresolved. A
-direct match removes the anchor, and pairing removes most of what is left. Each
-of ``pairs`` uniform-random openings is played twice with the seats swapped, both
-models searching at the same ``sims`` through ``search.gumbel_choose``, and the
-statistic is the per-pair difference
-
-    d_i = (A's wins in pair i) - 1     in {-1, 0, +1}
-
-whose standard error is reported next to the unpaired one, so the variance the
-pairing bought is visible rather than asserted. A pair is one unit: it shares its
-opening prefix and its whole RNG stream, derived from ``(seed, pair index)``, and
-is therefore reproducible on its own.
-
-A capped game scores ½ as everywhere else in this repo. A cap is not a decision,
-so a capped pair is counted apart from the win/split/loss counts, kept out of the
-sign test, and named in ``warnings``. Pairs that all carry the same ``d`` — the
-shape an all-splits match takes — have no spread to estimate and so get no Elo
-interval and no SE ratio, which is also named in ``warnings``.
-
-Run from ``python/mantisnet``:
+Each of ``pairs`` random openings is played twice with seats swapped.  The
+per-pair statistic is ``d_i = (A's wins) - 1`` in ``{-1, 0, +1}``.  Capped
+games score 1/2 and are counted separately.
 
     python -m mantisnet.klent.headtohead --a A.pt --b B.pt --pairs 64 --sims 32 \
         --tau 0.1 --lam 0.01 --out h2h.json
@@ -117,12 +98,7 @@ def _refuse_incomparable(a: dict, b: dict) -> None:
 
 
 def sign_test(a_wins: int, decisive: int) -> float:
-    """The exact two-sided binomial p at p = ½ over ``decisive`` pairs.
-
-    Exact rather than normal-approximated because the interesting matches are the
-    close ones, where the tail the approximation gets wrong is the whole answer.
-    No decisive pair is no evidence, which is ``p = 1``.
-    """
+    """Exact two-sided binomial p at p = 1/2 over ``decisive`` pairs."""
     if decisive < 0 or not 0 <= a_wins <= decisive:
         raise ValueError(f"a_wins must be within 0..decisive, got {a_wins}/{decisive}")
     if decisive == 0:
@@ -135,12 +111,8 @@ def sign_test(a_wins: int, decisive: int) -> float:
 def paired_statistics(pairs: list[list[dict]]) -> dict:
     """Summarise ``pairs``, each the two ``play_match`` rows of one seat pair.
 
-    A's score and its Wilson interval are the marginal figures, comparable with
-    any SealBot evaluation. Everything else is paired: ``d`` is A's wins in the
-    pair minus one, ``paired_se`` is the standard error of ``d``'s mean, and
-    ``unpaired_se`` is the standard error of the *same* estimand computed as if
-    the ``2 * pairs`` games were independent. A's score is ``(1 + mean d) / 2``,
-    so its own standard error is half of either.
+    Returns A's score with Wilson interval, paired ``d = (A wins) - 1``,
+    and both paired and unpaired standard errors.
     """
     if not pairs:
         raise ValueError("paired statistics need at least one pair")
@@ -256,30 +228,14 @@ def driver_match(
 ) -> tuple[dict, list[dict], dict]:
     """The in-driver paired match: the live model against a fixed reference.
 
-    This is :func:`head_to_head`'s instrument on the training loop's cadence.
-    Both models are already in memory, so there is no checkpoint audit here —
-    the caller identifies the reference; ``ref_config`` is its strength-defining
-    record and travels into the ``opponents`` table unchanged.
-
-    One schedule of ``pairs`` shared openings plays as a single batched match,
-    so each lockstep step forwards every live game of a side at once rather
-    than two at a time — the offline tool optimizes per-pair reproducibility,
-    this one optimizes the GPU it is borrowing from training. Pairing is by
-    schedule structure (games ``2i`` and ``2i + 1`` share pair ``i``), which
-    one generator for the whole match does not disturb.
-
-    Returns ``(result, per_game, stats)``: the first two shaped exactly for
-    ``sealbot.record_match`` — the summary carries ``paired_statistics``' Elo,
-    whose interval comes from the paired standard error — and ``stats`` is the
-    full paired summary for the caller's own record.
+    In-training-loop paired match.  Returns ``(result, per_game, stats)``
+    for ``sealbot.record_match`` and the caller's own record.
     """
     if pairs < 2:
         raise ValueError(
             f"a driver match needs pairs >= 2 to estimate its paired spread, got {pairs}"
         )
-    # Eager on both sides: the compiled callable is shared process-wide and
-    # keyed on the training model; evaluating a second architecture through it
-    # would recompile under the training loop.
+    # Eager: the compiled callable is keyed on the training model.
     eval_cfg = dataclasses.replace(cfg, compile=False)
     choose_live, choose_ref = (
         gumbel_choose(
@@ -346,22 +302,10 @@ def head_to_head(
     opening_range: tuple[int, int] = (2, 6),
     temperature: float = 1.0,
 ) -> dict:
-    """Play A against B over ``pairs`` seat-swapped pairs and summarise them.
+    """Play A against B over ``pairs`` seat-swapped pairs and summarise.
 
-    ``tau`` and ``lam`` are the coefficients both models search at, required when
-    ``sims > 0`` and ``None`` when it is zero, where the operator is never
-    consulted — the manifest then records that no operating point was used
-    instead of naming one that was not.
-
-    ``temperature`` is the root Gumbel scale of :func:`gumbel_choose`, applied
-    to both seats because an asymmetric one would measure the difference
-    between two search settings as though it were a difference between two
-    models. It is recorded with the result: a score at one temperature says
-    nothing about a score at another.
-
-    Returns the statistics of :func:`paired_statistics`, an audit record per
-    checkpoint, one row per pair, and the match's own parameters — enough for
-    someone else to reproduce the match or to say why they cannot.
+    ``tau``/``lam`` required when ``sims > 0``; ``None`` for argmax.
+    Returns paired statistics, audit records, per-pair rows, and parameters.
     """
     if pairs < 1:
         raise ValueError(f"pairs must be >= 1, got {pairs}")
@@ -381,15 +325,12 @@ def head_to_head(
     audit_a, audit_b = _audit(path_a, "--a"), _audit(path_b, "--b")
     _refuse_incomparable(audit_a, audit_b)
 
-    # A pair's generator draws its own opening and then drives both its games, so
-    # the pair is a function of ``(seed, pair index)`` alone. Drawing every
-    # schedule up front refuses an unusable opening range before any model loads.
+    # Each pair's RNG is derived from ``(seed, pair_index)``.
     generators = [np.random.default_rng([seed, index]) for index in range(pairs)]
     schedules = [shared_openings(rng, 1, opening_range) for rng in generators]
 
     started = time.monotonic()
-    # The evaluator reads only the device fields; the coefficients act through
-    # ``gumbel_choose``, which does not consult them at ``sims == 0``.
+    # Coefficients act through ``gumbel_choose``, not the evaluator config.
     cfg = KlentConfig(device=device, autocast=device == "cuda", compile=False)
     choose_a, choose_b = [
         gumbel_choose(
@@ -525,8 +466,7 @@ def main(argv=None) -> None:
             "--sims > 0 searches through the improvement operator: pass --tau and "
             "--lam, the KLENT coefficients the compared runs were trained at"
         )
-    # Checked before the match, because the match is hours long and its only
-    # durable output is this one file.
+    # Validate output path before the long match.
     if not args.out.parent.is_dir():
         parser.error(f"--out: no directory {args.out.parent} to write into")
     if args.out.is_dir():

@@ -1,46 +1,14 @@
-"""Relevant cell nodes, cell-window incidence, and local cell geometry.
+"""Cell nodes, cell-window incidence, and local cell geometry (§8, §10, §15).
 
-This module implements §8, §10 and §15: the finite cell node set of a position,
-the six geometric slots of every persistent window, and the two sparse edge
-families between cells. It owns no window enumeration — the window coordinates
-arrive as an argument — and no engine call: a cell is legal iff it is empty and
-within ``LEGAL_RADIUS`` steps of a stone, and the engine stays an independent
-oracle for that rule in the tests.
+Builds the finite cell set, its six geometric window slots, and two sparse
+edge families (adjacency §15.1 and occupied-radius §15.2). Cell index is
+lexicographic ``(q, r)`` order (§7); a cell is legal iff empty and within
+``LEGAL_RADIUS`` steps of a stone.
 
-Index conventions this module fixes (each is part of the representation):
-
-- Cell index: the rank of a cell's ``(q, r)`` in ascending lexicographic order
-  (§7). Coordinates pack into one int64 key whose order *is* lexicographic
-  order, so the sorted key array serves both as the node order and as the
-  lookup structure. ``CellSet.index_of`` answers ``-1`` for a coordinate the
-  scope omits, the package's one sentinel.
-- Nearest-stone bucket: the hex distance to the closest stone, ``0`` on an
-  occupied cell, and ``NEAREST_UNREACHED`` when no stone lies within
-  ``LEGAL_RADIUS`` — which covers both a cell of an empty window persisted by
-  the ``action_relevant`` scope and the stoneless opening. The clamp bucket and
-  the unreached bucket are distinct so that a legal cell landing on the latter
-  is a violation of the legality rule rather than an ordinary far cell.
-- Adjacency edge: a directed edge between cells one hex step apart, labelled
-  with the *undirected* axis it runs along, so the two directions of one
-  neighbour pair carry the same label (§15.1).
-- Radius edge: a directed edge from an occupied cell to a represented cell at
-  hex distance ``1..occupied_radius``, labelled with the D6 relation class of
-  the displacement ``dst - src`` and with the axis that displacement lies on,
-  or ``-1`` off-axis (§15.2, §11.3). Distance ``0`` is not a radius edge:
-  §11.2 gives the self relation its own reserved id, and no orbit table classes
-  the zero displacement.
-
-Both edge families and the nearest-stone pass walk a precomputed hex disk out
-from each stone or cell rather than a cell-by-stone outer product. The disk is
-a table of ``3 d (d + 1) + 1`` displacements built once per radius, so radius
-work is ``O(stones * disk)`` and independent of how many cells the halo holds
-— the difference that decides whether radius-12 edges are affordable in dense
-late positions (§15.2, §26).
-
-Whether the two edge families are built at all is the orchestrator's decision:
-``use_cell_adjacency`` and ``use_occupied_radius_edges`` say *whether* and are
-read by ``builder.py``; the config fields read here — ``cell_scope``,
-``occupied_radius``, ``d_max``, ``d6_relation_mode`` — say *how*.
+Adjacency edges are directed, labelled with the undirected axis. Radius edges
+run from occupied to represented cells at distance ``1..occupied_radius``,
+labelled with the D6 orbit class and axis (or ``-1`` off-axis). Both families
+walk a precomputed hex disk, so work is ``O(stones * disk)`` (§26).
 """
 
 from __future__ import annotations
@@ -51,20 +19,10 @@ from dataclasses import dataclass
 import numpy as np
 
 from .config import MantisACTConfig
-from .packed import NUM_AXES, SENTINEL
+from .packed import LEGAL_RADIUS, NEAREST_UNREACHED, NUM_AXES, SENTINEL
 from .pattern_classes import CELL_WINDOW_CLASS, TERNARY_CODES
 from .symmetry import AXES, coarse_relation, hex_distance, on_axis, orbit_table
 from .windows import window_cells
-
-# A placement is legal iff its cell is empty and within this many hex steps of
-# an occupied cell. The opening placement is the one exception: it has no stone
-# to measure from.
-LEGAL_RADIUS = 8
-
-# Nearest-stone buckets: the distances 0..LEGAL_RADIUS, then the bucket for a
-# cell no stone reaches.
-NEAREST_UNREACHED = LEGAL_RADIUS + 1
-NEAREST_BUCKETS = LEGAL_RADIUS + 2
 
 # Cell occupancy relative to the side to move (§8.2).
 OCCUPANCY_EMPTY, OCCUPANCY_OWN, OCCUPANCY_OPP = 0, 1, 2
@@ -126,9 +84,8 @@ def _disk(radius: int) -> tuple[np.ndarray, np.ndarray]:
     """Every displacement out to ``radius``, and its distance, distance-sorted.
 
     The zero displacement is first and each shell is contiguous, so a caller
-    slices a shell with ``searchsorted`` and drops the centre with ``[1:]``. The
-    table is cached and read-only: one per radius per process, shared by every
-    position built in it.
+    slices a shell with ``searchsorted`` and drops the centre with ``[1:]``.
+    Cached and read-only: one table per radius per process.
     """
     if radius < 0:
         raise ValueError(f"disk radius must not be negative, got {radius}")
@@ -150,9 +107,8 @@ class CellSet:
     """One position's cell nodes in the §7 order, with their §8.2 fields.
 
     Every array is indexed by cell index. ``key`` is the packed sort key of
-    ``qr``, kept because it is both the node order and the lookup structure and
-    rebuilding it per query would dominate the build. ``scope`` is the
-    ``cell_scope`` the set was built under, which is what lets :func:`incidence`
+    ``qr``, kept as both the node order and the lookup structure. ``scope`` is
+    the ``cell_scope`` the set was built under, which lets :func:`incidence`
     hold the default scope to its all-slots-present promise (§10).
     """
 
@@ -172,9 +128,9 @@ class CellSet:
         """Cell indices of an ``(..., 2)`` coordinate array, ``-1`` where absent.
 
         Vectorised over any leading shape; the result drops the trailing pair
-        axis. Absence is a legitimate answer — a window slot outside the scope,
-        a neighbour past the halo — so it is the sentinel rather than an error,
-        and the callers that cannot tolerate one check for it themselves.
+        axis. Absence (a window slot outside the scope, a neighbour past the
+        halo) is a legitimate answer, so it returns the sentinel rather than
+        raising; callers that cannot tolerate one check for it themselves.
         """
         return _lookup(self.key, qr)
 
@@ -182,12 +138,11 @@ class CellSet:
 def _nearest_buckets(key: np.ndarray, stone_qr: np.ndarray) -> np.ndarray:
     """The §8.2 nearest-stone bucket of every cell.
 
-    Each stone claims the cells of its radius-``LEGAL_RADIUS`` disk, and the
-    shells are written back to front so the nearest claim is the one that
-    survives. Writing whole shells makes this a loop over the nine distances
-    rather than over stones or cells, and it needs no per-cell minimum over a
-    ragged list of claims. A cell no disk reaches keeps ``NEAREST_UNREACHED``,
-    which is the clamp §8.2 asks for and, on a legal cell, a rule violation.
+    Each stone claims the cells of its radius-``LEGAL_RADIUS`` disk, with
+    shells written back to front so the nearest claim survives — a loop over
+    the nine distances rather than over stones or cells. A cell no disk
+    reaches keeps ``NEAREST_UNREACHED``, which on a legal cell is a rule
+    violation.
     """
     nearest = np.full(len(key), NEAREST_UNREACHED, dtype=np.int64)
     if len(stone_qr) == 0:
@@ -218,15 +173,14 @@ def relevant_cells(
 
     The scope selects which of the three sources contribute:
 
-    - ``occupied_only`` — the stones alone. §29 makes this the control whose
-      legal actions are created after the trunk, so its ``legal_to_cell_index``
-      is all ``-1``: a legal cell has no node to point at.
+    - ``occupied_only`` — the stones alone (§29's control). Its
+      ``legal_to_cell_index`` is all ``-1``: a legal cell has no node to point
+      at.
     - ``occupied_and_legal`` — the stones and the legal cells.
     - ``window_and_legal`` — those plus every window slot, so an empty and
       currently illegal cell inside a nonempty window is still a node (§8.1).
 
-    ``window_cells`` is ignored by the two narrower scopes: they are defined as
-    node sets that exclude it, not as scopes that were handed nothing.
+    ``window_cells`` is ignored by the two narrower scopes.
     """
     stone_qr = _coords("stone_qr", stone_qr)
     legal_qr = _coords("legal_qr", legal_qr)
@@ -283,10 +237,8 @@ def relevant_cells(
     is_legal[present] = 1
 
     nearest_bucket = _nearest_buckets(key, stone_qr)
-    # The legality rule this module computes against: a legal cell lies within
-    # LEGAL_RADIUS of a stone, and only the opening placement has no stone to
-    # measure from. A legal cell no stone reaches means the caller's legal list
-    # and the rule disagree, which would silently poison the halo.
+    # A legal cell lies within LEGAL_RADIUS of a stone; only the opening
+    # placement has no stone to measure from.
     if len(stone_qr):
         unreached = present[nearest_bucket[present] == NEAREST_UNREACHED]
         if unreached.size:
@@ -313,21 +265,17 @@ def incidence(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """The §10 cell-window incidence tables of the persistent windows.
 
-    ``window_set`` is the ``windows.WindowSet`` of the position, read for two
-    fields: its ``window_id`` of ``(native_axis, start_q, start_r)`` triples in
-    the §7 order, and its ``code``, the raw ternary code of each window's six
-    slots. The raw code is what §10.1 classes against — a pattern class has
-    already quotiented by reversal, and a slot's class must be taken in the same
-    joint orbit as the pattern it sits in. The slot geometry is decoded by
-    ``windows.window_cells``, which is where the slot-order convention lives.
+    ``window_set`` is read for its ``window_id`` of ``(native_axis, start_q,
+    start_r)`` triples in the §7 order, and its ``code``, the raw ternary code
+    of each window's six slots — §10.1 classes against the raw code since a
+    pattern class has already quotiented by reversal. Slot geometry is decoded
+    by ``windows.window_cells``.
 
     Returns ``(window_cell_index, window_incidence_class, window_incidence_mask)``,
     each ``[num_windows, 6]``. A slot whose cell the scope omits carries ``-1``
     in both tables and ``False`` in the mask. Under the default
     ``window_and_legal`` scope every slot of every persistent window is a node
-    by construction, so a gap there is refused rather than masked away: it means
-    the coordinates the cell set was built from are not this window set's, and
-    every incidence message through the missing slot would silently vanish.
+    by construction, so a gap there is refused rather than masked away.
     """
     window_id = np.asarray(window_set.window_id, dtype=np.int64).reshape(-1, 3)
     code = np.asarray(window_set.code, dtype=np.int64).reshape(-1)
@@ -372,10 +320,8 @@ def adjacency_edges(cell_set: CellSet) -> tuple[np.ndarray, np.ndarray, np.ndarr
     """The §15.1 directed edges between cells one hex step apart.
 
     Returns ``(src, dst, axis)``, the axis being the undirected one the step
-    runs along, so an edge and its reverse are labelled alike. Every cell tries
-    all six steps and keeps those landing on another node, which emits each
-    directed edge exactly once and makes the family symmetric: a step's reverse
-    is also one of the six.
+    runs along, so an edge and its reverse are labelled alike. Every cell
+    tries all six steps and keeps those landing on another node.
     """
     index = cell_set.index_of(cell_set.qr[:, None, :] + _STEPS[None, :, :])
     present = index >= 0
@@ -394,23 +340,20 @@ def radius_edges(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """The §15.2 edges from every stone to every cell within ``occupied_radius``.
 
-    Returns ``(src, dst, orbit, axis_or_neg1)``. The relation is the D6 class of
-    the displacement ``dst - src`` under the configured ``d6_relation_mode``,
-    and the axis is the one that displacement lies on, ``-1`` off-axis (§11.3).
-    The source's colour is not carried on the edge: it is
-    ``cell_set.occupancy[src]``, and stating it twice would let the two copies
-    disagree.
+    Returns ``(src, dst, orbit, axis_or_neg1)``. The relation is the D6 class
+    of the displacement ``dst - src`` under the configured
+    ``d6_relation_mode``, and the axis is the one that displacement lies on,
+    ``-1`` off-axis (§11.3). The source's colour is not carried on the edge:
+    it is ``cell_set.occupancy[src]``.
 
-    The threshold is a radius and nothing else. §15.3 forbids a fixed top-K
-    cutoff with coordinate-order tie breaking, because ties at the cutoff would
-    be broken by an order that is not D6-invariant: a position and its
-    reflection would then keep different neighbours, and every claim of exact
-    equivariance would be false while every shape and count stayed plausible.
+    The threshold is a radius and nothing else: §15.3 forbids a fixed top-K
+    cutoff with coordinate-order tie breaking, since such ties are not
+    D6-invariant.
 
-    The enumeration walks the radius disk out from each stone, so it costs
-    ``O(stones * disk)`` however many cells the halo holds, and each candidate's
-    displacement — hence its relation class and its axis route — is the disk
-    offset itself, classed once per call over the disk rather than once per edge.
+    The enumeration walks the radius disk out from each stone, costing
+    ``O(stones * disk)`` independent of halo size; each candidate's
+    displacement is the disk offset itself, classed once per call over the
+    disk rather than once per edge.
     """
     stone_qr = _coords("stone_qr", stone_qr)
     stone_own = np.asarray(stone_own, dtype=np.int64).reshape(-1)

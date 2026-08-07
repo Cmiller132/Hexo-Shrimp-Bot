@@ -1,61 +1,13 @@
-"""Global state latents and action-set latents: §17 and §21.
+"""Global state latents and action-set latents (§17, §21).
 
-This is the module that makes the architecture affordable. Cells, windows, and
-actions never see each other directly — §3.14 forbids any quadratic attention
-over those families, and §26 budgets the global path at
-``O(K * (N_cells + N_windows))``. A fixed handful of per-position latent tokens
-reads every node, mixes among themselves, and writes back, so board-wide
-context costs one pass over the nodes per block instead of one pass over the
-node pairs. Every operation here is linear in the node count; the only dense
-attention is over the latents themselves, whose count is a configured constant.
-
-The representation law (§12.1) governs both streams, and it forces three
-things about the parameters:
-
-- **Axis latents have one learned base, replicated across all three channels**
-  (§17.1). A per-channel base is a parameter attached to an absolute axis,
-  which §12.2 forbids outright: after a 60° rotation the channel that carried
-  base 0 would carry base 1's identity and the model's answer would move.
-- **Every axis-side projection is shared over the three channels**, and every
-  axis-side read and broadcast pairs channel ``a`` of the latent with channel
-  ``a`` of the node. Both sides permute together, so their contraction does
-  not.
-- **Invariant and axis streams talk only through symmetric pooling** — an
-  `AxisPool` over the channel set going up, one shared broadcast coming down
-  (§17.3). Anything else would have to name a channel.
-
-The entity-type embedding of the read is not an axis identity: it separates
-cells from windows, which no board symmetry exchanges, and §17.2 asks for it by
-name.
-
-Why the latent pair is not an `EquivariantState`. That container holds one
-entity's two streams over a shared leading shape; §17.1 gives the latents
-*different counts* — ``K_inv`` invariant tokens and ``K_axis`` axis tokens —
-so they are two entity families, not one. `LatentState` is that pair, and the
-pairing §12.4 needs is manufactured where `AxisMix` is applied: each axis
-latent is mixed against the mean of the invariant latents, and the invariant
-delta `AxisMix` computes for that pooled partner is averaged back over the
-axis latents. Both directions are symmetric pools over a whole set, which is
-exactly the invariant↔axis channel §17.3 permits, and §12.4 itself stays in
-one place.
-
-Axis latents therefore require invariant latents: an axis latent has no
-invariant half of its own, so with ``K_inv == 0`` there is nothing for
-`AxisMix` or the broadcast pool to pair with. That combination is refused by
-name rather than silently substituting a zero partner. No preset asks for it.
-
-Zero is a supported count otherwise. ``full_no_latents`` (``global_mode
-= "none"``), ``full_one_latent``, ``full_no_action_latents``, and
-``full_no_axis`` each remove a stream; a removed stream constructs no
-parameters and its pass returns its inputs unchanged, which is what §32
-requires of a disabled optional module.
-
-Working set. The read materialises one ``(N, K, C, heads, head_dim)`` fp32
-tensor per stream, which is the linear cost §26 budgets times a constant, and
-at batch sizes past a few dozen positions it is the largest allocation in the
-block. §36 puts correctness before kernels and §17.5 permits exactly this
-shape of implementation; the fused segment-attention kernel that removes the
-materialisation is Stage E's, and its parity target is this code.
+A fixed set of per-position latent tokens reads every node once per block and
+writes back, keeping the global path linear in node count (§3.14, §26)
+instead of attending over node pairs. Axis latents share one learned base
+across all three channels and every axis-side projection is shared across
+channels (§12.2); the invariant and axis streams mix only through symmetric
+pooling (§17.3). `LatentState` holds the invariant and axis latent tensors;
+`StateLatents` and `ActionLatents` own the learned bases for the state trunk
+and the action stack.
 """
 
 from __future__ import annotations
@@ -79,101 +31,18 @@ from .equivariant import (
     activation_module,
     at_least_fp32,
 )
-
-
-def row_positions(offsets: Tensor) -> Tensor:
-    """The position owning each row of a ragged family, from its CSR offsets."""
-    if offsets.ndim != 1 or offsets.shape[0] < 1:
-        raise ValueError(
-            f"offsets must be a 1-D (P + 1,) tensor, got {tuple(offsets.shape)}"
-        )
-    counts = offsets[1:] - offsets[:-1]
-    return torch.repeat_interleave(
-        torch.arange(offsets.shape[0] - 1, device=offsets.device), counts
-    )
-
-
-def segment_cross_attention(
-    q: Tensor, k: Tensor, v: Tensor, row_pos: Tensor, position_count: int
-) -> Tensor:
-    """Latent queries attend over their own position's ragged rows (§17.5).
-
-    ``q`` is ``(P, K, C, heads, head_dim)``: ``K`` latent slots per position,
-    each holding ``C`` channels that the keys share. ``C`` is 1 for the
-    invariant stream and 3 for the axis stream, where channel ``a`` of the
-    query only ever meets channel ``a`` of the key — that pairing is what makes
-    the axis read equivariant rather than merely parameter-shared.
-
-    ``k`` and ``v`` are ``(N, C, heads, head_dim)`` flat rows and ``row_pos``
-    is their ``(N,)`` position index; rows need not be grouped by position, so
-    several node families can be concatenated into one softmax. Scores,
-    softmax, and the weighted sum run at no less than fp32 (§27).
-
-    A position with no rows scores nothing and reads zero. It is reachable —
-    ``full_occupied_cells_only`` has no cell nodes at all on an empty board —
-    and zero is the only finite answer a softmax over an empty set can give.
-
-    Cost is ``O(N * K * C * heads * head_dim)``: every row is scored against
-    its own position's ``K`` latents and against nothing else, which is the
-    whole reason the global path is linear in nodes (§3.14, §26).
-    """
-    if q.ndim != 5:
-        raise ValueError(f"q must be (P, K, C, heads, head_dim), got {tuple(q.shape)}")
-    if k.ndim != 4 or k.shape != v.shape:
-        raise ValueError(
-            f"k and v must share shape (N, C, heads, head_dim), got "
-            f"{tuple(k.shape)} and {tuple(v.shape)}"
-        )
-    if q.shape[0] != position_count:
-        raise ValueError(
-            f"q holds {q.shape[0]} positions but position_count={position_count}"
-        )
-    if q.shape[2:] != k.shape[1:]:
-        raise ValueError(
-            f"q channels/heads/head_dim {tuple(q.shape[2:])} disagree with k's "
-            f"{tuple(k.shape[1:])}"
-        )
-    if row_pos.ndim != 1 or row_pos.shape[0] != k.shape[0]:
-        raise ValueError(
-            f"row_pos must be ({k.shape[0]},) to match the key rows, got "
-            f"{tuple(row_pos.shape)}"
-        )
-
-    channels, heads, head_dim = k.shape[1:]
-    slots = q.shape[1]
-    scale = 1.0 / math.sqrt(head_dim)
-    stats = (position_count, slots, channels, heads)
-
-    # (N, K, C, heads): each row against its own position's latents, and no
-    # other row's. The queries are promoted *before* the gather, not after:
-    # `index_select` backward is `index_add_` into a zero tensor of the
-    # source's dtype, and a bf16 scatter of N row gradients over P latent rows
-    # runs CUDA's compare-and-swap emulation of an atomic it has no instruction
-    # for (§27).
-    query = at_least_fp32(q).index_select(0, row_pos)
-    score = (query * at_least_fp32(k).unsqueeze(1)).sum(-1)
-    score = score * scale
-
-    # Segment softmax per (position, slot, channel, head), shifted by the
-    # segment maximum so a long ragged segment cannot overflow the exponential.
-    maxima = score.new_full(stats, torch.finfo(score.dtype).min)
-    maxima.index_reduce_(0, row_pos, score, "amax", include_self=True)
-    weight = (score - maxima.index_select(0, row_pos)).exp_()
-    total = score.new_zeros(stats).index_add_(0, row_pos, weight)
-
-    out = score.new_zeros((*stats, head_dim)).index_add_(
-        0, row_pos, weight.unsqueeze(-1) * at_least_fp32(v).unsqueeze(1)
-    )
-    return out / torch.where(total > 0, total, torch.ones_like(total)).unsqueeze(-1)
+from .latent_attention import (
+    latent_broadcast,
+    latent_read,
+    latent_segments,
+    row_positions,
+)
 
 
 def _dense_softmax_attention(score: Tensor, value: Tensor, dim: int) -> Tensor:
     """Softmax ``score`` over ``dim`` at fp32 and contract it against ``value``.
 
-    Used for every attention whose key set is a configured constant — latent
-    self-mixing across ``K``, and the broadcast where each node reads a fixed
-    handful of context rows. ``value`` carries one trailing ``head_dim``
-    dimension past ``score``'s shape.
+    ``value`` carries one trailing ``head_dim`` dimension past ``score``'s shape.
     """
     weight = at_least_fp32(score).softmax(dim=dim)
     return (weight.unsqueeze(-1) * at_least_fp32(value)).sum(dim=dim)
@@ -197,14 +66,25 @@ class LatentState:
 class RaggedStream:
     """One node family the latents read from and broadcast to.
 
-    ``state`` is the family's `EquivariantState` over ``(N,)`` rows and
-    ``offsets`` is its ``(P + 1,)`` CSR offsets from the packed batch, so the
-    rows of one position are a contiguous slice and no read crosses a position
-    (§26).
+    ``state`` is the family's `EquivariantState` over ``(N,)`` rows, ``offsets``
+    is its ``(P + 1,)`` CSR offsets from the packed batch, so the rows of one
+    position are a contiguous slice and no read crosses a position (§26), and
+    ``row_pos`` is the same information the other way round — the position
+    owning each row. It travels with the stream rather than being derived per
+    use because the trunk builds it once per family per forward and every
+    block's read and broadcast reuses it.
     """
 
     state: EquivariantState
     offsets: Tensor
+    row_pos: Tensor
+
+    def __post_init__(self) -> None:
+        if self.row_pos.ndim != 1 or int(self.row_pos.shape[0]) != self.rows:
+            raise ValueError(
+                f"row_pos is {tuple(self.row_pos.shape)} against the family's "
+                f"({self.rows},) rows"
+            )
 
     @property
     def rows(self) -> int:
@@ -234,17 +114,13 @@ def _check_counts(cfg: MantisACTConfig, num_inv: int, num_axis: int) -> None:
 
 
 class LatentPass(nn.Module):
-    """One block's latent read, self-mix, and broadcast (§17.2–§17.4, §21).
+    """One block's latent read, self-mix, and broadcast (§17.2-§17.4, §21).
 
-    Parameters are block-private, matching §14's rule for the message-passing
-    projections; only the latent bases, which live on `StateLatents` and
-    `ActionLatents`, are shared across a stack.
-
-    ``entity_names`` fixes the node families this pass serves, in the order
-    their entity-type embedding rows are laid out: cells and windows for the
-    state stack, actions alone for the action stack. Every family gets its own
-    norms per §18 and §27; the projections are shared across families and the
-    families are told apart by the type embedding §17.2 asks for.
+    Parameters are block-private; only the latent bases, held on `StateLatents`
+    and `ActionLatents`, are shared across a stack. ``entity_names`` fixes the
+    node families this pass serves — cells and windows for the state stack,
+    actions alone for the action stack — each with its own norms, sharing the
+    read/mix/broadcast projections and told apart by a type embedding (§17.2).
     """
 
     def __init__(
@@ -267,9 +143,8 @@ class LatentPass(nn.Module):
         self.entity_names = names
         self.has_inv = num_inv > 0
         self.has_axis = num_axis > 0
-        # The invariant read pools the *nodes'* axis states even when there is
-        # no axis latent, because §17.2 makes that pool part of the invariant
-        # key. It needs axis channels to exist, not axis latents.
+        # Pools the nodes' axis states into the invariant key (§17.2); needs
+        # axis channels to exist, not axis latents.
         self.pools_node_axis = self.has_inv and cfg.d_axis > 0
 
         d_inv, d_axis, heads = cfg.d_inv, cfg.d_axis, cfg.num_heads
@@ -363,12 +238,9 @@ class LatentPass(nn.Module):
         counts = {int(s.offsets.shape[0]) - 1 for s in streams}
         if len(counts) != 1:
             raise ValueError(f"families disagree on position count: {sorted(counts)}")
+        # A mismatched offset/row count is caught by `row_positions`'s own ATen
+        # check and by `RaggedStream.__post_init__`, so it is not re-checked here.
         for name, stream in zip(self.entity_names, streams):
-            if int(stream.offsets[-1]) != stream.rows:
-                raise ValueError(
-                    f"{name} offsets end at {int(stream.offsets[-1])} but the "
-                    f"family carries {stream.rows} rows"
-                )
             if stream.state.d_axis != self.cfg.d_axis:
                 raise ValueError(
                     f"{name} carries an axis width of {stream.state.d_axis} but "
@@ -394,7 +266,11 @@ class LatentPass(nn.Module):
         inv, axis = self._require(latents)
         positions = int(streams[0].offsets.shape[0]) - 1
         heads = self.cfg.num_heads
-        row_pos = torch.cat([row_positions(s.offsets) for s in streams])
+        # One multi-range view shared by both streams; the ranges depend only
+        # on the offsets.
+        segments = latent_segments(
+            [s.offsets for s in streams], [s.row_pos for s in streams]
+        )
         normed = [self.norm_src[i](s.state) for i, s in enumerate(streams)]
 
         keys = []
@@ -407,14 +283,13 @@ class LatentPass(nn.Module):
             keys.append(feature)
         rows = torch.cat(keys)
         n_rows = rows.shape[0]
-        out = segment_cross_attention(
+        out = latent_read(
             self.q_read_inv(self.norm_read_q_inv(inv)).view(
                 positions, self.num_inv, 1, heads, self.head_dim_inv
             ),
             self.k_read_inv(rows).view(n_rows, 1, heads, self.head_dim_inv),
             self.v_read_inv(rows).view(n_rows, 1, heads, self.head_dim_inv),
-            row_pos,
-            positions,
+            segments,
         )
         delta = self.o_read_inv(
             out.reshape(positions, self.num_inv, self.cfg.d_inv).to(inv.dtype)
@@ -429,7 +304,7 @@ class LatentPass(nn.Module):
                 ]
             )
             n_rows = rows.shape[0]
-            out = segment_cross_attention(
+            out = latent_read(
                 self.q_read_axis(self.norm_read_q_axis(axis)).view(
                     positions, self.num_axis, AXIS_CHANNELS, heads, self.head_dim_axis
                 ),
@@ -439,8 +314,7 @@ class LatentPass(nn.Module):
                 self.v_read_axis(rows).view(
                     n_rows, AXIS_CHANNELS, heads, self.head_dim_axis
                 ),
-                row_pos,
-                positions,
+                segments,
             )
             delta = self.o_read_axis(
                 out.reshape(
@@ -487,12 +361,9 @@ class LatentPass(nn.Module):
         )
         axis = axis + self.scale_mix_axis(self.drop(delta))
 
-        # §12.4 over the manufactured pairing: each axis latent against the
-        # mean of the invariant latents. `AxisMix` returns both gated
-        # residuals; the invariant one belongs to the pooled partner, so it is
-        # averaged back over the axis latents and applied to every invariant
-        # latent. Both directions are pools over a whole set, which is the
-        # invariant<->axis channel §17.3 permits.
+        # §12.4's pairing: each axis latent against the mean of the invariant
+        # latents. AxisMix's invariant residual is averaged back over the axis
+        # latents and applied to every invariant latent (§17.3).
         paired = EquivariantState(
             inv.mean(dim=1, keepdim=True).expand(-1, self.num_axis, -1), axis
         )
@@ -503,13 +374,8 @@ class LatentPass(nn.Module):
     def broadcast(
         self, latents: LatentState, entities: Mapping[str, RaggedStream]
     ) -> dict[str, RaggedStream]:
-        """Nodes read the latents back (§17.4).
-
-        Each node attends over the small fixed context set of its own position,
-        so the cost is one gather and one softmax per node — linear again, and
-        the softmax key count is a configured constant rather than a node
-        count.
-        """
+        """Nodes read the latents back (§17.4): one gather and one softmax per
+        node, over its position's fixed-size context set."""
         if not self.enabled:
             return dict(entities)
         streams = self._ordered(entities)
@@ -528,16 +394,11 @@ class LatentPass(nn.Module):
             )
         context = torch.cat(context, dim=1)  # (P, R, d_inv)
         positions, context_rows = context.shape[0], context.shape[1]
-        # The context is promoted before every node gathers from it. The
-        # softmax and its weighted sum are fp32 either way (§27), but the
-        # gather's *backward* is an `index_add_` in the source's dtype, and
-        # here that scatters one gradient row per node onto a handful of
-        # per-position context rows: in bf16 that is CUDA's compare-and-swap
-        # emulation under maximal contention, which measured 63% of the whole
-        # trunk's backward before the promotion moved above the gather.
-        inv_shape = (positions, context_rows, heads, self.head_dim_inv)
-        key_inv = at_least_fp32(self.k_bcast_inv(context)).view(inv_shape)
-        value_inv = at_least_fp32(self.v_bcast_inv(context)).view(inv_shape)
+        # Context layout is (P, R, C, heads, head_dim); a node's channel `a`
+        # meets latent channel `a` only, which carries §12.1 through the write.
+        inv_shape = (positions, context_rows, 1, heads, self.head_dim_inv)
+        key_inv = self.k_bcast_inv(context).view(inv_shape)
+        value_inv = self.v_bcast_inv(context).view(inv_shape)
         if self.has_axis:
             axis_shape = (
                 positions,
@@ -546,22 +407,19 @@ class LatentPass(nn.Module):
                 heads,
                 self.head_dim_axis,
             )
-            key_axis = at_least_fp32(self.k_bcast_axis(normed_axis)).view(axis_shape)
-            value_axis = at_least_fp32(self.v_bcast_axis(normed_axis)).view(axis_shape)
+            key_axis = self.k_bcast_axis(normed_axis).view(axis_shape)
+            value_axis = self.v_bcast_axis(normed_axis).view(axis_shape)
 
         updated: dict[str, RaggedStream] = {}
         for index, (name, stream) in enumerate(zip(self.entity_names, streams)):
-            pos = row_positions(stream.offsets)
+            pos = stream.row_pos
             n_rows = stream.rows
             node = stream.state
 
             query = self.q_bcast_inv(self.norm_bcast_q_inv[index](node.inv)).view(
-                n_rows, heads, self.head_dim_inv
+                n_rows, 1, heads, self.head_dim_inv
             )
-            score = (query.unsqueeze(1) * key_inv.index_select(0, pos)).sum(-1)
-            out = _dense_softmax_attention(
-                score / math.sqrt(self.head_dim_inv), value_inv.index_select(0, pos), 1
-            )
+            out = latent_broadcast(query, key_inv, value_inv, pos, stream.offsets)
             delta = self.o_bcast_inv(out.reshape(n_rows, d_inv).to(node.inv.dtype))
             node_inv = node.inv + self.scale_bcast_inv(self.drop(delta))
 
@@ -570,21 +428,14 @@ class LatentPass(nn.Module):
                 query = self.q_bcast_axis(self.norm_bcast_q_axis[index](node.axis)).view(
                     n_rows, AXIS_CHANNELS, heads, self.head_dim_axis
                 )
-                # Channel `a` of the node meets channel `a` of the latent and
-                # nothing else, which is what carries §12.1 through the write.
-                score = (query.unsqueeze(1) * key_axis.index_select(0, pos)).sum(-1)
-                out = _dense_softmax_attention(
-                    score / math.sqrt(self.head_dim_axis),
-                    value_axis.index_select(0, pos),
-                    1,
-                )
+                out = latent_broadcast(query, key_axis, value_axis, pos, stream.offsets)
                 delta = self.o_bcast_axis(
                     out.reshape(n_rows, AXIS_CHANNELS, d_axis).to(node.axis.dtype)
                 )
                 node_axis = node.axis + self.scale_bcast_axis(self.drop(delta))
 
             updated[name] = RaggedStream(
-                EquivariantState(node_inv, node_axis), stream.offsets
+                EquivariantState(node_inv, node_axis), stream.offsets, stream.row_pos
             )
         return updated
 
@@ -601,12 +452,10 @@ class LatentPass(nn.Module):
 class _LatentStack(nn.Module):
     """Latent bases plus one `LatentPass` per block.
 
-    The bases are stack-level because they are the tokens' identity: one set
-    initialised once and carried through every block, not re-created per block.
-    Invariant latents have distinct learned identities; each axis latent has a
-    single learned base replicated across the three channels, because a
-    per-channel base would attach a parameter to an absolute axis, which §12.2
-    forbids and §17.1 and §27 restate.
+    The bases are stack-level: one set of tokens carried through every block.
+    Each axis latent shares a single learned base across its three channels;
+    a per-channel base would attach a parameter to an absolute axis (§12.2,
+    §17.1, §27).
     """
 
     def __init__(
@@ -621,8 +470,8 @@ class _LatentStack(nn.Module):
         super().__init__()
         if blocks < 0:
             raise ValueError(f"blocks={blocks} must not be negative")
-        # Checked here as well as in every pass: with `blocks == 0` no pass is
-        # built, and the stack would otherwise hold bases it never validates.
+        # Checked here too: with `blocks == 0` no pass is built, so the stack
+        # would otherwise hold bases it never validates.
         _check_counts(cfg, num_inv, num_axis)
         if blocks == 0 and (num_inv or num_axis):
             raise ValueError(
@@ -672,17 +521,14 @@ class StateLatents(_LatentStack):
     """The global state latents of §17, one pass per state trunk block.
 
     ``initial`` seeds them from the learned bases and, when
-    ``use_global_numeric_features`` is on, from §13.3's state-derived scalars.
-    Only the invariant latents take that seed: the scalars are invariant, and
-    adding an invariant quantity to the axis channels would say nothing about
-    direction while making the three channels' inputs identical.
+    ``use_global_numeric_features`` is on, from §13.3's state-derived scalars;
+    only the invariant latents take that seed.
 
-    Use it from a trunk as::
-
-        latents = state_latents.initial(batch.global_numeric)
-        for index, block in enumerate(blocks):
-            ...
-            latents, entities = state_latents[index](latents, entities)
+    ```python
+    latents = state_latents.initial(batch.global_numeric)
+    for index, block in enumerate(blocks):
+        latents, entities = state_latents[index](latents, entities)
+    ```
     """
 
     def __init__(self, cfg: MantisACTConfig) -> None:
@@ -727,12 +573,9 @@ class StateLatents(_LatentStack):
 class ActionLatents(_LatentStack):
     """The action-set latents of §21, one pass per action block.
 
-    Two invariant queries over the legal action set: read, self-mix, broadcast.
-    They are a separate stack from `StateLatents` on purpose — §21 keeps them
-    apart so the state latents never carry post-placement effects — and they
-    have no axis stream, because §21 asks for invariant queries only. Direction
-    reaches the action axis channels through the block's own `AxisMix` (§22.4),
-    not through a second latent family.
+    A separate stack from `StateLatents` so the state latents never carry
+    post-placement effects. Invariant-only (§21); direction reaches the action
+    axis channels through the block's own `AxisMix` (§22.4) instead.
     """
 
     def __init__(self, cfg: MantisACTConfig) -> None:
@@ -758,5 +601,4 @@ __all__ = [
     "RaggedStream",
     "StateLatents",
     "row_positions",
-    "segment_cross_attention",
 ]

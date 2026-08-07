@@ -36,6 +36,7 @@ code.
 from __future__ import annotations
 
 import random
+import warnings
 from dataclasses import replace
 
 import hexo_py
@@ -45,13 +46,17 @@ import torch
 from torch import nn
 
 from mantisnet.models.mantis_act.builder import build
+from mantisnet.models.mantis_act.cells import relevant_cells
 from mantisnet.models.mantis_act.config import PRESETS, MantisACTConfig
 from mantisnet.models.mantis_act.equivariant import (
     AXIS_CHANNELS,
     EquivariantState,
     permute_axis_channels,
 )
+from mantisnet.models.mantis_act.latents import row_positions
 from mantisnet.models.mantis_act.packed import (
+    _VALUE_RANGES,
+    NEAREST_BUCKETS,
     PHASE_FIRST,
     PHASE_OPENING,
     PHASE_SECOND,
@@ -60,7 +65,9 @@ from mantisnet.models.mantis_act.packed import (
 )
 from mantisnet.models.mantis_act.pattern_classes import ALL_WINDOW_PATTERN_CLASSES
 from mantisnet.models.mantis_act.state_trunk import (
-    CELL_NEAREST_BUCKETS,
+    CELL_LEGAL_CLASSES,
+    CELL_OCCUPANCY_CLASSES,
+    WINDOW_STATUSES,
     CellEmbedding,
     StateTrunk,
     StateTrunkBlock,
@@ -87,10 +94,10 @@ PLIES = (0, 1, 2, 5, 21, 60, 120)
 # D6 element induces, plus the two transpositions that fix a channel.
 PERMUTATIONS = ((1, 2, 0), (2, 0, 1), (0, 2, 1), (2, 1, 0), (1, 0, 2))
 
-# The one preset the trunk cannot build, and the input it is missing.
-BLOCKED_PRESET = "full_with_typed_window_attention"
+TRUNK_PRESETS = tuple(PRESETS)
 
-TRUNK_PRESETS = tuple(name for name in PRESETS if name != BLOCKED_PRESET)
+# §16's arm, whose step 5 the other presets do not hold.
+TYPED_PRESET = "full_with_typed_window_attention"
 
 
 # --------------------------------------------------------------------------
@@ -162,17 +169,17 @@ def test_every_preset_that_reaches_the_trunk_constructs(preset):
     assert len(module.latents) == cfg.state_blocks
 
 
-def test_typed_window_attention_is_refused_by_the_input_it_needs():
-    """§16 behind the flag: named, not silently no-opped (§18 step 5)."""
-    with pytest.raises(NotImplementedError) as raised:
-        StateTrunk(PRESETS[BLOCKED_PRESET])
-    message = str(raised.value)
-    assert "window_window_mode" in message
-    # The refusal names the missing input, which is the blocking item.
-    assert "window_id" in message and "position" in message
-    # And the block refuses on its own, so no construction path evades it.
-    with pytest.raises(NotImplementedError):
-        StateTrunkBlock(PRESETS[BLOCKED_PRESET])
+def test_typed_window_attention_exists_only_in_the_arm_that_asks_for_it():
+    """§18 step 5 is a stage of the block, not a disabled branch inside one."""
+    assert all(block.window_attention is None for block in StateTrunk(FULL).blocks)
+    typed = StateTrunk(PRESETS[TYPED_PRESET])
+    assert all(block.window_attention is not None for block in typed.blocks)
+    # Every block holds its own attention parameters (§14's block-private rule).
+    first, second = typed.blocks[0].window_attention, typed.blocks[1].window_attention
+    assert first.q_inv.weight is not second.q_inv.weight
+    assert first.bias_inv is not second.bias_inv
+
+
 
 
 def test_the_quadratic_and_tokenised_paths_are_refused():
@@ -593,7 +600,32 @@ def test_a_block_refuses_an_edge_set_its_config_disagrees_with(trunk, batch):
             edges=edges,
             latent_pass=trunk.latents[0],
             cell_offsets=batch.cell_offsets,
+            cell_row_pos=row_positions(batch.cell_offsets, n_cells),
             window_offsets=batch.window_offsets,
+            window_row_pos=row_positions(batch.window_offsets, n_windows),
+            cell_phase=torch.zeros(n_cells, dtype=torch.long),
+            window_phase=torch.zeros(n_windows, dtype=torch.long),
+        )
+
+
+def test_a_typed_attention_block_refuses_an_edge_set_without_window_pairs(batch):
+    """§18 step 5 skipped silently would make the arm a costly copy of §29's."""
+    block = StateTrunkBlock(PRESETS[TYPED_PRESET])
+    edges = state_edges(batch, FULL)
+    assert edges.window_window is None
+    latents = StateTrunk(FULL)
+    n_cells, n_windows = int(batch.cell_offsets[-1]), int(batch.window_offsets[-1])
+    with pytest.raises(ValueError, match="window_window_mode"):
+        block(
+            zeros(n_cells, FULL),
+            zeros(n_windows, FULL),
+            latents.latents.initial(batch.global_numeric),
+            edges=edges,
+            latent_pass=latents.latents[0],
+            cell_offsets=batch.cell_offsets,
+            cell_row_pos=row_positions(batch.cell_offsets, n_cells),
+            window_offsets=batch.window_offsets,
+            window_row_pos=row_positions(batch.window_offsets, n_windows),
             cell_phase=torch.zeros(n_cells, dtype=torch.long),
             window_phase=torch.zeros(n_windows, dtype=torch.long),
         )
@@ -613,25 +645,88 @@ def test_the_window_numeric_block_is_absent_when_it_is_disabled(graphs):
 
 
 # --------------------------------------------------------------------------
+# The forward does not stall the host
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="a host stall needs a real device"
+)
+def test_the_forward_stalls_the_host_at_most_twice(batch):
+    """§26's forward reads nothing back off the device except two row counts.
+
+    Every bound this trunk indexes with is fixed on the host before a tensor
+    exists, every ragged row count it needs is a host-side tensor shape, and
+    every structural property of an edge family travels with the family. What
+    is left is two ``nonzero`` calls, and neither is a check: each discovers a
+    count no host tensor carries — how many window slots the cell scope
+    represents, and how many radius displacements lie on an axis — and each
+    runs once per batch rather than once per block.
+
+    This is the property the whole shape of `messages.TypedEdges`,
+    `latents.RaggedStream` and `latent_attention.row_positions` exists to hold,
+    and nothing else in this suite can see it: a re-introduced ``int(t.min())``
+    or a ``repeat_interleave`` without ``output_size`` is numerically perfect
+    and costs a third of the step.
+    """
+    device_batch = batch.to("cuda")
+    torch.manual_seed(SEED)
+    module = StateTrunk(FULL).cuda().eval()
+
+    def run():
+        with torch.no_grad(), torch.autocast("cuda", torch.bfloat16):
+            module(device_batch)
+
+    def stalls():
+        torch.cuda.synchronize()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.set_sync_debug_mode("warn")
+            try:
+                run()
+            finally:
+                torch.cuda.set_sync_debug_mode("default")
+        return [w for w in caught if "synchron" in str(w.message).lower()]
+
+    # Allocator growth, lazy plan construction and any kernel autotune are not
+    # the forward; they are burned before the count is taken. The first entry
+    # into the warning mode itself reports one extra stall whatever runs under
+    # it, so that pass is burned too and the count is taken twice after it.
+    for _ in range(3):
+        run()
+    stalls()
+
+    first, second = stalls(), stalls()
+    assert len(first) == len(second) == 2, [str(w.message) for w in second]
+
+
+# --------------------------------------------------------------------------
 # Loud refusals of malformed input (house rule)
 
 
-def test_an_out_of_range_class_index_raises_naming_the_field(graphs):
-    packed = one(graphs[21])
-    embedding = CellEmbedding(FULL)
-    broken = replace(
-        packed, cell_nearest_bucket=packed.cell_nearest_bucket.clone()
-    )
-    broken.cell_nearest_bucket[3] = CELL_NEAREST_BUCKETS
-    with pytest.raises(ValueError, match=r"cell_nearest_bucket must be < 10"):
-        embedding(broken)
+def test_every_class_index_the_embeddings_read_is_bounded_before_they_read_it():
+    """The embeddings index without re-reading, so this is where the bounds are.
 
-    broken = replace(packed, cell_occupancy=packed.cell_occupancy.clone())
-    broken.cell_occupancy[1] = -1
-    with pytest.raises(ValueError, match="cell_occupancy must be >= 0"):
-        embedding(broken)
+    Each of the six class columns the two embeddings gather with is refused by
+    `ACTGraph`'s own validation against the same vocabulary the table is sized
+    by, on the host, in numpy, once per position — and none of them is an index
+    into another family, so `collate` does not shift them and the per-graph
+    check is equal-strength on the packed batch. That includes the nearest-stone
+    bucket: its ceiling is closed in `_VALUE_RANGES` beside the other five, so
+    the check is the packer's and reaches every producer rather than living in
+    one builder helper.
+    """
+    stones = np.array([[0, 0], [1, 0]], dtype=np.int64)
+    own = np.array([0, 1], dtype=np.int64)
+    legal = np.array([[0, 1], [1, 1]], dtype=np.int64)
+    good = relevant_cells(stones, own, legal, stones, FULL)
+    assert int(good.nearest_bucket.max()) < NEAREST_BUCKETS
 
-    broken = replace(packed, window_pattern_class=packed.window_pattern_class.clone())
-    broken.window_pattern_class[0] = ALL_WINDOW_PATTERN_CLASSES
-    with pytest.raises(ValueError, match="window_pattern_class must be < 378"):
-        WindowEmbedding(FULL)(broken)
+    # The vocabularies each table is sized by, against the packer's own ranges.
+    assert (CELL_OCCUPANCY_CLASSES, CELL_LEGAL_CLASSES) == (3, 2)
+    bounds = dict((name, (low, high)) for name, low, high in _VALUE_RANGES)
+    assert bounds["cell_occupancy"] == (0, CELL_OCCUPANCY_CLASSES - 1)
+    assert bounds["cell_is_legal"] == (0, CELL_LEGAL_CLASSES - 1)
+    assert bounds["cell_nearest_bucket"] == (0, NEAREST_BUCKETS - 1)
+    assert bounds["window_pattern_class"] == (0, ALL_WINDOW_PATTERN_CLASSES - 1)
+    assert bounds["window_status"] == (0, WINDOW_STATUSES - 1)
+    assert bounds["window_axis"] == (0, AXIS_CHANNELS - 1)

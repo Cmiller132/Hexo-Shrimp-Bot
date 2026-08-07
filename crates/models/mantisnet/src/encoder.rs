@@ -1,14 +1,9 @@
 //! Batched MantisNet graph encoding and collation.
 //!
-//! The container package and PyO3 binding share this implementation. The Python
-//! builder defines the parity reference checked by
+//! Orderings match the Python builder (`mantisnet.builder`): windows sort by
+//! `(q*2^21 + r)*4 + axis`; incidence is window-major then slot; the decoder
+//! table is legal-cell-major, then axis, then offset. Parity is checked by
 //! `python/mantisnet/tests/test_rust_builder.py`.
-//!
-//! Orderings that parity depends on (all inherited from the Python builder):
-//! windows sort by the packed key `(q·2²¹ + r)·4 + axis`; incidence is
-//! window-major then slot; the decoder table is legal-cell-major, then axis,
-//! then offset. Positions build in parallel under rayon; assembly into flat
-//! arrays is single-threaded.
 
 use hexo_engine as engine;
 use rayon::prelude::*;
@@ -58,35 +53,22 @@ const PATTERN_RANK: [i8; 64] = {
 
 /// Number of joint window-occupancy/candidate-slot classes the decoder reads.
 ///
-/// A reflection reverses a window's slot order, so it sends the pair
-/// `(mask, slot)` to `(reverse6(mask), 5 - slot)` jointly, and the orbits of that
-/// involution are the finest reversal-invariant description of the pair. The 186
-/// pairs of a nonempty, nonfull mask with an empty slot fold to 93 orbits: the
-/// involution has no fixed point, because no slot is its own mirror.
+/// Orbits of the `(mask, slot) -> (reverse6(mask), 5 - slot)` involution
+/// over nonempty, nonfull masks with an empty slot: 186 pairs, 93 orbits.
 pub const DEC_CLASSES: i64 = 93;
 
-/// Number of joint window-occupancy/occupied-slot classes stone incidence
-/// carries.
+/// Number of joint window-occupancy/occupied-slot classes for stone incidence.
 ///
-/// The same involution as [`DEC_CLASSES`], over the pairs whose slot holds a
-/// stone: also 186 pairs, also fixed-point-free, also 93 orbits. The joint
-/// class binds a stone's message to its exact slot in its window's pattern —
-/// the coarse end/near-end/centre fold aliased the two ends of every
-/// non-palindromic window.
+/// Same involution as [`DEC_CLASSES`], over pairs whose slot holds a stone:
+/// 186 pairs, 93 orbits.
 pub const OCC_CLASSES: i64 = 93;
 
 /// Orbit table of `(mask, slot)` pairs under the joint reversal, indexed
 /// `mask * 6 + slot`.
 ///
-/// A reflection sends `(mask, slot)` to `(reverse6(mask), 5 - slot)` jointly.
-/// Over the pairs of a nonempty, nonfull mask whose slot bit equals
-/// `occupied`, the entry is the orbit's rank in ascending `(mask, slot)`
-/// order — the ranking convention the Python builder shares — and `-1`
-/// elsewhere. Ascending order reaches each orbit's representative first, so
-/// its rank is assigned there and its partner reads it back: the partner's
-/// slot bit matches this one's, since bit `5 - s` of `rev` is bit `s` of `m`.
-/// One construction serves both class systems: `occupied = false` is the
-/// decoder's empty-candidate table, `occupied = true` the stone incidence's.
+/// Entries are orbit ranks in ascending `(mask, slot)` order for nonempty,
+/// nonfull masks where the slot bit matches `occupied`; `-1` elsewhere.
+/// `occupied = false` gives the decoder table, `true` the stone-incidence table.
 const fn orbit_table(occupied: bool) -> [i8; 64 * 6] {
     let want = occupied as usize;
     let mut table = [-1i8; 64 * 6];
@@ -144,11 +126,9 @@ pub struct Graph {
     moves_remaining: u8,
 }
 
-/// A malformed worker-to-batcher MantisNet position item.
+/// Error from decoding a MantisNet wire-format position item.
 ///
-/// The decoder includes the item number in errors from [`decode_batch`], so a
-/// corrupt worker result identifies the exact batch entry that violated the
-/// representation contract.
+/// Includes the batch item index when produced by [`decode_batch`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WireError {
     item: Option<usize>,
@@ -204,9 +184,8 @@ impl WireCounts {
     }
 
     fn payload_len(self) -> Option<usize> {
-        // stone_own: i64; stone_qr: two i32s. The remaining terms are
-        // respectively four i64s (feature plus identity triple), three i64s,
-        // three i64s, and two i64s.
+        // Per-stone: 8 (own) + 8 (qr). Per-window: 32 (feat + id triple).
+        // Per-incidence: 24. Per-decoder: 24. Per-background: 16.
         self.stones
             .checked_mul(16)?
             .checked_add(self.windows.checked_mul(32)?)?
@@ -357,9 +336,7 @@ fn read_count(
     field: &'static str,
 ) -> Result<usize, WireError> {
     let count = reader.u32(field)? as usize;
-    // Even `legal`, which has no direct payload array, later drives an
-    // allocation in `collate`. Tying every count to the complete item size
-    // rejects adversarial headers before any count-sized allocation.
+    // Cap every count at the item length to prevent oversized allocations.
     if count > item_len {
         return Err(WireError::new(format!(
             "{field} count {count} exceeds item length {item_len}"
@@ -568,10 +545,7 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
 
 /// Build one live position's graph with indices local to that position.
 ///
-/// # Errors
-///
-/// Returns an error for a terminal position. Terminal outcomes come from the
-/// engine and are never questions for the network.
+/// Returns an error for terminal positions.
 pub fn build(pos: &engine::Position) -> Result<Graph, String> {
     if pos.is_terminal() {
         return Err("terminal position: the builder refuses it".into());
@@ -617,8 +591,7 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
         });
     }
 
-    // Candidate windows through every stone, deduplicated and ordered by the
-    // packed key — the same sort np.unique gives the Python builder.
+    // Candidate windows through every stone, deduplicated and sorted by packed key.
     let mut candidates: Vec<(i64, engine::WindowRef, u8, u8)> =
         Vec::with_capacity(stones.len() * 18);
     for &(c, _) in &stones {
@@ -642,8 +615,7 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
     let mut window_id = Vec::new();
     let mut live_occ = Vec::new();
     let mut live_ref = Vec::new();
-    // Sorted, because `candidates` is: the decoder probes it by binary
-    // search, which beats a hash map at this size and probe count.
+    // Sorted for binary-search lookup by the decoder.
     let mut live_keys: Vec<i64> = Vec::new();
     for &(key, wr, m0, m1) in &candidates {
         if (m0 > 0) == (m1 > 0) {
@@ -662,7 +634,7 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
         live_ref.push(wr);
     }
 
-    // Incidence: window-major, slot-ascending, matching np.nonzero row-major.
+    // Incidence: window-major, slot-ascending.
     let mut inc_stone = Vec::new();
     let mut inc_window = Vec::new();
     let mut inc_class = Vec::new();
@@ -672,15 +644,12 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
                 let cell = wr.window.cell(k);
                 inc_stone.push(stone_index[&pack(cell)]);
                 inc_window.push(w as i64);
-                // Total on set bits by construction: the guard above is the
-                // table's occupancy condition.
                 inc_class.push(OCC_CLASS[occ as usize * 6 + k] as i64);
             }
         }
     }
 
-    // Decoder table: legal-cell-major, then the (axis, offset) order
-    // `windows_through` returns, which is the Python builder's flat order.
+    // Decoder table: legal-cell-major, then (axis, offset) order.
     let mut dec_cell = Vec::new();
     let mut dec_window = Vec::new();
     let mut dec_class = Vec::new();
@@ -694,9 +663,6 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
             }
             let key = pack(wr.window.start) * 4 + wr.window.axis.index() as i64;
             if let Ok(w) = live_keys.binary_search(&key) {
-                // The class is joint in the window's occupancy and the
-                // candidate's own slot, so it reads the raw mask in slot order
-                // rather than the canonicalized rank the window feature carries.
                 let occ = live_occ[w] as usize;
                 let slot = i % 6;
                 let class = DEC_CLASS[occ * 6 + slot];

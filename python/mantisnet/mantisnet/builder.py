@@ -1,25 +1,13 @@
-"""The MantisNet input builder: positions to graphs, graphs to batches.
+"""MantisNet input builder: positions to graphs, graphs to batches.
 
-This module implements the representation of ``docs/MODEL_SPEC.md`` §3–§4
-and the batching contract of §9 under ``MODEL_REPR_VERSION``. It derives live
-windows from the stone list without calling the engine's window walk, which
-remains the independent oracle for §12.1.
+Index conventions (each is part of ``MODEL_REPR_VERSION``):
 
-Index conventions this module fixes (each is part of the representation):
-
-- Window feature: ``colour * NUM_PATTERNS + pattern_rank``, colour ``0`` = own,
-  ``1`` = opponent, rank = position of the canonical occupancy mask in the
-  sorted list of the ``NUM_PATTERNS`` canonical 6-bit patterns of 1–5 bits.
-- Decoder class: the rank of the ``(occupancy mask, candidate slot)`` reversal
-  orbit in ascending ``(mask, slot)`` order, one of ``DEC_CLASSES``. Stone
-  incidence uses the same joint-orbit construction over occupied rather than
-  empty slots, one of ``OCC_CLASSES`` (§4.3).
-- Attention distance bucket: hex distance ``d >= 1`` maps to ``d - 1`` clamped
-  to ``D_MAX - 1``; ``SELF`` is ``D_MAX``; ``TOKEN`` is ``D_MAX + 1`` and wins
-  over ``SELF`` on the token–token pair.
-- Nearest-stone bucket: distance ``d`` in ``1..8`` maps to ``d - 1``. The one
-  stoneless position (ply 0) has no nearest stone; the clamp sends it to
-  bucket ``7``.
+- Window feature: ``colour * NUM_PATTERNS + pattern_rank``.
+- Decoder class: rank of ``(mask, slot)`` reversal orbit, one of ``DEC_CLASSES``.
+  Stone incidence uses the same orbit over occupied slots (``OCC_CLASSES``, §4.3).
+- Attention distance: ``d - 1`` clamped to ``D_MAX - 1``; SELF = ``D_MAX``;
+  TOKEN = ``D_MAX + 1``.
+- Nearest-stone bucket: ``d - 1`` for ``d`` in ``1..8``; ply 0 clamps to 7.
 """
 
 from __future__ import annotations
@@ -57,7 +45,7 @@ _PATTERN_RANK = np.full(64, -1, dtype=np.int64)
 _PATTERN_RANK[_CANONICAL] = np.arange(len(_CANONICAL))
 
 # 34: the 62 nonempty, nonfull 6-bit masks fold to (62 + 6 palindromes) / 2
-# orbits under reversal. (MODEL_SPEC §3.2.)
+# orbits under reversal.
 NUM_PATTERNS = len(_CANONICAL)
 
 # Stones in each canonical pattern, indexed by rank — reversal preserves the
@@ -480,6 +468,55 @@ def collate_prefixes(games, ts) -> Batch:
     import hexo_py
 
     return batch_from_arrays(**hexo_py.build_batch_prefixes(list(games), list(ts)))
+
+
+class PaddedPairChunkCost:
+    """What binds one MantisNet fitting chunk (``fitloop.ChunkCost``).
+
+    Two limits, because this representation has two costs that do not scale
+    together. Stone attention is padded to the chunk's longest position, so it
+    holds ``positions * width^2`` pairs whatever the shorter positions cost —
+    the one non-additive term in either architecture's law. The decoder holds
+    one row per legal cell and its backward graph with it, which is additive.
+
+    ``lengths[i]`` is sample ``i``'s padded attention width, its ply plus the
+    position token; ``cells[i]`` is its legal-move count. The pack order is
+    descending ``lengths``, so a chunk's width is fixed by its first sample and
+    every later one is no wider.
+    """
+
+    def __init__(self, lengths, cells, pair_budget: int, cell_budget: int) -> None:
+        if len(lengths) != len(cells):
+            raise ValueError(
+                f"{len(lengths)} lengths against {len(cells)} legal-cell counts"
+            )
+        self._lengths = lengths
+        self._cells = cells
+        self._pair_budget = int(pair_budget)
+        self._cell_budget = int(cell_budget)
+        self._width = 0
+        self._cell_total = 0
+        self._taken = 0
+
+    def sort_key(self, index: int) -> int:
+        return int(self._lengths[index])
+
+    def open(self) -> None:
+        self._width = 0
+        self._cell_total = 0
+        self._taken = 0
+
+    def accepts(self, index: int, size: int) -> bool:
+        return (
+            (size + 1) * self._width * self._width <= self._pair_budget
+            and self._cell_total + int(self._cells[index]) <= self._cell_budget
+        )
+
+    def take(self, index: int) -> None:
+        if not self._taken:
+            self._width = int(self._lengths[index])
+        self._taken += 1
+        self._cell_total += int(self._cells[index])
 
 
 def collate(graphs: list[PositionGraph]) -> Batch:

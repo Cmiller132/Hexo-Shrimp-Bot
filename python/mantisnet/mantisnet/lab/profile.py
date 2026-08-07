@@ -278,11 +278,9 @@ def profile_fit(
 ) -> dict:
     """Profile real optimizer steps inside the production fit engine.
 
-    One full warm epoch absorbs compilation, autotuning, and allocator growth;
-    a second epoch then runs with a ``torch.profiler`` window over
-    ``wait + warmup + active`` genuine steps (the epoch itself runs to
-    completion — the window is a slice of it, not a reduced workload). Kernel
-    self-time is bucketed by family so the table has a headline.
+    A warm epoch absorbs compilation, autotuning, and allocator growth; a
+    second full epoch runs with a ``torch.profiler`` window over
+    ``wait + warmup + active`` steps. Kernel self-time is bucketed by family.
     """
     if wait < 0 or warmup < 0 or active <= 0:
         raise ValueError(

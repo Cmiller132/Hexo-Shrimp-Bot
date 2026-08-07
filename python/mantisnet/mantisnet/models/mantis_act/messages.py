@@ -1,76 +1,17 @@
-"""Relation-gated messages over typed sparse edges, and the trunk's three paths.
+"""Relation-gated messages over typed sparse edges (§14-§16).
 
-This module implements §14 and §15 of ``docs/MANTIS_ACT_SPEC.md``: one generic
-module for a typed sparse edge family, and the three concrete families the
-state trunk runs — cell↔window incidence in both directions (§18.1, §18.2),
-hex adjacency between cells (§15.1, §18.3), and the occupied-to-cell radius
-edges typed by their D6 orbit (§15.2, §18.4).
+One generic module covers cell<->window incidence, hex adjacency, and
+occupied-radius orbit edges; ``TypedWindowAttention`` (§16) is separate
+because its segment softmax cannot share the fused single-walk reduction.
 
-What a message is (§14). An edge carries a relation id ``r`` and, when its
-displacement lies on an axis, the route ``a`` of that axis. The relation
-supplies a multiplicative gate and an additive bias; the source supplies the
-value::
+Message: ``sigmoid(Wg(E_rel[r])) * Wv(LN(src)) + Wb(E_rel[r])``, summed by
+destination in fp32.  Reductions: ``sum`` (default), ``mean``, ``attention``
+(§14 ablations); ``incidence_message="additive"`` drops the gate (§29).
 
-    msg_inv  = sigmoid(Wg_inv(E_rel[r])) * Wv_inv(LN(src.h_inv)) + Wb_inv(E_rel[r])
-    msg_axis = sigmoid(Wg_axis(E_rel[r])) * Wv_axis(LN(src.h_axis[a])) + Wb_axis(E_rel[r])
-
-Messages are summed by destination in fp32 and the destination's two streams
-are updated through their own MLPs. Sum is the default because incidence count
-is signal: a cell in four windows differs from a cell in one, and a mean erases
-exactly that. ``mean`` and ``attention`` stay reachable as the §14 ablations,
-and ``incidence_message="additive"`` drops the gate for the legacy
-``U @ src + E_relation`` control of §29's ``full_additive_incidence``.
-
-Why this is equivariant (§12.1). Every axis-stream parameter — the norm, the
-value projection, the gate and bias projections, the update MLP, the attention
-score vector — is one shared set applied independently to whichever channel an
-edge routes through, and the relation id is a D6 invariant. Under a transform
-``g`` an edge routed through axis ``a`` becomes an edge routed through
-``pi_g(a)`` between the images of its endpoints, and the same shared parameters
-produce the same vector in channel ``pi_g(a)`` of the image destination. No
-absolute axis id is ever an embedding index, no axis has its own weights, and
-the three channels are never concatenated in a fixed order (§12.2). An edge
-that lies on no axis updates the invariant stream only, which is invariant
-because "lies on no axis" is itself preserved by the group.
-
-Index conventions this module fixes:
-
-- A relation id is an index into one embedding table per edge family; the
-  vocabularies are :data:`INCIDENCE_RELATIONS` for cell↔window incidence
-  (§10.1's single 2187-row joint table), :func:`relation_vocabulary_size` for
-  hex adjacency, and :func:`radius_relation_count` for the radius edges.
-- The radius relation is the *joint* id ``2 * orbit + is_opponent``. §15.2 puts
-  the orbit class and the source's OWN/OPP colour on the same edge, and adding
-  two embeddings instead would make the relation's gate the sum of a colour
-  term and a geometry term — unable to say that a shape means one thing from
-  a stone of one colour and another from the other. §10.1 refuses that
-  factorisation for the incidence relation for the same reason; the product
-  space here is 104 rows, so exactness costs nothing.
-- An axis route is ``0..2``, or ``-1`` for an edge on no axis. ``-1`` routes no
-  axis message; it is never an index.
-
-Where indices are checked. :class:`TypedEdges` validates every index against
-the family size and the relation vocabulary at construction, so an out-of-range
-or ``-1`` index raises naming the field, the value, and the edge — once per
-batch, at the point the builder's output is turned into an edge set, rather
-than once per block inside the forward. A ``-1`` is a builder fault: an
-unrepresented window slot must be masked out of the incidence table, not
-carried into it, and both ``index_select`` and an embedding lookup would
-otherwise read the far end of the table and return a plausible wrong row.
-
-Numerics (§27). Parameters are fp32 and the forward runs under bf16 autocast
-unchanged. Every segment reduction and every softmax is taken in fp32, so a
-long destination's aggregate does not stall the way a bf16 running sum does;
-the update MLP runs in whatever dtype autocast chose and its delta is cast back
-to the residual stream's dtype before the add, so the stream's precision is the
-state's and not autocast's.
-
-Composition. A message module is a pre-norm residual branch over
-``EquivariantState``, the same shape as ``equivariant.AxisMix`` and
-``equivariant.EquivariantFFN``: a state goes in and the updated state comes
-out, with the branch's own LayerScale on the delta (§27). The trunk therefore
-chains stages rather than adding deltas itself, and §18.11's phase FiLM is a
-stage of the block like the others.
+Axis-stream parameters are shared across channels; a relation id is a D6
+invariant; edges on no axis update the invariant stream only (§12.1).
+Each module is a pre-norm residual branch over ``EquivariantState`` with
+its own LayerScale (§27).
 """
 
 from __future__ import annotations
@@ -80,17 +21,22 @@ from dataclasses import dataclass, field
 import torch
 from torch import Tensor, nn
 
-from .cells import OCCUPANCY_OPP, OCCUPANCY_OWN
+from ...window_pairs import WA_CLASSES, derive_pair_tables, edge_attention
+from .cells import OCCUPANCY_OPP
 from .config import MantisACTConfig
 from .equivariant import (
     AXIS_CHANNELS,
+    EquivariantNorm,
+    EquivariantResidual,
     EquivariantState,
     LayerScale,
     activation_module,
     at_least_fp32,
 )
+from .latent_attention import row_positions
 from .packed import PackedACTBatch
 from .pattern_classes import ALL_CELL_WINDOW_REL_CLASSES
+from .segment_message import MessagePlan, message_plan, relation_gated_message
 from .symmetry import (
     RELATION_PAD,
     coarse_relation,
@@ -102,6 +48,12 @@ from .symmetry import (
 # never emits the three all-empty classes; the table is still the 2187-row one,
 # so a scope change does not renumber a relation.
 INCIDENCE_RELATIONS = ALL_CELL_WINDOW_REL_CLASSES
+
+# §16's typed collinear/crossing vocabulary: 11 collinear offsets, 36 crossing
+# fold products, and the self loop. Read off `window_pairs`, which generates the
+# classes, so this is the size of the table indexed rather than a second
+# statement of it.
+WINDOW_WINDOW_RELATIONS = WA_CLASSES
 
 # §27: embeddings, relation tables, and latent bases.
 EMBEDDING_INIT_STD = 0.02
@@ -165,24 +117,6 @@ def make_relation_embedding(num_relations: int, d_rel: int) -> nn.Embedding:
 # Segment reductions (§27: every one of them in fp32)
 
 
-def _check_range(name: str, values: Tensor, low: int, high: int) -> None:
-    """Refuse an index outside ``[low, high)``, naming the value and its row."""
-    if values.numel() == 0:
-        return
-    smallest = int(values.min())
-    if smallest < low:
-        raise ValueError(
-            f"{name} must be >= {low}: found {smallest} at row "
-            f"{int(values.argmin())}"
-        )
-    largest = int(values.max())
-    if largest >= high:
-        raise ValueError(
-            f"{name} must be < {high}: found {largest} at row "
-            f"{int(values.argmax())}"
-        )
-
-
 def segment_sum(values: Tensor, index: Tensor, n_segments: int) -> Tensor:
     """Sum ``(E, D)`` rows into ``(n_segments, D)`` by ``index``, in fp32."""
     if values.ndim != 2:
@@ -193,14 +127,6 @@ def segment_sum(values: Tensor, index: Tensor, n_segments: int) -> Tensor:
         )
     out = values.new_zeros((n_segments, values.shape[1]), dtype=torch.float32)
     return out.index_add_(0, index, values.float())
-
-
-def segment_counts(index: Tensor, n_segments: int) -> Tensor:
-    """How many rows each segment owns, as fp32."""
-    ones = torch.ones(index.shape[0], dtype=torch.float32, device=index.device)
-    return torch.zeros(n_segments, dtype=torch.float32, device=index.device).index_add_(
-        0, index, ones
-    )
 
 
 def segment_softmax(scores: Tensor, index: Tensor, n_segments: int) -> Tensor:
@@ -220,34 +146,15 @@ def segment_softmax(scores: Tensor, index: Tensor, n_segments: int) -> Tensor:
     return weights / total.index_select(0, index)
 
 
-def aggregate_by_destination(
-    messages: Tensor,
-    index: Tensor,
-    n_segments: int,
-    *,
-    reduce: str,
-    score: Tensor | None = None,
+def attention_by_destination(
+    messages: Tensor, index: Tensor, n_segments: int, score: Tensor
 ) -> Tensor:
-    """Reduce per-edge messages into per-destination rows in fp32 (§14).
+    """§14's attention reduction of per-edge messages, in fp32.
 
-    ``sum`` is the default of §14: the number of edges into a destination is
-    signal, and both ``mean`` and ``attention`` normalise it away, which is why
-    they are ablations rather than alternatives. ``attention`` needs a per-edge
-    score; the other two refuse one, because a score that reached neither the
-    weights nor an error would be a silently dead branch.
+    Unlike ``sum`` and ``mean``, a segment softmax needs every edge's score
+    before any destination's weights are known, so this is the one reduction
+    with an explicit ``(E, d)`` tensor rather than the fused walk.
     """
-    if reduce not in _REDUCTIONS:
-        raise ValueError(f"unknown reduce {reduce!r}; expected one of {list(_REDUCTIONS)}")
-    if (score is None) != (reduce != "attention"):
-        raise ValueError(
-            f"reduce={reduce!r} with score={'a tensor' if score is not None else None}: "
-            'a score is required by "attention" and read by nothing else'
-        )
-    if reduce == "sum":
-        return segment_sum(messages, index, n_segments)
-    if reduce == "mean":
-        total = segment_sum(messages, index, n_segments)
-        return total / segment_counts(index, n_segments).clamp(min=1.0).unsqueeze(1)
     weights = segment_softmax(score, index, n_segments)
     return segment_sum(messages.float() * weights.unsqueeze(1), index, n_segments)
 
@@ -258,17 +165,29 @@ def aggregate_by_destination(
 
 @dataclass(frozen=True, eq=False)
 class TypedEdges:
-    """One typed sparse edge family, validated at construction (§14, §26).
+    """One typed sparse edge family, with the structure its kernels reduce over.
 
     ``src`` and ``dst`` index the source and destination node families in the
     batch frame; ``relation`` indexes the family's relation vocabulary; ``axis``
     is the structural axis an edge routes its line message through, ``-1`` for
     an edge on no axis, or ``None`` for a family that routes no axis message at
-    all. The sizes and the vocabulary travel with the edges so that every bound
-    is checked exactly once, here, rather than per block in a forward.
+    all.
 
-    ``name`` is the family's name in an error message, so a ``-1`` that came
-    out of a masked-in incidence slot says which table it came from.
+    ``dst_sorted`` and ``fully_routed`` are structural properties of the family
+    rather than measurements of its data, stated host-side by the builder
+    rather than probed from the device:
+
+    - ``dst_sorted``: the rows arrive destination-ascending, so
+      `segment_message.message_plan` adopts that order instead of sorting.
+    - ``fully_routed``: every row carries a real axis, so ``routed()`` may hand
+      its columns on untouched; a family that may carry ``-1`` pays one subset
+      gather.
+
+    Index bounds are the packer's, checked in numpy before a tensor exists
+    (``_VALUE_RANGES``/``_INDEX_FIELDS``) and re-derived after concatenation by
+    ``collate``'s ``_refuse_crossing``. What this dataclass validates is
+    everything a host can see for free: container, dtype, rank, row agreement,
+    device, and sizes. ``name`` is the family's name in an error message.
     """
 
     src: Tensor
@@ -278,11 +197,17 @@ class TypedEdges:
     n_src: int
     n_dst: int
     num_relations: int
+    dst_sorted: bool
+    fully_routed: bool
     name: str = "edges"
-    # Rows whose axis route is a real axis, or ``None`` when every row is. The
-    # subset is taken once here because the trunk reuses one edge set across
-    # every block.
+    # Rows whose axis route is a real axis, or ``None`` when every row is.
+    # Taken once here since the trunk reuses one edge set across every block.
     axis_rows: Tensor | None = field(init=False, default=None)
+    # The fused message's CSR views, keyed by channel count and built on first
+    # use; reused across every block of the trunk.
+    _plans: dict[int, MessagePlan] = field(
+        init=False, default_factory=dict, repr=False
+    )
 
     def __post_init__(self) -> None:
         named = {"src": self.src, "dst": self.dst, "relation": self.relation}
@@ -311,15 +236,23 @@ class TypedEdges:
                 raise ValueError(
                     f"{self.name}.{field_name} must be a nonnegative int, got {size!r}"
                 )
+        for field_name in ("dst_sorted", "fully_routed"):
+            if not isinstance(getattr(self, field_name), bool):
+                raise TypeError(
+                    f"{self.name}.{field_name} must be a host-side bool, got "
+                    f"{getattr(self, field_name)!r}"
+                )
+        if self.axis is None and not self.fully_routed:
+            raise ValueError(
+                f"{self.name} carries no axis route at all, so fully_routed=False "
+                "describes nothing: a family without an axis column routes no "
+                "axis message and has no unrouted subset"
+            )
 
-        _check_range(f"{self.name}.src", self.src, 0, self.n_src)
-        _check_range(f"{self.name}.dst", self.dst, 0, self.n_dst)
-        _check_range(f"{self.name}.relation", self.relation, 0, self.num_relations)
-        if self.axis is not None:
-            _check_range(f"{self.name}.axis", self.axis, -1, AXIS_CHANNELS)
-            routed = self.axis >= 0
-            if not bool(routed.all()):
-                object.__setattr__(self, "axis_rows", routed.nonzero(as_tuple=True)[0])
+        if self.axis is not None and not self.fully_routed:
+            object.__setattr__(
+                self, "axis_rows", (self.axis >= 0).nonzero(as_tuple=True)[0]
+            )
 
     def __len__(self) -> int:
         return int(self.src.shape[0])
@@ -338,6 +271,34 @@ class TypedEdges:
             self.axis.index_select(0, rows),
         )
 
+    def plan(self, channels: int) -> MessagePlan:
+        """This family's CSR views for the fused message (§14), cached.
+
+        ``channels`` is 1 for the invariant stream and :data:`AXIS_CHANNELS`
+        for the axis stream, whose plan covers the routed rows alone — an
+        off-axis row routes nothing, so it is excluded rather than walked.
+        """
+        cached = self._plans.get(channels)
+        if cached is not None:
+            return cached
+        if channels == 1:
+            edges = (self.src, self.dst, self.relation, None)
+        else:
+            src, dst, relation, axis = self.routed()
+            edges = (src, dst, relation, axis)
+        # An axis plan covers a subset of the rows taken in order, and a
+        # subsequence of an ascending sequence is ascending, so the family's own
+        # ordering carries to both plans.
+        self._plans[channels] = message_plan(
+            *edges,
+            self.n_src,
+            self.n_dst,
+            self.num_relations,
+            channels,
+            dst_sorted=self.dst_sorted,
+        )
+        return self._plans[channels]
+
 
 def incidence_edges(batch: PackedACTBatch) -> tuple[TypedEdges, TypedEdges]:
     """The cell↔window incidence of §10, both directions (§18.1, §18.2).
@@ -345,10 +306,14 @@ def incidence_edges(batch: PackedACTBatch) -> tuple[TypedEdges, TypedEdges]:
     One traversal of the ``(N_windows, 6)`` slot tables produces both: the mask
     selects the slots whose cell the scope represents, and the surviving slots
     give the cell, the joint ``(pattern, slot)`` relation class, and — as the
-    route — the window's own native axis, which is the structural axis of the
-    line the message travels along (§12.3). Returned in trunk order: cells into
-    windows first, then windows into cells, which must read the windows the
-    first pass just updated.
+    route — the window's own native axis (§12.3). Returned in trunk order:
+    cells into windows first, then windows into cells, which reads the windows
+    the first pass just updated.
+
+    Every column is bounded by the packer (`packed.py`'s ``_VALUE_RANGES`` and
+    ``_INDEX_FIELDS``, re-derived after collation by ``_refuse_crossing``) and
+    is not re-read here. ``mask.nonzero()`` is the one device read on this
+    path: it discovers how many slots the scope represents, once per batch.
     """
     mask = batch.window_incidence_mask
     if mask.dtype != torch.bool:
@@ -368,6 +333,10 @@ def incidence_edges(batch: PackedACTBatch) -> tuple[TypedEdges, TypedEdges]:
         n_src=n_cells,
         n_dst=n_windows,
         num_relations=INCIDENCE_RELATIONS,
+        # `nonzero` walks the (N_windows, 6) mask row-major, so the window index
+        # it returns is nondecreasing by construction.
+        dst_sorted=True,
+        fully_routed=True,
         name="incidence cells->windows",
     )
     to_cells = TypedEdges(
@@ -378,6 +347,11 @@ def incidence_edges(batch: PackedACTBatch) -> tuple[TypedEdges, TypedEdges]:
         n_src=n_windows,
         n_dst=n_cells,
         num_relations=INCIDENCE_RELATIONS,
+        # The same rows read backwards: window-major, and a window's cells are
+        # in slot order rather than cell order. This is the one family whose
+        # destination view the plan has to sort.
+        dst_sorted=False,
+        fully_routed=True,
         name="incidence windows->cells",
     )
     return to_windows, to_cells
@@ -387,19 +361,34 @@ def adjacency_edges(batch: PackedACTBatch, cfg: MantisACTConfig) -> TypedEdges:
     """The §15.1 hex-distance-one edges between cells (§18.3).
 
     Every such displacement lies on an axis and belongs to one orbit, so the
-    relation is constant across the family and the axis route is always real.
+    relation is constant across the family (one host-side integer from
+    ``adjacency_relation_id(cfg)``, checked against ``cfg``'s vocabulary here)
+    and the axis route is always real, making the family ``fully_routed``.
     """
     axis = batch.adjacency_axis
-    _check_range("adjacency_axis", axis, 0, AXIS_CHANNELS)
     n_cells = int(batch.cell_occupancy.shape[0])
+    relation_id = adjacency_relation_id(cfg)
+    num_relations = relation_vocabulary_size(cfg)
+    if not 0 <= relation_id < num_relations:
+        raise ValueError(
+            f"the hex-step relation id {relation_id} of d6_relation_mode "
+            f"{cfg.d6_relation_mode!r} lies outside its own "
+            f"{num_relations}-class vocabulary"
+        )
     return TypedEdges(
         src=batch.adjacency_src,
         dst=batch.adjacency_dst,
-        relation=torch.full_like(batch.adjacency_src, adjacency_relation_id(cfg)),
+        relation=torch.full_like(batch.adjacency_src, relation_id),
         axis=axis,
         n_src=n_cells,
         n_dst=n_cells,
-        num_relations=relation_vocabulary_size(cfg),
+        num_relations=num_relations,
+        # §7 sorts this family by (dst, src, axis) and `_check_ordering`
+        # (`packed.py:388-408`) refuses a graph that is not; `collate` shifts
+        # each position's rows by its own offset and concatenates them in
+        # position order, so the concatenation is still destination-ascending.
+        dst_sorted=True,
+        fully_routed=True,
         name="hex adjacency",
     )
 
@@ -408,25 +397,30 @@ def radius_edges(batch: PackedACTBatch, cfg: MantisACTConfig) -> TypedEdges:
     """The §15.2 occupied-source to represented-destination edges (§18.4).
 
     The relation joins the displacement's D6 class with the source stone's
-    OWN/OPP colour, which the builder deliberately leaves on the cell rather
-    than restating on the edge. The route is the axis the displacement lies on
-    and ``-1`` off it, so an off-axis edge updates the invariant stream only;
+    OWN/OPP colour. The route is the axis the displacement lies on and ``-1``
+    off it, so an off-axis edge updates the invariant stream only;
     ``route_on_axis_radius_messages=False`` drops the route from the whole
-    family, and then no axis parameters exist on this path at all.
+    family, and then no axis parameters exist on this path at all — the family
+    is not ``fully_routed`` otherwise.
 
-    This is the largest edge family in a real position — about 71,700 rows at
-    ply 161 of stack-939 self-play against 7,200 incidences — so it is one
-    gather per stream and one segment reduction, with no per-edge Python and
-    nothing quadratic in cells.
+    ``radius_orbit``'s upper bound moves with ``d6_relation_mode``/``d_max``, so
+    the packer records the batch's own ceiling as ``radius_orbit_bound`` and it
+    is compared here against this ``cfg``'s vocabulary — the only check that
+    catches a batch and a model built under different relation spaces. That a
+    radius edge's source is occupied is a semantic claim rather than an index
+    bound, checked separately at `packed.py`'s ``_check_consistency``.
     """
-    orbits = batch.radius_orbit
     base = relation_vocabulary_size(cfg)
-    _check_range("radius_orbit", orbits, 0, base)
+    if batch.radius_orbit_bound > base:
+        raise ValueError(
+            f"the batch carries radius orbits up to "
+            f"{batch.radius_orbit_bound - 1}, outside the {base}-class "
+            f"vocabulary of d6_relation_mode {cfg.d6_relation_mode!r} at "
+            f"d_max={cfg.d_max}: the graph and this model were built for "
+            "different §11.2 relation spaces"
+        )
     occupancy = batch.cell_occupancy.index_select(0, batch.radius_src)
-    _check_range(
-        "occupancy of radius_src", occupancy, OCCUPANCY_OWN, OCCUPANCY_OPP + 1
-    )
-    relation = 2 * orbits + (occupancy == OCCUPANCY_OPP).long()
+    relation = 2 * batch.radius_orbit + (occupancy == OCCUPANCY_OPP).long()
     n_cells = int(batch.cell_occupancy.shape[0])
     return TypedEdges(
         src=batch.radius_src,
@@ -436,8 +430,232 @@ def radius_edges(batch: PackedACTBatch, cfg: MantisACTConfig) -> TypedEdges:
         n_src=n_cells,
         n_dst=n_cells,
         num_relations=radius_relation_count(cfg),
+        # §7 sorts this family by (dst, src, orbit) and `_check_ordering`
+        # (`packed.py:388-408`) refuses a graph that is not; `collate`
+        # concatenates the positions in order with per-position shifts, so the
+        # concatenation is still destination-ascending.
+        dst_sorted=True,
+        # §11.3 gives an off-axis displacement the route -1 by design
+        # (`packed.py:153`), so this family always takes the routed subset.
+        fully_routed=not cfg.route_on_axis_radius_messages,
         name="occupied radius",
     )
+
+
+@dataclass(frozen=True, eq=False)
+class WindowWindowEdges:
+    """§16's typed collinear/crossing window↔window edges, in three CSR views.
+
+    ``ptr``/``src``/``cls`` is the destination-major view a forward reduces
+    over, and ``cptr``/``cedge`` the class-major view the class-bias gradient
+    reduces over. The source-major view the backward's ``dk``/``dv`` sweep
+    walks is not stored separately: the edge set is closed under reversal, so
+    it is ``ptr``, ``src`` and ``scls`` — the same destination-major view with
+    the class mirrored — which is why :meth:`views` passes the first two twice.
+
+    ``n_windows`` is the family both endpoints index, host-side. Built once per
+    batch and reused by every block.
+    """
+
+    ptr: Tensor
+    src: Tensor
+    cls: Tensor
+    scls: Tensor
+    cptr: Tensor
+    cedge: Tensor
+    n_windows: int
+
+    def views(self) -> tuple[Tensor, ...]:
+        """The eight arguments `window_pairs.edge_attention` takes, in order."""
+        return (
+            self.ptr,
+            self.src,
+            self.cls,
+            self.ptr,
+            self.src,
+            self.scls,
+            self.cptr,
+            self.cedge,
+        )
+
+    def __len__(self) -> int:
+        return int(self.src.shape[0])
+
+
+def window_window_edges(batch: PackedACTBatch) -> WindowWindowEdges:
+    """The §16 typed window↔window edges of ``batch`` (§18.5).
+
+    Two windows relate in exactly one of two ways, both functions of the
+    identity triples ``(native_axis, start_q, start_r)`` alone: collinear at a
+    signed start offset of at most eleven, or crossing at the one lattice cell
+    two non-parallel hex lines meet in. `window_pairs` enumerates both by
+    sorted join and folds each into a D6-invariant class; the join and the
+    flash kernels that reduce over it are imported rather than reimplemented.
+
+    Derived on the device, once per batch, rather than built by the builder and
+    shipped: the edge views are two orders of magnitude larger than the window
+    identities they are a join of, so the identities cross the bus and the
+    edges never do. The join is data-dependent and runs through `window_pairs`'
+    custom op to stay inside a compiled graph.
+    """
+    n_windows = int(batch.window_pattern_class.shape[0])
+    window_pos = row_positions(batch.window_offsets, n_windows)
+    ptr, src, cls, scls, cptr, cedge = derive_pair_tables(batch.window_id, window_pos)
+    return WindowWindowEdges(
+        ptr=ptr,
+        src=src,
+        cls=cls,
+        scls=scls,
+        cptr=cptr,
+        cedge=cedge,
+        n_windows=n_windows,
+    )
+
+
+class TypedWindowAttention(nn.Module):
+    """§16's typed window↔window attention, as §18's optional step 5.
+
+    A pre-norm residual branch over the window `EquivariantState`. Each stream
+    runs multi-head attention over the edge views of :func:`window_window_edges`,
+    with one learned additive score bias per (head, relation class) and the
+    softmax taken per destination segment in fp32. Every window carries a self
+    loop, so no segment is empty.
+
+    ```text
+    score(dst, src) = q_dst . k_src / sqrt(head_dim) + bias[head, class(dst, src)]
+    out_dst         = sum_src softmax(score) * v_src
+    delta           = W_out(out)
+    ```
+
+    Equivariant (§12.1): a relation class is a D6 invariant (`window_pairs`
+    folds a collinear edge by ``|offset|`` and a crossing edge by the pair of
+    per-side folds ``min(t, 5 - t)`` and ``max(-t, t - 5)``), so the invariant
+    stream is a function of invariants alone. The axis stream attends within a
+    channel — channel ``a`` of a destination reads channel ``a`` of its
+    sources, with one shared projection set and one bias table broadcast across
+    all three channels, never a per-channel table (§12.2).
+
+    The three channels ride in the head dimension — the axis query is laid out
+    as ``(window, 3 * num_heads, head_dim)``, giving one softmax per
+    ``(window, channel, head)`` over the same edge tables the invariant stream
+    uses, rather than a second, three-times-larger edge set.
+
+    The query, key and value projections are bias-free: a value bias is spanned
+    by the output projection's own bias, and the score's constant term is
+    already the relation bias table.
+    """
+
+    def __init__(self, cfg: MantisACTConfig) -> None:
+        super().__init__()
+        if cfg.window_window_mode != "typed_collinear_crossing":
+            raise ValueError(
+                f"window_window_mode={cfg.window_window_mode!r} does not ask for "
+                "typed window attention"
+            )
+        self.heads = cfg.num_heads
+        self.d_inv = cfg.d_inv
+        self.d_axis = cfg.d_axis
+
+        self.norm = EquivariantNorm(cfg)
+        self.q_inv = nn.Linear(cfg.d_inv, cfg.d_inv, bias=False)
+        self.k_inv = nn.Linear(cfg.d_inv, cfg.d_inv, bias=False)
+        self.v_inv = nn.Linear(cfg.d_inv, cfg.d_inv, bias=False)
+        self.out_inv = nn.Linear(cfg.d_inv, cfg.d_inv)
+        # Zero at init, so every destination starts with the uniform weights
+        # §27 asks of a relation attention bias.
+        self.bias_inv = nn.Parameter(torch.zeros(cfg.num_heads, WINDOW_WINDOW_RELATIONS))
+
+        if cfg.d_axis:
+            if cfg.d_axis % cfg.num_heads:
+                raise ValueError(
+                    f"d_axis={cfg.d_axis} must divide into num_heads="
+                    f"{cfg.num_heads} heads for typed window attention"
+                )
+            self.q_axis = nn.Linear(cfg.d_axis, cfg.d_axis, bias=False)
+            self.k_axis = nn.Linear(cfg.d_axis, cfg.d_axis, bias=False)
+            self.v_axis = nn.Linear(cfg.d_axis, cfg.d_axis, bias=False)
+            self.out_axis = nn.Linear(cfg.d_axis, cfg.d_axis)
+            self.bias_axis = nn.Parameter(
+                torch.zeros(cfg.num_heads, WINDOW_WINDOW_RELATIONS)
+            )
+        else:
+            self.q_axis = self.k_axis = self.v_axis = self.out_axis = None
+            self.bias_axis = None
+
+        self.residual = EquivariantResidual(cfg)
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def _check(self, edges: WindowWindowEdges, windows: EquivariantState) -> None:
+        """Refuse an edge set or a state that does not match this module."""
+        if windows.leading_shape != (edges.n_windows,):
+            raise ValueError(
+                f"window state covers {windows.leading_shape} windows against the "
+                f"edge family's ({edges.n_windows},)"
+            )
+        if windows.d_inv != self.d_inv:
+            raise ValueError(
+                f"window state is d_inv={windows.d_inv} against this attention's "
+                f"{self.d_inv}"
+            )
+        if windows.has_axis != (self.q_axis is not None):
+            built = "with" if self.q_axis is not None else "without"
+            given = "one" if windows.has_axis else "none"
+            raise ValueError(
+                f"typed window attention was built {built} an axis stream, but "
+                f"the state has {given}"
+            )
+        if windows.has_axis and windows.d_axis != self.d_axis:
+            raise ValueError(
+                f"window state is d_axis={windows.d_axis} against this "
+                f"attention's {self.d_axis}"
+            )
+
+    def forward(
+        self, edges: WindowWindowEdges, windows: EquivariantState
+    ) -> EquivariantState:
+        """The windows after they have attended to their typed partners."""
+        self._check(edges, windows)
+        views = edges.views()
+        n_windows = edges.n_windows
+        z = self.norm(windows)
+
+        heads = self.heads
+        head_dim = self.d_inv // heads
+        out = edge_attention(
+            self.q_inv(z.inv).view(n_windows, heads, head_dim),
+            self.k_inv(z.inv).view(n_windows, heads, head_dim),
+            self.v_inv(z.inv).view(n_windows, heads, head_dim),
+            self.bias_inv,
+            *views,
+        )
+        # The kernel answers in fp32 whatever the stream is (§27); the delta is
+        # cast back to the state's own precision before the residual, so the
+        # stream's dtype stays the state's and not the reduction's.
+        delta_inv = self.drop(self.out_inv(out.reshape(n_windows, self.d_inv))).to(
+            windows.inv.dtype
+        )
+
+        if self.q_axis is None:
+            return self.residual(windows, delta_inv)
+
+        # The three channels ride in the head dimension: head `c * heads + h` is
+        # channel `c`'s head `h`, so the kernel's per-(window, head) softmax is
+        # the per-(window, channel, head) softmax this stream wants, over the
+        # same edge tables. The bias table is one set of `heads` rows repeated
+        # across the channels rather than three sets, which is what keeps the
+        # score free of a per-absolute-axis parameter (§12.2).
+        shape = (n_windows, AXIS_CHANNELS * heads, self.d_axis // heads)
+        out = edge_attention(
+            self.q_axis(z.axis).reshape(shape),
+            self.k_axis(z.axis).reshape(shape),
+            self.v_axis(z.axis).reshape(shape),
+            self.bias_axis.repeat(AXIS_CHANNELS, 1),
+            *views,
+        )
+        delta_axis = self.drop(
+            self.out_axis(out.reshape(n_windows, AXIS_CHANNELS, self.d_axis))
+        ).to(windows.axis.dtype)
+        return self.residual(windows, delta_inv, delta_axis)
 
 
 # --------------------------------------------------------------------------
@@ -445,23 +663,32 @@ def radius_edges(batch: PackedACTBatch, cfg: MantisACTConfig) -> TypedEdges:
 
 
 class _PairMLP(nn.Module):
-    """``MLP([a; b])`` with the concatenation folded into two input linears.
+    """``MLP([a; b])`` — §14's update MLP over the destination and its aggregate.
 
-    A linear over a concatenation is the sum of two linears, so this keeps the
-    spec's parameters and arithmetic without materialising the wide input.
+    The concatenation is materialised and one linear runs over it, rather than
+    two linears running over the halves with their results added — the two
+    forms compute the same function, but the wide input costs fewer launches
+    under autocast. ``b`` is the fp32 segment-reduction accumulator (§27) and
+    ``a`` the normed destination in the autocast dtype.
     """
 
     def __init__(
         self, d_a: int, d_b: int, d_hidden: int, d_out: int, activation: nn.Module
     ) -> None:
         super().__init__()
-        self.lin_a = nn.Linear(d_a, d_hidden)
-        self.lin_b = nn.Linear(d_b, d_hidden, bias=False)
+        self.d_a = int(d_a)
+        self.d_b = int(d_b)
+        self.lin_in = nn.Linear(d_a + d_b, d_hidden)
         self.act = activation
         self.out = nn.Linear(d_hidden, d_out)
 
     def forward(self, a: Tensor, b: Tensor) -> Tensor:
-        return self.out(self.act(self.lin_a(a) + self.lin_b(b)))
+        if a.shape[-1] != self.d_a or b.shape[-1] != self.d_b:
+            raise ValueError(
+                f"this update MLP pairs a {self.d_a}-wide left operand with a "
+                f"{self.d_b}-wide right one, got {a.shape[-1]} and {b.shape[-1]}"
+            )
+        return self.out(self.act(self.lin_in(torch.cat((a, b.to(a.dtype)), dim=-1))))
 
 
 class RelationGatedMessage(nn.Module):
@@ -469,14 +696,10 @@ class RelationGatedMessage(nn.Module):
 
     Holds one norm and value projection per stream on the source side, the
     relation's gate and bias projections, and the destination's norm, update
-    MLP and LayerScale. Both streams are optional in the sense that the axis
-    half exists exactly when the model has axis channels *and* this family
-    routes them: a family that carries no route (``route_axis=False``) carries
-    no axis parameters either, so nothing is left orphaned.
-
-    The value projections are bias-free. §14 writes them as bare matrices and
-    the relation's bias is the additive term; a second constant would be the
-    same parameter twice.
+    MLP and LayerScale. The axis half exists exactly when the model has axis
+    channels and this family routes them (``route_axis``); otherwise it holds
+    no axis parameters. The value projections are bias-free — the relation's
+    bias is already the additive term.
     """
 
     def __init__(
@@ -593,49 +816,74 @@ class RelationGatedMessage(nn.Module):
     def _aggregate(
         self,
         values: Tensor,
-        src_slots: Tensor,
-        dst_slots: Tensor,
-        relation: Tensor,
-        n_segments: int,
+        edges: TypedEdges,
+        channels: int,
         *,
         gate_projection: nn.Linear | None,
         bias_projection: nn.Linear,
         score_vector: Tensor | None,
     ) -> Tensor:
-        """One stream's per-edge messages and their fp32 aggregate (§14).
+        """One stream's aggregate of §14's messages, in fp32.
 
-        Both streams run this: the invariant one over node rows, the axis one
-        over ``(node, axis)`` slots of a flattened view, which is what lets a
-        routed message be a single gather rather than a ``(E, 3, d_axis)``
+        Both streams run this: the invariant one with ``channels=1`` over node
+        rows, the axis one with ``channels=AXIS_CHANNELS`` over the
+        ``(node, axis)`` slots of a flattened view, so a routed message
+        addresses a row rather than a channel of a ``(E, 3, d_axis)``
         intermediate. The gate and bias are functions of the relation alone, so
-        they are projected once over the whole vocabulary — tens of rows — and
-        gathered per edge, rather than projected per edge.
+        they are projected once over the whole vocabulary and read per edge
+        inside the kernel.
+
+        Every table the kernel reads is fp32 (§27): the accumulator is fp32 in
+        registers and the value, gate and bias gradients come out of
+        contiguous segment reductions rather than atomic scatters — CUDA has no
+        native bf16 ``atomicAdd`` and emulates one with compare-and-swap.
         """
         rel = self.relation.weight
-        # Every gather is taken from an fp32 source, which is §27's fp32
-        # segment reduction read in the direction that actually costs
-        # something. `index_select` backward is `index_add_` into a zero
-        # tensor of the *source's* dtype, so a bf16 source makes the gradient
-        # of a gather a bf16 atomic scatter — and CUDA has no native bf16
-        # atomicAdd, so it becomes a compare-and-swap loop whose contention is
-        # worst exactly here: the ply-161 radius family scatters 573k edge
-        # gradients back over 104 relation rows. Measured on a 4070 Ti that
-        # one scatter is 12.5 ms in bf16 against 0.45 ms in fp32.
-        # The aggregate is fp32 either way, so promoting at the gather rather
-        # than after it materialises no tensor that did not already exist.
-        messages = at_least_fp32(values).index_select(0, src_slots)
-        if gate_projection is not None:
-            gate = at_least_fp32(torch.sigmoid(gate_projection(rel)))
-            messages = messages * gate.index_select(0, relation)
-        messages = messages + at_least_fp32(bias_projection(rel)).index_select(0, relation)
-        score = (
-            (messages.float() * score_vector).sum(dim=1)
-            if score_vector is not None
+        values = at_least_fp32(values)
+        gate = (
+            at_least_fp32(torch.sigmoid(gate_projection(rel)))
+            if gate_projection is not None
             else None
         )
-        return aggregate_by_destination(
-            messages, dst_slots, n_segments, reduce=self.reduce, score=score
-        )
+        bias = at_least_fp32(bias_projection(rel))
+        if self.reduce == "attention":
+            return self._attend(values, edges, channels, gate, bias, score_vector)
+        plan = edges.plan(channels)
+        total = relation_gated_message(values, gate, bias, plan)
+        if self.reduce == "mean":
+            counts = plan.destination_counts().clamp(min=1.0)
+            total = total / counts.unsqueeze(1)
+        return total
+
+    def _attend(
+        self,
+        values: Tensor,
+        edges: TypedEdges,
+        channels: int,
+        gate: Tensor | None,
+        bias: Tensor,
+        score_vector: Tensor | None,
+    ) -> Tensor:
+        """§14's attention ablation, over the explicit per-edge messages.
+
+        A segment softmax needs every edge's score before any destination's
+        weights are known, so this reduction keeps the ``(E, d)`` formulation
+        the fused sum/mean path avoids.
+        """
+        if channels == 1:
+            src_slots, dst_slots, relation = edges.src, edges.dst, edges.relation
+            n_segments = edges.n_dst
+        else:
+            edge_src, edge_dst, relation, edge_axis = edges.routed()
+            src_slots = edge_src * channels + edge_axis
+            dst_slots = edge_dst * channels + edge_axis
+            n_segments = edges.n_dst * channels
+        messages = values.index_select(0, src_slots)
+        if gate is not None:
+            messages = messages * gate.index_select(0, relation)
+        messages = messages + bias.index_select(0, relation)
+        score = (messages.float() * score_vector).sum(dim=1)
+        return attention_by_destination(messages, dst_slots, n_segments, score)
 
     def forward(
         self,
@@ -645,21 +893,18 @@ class RelationGatedMessage(nn.Module):
     ) -> EquivariantState:
         """The destination after this edge family's messages reach it (§14).
 
-        A pre-norm residual branch, in the shape the rest of the package's
-        branches take: the state goes in, the norms, messages, aggregation and
-        update MLPs run on it, and the LayerScaled result is added back. A
-        family that routes no axis message leaves the destination's axis stream
-        exactly as it found it rather than returning a zero for it.
+        A pre-norm residual branch: the norms, messages, aggregation and update
+        MLPs run on the state and the LayerScaled result is added back. A
+        family that routes no axis message leaves the destination's axis
+        stream unchanged rather than returning a zero for it.
         """
         self._check(edges, source, destination)
         attending = self.reduce == "attention"
 
         aggregate = self._aggregate(
             self.wv_inv(self.ln_src_inv(source.inv)),
-            edges.src,
-            edges.dst,
-            edges.relation,
-            edges.n_dst,
+            edges,
+            1,
             gate_projection=self.wg_inv if self.gated else None,
             bias_projection=self.wb_inv,
             score_vector=self.score_inv if attending else None,
@@ -672,15 +917,12 @@ class RelationGatedMessage(nn.Module):
 
         # The axis stream runs over the (node, axis) slots of a flat view of the
         # three channels, so an edge's route selects a row rather than a channel
-        # of a wider intermediate. Edges on no axis are dropped first: they have
-        # no channel to land in (§11.3).
-        edge_src, edge_dst, edge_relation, edge_axis = edges.routed()
+        # of a wider intermediate. Edges on no axis are dropped by the plan:
+        # they have no channel to land in (§11.3).
         aggregate = self._aggregate(
             self.wv_axis(self.ln_src_axis(source.axis)).reshape(-1, self.d_axis),
-            edge_src * AXIS_CHANNELS + edge_axis,
-            edge_dst * AXIS_CHANNELS + edge_axis,
-            edge_relation,
-            edges.n_dst * AXIS_CHANNELS,
+            edges,
+            AXIS_CHANNELS,
             gate_projection=self.wg_axis if self.gated else None,
             bias_projection=self.wb_axis,
             score_vector=self.score_axis if attending else None,
@@ -700,10 +942,9 @@ class CellWindowIncidence(nn.Module):
     """Both directions of the §10 cell↔window incidence (§18.1, §18.2).
 
     The two directions share one relation table — they are the same edges read
-    the other way, so the class of a slot means the same thing in both — and
-    keep private projections and update MLPs, which is what §14 fixes as shared
-    and what it fixes as block-private. The trunk runs ``to_windows`` first and
-    then ``to_cells``, which reads the windows that pass just updated.
+    the other way — but keep private projections and update MLPs (§14). The
+    trunk runs ``to_windows`` first, then ``to_cells``, which reads the windows
+    the first pass just updated.
     """
 
     def __init__(
@@ -726,9 +967,8 @@ class CellWindowIncidence(nn.Module):
 class AdjacencyMessage(nn.Module):
     """§15.1: messages between cells one hex step apart (§18.3).
 
-    One relation class and always an axis route, so this path is where a cell
-    learns the immediate shape of the line it sits on, in the channel of that
-    line's own axis.
+    One relation class and always an axis route: a cell learns the immediate
+    shape of the line it sits on, in the channel of that line's own axis.
     """
 
     def __init__(
@@ -751,10 +991,9 @@ class RadiusMessage(nn.Module):
     """§15.2: occupied-source to represented-destination messages (§18.4).
 
     Carries the exact D6 orbit of the displacement jointly with the source
-    stone's colour, so a far legal cell that lies in no current window is still
+    stone's colour, so a far legal cell with no current window is still
     described by the shape of the stones around it. ``route_on_axis_radius_messages``
-    turns the axis route off for the whole family, and then the module holds no
-    axis parameters.
+    turns the axis route off for the whole family, leaving no axis parameters.
     """
 
     def __init__(
@@ -778,20 +1017,23 @@ class RadiusMessage(nn.Module):
 
 __all__ = [
     "INCIDENCE_RELATIONS",
+    "WINDOW_WINDOW_RELATIONS",
     "AdjacencyMessage",
     "CellWindowIncidence",
     "RadiusMessage",
     "RelationGatedMessage",
     "TypedEdges",
+    "TypedWindowAttention",
+    "WindowWindowEdges",
     "adjacency_edges",
     "adjacency_relation_id",
-    "aggregate_by_destination",
+    "attention_by_destination",
     "incidence_edges",
     "make_relation_embedding",
     "radius_edges",
     "radius_relation_count",
     "relation_vocabulary_size",
-    "segment_counts",
     "segment_softmax",
     "segment_sum",
+    "window_window_edges",
 ]

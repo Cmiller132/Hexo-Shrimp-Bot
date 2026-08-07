@@ -14,13 +14,22 @@ def _device(parser: argparse.ArgumentParser) -> None:
     )
 
 
+# The variant list is not an argparse `choices`: resolving it imports torch and
+# the whole ACT package, which would be paid by `--help`.  An unknown name is
+# refused by `variants.variant_spec`, whose message carries the full list.
+_VARIANT_HELP = (
+    "lab variant: 'mantis' for MantisNet, or one §29 MantisNet-ACT preset by "
+    "name (full_act_v4, full_live_windows, ...)"
+)
+
+
 def _model_kw(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model-kw",
         nargs="*",
         default=[],
         metavar="KEY=VALUE",
-        help="typed MantisConfig overrides",
+        help="typed overrides for the chosen variant's configuration dataclass",
     )
 
 
@@ -69,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     train = commands.add_parser("train", help="train supervised variant cells")
     train.add_argument("--corpus", required=True, help="frozen corpus path or name")
     train.add_argument("--sweep", required=True, help="sweep name or directory")
-    train.add_argument("--variant", default="mantis")
+    train.add_argument("--variant", default="mantis", help=_VARIANT_HELP)
     _model_kw(train)
     train.add_argument("--cell", help="override the derived cell name")
     train.add_argument("--seeds", type=int, default=3, help="run seeds 0..N-1")
@@ -79,9 +88,19 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train.add_argument("--ema-decay", type=float, default=0.0)
     train.add_argument(
+        "--batch", dest="batch_size", type=int, help="effective optimizer batch"
+    )
+    train.add_argument(
         "--cell-budget",
         type=int,
-        help="cap accumulation micro-chunks (memory knob; optimizer batch unchanged)",
+        help="cap accumulation micro-chunks by MantisNet's decoder rows "
+        "(memory knob; optimizer batch unchanged)",
+    )
+    train.add_argument(
+        "--graph-cell-budget",
+        type=int,
+        help="cap accumulation micro-chunks by MantisNet-ACT's graph cells plus "
+        "occupied cells (memory knob; optimizer batch unchanged)",
     )
     train.add_argument("--param-budget", type=int)
     train.add_argument("--param-tol", type=float, default=0.02)
@@ -105,6 +124,10 @@ def build_parser() -> argparse.ArgumentParser:
     report.add_argument("scores", nargs="*", help="explicit scores.json paths")
     report.add_argument("--sweep", help="sweep directory")
     report.add_argument("--out", help="report.json destination for explicit paths")
+    report.add_argument(
+        "--baseline",
+        help="cell label every arm is differenced against, seed by seed",
+    )
 
     bench = commands.add_parser("bench", help="benchmark production paths")
     bench_modes = bench.add_subparsers(dest="bench_mode", required=True)
@@ -190,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     check = commands.add_parser("check", help="run the model-contract battery")
     check_target = check.add_mutually_exclusive_group(required=True)
     check_target.add_argument("--checkpoint")
-    check_target.add_argument("--variant")
+    check_target.add_argument("--variant", help=_VARIANT_HELP)
     check.add_argument("--family")
     _model_kw(check)
     check.add_argument("--corpus")
@@ -214,11 +237,11 @@ def _named_path(value: str, parent: Path) -> Path:
     return parent / path
 
 
-def _parse_overrides(parser, values):
+def _parse_overrides(parser, values, variant: str = "mantis"):
     from .variants import parse_model_kw
 
     try:
-        return parse_model_kw(values)
+        return parse_model_kw(values, variant)
     except (TypeError, ValueError) as exc:
         parser.error(str(exc))
 
@@ -256,7 +279,7 @@ def main(argv=None) -> None:
 
         if args.seeds <= 0:
             parser.error("--seeds must be positive")
-        model_kw = _parse_overrides(parser, args.model_kw)
+        model_kw = _parse_overrides(parser, args.model_kw, args.variant)
         corpus = _named_path(args.corpus, Path("runs/corpora"))
         sweep = _named_path(args.sweep, Path("runs/lab"))
         cell = args.cell or derived_cell_name(args.variant, model_kw)
@@ -274,7 +297,9 @@ def main(argv=None) -> None:
                 ema_decay=args.ema_decay,
                 device=args.device,
                 compile=args.compile,
+                batch_size=args.batch_size,
                 cell_budget=args.cell_budget,
+                graph_cell_budget=args.graph_cell_budget,
                 param_budget=args.param_budget,
                 param_tol=args.param_tol,
             )
@@ -320,9 +345,9 @@ def main(argv=None) -> None:
         if bool(args.sweep) == bool(args.scores):
             parser.error("provide exactly one of --sweep or explicit scores paths")
         if args.sweep:
-            report_sweep(args.sweep)
+            report_sweep(args.sweep, baseline=args.baseline)
         else:
-            build_report(args.scores, args.out or "report.json")
+            build_report(args.scores, args.out or "report.json", baseline=args.baseline)
         return
 
     if args.command == "bench":
@@ -371,7 +396,9 @@ def main(argv=None) -> None:
 
         values = vars(args).copy()
         values.pop("command")
-        values["model_kw"] = _parse_overrides(parser, values["model_kw"])
+        values["model_kw"] = _parse_overrides(
+            parser, values["model_kw"], values["variant"]
+        )
         if values["checkpoint"] and values["model_kw"]:
             parser.error("--model-kw applies only with --variant")
         if values.get("corpus"):

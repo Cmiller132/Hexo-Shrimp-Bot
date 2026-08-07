@@ -537,17 +537,38 @@ def test_film_broadcasts_a_per_position_phase_over_latents():
     assert out.axis.shape == source.axis.shape
 
 
-def test_film_refuses_an_unknown_phase_id():
+def test_film_refuses_a_phase_id_it_cannot_index_by():
+    """Both directions, because only one of them is the dangerous one.
+
+    Above the vocabulary any gather refuses. *Below* it, torch's advanced
+    indexing wraps: ``phase_row[-1]`` is the last phase's row, in range and
+    wrongly typed, and ``-1`` is this representation's sentinel — it is what
+    ``window_cell_index``, ``legal_to_cell_index`` and ``radius_axis_or_neg1``
+    all carry — so a site that gathered a phase through a sentinel-bearing
+    column would receive another phase's modulation with nothing raised at any
+    stage. That is the symmetric fault ``CLAUDE.md`` names, and the reason the
+    selection is an ``index_select`` rather than a subscript.
+    """
     film = PhaseFiLM(cfg())
     source = state(n=3).to(torch.float32)
-    with pytest.raises(ValueError, match="must lie in 0..2, got a range of 0..7"):
-        film(source, torch.tensor([0, 1, 7]))
-    with pytest.raises(ValueError, match="must lie in 0..2, got a range of -1..1"):
-        film(source, torch.tensor([-1, 1, 1]))
     with pytest.raises(ValueError, match="must be int64"):
         film(source, torch.tensor([0.0, 1.0, 2.0]))
     with pytest.raises(ValueError, match="does not broadcast"):
         film(source, torch.zeros(5, dtype=torch.long))
+
+    for three_way in (True, False):
+        film = PhaseFiLM(cfg(use_three_way_phase=three_way))
+        # The three ids the vocabulary holds all index a row, in both arms.
+        rows = film._rows(torch.tensor([0, 1, 2]), (3,))
+        assert int(rows.min()) >= 0 and int(rows.max()) < len(PHASE_IDS)
+        # And neither end of the range is answered with a row.
+        with pytest.raises(ValueError, match=r"must lie in 0\.\.2"):
+            film._rows(torch.tensor([0, 1, len(PHASE_IDS)]), (3,))
+        with pytest.raises(ValueError, match=r"must lie in 0\.\.2"):
+            film._rows(torch.tensor([0, 1, -1]), (3,))
+        # Through the module's own entry point, not only the helper's.
+        with pytest.raises(ValueError, match=r"must lie in 0\.\.2"):
+            film.double()(state(n=3), torch.tensor([0, 1, -1]))
 
 
 def test_film_refuses_to_exist_under_token_only_conditioning():

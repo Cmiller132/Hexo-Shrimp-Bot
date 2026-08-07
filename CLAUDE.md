@@ -8,7 +8,7 @@ turn. A placement is legal if the cell is empty and within 8 hex steps of some
 occupied cell. Six or more of your own stones in a row along one axis wins,
 checked after *every* placement — so a turn can end on its first stone. No
 draws, passes, or captures, and stones are permanent. `hexo-engine` is
-authoritative; `docs/ENGINE_SPEC.md` is the normative target.
+authoritative; `crates/hexo-engine/README.md` is the normative reference.
 
 ## Verifying
 
@@ -32,9 +32,9 @@ the only detectors. They are not redundant with each other, and making one of
 them agree with the implementation *by construction* silently deletes a
 detector rather than fixing anything.
 
-**`docs/ENGINE_SPEC.md` is normative for `hexo-engine`.** Where the code and the
-spec disagree, that is a finding to raise, not a discrepancy to quietly resolve
-in whichever direction is less work.
+**`crates/hexo-engine/README.md` is normative for `hexo-engine`.** Where the
+code and the README disagree, that is a finding to raise, not a discrepancy to
+quietly resolve in whichever direction is less work.
 
 **`target/` collides between Windows and WSL.** Set
 `CARGO_TARGET_DIR=target-wsl` on the WSL side; both are gitignored.

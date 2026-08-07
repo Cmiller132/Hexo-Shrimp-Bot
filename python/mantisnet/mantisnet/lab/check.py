@@ -1,4 +1,4 @@
-﻿"""Model-contract checks and the tiny end-to-end lab smoke run."""
+"""Model-contract checks and the tiny end-to-end lab smoke run."""
 
 from __future__ import annotations
 
@@ -67,9 +67,8 @@ def _transformed_batch(case: CohortCase, transform, collate_fn):
 
 # Policy logits are unbounded — KLENT-sharpened checkpoints reach |logit| in
 # the hundreds, where one fp32 ulp is ~3e-5 and a transformed or re-batched
-# board reorders every scatter accumulation. Logit comparisons therefore
-# carry a relative term sized in ulps (5e-6 ~ 40 ulps); a genuine symmetry or
-# batch-dependence break shows up orders of magnitude above it. Bounded
+# board reorders every scatter accumulation. Logit comparisons carry a
+# relative term sized in ulps (5e-6 ~ 40 ulps) for this reason; bounded
 # quantities (value, distributions) stay on the strict absolute tolerance.
 _LOGIT_RTOL = 5e-6
 
@@ -205,7 +204,7 @@ def _check_builder_agreement(cases, collate_fn) -> int:
 def contract_battery(
     model, cases, *, collate_fn, device: str = "cpu", rust_collate=True
 ) -> dict:
-    """Run the MODEL_SPEC contract battery and return its exact work counts."""
+    """Run the contract battery and return its exact work counts."""
     if not cases:
         raise ValueError("the contract battery requires at least one real position")
     if any(case.position.is_terminal for case in cases):
@@ -266,10 +265,9 @@ def run_check(
         model = model.to(device).eval()
         identity = {"variant": variant, "model_kw": normalized_kw}
     if corpus is None:
-        # Cohort generation is deliberately representation-neutral. Collector
-        # owns the production Rust batch path, so asking a not-yet-approved
-        # variant to act here would bypass its declared collator before this
-        # battery has had a chance to validate it.
+        # Cohort generation is representation-neutral: Collector owns the
+        # production Rust batch path, so a not-yet-approved variant does not
+        # act here before its declared collator has been validated.
         cases = selfplay_cohort(
             envs=envs,
             steps=steps,
@@ -373,7 +371,7 @@ def _write_synthetic_run(run_dir: Path) -> int:
 
 
 def smoke(work_dir: str | Path | None = None) -> dict:
-    """Run freeze â†’ tiny train â†’ evaluate â†’ report entirely on CPU."""
+    """Run freeze -> tiny train -> evaluate -> report entirely on CPU."""
     owned_tmp = tempfile.TemporaryDirectory(prefix="mantisnet-lab-smoke-") if work_dir is None else None
     root = Path(owned_tmp.name if owned_tmp is not None else work_dir)
     root.mkdir(parents=True, exist_ok=True)

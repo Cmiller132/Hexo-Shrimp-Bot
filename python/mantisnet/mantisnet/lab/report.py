@@ -38,9 +38,49 @@ def _mean_sd(values: Sequence[float | None], label: str) -> dict[str, object]:
     }
 
 
+def _by_seed(
+    values: Sequence[float | None], seeds: Sequence[object], label: str
+) -> dict[object, float]:
+    """A metric keyed by the seed that produced it, dropping absent entries."""
+
+    present = {
+        seed: float(value)
+        for seed, value in zip(seeds, values, strict=True)
+        if value is not None
+    }
+    if present and len(present) != len(values):
+        raise ValueError(f"metric {label} is absent for only some seeds")
+    return present
+
+
+def _paired(
+    values: dict[object, float], baseline: dict[object, float], label: str
+) -> dict[str, object]:
+    """This arm minus the baseline arm, seed by seed.
+
+    Differencing within a seed removes the shared sample-permutation draw,
+    which is most of the spread across seeds; its standard deviation says
+    whether an arm moved, unlike the pooled per-arm standard deviation.
+    """
+
+    seeds = sorted(set(values) & set(baseline), key=lambda s: (s is None, s))
+    if not seeds:
+        raise ValueError(
+            f"metric {label} shares no seed with the baseline arm: "
+            f"{sorted(values, key=str)} against {sorted(baseline, key=str)}"
+        )
+    differences = [values[seed] - baseline[seed] for seed in seeds]
+    return {
+        "n": len(differences),
+        "seeds": list(seeds),
+        "mean": statistics.fmean(differences),
+        "sample_sd": statistics.stdev(differences) if len(differences) >= 2 else None,
+    }
+
+
 def _identity(score: dict) -> tuple[str, str, dict[str, object]]:
     variant = score["variant"]
-    model_kw = normalize_model_kw(score.get("model_kw", {}))
+    model_kw = normalize_model_kw(score.get("model_kw", {}), variant)
     identity = json.dumps([variant, model_kw], sort_keys=True, separators=(",", ":"))
     label = derived_cell_name(variant, model_kw)
     return identity, label, model_kw
@@ -84,8 +124,15 @@ def _cell_throughput(scores_path: Path) -> float:
     return statistics.fmean(values)
 
 
-def aggregate_scores(paths: Iterable[str | os.PathLike[str]]) -> dict[str, object]:
-    """Aggregate comparable score files into a JSON-serializable report."""
+def aggregate_scores(
+    paths: Iterable[str | os.PathLike[str]], *, baseline: str | None = None
+) -> dict[str, object]:
+    """Aggregate comparable score files into a JSON-serializable report.
+
+    ``baseline`` names the arm every other arm is differenced against, by its
+    cell label. It is named rather than inferred: which arm is the control is a
+    property of the round, not of the file set.
+    """
 
     loaded = _load_scores(paths)
     hashes = {score["corpus"]["sha256"] for _path, score in loaded}
@@ -113,6 +160,7 @@ def aggregate_scores(paths: Iterable[str | os.PathLike[str]]) -> dict[str, objec
         model_kwargs[identity] = model_kw
 
     variants: dict[str, object] = {}
+    per_seed: dict[str, dict[str, dict[object, float]]] = {}
     for identity in sorted(grouped, key=lambda key: labels[key]):
         entries = grouped[identity]
         scores = [score for _path, score in entries]
@@ -165,12 +213,49 @@ def aggregate_scores(paths: Iterable[str | os.PathLike[str]]) -> dict[str, objec
             "imitation_top1": imitation,
             "horizon_sign_accuracy": horizon,
         }
+        per_seed[label] = {
+            "samples_per_second": _by_seed(
+                throughput, seeds, f"{label} samples_per_second"
+            ),
+            "imitation_top1": _by_seed(
+                [score["imitation"]["overall"]["top1"] for score in scores],
+                seeds,
+                f"{label} imitation top1",
+            ),
+            **{
+                f"horizon_sign_accuracy/{channel}/{bucket}": _by_seed(
+                    [
+                        score["horizon"][channel][bucket]["sign_accuracy"]
+                        for score in scores
+                    ],
+                    seeds,
+                    f"{label} {channel} {bucket} sign_accuracy",
+                )
+                for channel in channels
+                for bucket, _lower, _upper in DISTANCE_BUCKETS
+            },
+        }
+
+    if baseline is not None:
+        if baseline not in variants:
+            raise ValueError(
+                f"baseline arm {baseline!r} is not among the reported cells: "
+                + ", ".join(sorted(variants))
+            )
+        control = per_seed[baseline]
+        for label, row in variants.items():
+            row["paired_vs_baseline"] = {
+                metric: _paired(values, control[metric], f"{label} {metric}")
+                for metric, values in per_seed[label].items()
+                if metric in control and values and control[metric]
+            }
 
     first = loaded[0][1]
     return {
-        "report_format": 1,
+        "report_format": 2,
         "corpus": dict(first["corpus"]),
         "split": first["split"],
+        "baseline": baseline,
         "variants": variants,
     }
 
@@ -210,6 +295,23 @@ def render_report(report: dict[str, object]) -> str:
                     for bucket, _lower, _upper in DISTANCE_BUCKETS
                 )
             )
+    baseline = report["baseline"]
+    if baseline is not None:
+        lines.extend(
+            [
+                "",
+                f"per-seed paired difference against {baseline}",
+                "cell  paired seeds  samples/s  imitation top-1",
+            ]
+        )
+        for label, row in variants.items():
+            paired = row["paired_vs_baseline"]
+            top1 = paired["imitation_top1"]
+            lines.append(
+                f"{label}  {top1['n']}  "
+                f"{_format_stat(paired['samples_per_second'])}  "
+                f"{_format_stat(top1)}"
+            )
     return "\n".join(lines)
 
 
@@ -217,11 +319,12 @@ def build_report(
     scores_paths: Iterable[str | os.PathLike[str]],
     out: str | os.PathLike[str],
     *,
+    baseline: str | None = None,
     emit: bool = True,
 ) -> dict[str, object]:
     """Aggregate, write ``report.json``, and optionally print its text table."""
 
-    report = aggregate_scores(scores_paths)
+    report = aggregate_scores(scores_paths, baseline=baseline)
     destination = Path(out)
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(
@@ -234,9 +337,11 @@ def build_report(
 
 
 def report_sweep(
-    sweep: str | os.PathLike[str], *, emit: bool = True
+    sweep: str | os.PathLike[str], *, baseline: str | None = None, emit: bool = True
 ) -> dict[str, object]:
     """Convenience entry point for ``report --sweep``."""
 
     root = Path(sweep)
-    return build_report(discover_scores(root), root / "report.json", emit=emit)
+    return build_report(
+        discover_scores(root), root / "report.json", baseline=baseline, emit=emit
+    )

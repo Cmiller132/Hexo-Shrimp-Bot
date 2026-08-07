@@ -20,8 +20,6 @@ import numpy as np
 import pytest
 
 from mantisnet.models.mantis_act.cells import (
-    LEGAL_RADIUS,
-    NEAREST_UNREACHED,
     OCCUPANCY_OPP,
     OCCUPANCY_OWN,
     CellSet,
@@ -31,6 +29,7 @@ from mantisnet.models.mantis_act.cells import (
     relevant_cells,
 )
 from mantisnet.models.mantis_act.config import PRESETS, MantisACTConfig
+from mantisnet.models.mantis_act.packed import LEGAL_RADIUS, NEAREST_UNREACHED
 from mantisnet.models.mantis_act.symmetry import (
     D6_TRANSFORMS,
     axis_permutation,

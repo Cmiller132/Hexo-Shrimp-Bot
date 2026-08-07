@@ -1,41 +1,17 @@
-"""Persistent six-cell window enumeration and its ternary encoding (§4, §9).
+"""Persistent six-cell window enumeration and ternary encoding (§4, §9).
 
-A window is six consecutive cells of one hex line. The board is infinite, so
-the windows a position can be said to contain are only the finite scopes §4
-names: the ones through a stone, or — under ``action_relevant`` — also the ones
-through a currently legal cell. This module is the single enumerator of those
-scopes. It derives everything from the stone and legal-cell lists; the engine's
-own window walk stays an independent oracle for §30.1 rather than a dependency.
+A window is six consecutive cells of one hex line, identified by
+``(native_axis, start_q, start_r)`` with cells ``start + k * AXES[a]`` for
+slot ``k`` in ``0..5``. Finite scope: windows through a stone, and optionally
+through legal cells (``action_relevant``).
 
-Index conventions this module fixes (each is part of the representation):
+Ternary code: ``sum_k v_k * 3**k`` where 0=empty, 1=own, 2=opponent relative
+to side to move. Slot order follows the stored axis direction; downstream
+reads must canonicalise through ``PATTERN_CLASS``. Numeric features are in
+``WINDOW_NUMERIC_NAMES`` order, each in ``[0, 1]`` (§9.3).
 
-- Window identity: ``(native_axis, start_q, start_r)``, whose six cells are
-  ``start + k * AXES[native_axis]`` for slot ``k`` in ``0..5``. Axes are
-  undirected, so a line's two directions name one window: the walk below
-  reaches both and the deduplication keeps one.
-- Ternary code: slot ``k`` holds ``0`` empty, ``1`` own, ``2`` opponent
-  relative to the side to move, and the code is ``sum_k v_k * 3**k``, one of
-  ``pattern_classes.TERNARY_CODES``. Slot order runs along the stored axis
-  direction, which is why a reflection reverses it and why nothing downstream
-  may read the code without canonicalising it through ``PATTERN_CLASS``.
-- Numeric features: ``WINDOW_NUMERIC_NAMES`` in that order, each divided by
-  ``WINDOW_LEN`` so every entry lands in ``[0, 1]`` (§9.3). They are read from
-  the per-code tables of ``pattern_classes`` rather than recounted here, so a
-  window's counts and its pattern class cannot disagree.
-
-Windows are returned in the §7 order ``(native_axis, start_q, start_r)``. The
-identity packing below is monotone in exactly that key, so ``np.unique`` both
-deduplicates the 18-candidate walk and sorts its survivors in one pass, and
-``index_of`` is a binary search on the same key. The packing is bounded rather
-than open-ended: a coordinate outside ``_COORD_LIMIT`` would wrap into another
-window's key and silently merge two distinct windows, so it raises instead.
-
-§9.1's refusal is enforced on every candidate before any scope filter runs. Six
-own or six opponent stones in a line means the game is already over, and a
-terminal position must never reach the trunk; a *full mixed* window is an
-ordinary node and is kept. Both halves matter: refusing the mixed case would
-silently drop legal training positions, and admitting the one-colour case would
-feed the model a state the engine says does not exist.
+Windows are returned in §7 order; ``np.unique`` deduplicates and sorts in one
+pass. §9.1 refuses completed-line windows (six own or six opponent stones).
 """
 
 from __future__ import annotations
@@ -84,26 +60,34 @@ WINDOW_NUMERIC_FEATURES = len(WINDOW_NUMERIC_NAMES)
 if len(_NUMERIC_TABLES) != WINDOW_NUMERIC_FEATURES:
     raise RuntimeError("the window numeric names and their tables disagree in length")
 
-# Coordinate packing. Both components are offset into `0..2 * _COORD_LIMIT` and
-# laid out most-significant first — axis, then q, then r — so the packed key
-# orders identities exactly as §7 does and unpacks by two exact divmods with no
-# sign case. The limit is far beyond the i16 coordinates the engine produces,
-# and a coordinate reaching it is refused rather than wrapped.
-_COORD_LIMIT = 1 << 20
-_COORD_SPAN = 2 * _COORD_LIMIT
+# The coordinate range this representation addresses, and the packing that
+# fixes it. Both components are offset into `0..2 * WINDOW_COORD_LIMIT` and laid
+# out most-significant first — axis, then q, then r — so the packed key orders
+# identities exactly as §7 does and unpacks by two exact divmods with no sign
+# case. A coordinate reaching the limit is refused rather than wrapped.
+#
+# This module's own key addresses 2**30 either way; the binding constraint is
+# §16's device-side window-pair key, which packs a line's offset from the
+# origin by 2**16 into a 2**17 field. A *sum* of two coordinates must stay
+# inside 2**16, which puts each component inside 2**15 — the same int16 range
+# the engine's own move coordinates live in.
+WINDOW_COORD_LIMIT = 1 << 15
+_COORD_SPAN = 2 * WINDOW_COORD_LIMIT
 _AXIS_STRIDE = _COORD_SPAN * _COORD_SPAN
 
 
 def _pack_cells(qr: np.ndarray) -> np.ndarray:
     """Pack an ``(n, 2)`` coordinate array into collision-free int64 keys."""
-    if qr.size and int(np.abs(qr).max()) >= _COORD_LIMIT:
+    if qr.size and int(np.abs(qr).max()) >= WINDOW_COORD_LIMIT:
         flat = int(np.abs(qr).argmax())
         row = flat // 2
         raise ValueError(
             f"coordinate ({int(qr[row, 0])}, {int(qr[row, 1])}) lies outside the "
-            f"+-{_COORD_LIMIT} the identity packing addresses"
+            f"+-{WINDOW_COORD_LIMIT} this representation addresses"
         )
-    return (qr[:, 0] + _COORD_LIMIT) * _COORD_SPAN + (qr[:, 1] + _COORD_LIMIT)
+    return (qr[:, 0] + WINDOW_COORD_LIMIT) * _COORD_SPAN + (
+        qr[:, 1] + WINDOW_COORD_LIMIT
+    )
 
 
 def _pack_identity(window_id: np.ndarray) -> np.ndarray:
@@ -121,7 +105,9 @@ def _unpack_identity(key: np.ndarray) -> np.ndarray:
     """Invert :func:`_pack_identity` into an ``(n, 3)`` identity array."""
     upper, r = np.divmod(key, _COORD_SPAN)
     axis, q = np.divmod(upper, _COORD_SPAN)
-    return np.stack([axis, q - _COORD_LIMIT, r - _COORD_LIMIT], axis=1)
+    return np.stack(
+        [axis, q - WINDOW_COORD_LIMIT, r - WINDOW_COORD_LIMIT], axis=1
+    )
 
 
 def window_cells(window_id: np.ndarray) -> np.ndarray:
@@ -255,11 +241,11 @@ def enumerate_windows(
     and is read only by ``action_relevant``, though its consistency with the
     stones is checked under every scope. The three scopes of §4 are:
 
-    - ``live``: one-colour windows only, the current model's rule;
-    - ``nonempty``: every window with at least one stone, mixed included —
-      the default, and the point of the architecture;
+    - ``live``: one-colour windows only;
+    - ``nonempty``: every window with at least one stone, mixed included
+      (the default);
     - ``action_relevant``: those plus every empty window through a legal cell,
-      which needs the 18-candidate walk over the legal cells as well.
+      via the 18-candidate walk over the legal cells as well.
 
     Raises for a terminal position, for a coordinate outside the packing's
     range, for malformed stone or legal input, and for a scope this module does

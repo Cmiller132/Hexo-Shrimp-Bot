@@ -1,4 +1,4 @@
-//! MantisNet's strict package and session-variant configuration grammars.
+//! Package and session-variant configuration parsing.
 
 use crate::PACKAGE_NAME;
 use hexo_model::PackageError;
@@ -62,9 +62,8 @@ impl VariantFailure {
 
 /// Parse `tau=F,lambda=F[,source=PATH]`.
 ///
-/// Every key is stated exactly once except `source`, which is optional. Fields
-/// may be given in any order. Whitespace is never trimmed, and a repeated key
-/// is an error rather than a last-one-wins rule.
+/// All keys except `source` are required. Fields may appear in any order.
+/// Whitespace is not trimmed, and repeated keys are rejected.
 pub(crate) fn parse_config(config: &str) -> Result<Config, PackageError> {
     let mut tau = None;
     let mut lambda = None;
@@ -118,7 +117,7 @@ pub(crate) fn parse_config(config: &str) -> Result<Config, PackageError> {
     })
 }
 
-/// Parse one exact session variant grammar.
+/// Parse a session variant string into a [`Search`] configuration.
 pub(crate) fn parse_variant(variant: &str) -> Result<Search, PackageError> {
     parse_variant_inner(variant).map_err(|failure| failure.into_package_error(variant))
 }

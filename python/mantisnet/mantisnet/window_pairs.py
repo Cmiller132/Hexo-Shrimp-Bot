@@ -1,55 +1,21 @@
-"""Window-pair relation tables and attention for §5.1c.
+"""Window-pair relation tables and attention for section 5.1c.
 
-Unlike the cell-pass relay tables, these are not collated: a
-``window_attention`` model derives them once per forward on its own device
-from the batch's window identities. The int64 edge views cost several times
-more to ship over PCIe than to derive beside the model, and arms that never
-read them pay nothing. ``pair_tables`` is device-generic — CUDA in the trunk,
-CPU under the oracle tests.
+``pair_tables`` derives the edge set on-device from window identities.
+The edge set is served in three CSR views: by destination (forward, ``dq``),
+by source (``dk``/``dv``), and by class (``dbias``).
 
-Two windows relate in exactly one of two game-mechanical ways, and both are
-functions of the identity triples ``(axis, start_q, start_r)`` alone:
+Relation classes from window identity triples ``(axis, start_q, start_r)``:
 
-- **Colinear** (classes ``0..10``): the same line, signed start offset ``o``.
-  A reflection reverses the line, flipping the sign, so the class is
-  ``|o| - 1`` for ``|o| <= 11`` — overlap at 1..5, a gap of at most five
-  cells at 6..11. Beyond that the spans cannot participate in one forcing
-  sequence, and there is no edge.
-- **Crossing** (classes ``11..46``): two non-parallel hex-axis lines always
-  meet at exactly one lattice cell (every axis-pair determinant is ±1). The
-  relation is where that cell sits in each window's span parameter — slot
-  ``t`` in the destination, ``u`` in the source — including up to five cells
-  beyond an end, mirroring the colinear reach. Each side folds to
-  ``{in0, in1, in2, out1, out2, out3+}``; the class is
-  ``11 + fold(t) * 6 + fold(u)``.
-- **SELF** (class ``47``): one loop per window, so every softmax segment is
-  nonempty.
+- **Colinear** (``0..10``): same line, class ``|offset| - 1``.
+  Overlap at 1..5, gap at 6..11.
+- **Crossing** (``11..46``): non-parallel lines meeting at one cell.
+  Each side folds to ``{in0, in1, in2, out1, out2, out3+}``;
+  class = ``11 + fold(t) * 6 + fold(u)``.  D6-invariant because
+  each side's fold is invariant under line reversal independently.
+- **SELF** (``47``): one loop per window.
 
-D6-invariance of the crossing fold: a board symmetry permutes the three axes
-and may reverse the two lines' slot parameterizations *independently* (a 60°
-rotation maps the axes with mixed direction flips), so an invariant class may
-not couple the two sides' orientations. Reversal maps ``t`` to ``5 - t``,
-which preserves the in-span fold ``min(t, 5 - t)`` and the out-of-span
-distance ``max(-t, t - 5)`` — each side's fold is invariant on its own, and
-the product therefore under every group element.
-
-Edge enumeration is a sorted join, cell-key style: each window claims its 16
-line cells ``t ∈ -5..10``; two windows cross with mutual reach exactly when
-they claim one common cell with different axes, and they do so at exactly one
-cell, so the join yields each directed edge once. Colinear edges join on the
-line key instead. Both joins are per-position by construction (the keys pack
-the position index).
-
-The edge set is served in three CSR views, like the relay's: by destination
-(forward and ``dq``), by source (``dk``/``dv``), and by class (``dbias``).
-The CUDA kernels are flash-style: the forward keeps one destination segment's
-online softmax in registers and saves only the per-``(window, head)`` max and
-denominator; the backward recomputes every per-edge quantity from those stats
-inside deterministic segment sweeps — no atomics, and nothing of size
-``(E, head_dim)`` ever reaches memory. The eager slice composition over the
-destination view is the parity reference and serves CPU tensors and failed
-launches; its CUDA ``index_add_`` accumulation is atomic and nondeterministic,
-which is acceptable for a fallback and wrong for production.
+CUDA: flash-style kernels with online softmax in registers and deterministic
+segment sweeps.  CPU: eager slice composition as parity reference.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-﻿"""Supervised lab-cell fitting through the production model and fit engine."""
+"""Supervised lab-cell fitting through the production model and fit engine."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..builder import MODEL_REPR_VERSION, Batch
-from ..fitloop import FitBudgets, fit_epoch
+from ..builder import MODEL_REPR_VERSION
+from ..fitloop import FitBudgets, fit_epoch, pack_chunks
 from ..klent.train import KlentConfig, _gpu_lock
 from ..losses import policy_loss, value_loss
 from .corpus import FrozenCorpus, SampleSplit, load_corpus
@@ -36,8 +36,10 @@ class TrainConfig:
     batch_size: int = KlentConfig.batch_size
     pair_budget: int = KlentConfig.pair_budget
     cell_budget: int = KlentConfig.cell_budget
+    graph_cell_budget: int = KlentConfig.graph_cell_budget
     collect_pair_budget: int = KlentConfig.collect_pair_budget
     collect_cell_budget: int = KlentConfig.collect_cell_budget
+    collect_graph_cell_budget: int = KlentConfig.collect_graph_cell_budget
     lr: float = KlentConfig.lr
     lr_schedule: str = "constant"
     ema_decay: float = 0.0
@@ -60,8 +62,10 @@ class TrainConfig:
             "batch_size",
             "pair_budget",
             "cell_budget",
+            "graph_cell_budget",
             "collect_pair_budget",
             "collect_cell_budget",
+            "collect_graph_cell_budget",
         ):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
@@ -75,6 +79,24 @@ class TrainConfig:
             raise ValueError(
                 f"ema_decay must be finite and in [0.0, 1.0), got {self.ema_decay}"
             )
+
+    def budgets(self) -> FitBudgets:
+        """The fitting limits this recipe offers a model's ``chunk_cost``."""
+
+        return FitBudgets(
+            pair_budget=self.pair_budget,
+            cell_budget=self.cell_budget,
+            graph_cell_budget=self.graph_cell_budget,
+        )
+
+    def collect_budgets(self) -> FitBudgets:
+        """The no-grad limits validation and evaluation pack under."""
+
+        return FitBudgets(
+            pair_budget=self.collect_pair_budget,
+            cell_budget=self.collect_cell_budget,
+            graph_cell_budget=self.collect_graph_cell_budget,
+        )
 
     def epoch_lr(self, epoch: int) -> float:
         """The learning rate for a 1-based epoch under this recipe."""
@@ -103,15 +125,14 @@ def _as_corpus(corpus: str | os.PathLike[str] | FrozenCorpus) -> FrozenCorpus:
 
 
 def sample_sizes(corpus: FrozenCorpus, samples: SampleSplit) -> tuple[np.ndarray, np.ndarray]:
-    """Return exact attention-row and legal-cell sizes for a frozen split.
+    """Return the stone and legal-cell counts of every sample in a split.
 
-    The corpus format intentionally stores targets rather than representation
-    products.  Packing still needs exact legal widths, so each selected game is
-    replayed once here.  Rust ``collate_prefixes`` remains deferred to each
-    prefetch callback and no batch/tensor is materialized up front.
+    ``chunk_cost`` is written over these two quantities, so packing needs no
+    built graph. The corpus stores targets, not the legal count, so each
+    selected game is replayed once here to recover it.
     """
 
-    lengths = np.asarray(samples.t, dtype=np.int64) + 1
+    stones = np.asarray(samples.t, dtype=np.int64)
     cells = np.empty(len(samples), dtype=np.int64)
     by_game: dict[int, list[tuple[int, int]]] = {}
     for index, (game, t) in enumerate(zip(samples.game, samples.t, strict=True)):
@@ -136,48 +157,35 @@ def sample_sizes(corpus: FrozenCorpus, samples: SampleSplit) -> tuple[np.ndarray
             if pos.is_terminal:
                 raise ValueError(f"corpus sample {index} names terminal game {game} ply {t}")
             cells[index] = len(pos.legal_moves())
-    return lengths, cells
+    return stones, cells
 
 
-def pack_inference_indices(
-    lengths: np.ndarray,
+# A no-grad chunk is capped at this many positions however small they are: the
+# per-position Python in every scoring loop is what the cap bounds, not memory.
+INFERENCE_POSITION_CAP = 256
+
+
+def pack_inference_chunks(
+    model,
+    stones: np.ndarray,
     cells: np.ndarray,
+    budgets: FitBudgets,
     *,
-    pair_budget: int,
-    cell_budget: int,
-    position_cap: int = 256,
+    position_cap: int = INFERENCE_POSITION_CAP,
 ) -> list[list[int]]:
-    """Pack a no-grad pass under the production collect budgets."""
+    """Pack a no-grad pass under ``model``'s own law and the collect budgets.
 
-    if len(lengths) != len(cells):
-        raise ValueError("length and legal-cell arrays must have equal length")
-    if pair_budget <= 0 or cell_budget <= 0 or position_cap <= 0:
-        raise ValueError("inference budgets and position cap must be positive")
-    order = sorted(range(len(lengths)), key=lambda i: -int(lengths[i]))
-    chunks: list[list[int]] = []
-    chunk: list[int] = []
-    max_t = 0
-    n_cells = 0
-    for index in order:
-        t_pad = int(lengths[index])
-        width = int(cells[index])
-        candidate_t = max(max_t, t_pad)
-        if chunk and (
-            len(chunk) == position_cap
-            or (len(chunk) + 1) * candidate_t * candidate_t > pair_budget
-            or n_cells + width > cell_budget
-        ):
-            chunks.append(chunk)
-            chunk = []
-            max_t = 0
-            n_cells = 0
-            candidate_t = t_pad
-        chunk.append(index)
-        max_t = candidate_t
-        n_cells += width
-    if chunk:
-        chunks.append(chunk)
-    return chunks
+    Uses the same packing engine and cost law as fitting; only the limits
+    differ, since a no-grad chunk holds no backward graph.
+    """
+
+    if len(stones) != len(cells):
+        raise ValueError("stone and legal-cell arrays must have equal length")
+    if position_cap <= 0:
+        raise ValueError(f"inference position cap must be positive, got {position_cap}")
+    return pack_chunks(
+        range(len(stones)), position_cap, model.chunk_cost(stones, cells, budgets)
+    )
 
 
 def collate_samples(
@@ -185,7 +193,7 @@ def collate_samples(
     samples: SampleSplit,
     indices: Sequence[int],
     collate,
-) -> tuple[Batch, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[object, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Materialize one supervised chunk on the CPU prefetch worker."""
 
     games = [corpus.moves_for(int(samples.game[index])) for index in indices]
@@ -201,16 +209,22 @@ def collate_samples(
             f"corpus sample {indices[where]} has rank {int(ranks[where])} "
             f"for {int(counts[where])} legal moves"
         )
-    target = torch.zeros(batch.n_cells, dtype=torch.float32)
+    # One target row per legal cell of the chunk, which every representation
+    # states the same way: the last legal offset. It is the only tensor width
+    # the recipe needs from a batch it otherwise never looks inside.
+    target = torch.zeros(int(batch.legal_offsets[-1]), dtype=torch.float32)
     target[batch.legal_offsets[:-1] + ranks] = 1.0
     return batch, target, ranks, z
 
 
-def _supervised_heads(model, batch: Batch):
-    _stones, windows, token = model.trunk(batch)
-    policy, critic = model.cell_head_logits(windows, token, batch)
-    value, _value_dist, value_logits = model.value_head(windows, token, batch)
-    return policy, critic, value, value_logits
+def _supervised_heads(model, batch):
+    """The supervised pass, whichever architecture is being fitted.
+
+    ``supervised_heads`` is the seam analogous to KLENT's ``policy_q``: the
+    recipe holds a corpus, not a representation. The last two return values
+    are ``None`` for an architecture with no state-value head.
+    """
+    return model.supervised_heads(batch)
 
 
 _supervised_heads_compiled = None
@@ -223,10 +237,9 @@ def _supervised_fn(compile_model: bool):
         return _supervised_heads
     with _compile_lock:
         if _supervised_heads_compiled is None:
-            # Packed chunks span tail-to-full sizes and the AOT cache guards
-            # them by size range, so the graph set splits past the stock limit
-            # of 8 â€” after which every new range runs eager for the rest of
-            # the session. The set converges; give it room.
+            # Packed chunks span tail-to-full sizes; the AOT cache splits the
+            # graph by size range past the stock limit of 8, after which new
+            # ranges run eager. Raise the limit so the range set converges.
             torch._dynamo.config.recompile_limit = 64
             _supervised_heads_compiled = torch.compile(_supervised_heads, dynamic=True)
     return _supervised_heads_compiled
@@ -255,7 +268,7 @@ def fit_supervised_epoch(
     samples = frozen.split_samples(split)
     if not len(samples):
         raise ValueError(f"corpus split {split!r} is empty")
-    lengths, cells = sizes if sizes is not None else sample_sizes(frozen, samples)
+    stones, cells = sizes if sizes is not None else sample_sizes(frozen, samples)
     collate = variant_spec(variant).collate
     forward = _supervised_fn(cfg.compile)
     device_type = torch.device(cfg.device).type
@@ -294,26 +307,28 @@ def fit_supervised_epoch(
         critic_ce = -(
             critic_target * F.log_softmax(taken, dim=-1)
         ).sum(dim=-1).mean()
-        state_value_ce = value_loss(value_logits, z)
-        loss = policy_ce + critic_ce + state_value_ce
-        return loss, {
+        loss = policy_ce + critic_ce
+        stats = {
             "policy_loss": policy_ce.detach(),
             "critic_ce": critic_ce.detach(),
-            "value_loss": state_value_ce.detach(),
         }
+        # The state-value term is added only when the architecture has that
+        # head; `critic_ce` above is the action-value critic every
+        # architecture trains.
+        if value_logits is not None:
+            state_value_ce = value_loss(value_logits, z)
+            loss = loss + state_value_ce
+            stats["value_loss"] = state_value_ce.detach()
+        return loss, stats
 
     model.train()
     return fit_epoch(
         model,
         optimizer,
         rng,
-        lengths=lengths,
-        cells=cells,
-        budgets=FitBudgets(
-            batch_size=cfg.batch_size,
-            pair_budget=cfg.pair_budget,
-            cell_budget=cfg.cell_budget,
-        ),
+        sample_count=len(samples),
+        batch_size=cfg.batch_size,
+        cost=model.chunk_cost(stones, cells, cfg.budgets()),
         prepare=prepare,
         step=step,
         lock=_gpu_lock,
@@ -337,13 +352,8 @@ def validate_supervised(
     samples = frozen.split_samples(split)
     if not len(samples):
         raise ValueError(f"corpus split {split!r} is empty")
-    lengths, cells = sizes if sizes is not None else sample_sizes(frozen, samples)
-    chunks = pack_inference_indices(
-        lengths,
-        cells,
-        pair_budget=cfg.collect_pair_budget,
-        cell_budget=cfg.collect_cell_budget,
-    )
+    stones, cells = sizes if sizes is not None else sample_sizes(frozen, samples)
+    chunks = pack_inference_chunks(model, stones, cells, cfg.collect_budgets())
     collate = variant_spec(variant).collate
     forward = _supervised_fn(cfg.compile)
     device_type = torch.device(cfg.device).type
@@ -365,20 +375,20 @@ def validate_supervised(
         offsets = batch.legal_offsets.cpu().tolist()
         ranks_cpu = ranks.cpu().tolist()
         policy_cpu = policy.float().cpu()
-        value_cpu = value.float().cpu()
-        z_cpu = z.cpu()
         for row in range(len(indices)):
             lo, hi = offsets[row], offsets[row + 1]
             correct += int(int(policy_cpu[lo:hi].argmax()) == ranks_cpu[row])
-        sign_correct += int((torch.sign(value_cpu) == z_cpu).sum())
-        absolute_error += float((value_cpu - z_cpu).abs().sum())
+        if value is not None:
+            value_cpu = value.float().cpu()
+            z_cpu = z.cpu()
+            sign_correct += int((torch.sign(value_cpu) == z_cpu).sum())
+            absolute_error += float((value_cpu - z_cpu).abs().sum())
     n = len(samples)
-    return {
-        "samples": n,
-        "imitation_top1": correct / n,
-        "value_sign_accuracy": sign_correct / n,
-        "value_mae": absolute_error / n,
-    }
+    metrics: dict[str, float | int] = {"samples": n, "imitation_top1": correct / n}
+    if model.has_state_value_head:
+        metrics["value_sign_accuracy"] = sign_correct / n
+        metrics["value_mae"] = absolute_error / n
+    return metrics
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -424,17 +434,19 @@ def train_cell(
     ema_decay: float | None = None,
     device: str | None = None,
     compile: bool | None = None,
+    batch_size: int | None = None,
     cell_budget: int | None = None,
+    graph_cell_budget: int | None = None,
     param_budget: int | None = None,
     param_tol: float = 0.02,
     progress=None,
 ):
     """Train one fresh variant/seed cell and write its complete artifacts.
 
-    ``cell_budget`` caps the accumulation micro-chunks, not the optimizer
-    batch: gradients are summed over the same samples either way, so it is
-    an execution/memory knob, not a recipe change. Window-heavy arms use it
-    to keep their edge tables resident instead of paging.
+    ``cell_budget`` and ``graph_cell_budget`` cap accumulation micro-chunks
+    (an execution/memory knob, not the optimizer batch), one per
+    architecture's binding quantity. ``batch_size`` is the effective
+    optimizer batch and does change the recipe.
     """
 
     cfg = config or TrainConfig()
@@ -450,8 +462,12 @@ def train_cell(
         updates["autocast"] = torch.device(device).type == "cuda"
     if compile is not None:
         updates["compile"] = compile
+    if batch_size is not None:
+        updates["batch_size"] = batch_size
     if cell_budget is not None:
         updates["cell_budget"] = cell_budget
+    if graph_cell_budget is not None:
+        updates["graph_cell_budget"] = graph_cell_budget
     cfg = TrainConfig(**updates)
     frozen = _as_corpus(corpus)
 
@@ -487,7 +503,13 @@ def train_cell(
         "recipe": {
             **asdict(cfg),
             "optimizer": "Adam",
-            "loss_weights": {"policy": 1.0, "critic": 1.0, "state_value": 1.0},
+            # Every term this architecture trains, at equal weight; state_value
+            # present only when the model has that head.
+            "loss_weights": {
+                "policy": 1.0,
+                "critic": 1.0,
+                **({"state_value": 1.0} if model.has_state_value_head else {}),
+            },
         },
         "seed": seed,
         "versions": versions,

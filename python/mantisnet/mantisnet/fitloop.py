@@ -1,66 +1,83 @@
 """Shared packed fitting machinery for production and lab training.
 
-The engine owns only epoch mechanics: memory-budget packing, optimizer
-grouping, pipelined CPU preparation, sample-weighted accumulation, and the
-post-step parameter check. Callers own batch construction and their loss.
+The engine owns only epoch mechanics: the packing loop, optimizer grouping,
+pipelined CPU preparation, sample-weighted accumulation, and the post-step
+parameter check. Callers own batch construction, their loss, and — through
+:class:`ChunkCost` — what a chunk of their architecture costs.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Protocol, runtime_checkable
 
 import numpy as np
 import torch
 
-# Chunks prepared concurrently ahead of consumption. The GPU step outpaces a
-# single preparation worker, so the pipeline holds a few chunks in flight;
-# consumption order is fixed by the packed permutation either way.
-_PREFETCH_DEPTH = 4
+# Concurrent preparation workers and queue depth for chunk prefetching.
+_PREFETCH_DEPTH = 2
 
 
 @dataclass(frozen=True)
 class FitBudgets:
-    """Limits for one forward chunk and one accumulated optimizer group."""
+    """Memory limits the trainer offers a model's ``chunk_cost``.
 
-    batch_size: int
+    Each architecture reads the limits that name its binding quantities.
+
+    ``pair_budget``
+        Padded stone-attention pairs (quadratic in longest position).
+    ``cell_budget``
+        Decoder rows, one per legal cell.
+    ``graph_cell_budget``
+        Graph cells plus occupied cells (ACT's additive limit, §26).
+    """
+
     pair_budget: int
     cell_budget: int
+    graph_cell_budget: int
 
 
-def pack_chunks(
-    lengths,
-    cells,
-    order,
-    budgets: FitBudgets,
-) -> list[list[int]]:
-    """Pack indices under the position, padded-pair, and legal-cell limits.
+@runtime_checkable
+class ChunkCost(Protocol):
+    """What binds one forward chunk, for one architecture.
 
-    ``lengths[i]`` is the padded attention width of sample ``i``. The stable
-    descending sort preserves ``order`` within equal lengths, making that
-    order the packing tie-breaker. An indivisible sample that exceeds either
-    memory budget is retained as a singleton.
+    ``open`` starts an empty chunk, ``accepts`` asks whether one more sample
+    fits beside ``size`` already taken, and ``take`` records it.  A sample
+    that fits in no chunk is kept as a singleton.
     """
-    idx = sorted(order, key=lambda i: lengths[i], reverse=True)
+
+    def sort_key(self, index: int) -> int:
+        """The descending pack order key; equal keys keep the caller's order."""
+
+    def open(self) -> None:
+        """Begin a fresh chunk."""
+
+    def accepts(self, index: int, size: int) -> bool:
+        """Whether ``index`` fits beside the ``size`` samples already taken."""
+
+    def take(self, index: int) -> None:
+        """Record ``index`` as part of the open chunk."""
+
+
+def pack_chunks(order, batch_size: int, cost: ChunkCost) -> list[list[int]]:
+    """Pack indices under the position cap and ``cost``'s memory limits.
+
+    The stable descending sort by ``cost.sort_key`` preserves ``order`` within
+    equal keys, making that order the packing tie-breaker. An indivisible
+    sample that exceeds a memory limit on its own is retained as a singleton.
+    """
+    idx = sorted(order, key=cost.sort_key, reverse=True)
     chunks: list[list[int]] = []
     chunk: list[int] = []
-    chunk_length, chunk_cells = 0, 0
+    cost.open()
     for i in idx:
-        length = lengths[i]
-        cell_count = cells[i]
-        if chunk and (
-            len(chunk) == budgets.batch_size
-            or (len(chunk) + 1) * chunk_length * chunk_length
-            > budgets.pair_budget
-            or chunk_cells + cell_count > budgets.cell_budget
-        ):
+        if chunk and (len(chunk) == batch_size or not cost.accepts(i, len(chunk))):
             chunks.append(chunk)
-            chunk, chunk_cells = [], 0
-        if not chunk:
-            chunk_length = length
+            chunk = []
+            cost.open()
         chunk.append(int(i))
-        chunk_cells += cell_count
+        cost.take(i)
     if chunk:
         chunks.append(chunk)
     return chunks
@@ -89,9 +106,9 @@ def fit_epoch(
     optimizer,
     rng: np.random.Generator,
     *,
-    lengths,
-    cells,
-    budgets: FitBudgets,
+    sample_count: int,
+    batch_size: int,
+    cost: ChunkCost,
     prepare: Callable[[list[int]], object],
     step: Callable[[object], tuple[torch.Tensor, dict[str, torch.Tensor]]],
     lock,
@@ -99,23 +116,12 @@ def fit_epoch(
 ) -> dict[str, float | int]:
     """Fit one packed epoch and return sample-weighted statistic means.
 
-    ``prepare(indices)`` must be pure; it runs on the prefetch workers, up to
-    ``_PREFETCH_DEPTH`` chunks ahead of consumption. ``step(payload)`` runs
-    under ``lock`` and returns a per-sample-mean differentiable loss plus
-    detached scalar statistics. The engine scales each chunk's loss by its
-    fraction of the optimizer group before backpropagating.
-
-    RNG consumption is exactly two permutations: samples before packing, then
-    packed chunks before grouping. ``progress(consumed, total)`` is called
-    after every consumed chunk.
+    ``prepare(indices)`` runs on prefetch workers and must be pure.
+    ``step(payload)`` runs under ``lock`` and returns ``(loss, stats_dict)``.
+    ``progress(consumed, total)`` is called after every consumed chunk.
     """
     model.train()
-    chunks = pack_chunks(
-        lengths,
-        cells,
-        rng.permutation(len(lengths)),
-        budgets,
-    )
+    chunks = pack_chunks(rng.permutation(sample_count), batch_size, cost)
 
     groups: list[tuple[list[int], int]] = []
     group: list[int] = []
@@ -123,7 +129,7 @@ def fit_epoch(
     for k in rng.permutation(len(chunks)):
         group.append(int(k))
         count += len(chunks[k])
-        if count >= budgets.batch_size:
+        if count >= batch_size:
             groups.append((group, count))
             group, count = [], 0
     if group:
@@ -164,10 +170,7 @@ def fit_epoch(
             total += group_n
 
     if total == 0:
-        # Preserve the production fit's historical empty-buffer refusal. It
-        # previously failed while dividing its named metric totals by zero;
-        # returning a partial {"fit_steps": 0} result would violate fit's
-        # public four-key metric contract.
+        # Empty buffer: refuse rather than divide by zero.
         raise ZeroDivisionError("float division by zero")
     result: dict[str, float | int] = {
         name: float(value) / total for name, value in stat_sums.items()

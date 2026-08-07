@@ -17,10 +17,10 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from ..builder import collate_prefixes
 from ..fitloop import FitBudgets, fit_epoch, pack_chunks
 from ..losses import policy_loss
 from ..model import compose_acting_q, compose_q
+from ..models.mantis_act import ACT_GRAPH_CELL_BUDGET
 from .selfplay import Collector, Sample, collection_stats
 
 
@@ -48,25 +48,19 @@ class KlentConfig:
     device: str = "cpu"
     autocast: bool = False  # bf16 autocast for the network passes
     compile: bool = False  # torch.compile the policy/Q pass (one-time cost)
-    # Every network batch is packed under attention-pair and legal-cell budgets.
-    # Attention memory is quadratic in the batch's longest position (padding),
-    # decoder memory linear in its total legal cells. Fit and collection get
-    # separate budgets because fit holds the backward graph per cell while
-    # collection runs no_grad. Both allocations may be resident concurrently.
-    pair_budget: int = 8_000_000  # fit: padded (stones + token)^2 pairs per batch
-    cell_budget: int = 800_000  # fit: legal cells (decoder rows) per batch
-    collect_pair_budget: int = 24_000_000  # collection (no_grad) equivalents
+    # Memory budgets for batch packing; fit and collection are separate
+    # because fit holds the backward graph.
+    pair_budget: int = 8_000_000  # fit: padded (stones + token)^2 pairs
+    cell_budget: int = 800_000  # fit: legal cells (decoder rows)
+    graph_cell_budget: int = ACT_GRAPH_CELL_BUDGET  # fit: ACT graph cells
+    collect_pair_budget: int = 24_000_000  # collection (no_grad)
     collect_cell_budget: int = 2_400_000
+    collect_graph_cell_budget: int = 3 * ACT_GRAPH_CELL_BUDGET
 
 
 def _policy_q(model, batch):
-    """The KLENT pass: trunk + the two heads it trains, never the value head.
-
-    It returns policy logits and the critic's raw categorical logits. The
-    fitter scores the taken row; acting composes both Q roles outside.
-    """
-    _s, w, g = model.trunk(batch)
-    return model.cell_head_logits(w, g, batch)
+    """The KLENT pass: policy logits and critic categorical logits."""
+    return model.policy_q(batch)
 
 
 # One symbolic-shape graph serves every batch; compiled lazily, shared by
@@ -82,16 +76,15 @@ def _policy_q_fn(cfg: KlentConfig):
     if not cfg.compile:
         return _policy_q
     if _policy_q_compiled is None:
-        # Same room as the supervised compile helper: budget-packed chunks
-        # split into more size-range graphs than the stock limit of 8.
+        # Budget-packed chunks produce more size-range graphs than the default.
         torch._dynamo.config.recompile_limit = 64
         _policy_q_compiled = torch.compile(_policy_q, dynamic=True)
     return _policy_q_compiled
 
 
 def network_evaluate(model, cfg: KlentConfig):
-    """The self-play evaluator, returning flat CPU tensors so the collection
-    loop stays device-ignorant: policy logits, acting score, and action value."""
+    """Self-play evaluator returning flat CPU tensors: policy logits, acting
+    score, and action value."""
     policy_q = _policy_q_fn(cfg)
 
     def evaluate(batch):
@@ -99,8 +92,7 @@ def network_evaluate(model, cfg: KlentConfig):
             b = batch.to(cfg.device)
             with torch.no_grad(), torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
                 policy, critic_logits = policy_q(model, b)
-            # Composition is fp32 and outside autocast, so neither Q role
-            # depends on autocast precision.
+            # Q composition runs in fp32, outside autocast.
             return (
                 policy.float().cpu(),
                 compose_acting_q(
@@ -112,13 +104,14 @@ def network_evaluate(model, cfg: KlentConfig):
     return evaluate
 
 
-def _rebuild(samples: list[Sample]):
-    """Rebuild buffered move prefixes in parallel into one batch.
+def _rebuild(model, samples: list[Sample]):
+    """Rebuild buffered move prefixes into one batch of ``model``'s input.
 
-    Each stored π′ length must equal its replayed position's legal count
-    (``KLENT_FOR_HEXO.md`` §4.3).
+    Each stored pi' length must equal its replayed position's legal count.
     """
-    batch = collate_prefixes([s.moves for s in samples], [s.t for s in samples])
+    batch = model.collate_prefixes(
+        [s.moves for s in samples], [s.t for s in samples]
+    )
     counts = (batch.legal_offsets[1:] - batch.legal_offsets[:-1]).tolist()
     for s, count in zip(samples, counts):
         if count != len(s.improved):
@@ -129,14 +122,27 @@ def _rebuild(samples: list[Sample]):
     return batch
 
 
-def _pack(samples: list[Sample], order, cfg: KlentConfig) -> list[list[int]]:
-    """Compatibility wrapper for the shared fit-loop packer."""
-    return pack_chunks(
-        [s.t + 1 for s in samples],
-        [len(s.improved) for s in samples],
-        order,
-        FitBudgets(cfg.batch_size, cfg.pair_budget, cfg.cell_budget),
+def _budgets(cfg: KlentConfig) -> FitBudgets:
+    """The fitting limits this run offers, whichever architecture reads them."""
+    return FitBudgets(
+        pair_budget=cfg.pair_budget,
+        cell_budget=cfg.cell_budget,
+        graph_cell_budget=cfg.graph_cell_budget,
     )
+
+
+def _chunk_cost(model, samples: list[Sample], cfg: KlentConfig):
+    """``model``'s packing law over this buffer's stone and legal counts."""
+    return model.chunk_cost(
+        [s.t for s in samples],
+        [len(s.improved) for s in samples],
+        _budgets(cfg),
+    )
+
+
+def _pack(model, samples: list[Sample], order, cfg: KlentConfig) -> list[list[int]]:
+    """The chunks one epoch over ``samples`` would fit, in packing order."""
+    return pack_chunks(order, cfg.batch_size, _chunk_cost(model, samples, cfg))
 
 
 def fit(
@@ -150,18 +156,13 @@ def fit(
     """Fit one epoch over the buffer.
 
     ``progress(consumed, chunks)`` is called after each consumed chunk.
-
-    The memory budgets cap what one forward may hold, so chunks accumulate
-    sample-weighted gradients until at least ``batch_size`` samples have
-    contributed and the optimizer steps once. Each accumulated gradient is
-    the mean over its group. Chunk preparation runs pipelined ahead, and loss
-    totals remain on-device until the returned sample-weighted means are read."""
+    """
     model.train()
     policy_q = _policy_q_fn(cfg)
 
     def prep(indices: list[int]):
         chunk = [samples[i] for i in indices]
-        batch = _rebuild(chunk)
+        batch = _rebuild(model, chunk)
         target = torch.from_numpy(np.concatenate([s.improved for s in chunk]))
         ranks = torch.tensor([s.rank for s in chunk])
         returns = torch.tensor([s.g for s in chunk], dtype=torch.float32)
@@ -209,9 +210,9 @@ def fit(
         model,
         optimizer,
         rng,
-        lengths=[s.t + 1 for s in samples],
-        cells=[len(s.improved) for s in samples],
-        budgets=FitBudgets(cfg.batch_size, cfg.pair_budget, cfg.cell_budget),
+        sample_count=len(samples),
+        batch_size=cfg.batch_size,
+        cost=_chunk_cost(model, samples, cfg),
         prepare=prep,
         step=fit_step,
         lock=_gpu_lock,
@@ -222,12 +223,10 @@ def fit(
 def collect_episodes(
     model, collector: Collector, cfg: KlentConfig, progress=None
 ) -> tuple[list, dict]:
-    """One iteration's corpus: episodes plus the
-    ``KLENT_FOR_HEXO.md`` §8 collection metrics.
+    """Collect one iteration's episodes and section 8 metrics.
 
-    It consumes only the collector's RNG and mutates only collector slots, so
-    it may run on a worker against a weight snapshot. ``progress`` is called
-    once per collector step."""
+    ``progress`` is called once per collector step.
+    """
     model.eval()
     episodes, metrics = collector.collect(
         network_evaluate(model, cfg), cfg.games_per_iteration, progress

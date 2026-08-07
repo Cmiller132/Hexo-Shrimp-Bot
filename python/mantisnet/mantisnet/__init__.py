@@ -1,10 +1,4 @@
-"""MantisNet: the stone/window graph network of ``docs/MODEL_SPEC.md``.
-
-The shared Rust encoder owns the representation and ``MODEL_REPR_VERSION``;
-this package's Python builder is its independent parity reference. The model
-owns the weights, the losses define raw-head targets, and the Python-free
-container package owns improved evaluation and sessions.
-"""
+"""MantisNet: the stone/window graph network for Hexo."""
 
 from .builder import (
     DEC_CLASSES,

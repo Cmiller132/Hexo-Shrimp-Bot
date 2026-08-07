@@ -94,15 +94,13 @@ impl Error for ImprovementError {}
 
 /// Apply the KLENT closed-form policy improvement to one position.
 ///
-/// The calculation is performed in `f32`, in the same operation order as
-/// `mantisnet.klent.improve.improved_policy`:
-///
 /// `pi_prime(a) proportional to exp((Q(a) + tau * log pi(a)) / (tau + lambda))`
 ///
 /// `v_hat = sum_a pi_prime(a) * Q(a)`
 ///
-/// Both input slices use canonical legal-action order. The returned
-/// probabilities preserve that order.
+/// Computed in `f32` in the same operation order as
+/// `mantisnet.klent.improve.improved_policy`. Both input slices and the
+/// returned probabilities use canonical legal-action order.
 pub fn improve_policy(
     policy_logits: &[f32],
     q_values: &[f32],
@@ -168,8 +166,8 @@ pub fn improve_policy(
     if !v_hat.is_finite() {
         return Err(ImprovementError::NumericalFailure);
     }
-    // Sequential f32 accumulation of a convex combination can overshoot
-    // [-1, 1] by a few ulps, so clamp to Evaluation's exact interval.
+    // f32 accumulation can overshoot [-1, 1] by a few ulps; clamp to the
+    // Evaluation interval.
     let v_hat = v_hat.clamp(-1.0, 1.0);
 
     Ok(ImprovedPolicy { pi_prime, v_hat })

@@ -105,7 +105,7 @@ def oracle_live_windows(pos: hexo_py.Position) -> dict[tuple[int, int, int], tup
     to (colour relative to the mover, occupancy mask).
 
     The builder does not call ``windows_through``, so this is the independent
-    oracle required by MODEL_SPEC §12.1.
+    oracle for window enumeration parity.
     """
     mover = pos.current_player
     live: dict[tuple[int, int, int], tuple[int, int]] = {}

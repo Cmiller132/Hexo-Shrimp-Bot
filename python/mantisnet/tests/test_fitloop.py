@@ -6,7 +6,29 @@ import numpy as np
 import pytest
 import torch
 
-from mantisnet.fitloop import FitBudgets, fit_epoch, pack_chunks
+from mantisnet.builder import PaddedPairChunkCost
+from mantisnet.fitloop import ChunkCost, fit_epoch, pack_chunks
+
+
+class _UnitCost:
+    """One unit per sample: the loop's tests are about the loop, not a law."""
+
+    def __init__(self, count: int, limit: int) -> None:
+        self._count = count
+        self._limit = limit
+        self._taken = 0
+
+    def sort_key(self, index: int) -> int:
+        return 0
+
+    def open(self) -> None:
+        self._taken = 0
+
+    def accepts(self, index: int, size: int) -> bool:
+        return self._taken + 1 <= self._limit
+
+    def take(self, index: int) -> None:
+        self._taken += 1
 
 
 class _ScalarModel(torch.nn.Module):
@@ -31,20 +53,48 @@ class _ObservedLock:
 def test_packing_respects_all_limits_and_keeps_oversized_singletons():
     lengths = [11, 5, 5, 5, 4, 4, 4, 4]
     cells = [1, 7, 4, 2, 2, 2, 2, 2]
-    budgets = FitBudgets(batch_size=3, pair_budget=100, cell_budget=6)
+    batch_size, pair_budget, cell_budget = 3, 100, 6
+    cost = PaddedPairChunkCost(lengths, cells, pair_budget, cell_budget)
 
-    chunks = pack_chunks(lengths, cells, range(len(lengths)), budgets)
+    chunks = pack_chunks(range(len(lengths)), batch_size, cost)
 
+    assert isinstance(cost, ChunkCost)
     assert chunks == [[0], [1], [2, 3], [4, 5, 6], [7]]
     assert sorted(i for chunk in chunks for i in chunk) == list(range(len(lengths)))
     assert chunks[0] == [0]  # individually over the pair budget
     assert chunks[1] == [1]  # individually over the cell budget
     for chunk in chunks:
-        assert len(chunk) <= budgets.batch_size
+        assert len(chunk) <= batch_size
         if len(chunk) > 1:
             width = max(lengths[i] for i in chunk)
-            assert len(chunk) * width * width <= budgets.pair_budget
-            assert sum(cells[i] for i in chunk) <= budgets.cell_budget
+            assert len(chunk) * width * width <= pair_budget
+            assert sum(cells[i] for i in chunk) <= cell_budget
+
+
+def test_packing_is_the_costs_law_and_nothing_of_the_packers_own():
+    """A cost with no memory term packs by the position cap alone.
+
+    The loop owns the position cap, the deterministic descending order, and the
+    singleton rule; every other limit is the architecture's. A cost that always
+    accepts must therefore produce exactly ``batch_size``-sized chunks, which no
+    padded-pair or graph-cell term is left in the packer to shorten.
+    """
+
+    class _Boundless:
+        def sort_key(self, index):
+            return 0
+
+        def open(self):
+            pass
+
+        def accepts(self, index, size):
+            return True
+
+        def take(self, index):
+            pass
+
+    chunks = pack_chunks(range(7), 3, _Boundless())
+    assert chunks == [[0, 1, 2], [3, 4, 5], [6]]
 
 
 def test_groups_reach_batch_size_and_use_sample_weighted_means():
@@ -83,9 +133,9 @@ def test_groups_reach_batch_size_and_use_sample_weighted_means():
         model,
         optimizer,
         np.random.default_rng(14),
-        lengths=[1] * len(values),
-        cells=[2] * len(values),
-        budgets=FitBudgets(batch_size=5, pair_budget=1_000, cell_budget=6),
+        sample_count=len(values),
+        batch_size=5,
+        cost=_UnitCost(len(values), 3),
         prepare=prepare,
         step=step,
         lock=lock,
@@ -123,9 +173,9 @@ def test_nonfinite_refusal_names_the_optimizer_step_and_parameter():
             model,
             NonfiniteOptimizer(),
             np.random.default_rng(0),
-            lengths=[1],
-            cells=[1],
-            budgets=FitBudgets(batch_size=1, pair_budget=1, cell_budget=1),
+            sample_count=1,
+            batch_size=1,
+            cost=_UnitCost(1, 1),
             prepare=lambda indices: indices,
             step=lambda _payload: (model.weight.square(), {}),
             lock=lock,
@@ -160,17 +210,20 @@ def test_rng_consumes_sample_then_chunk_permutations_only():
         model,
         optimizer,
         rng,
-        lengths=[5, 5, 4, 4, 3, 3, 2, 2],
-        cells=[1] * 8,
-        budgets=FitBudgets(batch_size=3, pair_budget=1_000, cell_budget=1_000),
+        sample_count=8,
+        batch_size=3,
+        cost=PaddedPairChunkCost([5, 5, 4, 4, 3, 3, 2, 2], [1] * 8, 1_000, 1_000),
         prepare=prepare,
         step=lambda _payload: (model.weight * 0.0, {}),
         lock=_ObservedLock(),
     )
 
     # Stable descending packing after the first fixed permutation gives
-    # [[0, 1, 3], [2, 4, 5], [7, 6]]; the second permutation is [2, 0, 1].
-    assert prepared == [[7, 6], [0, 1, 3], [2, 4, 5]]
+    # [[0, 1, 3], [2, 4, 5], [7, 6]]; the second permutation [2, 0, 1] submits
+    # them in consumption order. Which chunks exist is the packing contract;
+    # the order `prepare`'s calls land in is not one, because all three are
+    # submitted at once to a `_PREFETCH_DEPTH`-wide pool and run concurrently.
+    assert sorted(prepared) == [[0, 1, 3], [2, 4, 5], [7, 6]]
     assert rng.calls == [8, 3]
     assert rng.outputs == []
 
@@ -183,9 +236,9 @@ def test_empty_epoch_preserves_the_production_fit_refusal():
             model,
             optimizer,
             np.random.default_rng(0),
-            lengths=[],
-            cells=[],
-            budgets=FitBudgets(batch_size=1, pair_budget=1, cell_budget=1),
+            sample_count=0,
+            batch_size=1,
+            cost=_UnitCost(0, 1),
             prepare=lambda indices: indices,
             step=lambda _payload: (model.weight * 0.0, {}),
             lock=_ObservedLock(),

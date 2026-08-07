@@ -31,7 +31,7 @@ from mantisnet.models.mantis_act.messages import (
     TypedEdges,
     adjacency_edges,
     adjacency_relation_id,
-    aggregate_by_destination,
+    attention_by_destination,
     incidence_edges,
     radius_edges,
     radius_relation_count,
@@ -85,6 +85,10 @@ def batch(**overrides) -> PackedACTBatch:
         legal_to_cell_index=_long(2, 3),
         window_pattern_class=_long(12, 7),
         window_status=_long(3, 1),
+        # The identities agree with `window_axis` in their leading column, which
+        # is what `ACTGraph._check_consistency` holds a real graph to, and the
+        # two lines cross so §16's join has both class families to find.
+        window_id=torch.tensor([[0, 0, 0], [2, 2, 1]], dtype=torch.long),
         window_axis=_long(0, 2),
         window_numeric=torch.zeros(N_WINDOWS, 3),
         window_cell_index=window_cell_index,
@@ -92,13 +96,16 @@ def batch(**overrides) -> PackedACTBatch:
             [[5, 9, 11, -1, -1, -1], [2, 7, -1, -1, -1, -1]], dtype=torch.long
         ),
         window_incidence_mask=window_cell_index >= 0,
-        adjacency_src=_long(0, 1, 1, 2),
-        adjacency_dst=_long(1, 0, 2, 1),
+        # Both edge families are in §7's (dst, src, relation) order, which is
+        # what `_check_ordering` fixes for every graph the packer collates and
+        # what `dst_sorted=True` rests on.
+        adjacency_src=_long(1, 0, 2, 1),
+        adjacency_dst=_long(0, 1, 1, 2),
         adjacency_axis=_long(0, 0, 1, 1),
-        radius_src=_long(0, 1, 4, 0, 4),
-        radius_dst=_long(2, 2, 3, 3, 1),
-        radius_orbit=_long(0, 3, 7, 1, 2),
-        radius_axis_or_neg1=_long(0, -1, 2, -1, 1),
+        radius_src=_long(4, 0, 1, 0, 4),
+        radius_dst=_long(1, 2, 2, 3, 3),
+        radius_orbit=_long(2, 0, 3, 1, 7),
+        radius_axis_or_neg1=_long(1, 0, -1, -1, 2),
         action_window_index=torch.zeros(N_LEGAL, NUM_AXES, 6, dtype=torch.long),
         action_post1_class=torch.zeros(N_LEGAL, NUM_AXES, 6, dtype=torch.long),
         action_pre_status=torch.zeros(N_LEGAL, NUM_AXES, 6, dtype=torch.long),
@@ -106,13 +113,21 @@ def batch(**overrides) -> PackedACTBatch:
         phase_id=_long(2),
         moves_remaining=_long(1),
         global_numeric=torch.zeros(1, 8),
+        radius_orbit_bound=8,
     )
     fields.update(overrides)
     return PackedACTBatch(**fields)
 
 
 def edge_set(name: str = "edges", **overrides) -> TypedEdges:
-    """A four-edge family over five sources and three destinations."""
+    """A four-edge family over five sources and three destinations.
+
+    The two structural flags are measured off the hand-built columns unless a
+    case states them, because here the columns *are* the fixture: production
+    families take them from §7 and from the packer's bounds, and
+    `test_the_structural_flags_describe_the_families_they_travel_with` is what
+    holds those declarations to the data.
+    """
     fields = dict(
         src=_long(0, 1, 1, 4),
         dst=_long(0, 0, 2, 2),
@@ -124,6 +139,11 @@ def edge_set(name: str = "edges", **overrides) -> TypedEdges:
         name=name,
     )
     fields.update(overrides)
+    dst, axis = fields["dst"], fields["axis"]
+    fields.setdefault("dst_sorted", bool((dst[1:] >= dst[:-1]).all()))
+    fields.setdefault(
+        "fully_routed", axis is None or bool((axis >= 0).all())
+    )
     return TypedEdges(**fields)
 
 
@@ -156,14 +176,16 @@ SHIFT = 4.0
 def expose_aggregate(message: RelationGatedMessage) -> None:
     """Make ``forward`` return the §14 aggregate itself.
 
-    ``update([LN(dst), agg]) = out(act(lin_a(LN(dst)) + lin_b(agg)))``, so
-    zeroing ``lin_a``'s matrix and setting its bias to ``SHIFT``, both other
-    matrices to the identity, and ``out``'s bias to ``-SHIFT`` leaves
-    ``act(agg + SHIFT) - SHIFT``, which is ``agg`` wherever ``agg > -SHIFT``
-    and the activation is the identity on its positive half. The model's own
-    LayerScale is set to one for the same reason. Only ReLU is exactly the
-    identity there, so a module built with another activation is refused
-    rather than silently measured through a curve.
+    ``update([LN(dst), agg]) = out(act(lin_in([LN(dst); agg])))``, and
+    ``lin_in``'s matrix splits by its input into a destination half and an
+    aggregate half. Zeroing the destination half, setting the bias to
+    ``SHIFT``, the aggregate half and ``out``'s matrix to the identity, and
+    ``out``'s bias to ``-SHIFT`` leaves ``act(agg + SHIFT) - SHIFT``, which is
+    ``agg`` wherever ``agg > -SHIFT`` and the activation is the identity on its
+    positive half. The model's own LayerScale is set to one for the same
+    reason. Only ReLU is exactly the identity there, so a module built with
+    another activation is refused rather than silently measured through a
+    curve.
     """
     if not isinstance(message.update_inv.act, nn.ReLU):
         raise TypeError(
@@ -179,9 +201,9 @@ def expose_aggregate(message: RelationGatedMessage) -> None:
                 else []
             ),
         ):
-            update.lin_a.weight.zero_()
-            update.lin_a.bias.fill_(SHIFT)
-            update.lin_b.weight.copy_(torch.eye(width))
+            update.lin_in.weight[:, : update.d_a].zero_()
+            update.lin_in.weight[:, update.d_a :].copy_(torch.eye(width))
+            update.lin_in.bias.fill_(SHIFT)
             update.out.weight.copy_(torch.eye(width))
             update.out.bias.fill_(-SHIFT)
             scale.gamma.fill_(1.0)
@@ -379,40 +401,25 @@ def test_axis_channels_permute_with_the_routes():
 
 
 # --------------------------------------------------------------------------
-# The three reductions of §14
+# §14's attention reduction — the one reduction with an explicit per-edge tensor
 
 
-def test_sum_counts_incidences_and_mean_does_not():
-    """§14: sum is the default because the number of edges is signal."""
-    messages = torch.arange(12.0).reshape(4, 3)
-    index = _long(0, 0, 0, 1)
-    total = aggregate_by_destination(messages, index, 2, reduce="sum")
-    mean = aggregate_by_destination(messages, index, 2, reduce="mean")
-
-    torch.testing.assert_close(total[0], messages[:3].sum(dim=0))
-    torch.testing.assert_close(mean[0], messages[:3].mean(dim=0))
-    torch.testing.assert_close(total[1], mean[1])
-    assert not torch.allclose(total[0], mean[0])
-
-
-def test_an_empty_destination_reduces_to_zero_under_every_mode():
+def test_an_empty_destination_attends_to_nothing_and_reads_zero():
     messages = torch.arange(6.0).reshape(2, 3)
     index = _long(1, 1)
-    score = torch.tensor([0.5, -0.5])
-    for reduce, kwargs in (("sum", {}), ("mean", {}), ("attention", {"score": score})):
-        out = aggregate_by_destination(messages, index, 3, reduce=reduce, **kwargs)
-        assert torch.all(out[0] == 0.0), reduce
-        assert torch.all(out[2] == 0.0), reduce
+    out = attention_by_destination(messages, index, 3, torch.tensor([0.5, -0.5]))
+    assert torch.all(out[0] == 0.0)
+    assert torch.all(out[2] == 0.0)
 
 
 def test_uniform_attention_is_the_mean():
+    """Equal scores give equal weights, so the read is each segment's mean."""
     messages = torch.randn(6, 4, generator=torch.Generator().manual_seed(7))
     index = _long(0, 0, 0, 1, 1, 2)
-    mean = aggregate_by_destination(messages, index, 3, reduce="mean")
-    attention = aggregate_by_destination(
-        messages, index, 3, reduce="attention", score=torch.zeros(6)
-    )
-    torch.testing.assert_close(attention, mean)
+    attention = attention_by_destination(messages, index, 3, torch.zeros(6))
+    torch.testing.assert_close(attention[0], messages[:3].mean(dim=0))
+    torch.testing.assert_close(attention[1], messages[3:5].mean(dim=0))
+    torch.testing.assert_close(attention[2], messages[5])
 
 
 def test_attention_weights_normalise_within_a_destination():
@@ -422,24 +429,6 @@ def test_attention_weights_normalise_within_a_destination():
     assert weights.dtype == torch.float32
     torch.testing.assert_close(weights[:2].sum(), torch.tensor(1.0))
     torch.testing.assert_close(weights[2:].sum(), torch.tensor(1.0))
-
-
-def test_a_reduction_refuses_a_score_it_would_not_read():
-    messages = torch.zeros(2, 3)
-    index = _long(0, 0)
-    with pytest.raises(ValueError, match="a score is required"):
-        aggregate_by_destination(
-            messages, index, 1, reduce="sum", score=torch.zeros(2)
-        )
-    with pytest.raises(ValueError, match="a score is required"):
-        aggregate_by_destination(messages, index, 1, reduce="attention")
-
-
-def test_an_unknown_reduction_raises_naming_it():
-    with pytest.raises(ValueError, match="logsumexp"):
-        aggregate_by_destination(
-            torch.zeros(1, 2), _long(0), 1, reduce="logsumexp"
-        )
 
 
 def test_the_three_reductions_disagree_at_the_module():
@@ -595,73 +584,86 @@ def test_layer_scale_and_relation_table_take_their_spec_init():
 
 
 # --------------------------------------------------------------------------
-# A -1 index is a builder fault and must raise (§25's sentinel convention)
+# What this module leans on instead of re-reading its own inputs
+#
+# Every column of every family below is bounded by the packer, on the host, in
+# numpy, before a tensor exists: `ACTGraph`'s `_VALUE_RANGES` and
+# `_INDEX_FIELDS`, run from `__post_init__` so no producer can skip them, and
+# `collate`'s `_refuse_crossing`, which checks collation's own offset
+# arithmetic. `tests/act/test_act_packed.py` is where each of
+# those refusals is exercised. What is left to test here is what this module
+# still owns: the host-side structure of an edge family, and the two structural
+# flags it now carries instead of measuring its data.
 
 
-def test_a_negative_relation_raises_naming_the_family():
-    with pytest.raises(ValueError, match=r"probe\.relation must be >= 0: found -1"):
-        edge_set("probe", relation=_long(3, -1, 3, 1))
+def test_the_structural_flags_describe_the_families_they_travel_with():
+    """The declarations are held to the data they claim to describe.
+
+    `dst_sorted` and `fully_routed` are host-side booleans set at the
+    construction site from §7 and from the packer's bounds, so nothing in a
+    forward reads the columns back. A wrong flag would make the segment
+    reduction walk the wrong runs, silently — this is the statement that keeps
+    them honest, and it measures each column independently of the builder that
+    set the flag.
+    """
+    to_windows, to_cells = incidence_edges(batch())
+    adjacency = adjacency_edges(batch(), config())
+    radius = radius_edges(batch(), config())
+    expected = {
+        "incidence cells->windows": (to_windows, True, True),
+        "incidence windows->cells": (to_cells, False, True),
+        "hex adjacency": (adjacency, True, True),
+        "occupied radius": (radius, True, False),
+    }
+    for label, (family, dst_sorted, fully_routed) in expected.items():
+        assert family.dst_sorted is dst_sorted, label
+        assert family.fully_routed is fully_routed, label
+        # Only the True direction is a claim about the data. `False` says
+        # "sort it" and "take the routed subset", which are correct whatever
+        # the column holds; `True` says the work can be skipped, and that is
+        # what has to be true.
+        if dst_sorted:
+            assert bool((family.dst[1:] >= family.dst[:-1]).all()), label
+        if fully_routed:
+            assert bool((family.axis >= 0).all()), label
+        # An unrouted family takes the subset; a routed one has none to take.
+        assert (family.axis_rows is None) is fully_routed, label
+    # The radius fixture really does mix routed and unrouted rows, so the one
+    # `fully_routed=False` above is not vacuous.
+    assert not bool((radius.axis >= 0).all())
 
 
-def test_a_relation_past_the_vocabulary_raises():
-    with pytest.raises(ValueError, match=r"probe\.relation must be < 8: found 8"):
-        edge_set("probe", relation=_long(3, 8, 3, 1))
+def test_a_structural_flag_must_be_a_host_side_bool():
+    """A device tensor here would be a sync in a forward and a silent truth."""
+    with pytest.raises(TypeError, match=r"probe\.dst_sorted must be a host-side bool"):
+        edge_set("probe", dst_sorted=torch.tensor(True))
+    with pytest.raises(TypeError, match=r"probe\.fully_routed must be a host-side bool"):
+        edge_set("probe", fully_routed=1)
 
 
-def test_a_negative_source_or_destination_raises():
-    with pytest.raises(ValueError, match=r"probe\.src must be >= 0"):
-        edge_set("probe", src=_long(0, -1, 1, 4))
-    with pytest.raises(ValueError, match=r"probe\.dst must be >= 0"):
-        edge_set("probe", dst=_long(0, 0, -1, 2))
+def test_a_family_with_no_axis_column_cannot_claim_an_unrouted_subset():
+    with pytest.raises(ValueError, match="carries no axis route at all"):
+        edge_set("probe", axis=None, fully_routed=False)
 
 
-def test_an_axis_past_the_third_raises():
-    with pytest.raises(ValueError, match=r"probe\.axis must be < 3: found 3"):
-        edge_set("probe", axis=_long(0, 3, -1, 1))
+def test_a_batch_from_another_relation_space_is_refused_by_its_recorded_ceiling():
+    """§11.2's vocabulary is the one index space a configuration resizes.
 
-
-def test_a_masked_in_incidence_slot_with_no_class_raises():
-    """A ``-1`` class under a live mask bit would silently read the last row."""
-    classes = batch().window_incidence_class.clone()
-    classes[0, 1] = -1
-    with pytest.raises(ValueError, match=r"incidence .*\.relation must be >= 0"):
-        incidence_edges(batch(window_incidence_class=classes))
-
-
-def test_a_masked_in_incidence_slot_with_no_cell_raises():
-    mask = batch().window_incidence_mask.clone()
-    mask[0, 3] = True  # slot 3 of window 0 holds the -1 cell sentinel
-    with pytest.raises(ValueError, match=r"incidence .*\.src must be >= 0"):
-        incidence_edges(batch(window_incidence_mask=mask))
-
-
-def test_a_negative_radius_orbit_raises():
-    orbits = batch().radius_orbit.clone()
-    orbits[2] = -1
-    with pytest.raises(ValueError, match="radius_orbit must be >= 0: found -1 at row 2"):
-        radius_edges(batch(radius_orbit=orbits), config())
-
-
-def test_a_radius_orbit_past_the_vocabulary_raises():
-    orbits = batch().radius_orbit.clone()
-    orbits[0] = 52
-    with pytest.raises(ValueError, match="radius_orbit must be < 52"):
-        radius_edges(batch(radius_orbit=orbits), config())
-
-
-def test_an_empty_radius_source_raises():
-    """§15.2 emits these edges from stones; an empty source is a builder fault."""
-    src = batch().radius_src.clone()
-    src[1] = 2  # an empty cell
-    with pytest.raises(ValueError, match="occupancy of radius_src must be >= 1"):
-        radius_edges(batch(radius_src=src), config())
-
-
-def test_an_off_axis_adjacency_edge_raises():
-    axis = batch().adjacency_axis.clone()
-    axis[1] = -1
-    with pytest.raises(ValueError, match="adjacency_axis must be >= 0"):
-        adjacency_edges(batch(adjacency_axis=axis), config())
+    `packed._VALUE_RANGES` therefore leaves `radius_orbit` open above and the
+    packer records the batch's own ceiling; this is the comparison that refuses
+    a batch built for one `d6_relation_mode` or `d_max` to a model built for
+    another. Both sides are host-side integers, so the model never reads the
+    orbit column back off the device to find out.
+    """
+    coarse = config(
+        d6_relation_mode="coarse_distance_axis", d_max=4, occupied_radius=4
+    )
+    assert relation_vocabulary_size(coarse) == 8
+    # A batch whose orbits reach 47 is an orbit48 batch, not a coarse one.
+    with pytest.raises(ValueError, match="different §11.2 relation spaces"):
+        radius_edges(batch(radius_orbit_bound=48), coarse)
+    # Exactly filling the vocabulary is not a violation.
+    assert radius_edges(batch(radius_orbit_bound=8), coarse).num_relations == 16
 
 
 # --------------------------------------------------------------------------
@@ -687,12 +689,12 @@ def test_incidence_edges_follow_the_mask_and_the_window_s_own_axis():
 def test_radius_edges_join_the_orbit_with_the_source_colour():
     edges = radius_edges(batch(), config())
     # Sources 0 and 4 are own stones, source 1 an opponent's.
-    torch.testing.assert_close(edges.relation, _long(0, 7, 14, 2, 4))
-    torch.testing.assert_close(edges.axis, _long(0, -1, 2, -1, 1))
+    torch.testing.assert_close(edges.relation, _long(4, 0, 7, 2, 14))
+    torch.testing.assert_close(edges.axis, _long(1, 0, -1, -1, 2))
     assert edges.num_relations == radius_relation_count(config())
     # Two of the five edges lie on no axis, so the routed subset is taken.
     assert edges.axis_rows is not None
-    torch.testing.assert_close(edges.axis_rows, _long(0, 2, 4))
+    torch.testing.assert_close(edges.axis_rows, _long(0, 1, 4))
 
 
 def test_the_same_shape_from_the_two_colours_is_two_relations():

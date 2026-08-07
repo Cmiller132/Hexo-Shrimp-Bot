@@ -101,7 +101,7 @@ docker compose -f docker/compose.yaml run --rm frontend-build
 - `docker/smoke-deck.py` checks the published deck API.
 - Container obligations are in
   [`docs/CONTAINER_SPEC.md`](../docs/CONTAINER_SPEC.md).
-- Deck deployment obligations are in [`docs/DECK_SPEC.md`](../docs/DECK_SPEC.md).
+- The deck is described in [`python/mantisnet/README.md`](../python/mantisnet/README.md).
 
 ## Invariants & gotchas
 

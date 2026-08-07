@@ -1,4 +1,4 @@
-//! KLENT acting, comparison selection, and the PlyRecord diagnostics bytes.
+//! KLENT acting, comparison selection, and self-play diagnostics.
 
 use hexo_engine::{Action, Position};
 use hexo_search::{Evaluation, SearchOutcome, SelectFromPolicy, SelectFromSearch, SplitMix64};
@@ -55,7 +55,7 @@ impl SelectFromPolicy for ActingPolicy {
     }
 }
 
-/// MCTS is a comparison variant, so it chooses the most visited root child.
+/// Selects the most-visited root child.
 pub(crate) struct MaxVisits;
 
 impl SelectFromSearch for MaxVisits {

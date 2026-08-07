@@ -1,38 +1,12 @@
-"""The MantisNet-ACT containers: one position's graph, and a batch of them.
+"""MantisNet-ACT graph containers (§7, §25, §26).
 
-This module owns the ragged plumbing of ``docs/MANTIS_ACT_SPEC.md`` §7, §25 and
-§26 and nothing else. It holds no game logic: no window enumeration, no
-legality, no geometry, and no class table beyond the asserted sizes it borrows
-to bound an index. It knows only that a graph is a set of node families with
-indices between them, and what a valid one looks like.
+``ACTGraph`` is one position's node families and indices between them.
+``collate`` batches them, shifting each index by its family's offset into the
+batch frame. ``-1`` is the sole sentinel (survives collation unchanged).
 
-Index conventions this module fixes:
-
-- Every index in an ``ACTGraph`` is in that position's own frame:
-  ``legal_to_cell_index`` and the cell geometry index cells, ``window_cell_index``
-  indexes cells, and ``action_window_index`` indexes windows. ``collate`` shifts
-  each by its family's offset into the batch frame; nothing else renumbers.
-- ``-1`` is the only sentinel and always means "no such entity" — a slot outside
-  the cell scope, a legal action whose cell the scope omits, an action row with
-  no persistent pre-action window, a displacement lying on no axis. It survives
-  collation as ``-1``: shifting a sentinel would turn it into a real index into
-  the preceding position's slice, and no shape or dtype check downstream can see
-  that. ``_to_global`` is the single place the distinction is made, and every
-  field that carries a sentinel is declared as such in ``_INDEX_FIELDS``.
-- ``_INDEX_FIELDS`` is one table driving three jobs — ``validate``'s bounds
-  check, ``collate``'s offset arithmetic, and ``collate``'s refusal of any edge
-  whose endpoints land in different positions (§26). A field added to one and
-  not the others is impossible.
-- The CSR offset tensors are ``(position_count + 1,)`` with a leading zero, so
-  position ``p`` owns rows ``offsets[p]:offsets[p + 1]`` of its family.
-
-``validate`` is the loud failure surface for the whole builder stage: builders
-call it before returning a graph, and it raises naming the offending field, row,
-and value rather than letting a malformed table reach an embedding lookup. Class
-codes are bounded by ``pattern_classes``' own asserted counts, never by a number
-restated here; the vocabularies a config can resize — the D6 relation mode's
-orbits, the nearest-stone buckets — are checked for sign only, since their
-cardinality belongs to the module that emits them.
+``__post_init__`` runs ``_validate``: an instance that exists has passed bounds
+checks on every index field. CSR offsets are ``(position_count + 1,)`` with a
+leading zero.
 """
 
 from __future__ import annotations
@@ -52,11 +26,22 @@ from .pattern_classes import (
     OWN_LIVE,
     POST1_REL_CLASSES,
 )
+from .windows import WINDOW_COORD_LIMIT
 
 WINDOW_LEN = 6
 NUM_AXES = 3
 # 3 axes x 6 candidate slots through every legal cell (§19.2).
 POST_ACTION_ROWS = NUM_AXES * WINDOW_LEN
+
+# The rules' legality radius, and the §8.2 nearest-stone bucket vocabulary it
+# fixes: one bucket per hex distance 0..LEGAL_RADIUS, plus one for a cell no
+# stone reaches. A cell scope holds nothing outside a stone's disk, so this
+# vocabulary is the rules', not a configuration's, and `_VALUE_RANGES` closes
+# the field against it here rather than leaving the ceiling to whichever module
+# emits the buckets.
+LEGAL_RADIUS = 8
+NEAREST_UNREACHED = LEGAL_RADIUS + 1
+NEAREST_BUCKETS = LEGAL_RADIUS + 2
 
 # Three-way placement phase (§13.1). ``moves_remaining`` stays authoritative for
 # the KLENT return sign; this id is a model feature.
@@ -127,14 +112,22 @@ _VALUE_RANGES: tuple[tuple[str, int, int | None], ...] = (
     ("cell_occupancy", 0, 2),  # EMPTY / OWN / OPP relative to the mover (§8.2)
     ("cell_is_legal", 0, 1),
     ("cell_is_occupied", 0, 1),
-    # The bucket count is the cell builder's; ``d_max`` and the legal radius
-    # both move it.
-    ("cell_nearest_bucket", 0, None),
+    ("cell_nearest_bucket", 0, NEAREST_BUCKETS - 1),
     ("window_pattern_class", 0, ALL_WINDOW_PATTERN_CLASSES - 1),
     ("window_status", EMPTY, MIXED),
     ("window_axis", 0, NUM_AXES - 1),
+    # A window identity is three columns, and the axis one is already covered
+    # above through the field that must equal it (`_check_consistency`). What
+    # this entry adds is the coordinate range `windows.WINDOW_COORD_LIMIT`
+    # fixes: past it a start coordinate wraps in one of the two packings a
+    # window identity passes through and silently merges two distinct windows.
+    # `windows.py` refuses it on its own input; this is the same bound stated
+    # where every graph passes, however it was built.
+    ("window_id", 1 - WINDOW_COORD_LIMIT, WINDOW_COORD_LIMIT - 1),
     ("adjacency_axis", 0, NUM_AXES - 1),
-    # ``d6_relation_mode`` chooses the relation vocabulary (§11.2).
+    # ``d6_relation_mode`` chooses the relation vocabulary (§11.2), so the
+    # ceiling is the model's to state; ``collate`` records this batch's own as
+    # ``radius_orbit_bound`` and `messages.radius_edges` compares the two.
     ("radius_orbit", 0, None),
     ("radius_axis_or_neg1", SENTINEL, NUM_AXES - 1),
     ("action_post1_class", 0, POST1_REL_CLASSES - 1),
@@ -157,13 +150,22 @@ _INDEX_FIELDS: tuple[tuple[str, str, str, bool], ...] = (
     ("action_window_index", _LEGAL, _WINDOWS, True),
 )
 
-# The packed batch's array fields, in spec §25 order. ``cell_qr`` and
-# ``window_id`` are builder metadata and stay out of the model's input (§7).
+# The packed batch's array fields, in spec §25 order. ``cell_qr`` is builder
+# metadata and stays out of the model's input (§7).
+#
+# ``window_id`` is the one identity table that crosses into the batch, and it
+# is not a §25 field: §16's typed window↔window edges are a join of the window
+# identities, cheaper to ship than the edges they generate. It is never
+# renumbered — a window identity is an absolute coordinate triple, not an
+# index into a family — and no parameter is ever selected by it.
+# `messages.window_window_edges` is its only reader, deriving D6-invariant
+# relation classes from it.
 _PACKED_ARRAYS: tuple[str, ...] = (
     "cell_occupancy",
     "cell_is_legal",
     "cell_nearest_bucket",
     "legal_to_cell_index",
+    "window_id",
     "window_pattern_class",
     "window_status",
     "window_axis",
@@ -235,7 +237,7 @@ def _check_range(name: str, values: np.ndarray, low: int, high: int | None) -> N
         )
 
 
-def _to_global(name: str, index: np.ndarray, offset: int, *, sentinel: bool) -> np.ndarray:
+def _to_global(index: np.ndarray, offset: int, *, sentinel: bool) -> np.ndarray:
     """Shift one position's indices into the batch frame, keeping ``-1`` as ``-1``.
 
     An offset sentinel reads as a genuine index into the preceding position's
@@ -243,21 +245,13 @@ def _to_global(name: str, index: np.ndarray, offset: int, *, sentinel: bool) -> 
     dtype check. The two cases are therefore separate branches here rather than
     one arithmetic expression, and this is the only place in the module that
     adds an offset to an index.
+
+    The values need no floor check of their own: `_INDEX_FIELDS` gives every
+    index field its floor — the sentinel where one is allowed and zero where
+    none is — and `ACTGraph.__post_init__` has run it before any graph exists.
     """
     if sentinel:
-        missing = index == SENTINEL
-        if index.size and int(index.min()) < SENTINEL:
-            flat = int(index.argmin())
-            raise ValueError(
-                f"{name} allows only {SENTINEL} as a sentinel: found "
-                f"{int(index.min())} at flat index {flat}"
-            )
-        return np.where(missing, SENTINEL, index + offset)
-    if index.size and int(index.min()) < 0:
-        flat = int(index.argmin())
-        raise ValueError(
-            f"{name} carries no sentinel: found {int(index.min())} at flat index {flat}"
-        )
+        return np.where(index == SENTINEL, SENTINEL, index + offset)
     return index + offset
 
 
@@ -267,8 +261,15 @@ class ACTGraph:
 
     Every array is in this position's own frame. The family sizes are read off
     the arrays rather than stored, so a graph cannot claim a count its tables
-    disagree with. ``cell_qr`` and ``window_id`` are builder metadata for dedup,
-    ordering, tests, and diagnostics; they never reach the model (§7).
+    disagree with. ``cell_qr`` is builder metadata for dedup, ordering, tests,
+    and diagnostics and never reaches the model (§7); ``window_id`` is that too,
+    and is additionally the join key §16's typed window↔window edges are
+    enumerated from, which is why `collate` carries it and `cell_qr` stays
+    behind.
+
+    Construction validates (`_validate`), so an ``ACTGraph`` that exists is a
+    graph that passed and nothing downstream re-derives a field's dtype,
+    shape, ordering, or value range as a defence.
     """
 
     # Cells (§8), sorted lexicographically by (q, r).
@@ -281,7 +282,7 @@ class ACTGraph:
     # throughout when the cell scope represents no empty cell (§29).
     legal_to_cell_index: np.ndarray  # (n_legal,)
     # Persistent windows (§9), sorted by (native_axis, start_q, start_r).
-    window_id: np.ndarray  # (n_windows, 3) metadata only
+    window_id: np.ndarray  # (n_windows, 3) (native_axis, start_q, start_r)
     window_pattern_class: np.ndarray  # (n_windows,)
     window_status: np.ndarray  # (n_windows,) EMPTY/OWN_LIVE/OPP_LIVE/MIXED
     window_axis: np.ndarray  # (n_windows,) 0..2
@@ -309,6 +310,9 @@ class ACTGraph:
     moves_remaining: int  # 1 or 2
     phase_id: int  # OPENING / FIRST / SECOND
 
+    def __post_init__(self) -> None:
+        self._validate()
+
     @property
     def n_cells(self) -> int:
         return len(self.cell_occupancy)
@@ -333,12 +337,13 @@ class ACTGraph:
         """Each node family's size, as the index tables must respect it."""
         return {family: len(getattr(self, field)) for family, field in _FAMILY_SIZED_BY.items()}
 
-    def validate(self) -> None:
+    def _validate(self) -> None:
         """Refuse a graph that violates §7 ordering, a shape, or an index bound.
 
-        Builders call this before returning. It raises ``TypeError`` for a wrong
-        container or dtype and ``ValueError`` for everything else, always naming
-        the field and the offending value.
+        Runs from ``__post_init__``, so it is the one gate every graph passes
+        however it was built. It raises ``TypeError`` for a wrong container or
+        dtype and ``ValueError`` for everything else, always naming the field
+        and the offending value.
         """
         sizes = self.family_sizes()
 
@@ -430,6 +435,36 @@ class ACTGraph:
                     f"{int(self.legal_to_cell_index[bad])}, which is not flagged legal"
                 )
 
+        # §15.2 emits a radius edge from a stone. An empty source produces a
+        # relation of ``2 * orbit + 0`` that is perfectly in range and means
+        # something the position does not contain, so no shape, dtype, index
+        # bound, or round trip downstream can see it — it is checked here, on
+        # the graph, where the occupancy that contradicts it is still beside it.
+        if self.radius_src.size:
+            source_occupancy = self.cell_occupancy[self.radius_src]
+            empty = np.flatnonzero(source_occupancy == 0)
+            if empty.size:
+                bad = int(empty[0])
+                raise ValueError(
+                    f"radius edge {bad} has source cell "
+                    f"{int(self.radius_src[bad])}, which is empty: §15.2's edges "
+                    "run from occupied cells"
+                )
+
+        # A window's native axis is stated twice: as the model's `window_axis`
+        # column and as the leading component of the identity §16's edge join
+        # reads. The two are read by different stages — the embedding routes a
+        # line message by the first, the pair join decides collinear against
+        # crossing by the second — so a disagreement is not a shape error
+        # anywhere and would simply make the two stages describe different
+        # boards.
+        if not np.array_equal(self.window_axis, self.window_id[:, 0]):
+            bad = int(np.flatnonzero(self.window_axis != self.window_id[:, 0])[0])
+            raise ValueError(
+                f"window {bad} names native axis {int(self.window_axis[bad])} in "
+                f"window_axis and {int(self.window_id[bad, 0])} in its identity"
+            )
+
         represented = self.window_cell_index >= 0
         if not np.array_equal(self.window_incidence_mask, represented):
             row, slot = (self.window_incidence_mask != represented).nonzero()
@@ -492,6 +527,7 @@ class PackedACTBatch:
     cell_nearest_bucket: torch.Tensor
     legal_to_cell_index: torch.Tensor  # (N_legal,) global cell index
 
+    window_id: torch.Tensor  # (N_win, 3) (native_axis, start_q, start_r), §16 only
     window_pattern_class: torch.Tensor  # (N_win,) long
     window_status: torch.Tensor
     window_axis: torch.Tensor
@@ -517,6 +553,15 @@ class PackedACTBatch:
     phase_id: torch.Tensor  # (P,) long
     moves_remaining: torch.Tensor  # (P,) long
     global_numeric: torch.Tensor  # (P, G) float32
+
+    # One past the largest orbit id in ``radius_orbit``, or 0 for a batch with
+    # no radius edge. Host-side. §11.2's orbit vocabulary is the one index
+    # space a configuration resizes, so ``_VALUE_RANGES`` leaves
+    # ``radius_orbit`` open above and the packer records the batch's own
+    # ceiling instead; `messages.radius_edges` compares it against the model's
+    # ``relation_vocabulary_size`` to refuse a batch and a model built under
+    # different ``d6_relation_mode``/``d_max`` settings.
+    radius_orbit_bound: int
 
     def to(self, device) -> "PackedACTBatch":
         """The same batch with every tensor on ``device``."""
@@ -560,6 +605,12 @@ def _refuse_crossing(
     position in practice — is caught here instead of aliasing silently onto a
     neighbour's node.
     """
+    if index.size == 0:
+        # An empty family has no endpoint to cross a position with. It is
+        # reachable: the opening board holds no window at all, so a batch of
+        # only that position gives `window_cell_index` shape (0, 6), whose
+        # `-1` extent numpy cannot infer against a zero row count.
+        return
     flat = index.reshape(len(row_positions), -1) if index.ndim > 1 else index[:, None]
     live = flat >= 0
     target_positions = np.searchsorted(target_offsets, flat, side="right") - 1
@@ -580,9 +631,10 @@ def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
 
     Every index is shifted by its target family's offset, ``-1`` sentinels are
     preserved, and every shifted index is checked to land inside its own
-    position. Graphs are assumed to have passed ``ACTGraph.validate``; the
-    cross-position check is re-derived here because concatenation is the one
-    step that can turn an out-of-range index into a plausible one.
+    position. Nothing a graph already states about itself is re-checked here —
+    an ``ACTGraph`` cannot exist without having passed ``_validate``. This
+    function's own arithmetic is what `_refuse_crossing` guards: a family
+    shifted by the wrong offset is a fault no graph can carry on its own.
     """
     if not graphs:
         raise ValueError("empty batch: collate needs at least one position")
@@ -601,7 +653,7 @@ def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
             array = getattr(graph, name)
             if target is not None:
                 family, sentinel = target
-                array = _to_global(name, array, int(offsets[family][i]), sentinel=sentinel)
+                array = _to_global(array, int(offsets[family][i]), sentinel=sentinel)
             parts.append(array)
         widths = {part.shape[1:] for part in parts}
         if len(widths) != 1:
@@ -619,8 +671,10 @@ def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
         )
 
     global_numeric = np.stack([g.global_numeric for g in graphs])
+    orbits = packed["radius_orbit"]
     return PackedACTBatch(
         position_count=len(graphs),
+        radius_orbit_bound=0 if orbits.numel() == 0 else int(orbits.max()) + 1,
         cell_offsets=torch.from_numpy(offsets[_CELLS]),
         window_offsets=torch.from_numpy(offsets[_WINDOWS]),
         legal_offsets=torch.from_numpy(offsets[_LEGAL]),
@@ -631,6 +685,64 @@ def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
         global_numeric=torch.from_numpy(np.ascontiguousarray(global_numeric)),
         **packed,
     )
+
+
+# The graph-cell budget a fitting chunk is packed under (§26), in graph cells
+# plus occupied cells. See :class:`ACTChunkCost` for what that quantity is and
+# why it is the one that binds; the number is where the measured throughput of
+# ``policy_q`` stops rising and before the measured peak leaves the card.
+ACT_GRAPH_CELL_BUDGET = 48_000
+
+
+class ACTChunkCost:
+    """What binds one MantisNet-ACT fitting chunk (``fitloop.ChunkCost``, §26).
+
+    Every family §26 lists is ragged and concatenated; this architecture pads
+    nothing, so unlike MantisNet it has no term quadratic in a chunk's longest
+    position, and one additive limit covers it. The unit is *graph cells plus
+    occupied cells*:
+
+    ```text
+    cost(sample) = cells + stones = 2 * stones + legal actions
+    ```
+
+    using the identity ``cells == stones + legal`` that holds exactly on this
+    game (§8.1 of ``docs/MANTIS_ACT_DEVIATIONS.md``). Both terms are known from
+    a stored sample without building its graph, which is what a packer needs.
+
+    Measured against real self-play, this unit tracks memory flat to under 1%
+    across the ply range, while radius edges — the largest family by row count
+    — drive almost none of the memory, since the fused segment message
+    recomputes them in backward rather than holding them; a budget in edge
+    count would be wrong by several times end to end. ``ACT_GRAPH_CELL_BUDGET``
+    is set where measured throughput plateaus and before the card runs out.
+    """
+
+    def __init__(self, stones, legal, graph_cell_budget: int) -> None:
+        if len(stones) != len(legal):
+            raise ValueError(
+                f"{len(stones)} stone counts against {len(legal)} legal-move counts"
+            )
+        self._stones = stones
+        self._legal = legal
+        self._budget = int(graph_cell_budget)
+        self._total = 0
+
+    def units(self, index: int) -> int:
+        """Sample ``index``'s graph cells plus its occupied cells."""
+        return 2 * int(self._stones[index]) + int(self._legal[index])
+
+    def sort_key(self, index: int) -> int:
+        return self.units(index)
+
+    def open(self) -> None:
+        self._total = 0
+
+    def accepts(self, index: int, size: int) -> bool:
+        return self._total + self.units(index) <= self._budget
+
+    def take(self, index: int) -> None:
+        self._total += self.units(index)
 
 
 def _segment_counts(offsets: torch.Tensor) -> torch.Tensor:

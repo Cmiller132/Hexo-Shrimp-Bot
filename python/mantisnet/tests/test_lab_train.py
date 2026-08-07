@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from mantisnet.lab.corpus import FrozenCorpus, SampleSplit
+from mantisnet.lab.evaluate import evaluate_cell
 from mantisnet.lab.train import TrainConfig, train_cell
 from mantisnet.lab.variants import (
     VARIANTS,
@@ -21,6 +22,7 @@ from mantisnet.lab.variants import (
     parse_model_kw,
     refuse_param_budget,
 )
+from mantisnet.models.mantis_act import PRESETS as ACT_PRESETS
 
 from .test_klent_returns import FIRST_STONE_WIN
 
@@ -80,7 +82,11 @@ def tiny_corpus(tmp_path: Path, *, sha: str = "a" * 64) -> FrozenCorpus:
 
 
 def test_variant_registry_is_exact_and_overrides_are_typed():
-    assert list(VARIANTS) == ["mantis"]
+    # MantisNet, plus one arm per §29 MantisNet-ACT preset. Each ACT arm's own
+    # registration contract — its configuration dataclass, the collator bound
+    # to its preset, and the builder-side overrides it refuses — is checked in
+    # tests/act/test_act_lab_variants.py.
+    assert sorted(VARIANTS) == sorted({"mantis", *ACT_PRESETS})
     assert VARIANTS["mantis"].rust_collate is True
     parsed = parse_model_kw(["h=16", "blocks=1", "dropout=0.25"])
     assert parsed == {"h": 16, "blocks": 1, "dropout": 0.25}
@@ -150,6 +156,94 @@ def test_tiny_cell_trains_all_heads_and_writes_complete_artifacts(tmp_path):
 
     with pytest.raises(FileExistsError, match="nonempty"):
         train_cell(corpus, cell, model_kw=TINY_MODEL_KW, epochs=1)
+
+
+TINY_ACT_MODEL_KW = {
+    "d_inv": 16,
+    "d_axis": 8,
+    "d_rel": 8,
+    "num_heads": 2,
+    "ffn_mult": 1,
+    "state_blocks": 1,
+    "action_blocks": 1,
+    "policy_private_blocks": 1,
+    "critic_private_blocks": 1,
+}
+
+
+def _tiny_act_config() -> TrainConfig:
+    return TrainConfig(
+        epochs=2,
+        batch_size=12,
+        pair_budget=100_000,
+        cell_budget=100_000,
+        graph_cell_budget=100_000,
+        collect_pair_budget=100_000,
+        collect_cell_budget=100_000,
+        collect_graph_cell_budget=100_000,
+        lr=1e-3,
+        device="cpu",
+        autocast=False,
+        compile=False,
+    )
+
+
+def test_an_act_cell_trains_the_two_terms_it_holds_and_records_only_those(tmp_path):
+    """§29 gives MantisNet-ACT no state-value head, so the recipe drops term 3.
+
+    The critic is not what is missing: `critic_ce` is the action-value
+    categorical both architectures train, and it is present here. Nothing in
+    this cell adds a head to the architecture to satisfy the harness.
+    """
+
+    corpus = tiny_corpus(tmp_path)
+    cell = tmp_path / "sweep" / "act" / "s0"
+    result = train_cell(
+        corpus,
+        cell,
+        variant="full_act_v4",
+        model_kw=TINY_ACT_MODEL_KW,
+        seed=0,
+        config=_tiny_act_config(),
+    )
+
+    config = json.loads((cell / "config.json").read_text(encoding="utf-8"))
+    assert config["recipe"]["loss_weights"] == {"critic": 1.0, "policy": 1.0}
+
+    for row in result["metrics"]:
+        assert np.isfinite(row["policy_loss"]) and np.isfinite(row["critic_ce"])
+        assert "value_loss" not in row
+        assert np.isfinite(row["val"]["imitation_top1"])
+        assert "value_sign_accuracy" not in row["val"]
+        assert "value_mae" not in row["val"]
+    first = sum(result["metrics"][0][name] for name in ("policy_loss", "critic_ce"))
+    last = sum(result["metrics"][-1][name] for name in ("policy_loss", "critic_ce"))
+    assert last < first
+
+    scores = evaluate_cell(cell, corpus, device="cpu")
+    assert set(scores["horizon"]) == {"v_hat"}
+    assert scores["flags"]["state_value_scored"] is False
+    assert scores["variant"] == "full_act_v4"
+
+
+def test_an_enabled_state_value_head_is_refused_rather_than_left_unscored(tmp_path):
+    """§23.3's head is a scalar auxiliary, not the binned readout term 3 reads.
+
+    Instantiating it under this recipe would count parameters that nothing
+    trains and no score channel reports, so the seam refuses instead.
+    """
+
+    corpus = tiny_corpus(tmp_path)
+    cell = tmp_path / "sweep" / "act-sv" / "s0"
+    with pytest.raises(ValueError, match="enable_state_value_head"):
+        train_cell(
+            corpus,
+            cell,
+            variant="full_act_v4",
+            model_kw={**TINY_ACT_MODEL_KW, "enable_state_value_head": True},
+            seed=0,
+            config=_tiny_act_config(),
+        )
 
 
 def test_cosine_lr_schedule_anneals_and_is_recorded(tmp_path):
