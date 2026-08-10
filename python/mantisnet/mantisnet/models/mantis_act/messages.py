@@ -34,6 +34,7 @@ from .equivariant import (
     at_least_fp32,
 )
 from .latent_attention import row_positions
+from .linear_fusion import horizontal_linears
 from .packed import PackedACTBatch
 from .plans import (
     INCIDENCE_RELATIONS,
@@ -591,10 +592,13 @@ class TypedWindowAttention(nn.Module):
 
         heads = self.heads
         head_dim = self.d_inv // heads
+        query, key, value = horizontal_linears(
+            z.inv, (self.q_inv, self.k_inv, self.v_inv)
+        )
         out = edge_attention(
-            self.q_inv(z.inv).view(n_windows, heads, head_dim),
-            self.k_inv(z.inv).view(n_windows, heads, head_dim),
-            self.v_inv(z.inv).view(n_windows, heads, head_dim),
+            query.view(n_windows, heads, head_dim),
+            key.view(n_windows, heads, head_dim),
+            value.view(n_windows, heads, head_dim),
             self.bias_inv,
             *views,
         )
@@ -615,10 +619,13 @@ class TypedWindowAttention(nn.Module):
         # across the channels rather than three sets, which is what keeps the
         # score free of a per-absolute-axis parameter (§12.2).
         shape = (n_windows, AXIS_CHANNELS * heads, self.d_axis // heads)
+        query, key, value = horizontal_linears(
+            z.axis, (self.q_axis, self.k_axis, self.v_axis)
+        )
         out = edge_attention(
-            self.q_axis(z.axis).reshape(shape),
-            self.k_axis(z.axis).reshape(shape),
-            self.v_axis(z.axis).reshape(shape),
+            query.reshape(shape),
+            key.reshape(shape),
+            value.reshape(shape),
             self.bias_axis.repeat(AXIS_CHANNELS, 1),
             *views,
         )
@@ -812,12 +819,15 @@ class RelationGatedMessage(nn.Module):
         """
         rel = self.relation.weight
         values = at_least_fp32(values)
-        gate = (
-            at_least_fp32(torch.sigmoid(gate_projection(rel)))
-            if gate_projection is not None
-            else None
-        )
-        bias = at_least_fp32(bias_projection(rel))
+        if gate_projection is None:
+            gate = None
+            bias = at_least_fp32(bias_projection(rel))
+        else:
+            gate, bias = horizontal_linears(
+                rel, (gate_projection, bias_projection)
+            )
+            gate = at_least_fp32(torch.sigmoid(gate))
+            bias = at_least_fp32(bias)
         if self.reduce == "attention":
             return self._attend(values, edges, channels, gate, bias, score_vector)
         plan = edges.plan(channels)
