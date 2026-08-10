@@ -246,6 +246,7 @@ def fit_supervised_epoch(
     variant: str = "mantis",
     progress=None,
     sizes: tuple[np.ndarray, np.ndarray] | None = None,
+    steady: tuple[int, int] | None = None,
 ) -> dict[str, float | int]:
     """Fit one corpus epoch without creating artifacts.
 
@@ -321,6 +322,7 @@ def fit_supervised_epoch(
         step=step,
         lock=_gpu_lock,
         progress=progress,
+        steady=steady,
     )
 
 

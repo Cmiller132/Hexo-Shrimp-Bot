@@ -405,10 +405,23 @@ def bench_fit(
     pair_budget: int | None = None,
     cell_budget: int | None = None,
     adam_impl: str = "auto",
+    steady_warmup: int | None = None,
+    steady_measure: int | None = None,
     model_kw: dict | None = None,
     family: str | None = None,
 ) -> dict:
-    """Benchmark a production KLENT fit or one supervised corpus epoch."""
+    """Benchmark a production KLENT fit or one supervised corpus epoch.
+
+    With ``steady_warmup``/``steady_measure`` set, the run is the campaign
+    speed harness of ``docs/MANTIS_GRAFT_SPEC.md`` §2.2: one epoch whose first
+    ``steady_warmup`` chunks absorb compilation and cache warm-up untimed,
+    followed by a CUDA-synchronized window of ``steady_measure`` chunks that
+    yields the reported throughput; the epoch then stops early.
+    """
+    if (steady_warmup is None) != (steady_measure is None):
+        raise ValueError(
+            "steady_warmup and steady_measure must be given together"
+        )
     cfg = _config(device, compile, pair_budget, cell_budget, adam_impl)
     model, loaded = _load_or_fresh(
         checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
@@ -457,13 +470,14 @@ def bench_fit(
         sample_count = len(samples)
         source = "collect"
 
-        def run_epoch(epoch_seed):
+        def run_epoch(epoch_seed, steady=None):
             return fit(
                 model,
                 samples,
                 optimizer,
                 cfg,
                 np.random.default_rng(epoch_seed),
+                steady=steady,
             )
     else:
         from .corpus import load_corpus
@@ -477,7 +491,7 @@ def bench_fit(
         # sizes from its buffer, so the replay stays outside the timed epoch.
         sizes = sample_sizes(frozen, samples)
 
-        def run_epoch(epoch_seed):
+        def run_epoch(epoch_seed, steady=None):
             return fit_supervised_epoch(
                 model,
                 optimizer,
@@ -486,17 +500,28 @@ def bench_fit(
                 cfg=cfg,
                 rng=np.random.default_rng(epoch_seed),
                 sizes=sizes,
+                steady=steady,
             )
 
-    # Compilation, autotuning, and first-use allocator work happen outside
-    # the timed epoch.
-    run_epoch(seed)
-    _sync(device)
-    _vram_reset(device)
-    start = time.perf_counter()
-    metrics = run_epoch(seed + 1)
-    _sync(device)
-    seconds = time.perf_counter() - start
+    if steady_warmup is not None:
+        # §2.2 window: one epoch, warm-up absorbed by its leading chunks. The
+        # reported peak VRAM covers the whole truncated epoch, compilation
+        # included — conservative, and identical in kind across arms.
+        _vram_reset(device)
+        metrics = run_epoch(seed, steady=(steady_warmup, steady_measure))
+        window = metrics["steady"]
+        sample_count = int(window["samples"])
+        seconds = float(window["seconds"])
+    else:
+        # Compilation, autotuning, and first-use allocator work happen outside
+        # the timed epoch.
+        run_epoch(seed)
+        _sync(device)
+        _vram_reset(device)
+        start = time.perf_counter()
+        metrics = run_epoch(seed + 1)
+        _sync(device)
+        seconds = time.perf_counter() - start
     report = {
         "mode": "fit",
         **_family_fields(loaded),

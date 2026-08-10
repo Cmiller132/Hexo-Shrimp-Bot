@@ -154,6 +154,7 @@ def fit(
     cfg: KlentConfig,
     rng: np.random.Generator,
     progress=None,
+    steady: tuple[int, int] | None = None,
 ):
     """Fit one epoch over the buffer.
 
@@ -234,6 +235,7 @@ def fit(
         step=fit_step,
         lock=_gpu_lock,
         progress=progress,
+        steady=steady,
     )
 
 

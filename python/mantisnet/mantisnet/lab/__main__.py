@@ -160,6 +160,14 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--seed", type=int, default=7)
     fit.add_argument("--pair-budget", type=int)
     fit.add_argument("--cell-budget", type=int)
+    fit.add_argument(
+        "--steady-warmup", type=int,
+        help="untimed leading chunks of the MANTIS_GRAFT_SPEC §2.2 window",
+    )
+    fit.add_argument(
+        "--steady-measure", type=int,
+        help="timed chunks of the §2.2 window; the epoch stops when it closes",
+    )
     _adam_impl(fit)
     _model_kw(fit)
     _device(fit)
