@@ -1,10 +1,29 @@
-# MantisNet-ACT v4 — Build Specification
+# MantisNet-ACT v4.1 — Build Specification
 
 **Status:** normative implementation target for a new architecture alongside the existing MantisNet.
 
 **Architecture ID:** `mantis_act_v4`
 
 **Instruction to the implementation model:** implement the complete configurable superset described here. Do not replace, mutate, or remove the current MantisNet. Add this as a separate selectable architecture, preserve the existing KLENT-facing interface, and implement every major component behind explicit toggles so the requested ablations can be run from configuration.
+
+### v4.1 changelog
+
+- Same-turn second-placement partner rows and messages are removed from the
+  architecture and ablation matrix; one placement remains one MDP action.
+- The typed-window-attention control is an exactly parameter-matched dedicated
+  window FFN stage, with invariant/axis hidden widths 111/97.
+- The production parameter count is a reference ceiling for controls, not a
+  minimum model-size target; invariant width remains an owner decision.
+- `occupied_and_legal` is removed. `window_and_legal` remains distinct under
+  `action_relevant` windows.
+- Packed batches carry consuming-operation execution plans, a 13-field builder
+  fingerprint, and an explicit packed-schema discriminator.
+- Key-projection biases are forbidden, checkpoint/config loading is strict over
+  dropout, chunk-cost laws are preset-specific, and KLENT collection, search,
+  fitting, and evaluation use architecture-neutral seams.
+- Ablations use a predeclared supervised survivor screen followed by self-play
+  confirmation, and the performance acceptance protocol is fixed pending its
+  merged-tree threshold calibration.
 
 ---
 
@@ -18,7 +37,6 @@ Build a stronger exactly D6-equivariant model for HEXO that directly represents:
 - exact D6 displacement shapes using 48 radius-12 orbit classes;
 - global board context through multiple latent tokens;
 - the counterfactual result of placing each legal action;
-- useful same-turn second-placement partners;
 - distinct policy and critic computations after a shared trunk.
 
 The default full model must continue to output one raw policy logit and one action-value prediction per legal cell in exact engine legal-move order.
@@ -39,7 +57,33 @@ Do not change these contracts:
 - the KLENT evaluator consumes flat policy logits, `q_score`, and `q_value` in legal-cell order;
 - ordinary checkpoint loading is strict.
 
-This document changes the model representation, so use a new model representation version and architecture/config hash.
+The architecture-neutral KLENT boundary is:
+
+```text
+collate_positions(positions) -> architecture batch
+collate_prefixes(games, plies) -> architecture batch
+chunk_cost(sample_metadata, budgets) -> deterministic packing law
+policy_q(batch) -> flat policy logits, flat critic logits
+supervised_heads(batch) -> declared supervised outputs
+has_state_value_head -> bool
+```
+
+Collection and search receive `collate_positions` and `chunk_cost` from the
+selected architecture; they must not import a concrete builder. Fitting and
+corpus evaluation use `collate_prefixes`, `chunk_cost`, and the model methods
+above. The external evaluator remains:
+
+```text
+evaluate(batch) -> flat CPU (policy_logits, q_score, q_value)
+```
+
+All flat action tensors and `legal_offsets` remain in exact engine legal order.
+Search consumes only that evaluator contract plus engine positions; it is
+independent of the batch representation.
+
+This document changes the model representation, so use the ACT representation,
+packed-schema, checkpoint-format, and architecture/config discriminators in
+§28. The legacy MantisNet discriminators do not change.
 
 ---
 
@@ -56,12 +100,11 @@ The `full_act_v4` preset must enable all of the following:
 7. four invariant state latents and two axis-equivariant state latents;
 8. placement-phase FiLM conditioning in every block;
 9. all 18 post-placement windows through every legal action;
-10. same-turn partner messages for first placements;
-11. two action-set latents;
-12. separate policy-private and critic-private adapters;
-13. the current three-class categorical critic by default;
-14. no direct quadratic attention over all cells, windows, or actions;
-15. no state-value head by default.
+10. two action-set latents;
+11. separate policy-private and critic-private adapters;
+12. the current three-class categorical critic by default;
+13. no direct quadratic attention over all cells, windows, or actions;
+14. no state-value head by default.
 
 ---
 
@@ -106,6 +149,8 @@ mantisnet/models/mantis_act/
     latents.py
     state_trunk.py
     action_encoder.py
+    post_rows.py
+    plans.py
     heads.py
     model.py
     diagnostics.py
@@ -132,6 +177,8 @@ class MantisACTConfig:
     d_rel: int = 24
     num_heads: int = 4
     ffn_mult: int = 2
+    extra_window_ffn_hidden_inv: int = 0
+    extra_window_ffn_hidden_axis: int = 0
 
     # Depth
     state_blocks: int = 4
@@ -165,22 +212,18 @@ class MantisACTConfig:
     num_inv_latents: int = 4
     num_axis_latents: int = 2
     num_action_latents: int = 2
-    use_full_cell_attention: bool = False
     window_window_mode: str = "none"
 
     # Action modeling
     use_counterfactual_action_windows: bool = True
-    use_action_pair_messages: bool = True
-    pair_scope: str = "post_action_collinear"
-    pair_max_distance: int = 5
     use_action_set_latents: bool = True
 
     # Phase
-    phase_conditioning: str = "film"
     use_three_way_phase: bool = True
 
     # Heads
     head_separation: str = "private_adapters"
+    axis_pool_mode: str = "attention"
     critic_type: str = "categorical3"
     enable_state_value_head: bool = False
 
@@ -195,9 +238,31 @@ class MantisACTConfig:
     layer_scale_init: float = 1e-2
 ```
 
-The default model should target roughly 2.5–4 million trainable parameters. Provide a model-summary function reporting parameters by subsystem.
+The dedicated extra-window FFN stage is absent exactly when both of its hidden
+widths are zero. A nonzero stage requires a positive invariant width and, when
+axis channels exist, a positive axis width. It is window-only, occurs once per
+state block at the same residual location as the optional typed-window path,
+and shares no weights across blocks.
 
-Fields changing node sets, relation semantics, tensor shapes, or output semantics must be included in the checkpoint architecture hash.
+The resolved production `full_act_v4` parameter count is the reference ceiling
+for controls, not a parity floor that smaller variants must be padded up to.
+The default `d_inv=64` remains an owner-selected width; changing it to reach an
+arbitrary total is not an implementation decision. Provide a model-summary
+function reporting exact parameters by subsystem and named stage.
+
+`dropout` is part of the resolved training semantics. It is included in the
+architecture hash and checkpoint config comparison, and ordinary load/resume
+requires exact equality. Evaluation still disables dropout through module mode;
+it does not obtain permission to load a checkpoint under a different value.
+
+Every resolved configuration field, including training-semantic fields such as
+`dropout`, is included in the checkpoint architecture hash and strict config
+comparison.
+
+`use_full_cell_attention` and `phase_conditioning` are not configuration fields.
+Full-cell attention is not an ACT path, and §13.2 fixes FiLM as the phase
+mechanism. Deserialization must refuse those obsolete names and the former
+`token_only` value rather than retaining no-op knobs.
 
 ---
 
@@ -208,10 +273,12 @@ For deterministic batching, testing, and diagnostics:
 - sort cell nodes lexicographically by `(q, r)`;
 - sort persistent windows by `(native_axis, start_q, start_r)`;
 - preserve legal actions in engine order, never sorted independently;
-- sort ordinary graph edges by `(dst, src, relation)`;
-- sort action partner rows by `(dst_action, partner_coord, evidence_kind, window_identity)`.
+- sort ordinary graph edges by `(dst, src, relation)`.
 
-Coordinates and window identities are builder metadata only. Do not embed raw coordinates or absolute axis IDs.
+Coordinates are builder/debug metadata only. Persistent window identities may
+reach the packed batch solely as the join key for the optional typed-window
+path; they are not embedded and never select a parameter. Do not embed raw
+coordinates or absolute axis IDs.
 
 ---
 
@@ -222,7 +289,6 @@ Coordinates and window identities are builder metadata only. Do not embed raw co
 ```python
 cell_scope: Literal[
     "occupied_only",
-    "occupied_and_legal",
     "window_and_legal",
 ]
 ```
@@ -240,6 +306,15 @@ For `window_and_legal`, the node set is the union of:
 - every coordinate appearing in a persistent window.
 
 A cell inside a nonempty six-cell window may be represented even when it is empty and currently illegal. This lets empty intersections and future support participate in the state graph.
+
+For `live` and `nonempty` windows, every empty persistent-window cell is within
+five steps of a stone and therefore already legal; in those two scopes the
+full node set is exactly occupied plus legal cells. This does **not** make
+`window_and_legal` a removable name. Under `action_relevant`, a legal cell at
+distance eight may seed an empty persistent window reaching distance thirteen,
+so its window cells can be neither occupied nor legal. The removed
+`occupied_and_legal` name would therefore be equivalent in two window scopes
+and inequivalent in the third.
 
 ### 8.2 Cell fields
 
@@ -274,6 +349,11 @@ legal_to_cell_index: [num_legal]
 ```
 
 Output row `j` must always correspond to `legal_moves[j]`.
+
+Under `window_and_legal`, every entry is the represented cell's nonnegative
+index. Under `occupied_only`, no empty legal cell is a trunk node, so every
+entry is the `-1` sentinel. Consumers branch on the resolved scope and must not
+use `-1` as an accidental gather index.
 
 ---
 
@@ -422,6 +502,8 @@ D6_ORBITS_DMAX12 = 48
 ```
 
 Generate this table from the transform functions. Do not manually enumerate 48 cases.
+`d_max` and `occupied_radius` are integers in `1..12`; larger values are refused
+rather than silently extending or clipping the frozen relation vocabulary.
 
 ### 11.2 Relation IDs
 
@@ -434,6 +516,10 @@ Generate this table from the transform functions. Do not manually enumerate 48 c
 ```
 
 Sparse default paths do not emit edges beyond radius 12. Global latents carry longer-range context.
+
+In `coarse` mode, relation identity is exactly `(hex_distance,
+is_on_any_undirected_axis)`. The on-axis component is a binary invariant flag;
+the absolute axis number is carried only by the separate equivariant route.
 
 ### 11.3 Axis routing
 
@@ -550,11 +636,10 @@ scale = 1
 bias = 0
 ```
 
-Toggle:
-
-```python
-phase_conditioning: Literal["token_only", "film"]
-```
+FiLM is the only phase-conditioning path and therefore is not a configuration
+knob. `use_three_way_phase=False` is the explicit two-way ablation: it folds
+OPENING into SECOND while retaining the same FiLM mechanism. There is no
+`token_only` mode because this architecture has no phase-token stream.
 
 ### 13.3 Global numeric features
 
@@ -568,6 +653,11 @@ log1p(legal count)
 log1p(persistent window count)
 fraction of own-live / opponent-live / mixed windows
 ```
+
+This is exactly eight float32 scalars when enabled. Disabled global, window,
+or action-tactical numeric families remain present as arrays with trailing
+width zero; the packed schema never omits a field because a feature toggle is
+off.
 
 No history, recency, absolute move number, or board origin is used.
 
@@ -668,7 +758,25 @@ The full model instead uses:
 - cell↔window incidence;
 - multiple global latents.
 
-If typed window attention is enabled, provide a parameter-matched extra-FFN control preset and report its separate parameter/time cost.
+The control is a dedicated extra window-only equivariant FFN stage, not a
+global `ffn_mult` change. In `full_extra_ffn_control` set:
+
+```text
+extra_window_ffn_hidden_inv  = 111
+extra_window_ffn_hidden_axis = 97
+window_window_mode           = "none"
+```
+
+At the default widths its per-block parameter count is exactly:
+
+```text
+352 + 129 * 111 + 49 * 97 = 19,424
+```
+
+which equals the typed-window-attention stage exactly; over four state blocks
+both deltas are 77,696 parameters. Construction and the model-summary test must
+assert equality, not merely report approximate matching. Report the two arms'
+separate time and memory costs in `docs/ABLATIONS.md`.
 
 ---
 
@@ -711,6 +819,28 @@ Invariant latents may have distinct learned identities. Each axis latent has one
 ### 17.5 Packed implementation
 
 Use ragged packed segment attention. A slow per-position reference implementation may exist for tests, but the training path must not loop over every node in Python.
+
+### 17.6 Key projections have no bias
+
+Every key projection used under a softmax is bias-free. Adding one constant key
+bias to every key shifts all scores for a query by the same scalar and cancels
+exactly in the softmax, so such a parameter is structurally dead. Query, value,
+and output projections retain their specified biases.
+
+The `full_act_v4` named-parameter census contains exactly 34 key-bias tensors
+to remove, totaling 1,616 scalars:
+
+| location | passes/blocks | key biases per instance | tensors | scalars |
+|---|---:|---:|---:|---:|
+| state latent read/mix/broadcast, invariant and axis | 4 | 6 | 24 | 1,056 |
+| invariant action-latent read/mix/broadcast | 2 | 3 | 6 | 384 |
+| state-to-action invariant and axis broadcast | 2 | 2 | 4 | 176 |
+| **total** |  |  | **34** | **1,616** |
+
+The detector enumerates `named_parameters()` and requires that no parameter
+whose owning projection is a softmax key ends in `.bias`; a raw substring count
+is not sufficient. Removing these tensors is a checkpoint state-dict shape
+change and therefore follows §28's format-bump rule.
 
 ---
 
@@ -755,12 +885,16 @@ Every legal cell becomes an action embedding after the state trunk.
 
 ### 19.1 Base action state
 
-Gather in engine order:
+For `window_and_legal`, gather in engine order:
 
 ```text
 A_inv  = C_inv[legal_to_cell_index]
 A_axis = C_axis[legal_to_cell_index]
 ```
+
+For `occupied_only`, `legal_to_cell_index` is `-1` and the action encoder uses
+a shared learned empty/legal base replicated in engine order. It must not index
+the final occupied cell by Python-style negative indexing.
 
 ### 19.2 Fixed 18 post-placement windows
 
@@ -830,80 +964,9 @@ These are deterministic functions of the current state and hypothetical action. 
 
 ---
 
-## 20. Same-turn second-placement modeling
-
-The output remains one placement at a time. Partner modeling only enriches the first-placement action representation and `Q(s, a1)`.
-
-Enable partner messages only for `phase == FIRST` / `moves_remaining == 2`.
-
-Do not emit or apply partner messages for an action that already wins immediately.
-
-### 20.1 Pair scopes
-
-```python
-pair_scope: Literal[
-    "none",
-    "current_legal_collinear",
-    "post_action_collinear",
-    "post_action_tactical",  # optional heavier mode
-]
-```
-
-Recommended initial default:
-
-```python
-pair_scope = "post_action_collinear"
-```
-
-### 20.2 Collinear partner enumeration
-
-For every legal first action `a`, enumerate every empty coordinate `b` on the three axes at signed distance 1 through 5.
-
-- `current_legal_collinear`: retain only currently legal `b`;
-- `post_action_collinear`: retain `b` if the engine says it would be legal after placing `a`.
-
-The second mode must include newly opened legal cells that are absent from the current action set.
-
-### 20.3 Pair evidence rows
-
-For each ordered `(a, b)`, enumerate every six-cell window containing both. Emit one evidence row per shared window:
-
-```text
-dst_action_index = a
-src_action_index = current legal index of b, else -1
-pair_axis
-pair_distance 1..5
-post2_pattern_class  # one of the 377 nonempty reversal classes after adding a and b
-src_is_current_legal
-```
-
-For current legal `b`, use its pre-pair action embedding as source content. For newly legal `b`, use a shared prospective-partner base plus the post-two-placement pattern relation.
-
-Aggregate pair evidence into the destination action’s matching axis channel and a symmetric invariant summary.
-
-### 20.4 Optional tactical partner scope
-
-`post_action_tactical` additionally includes engine-legal second cells that, after `a`:
-
-- complete or strengthen an own four/five window;
-- hit a remaining opponent four/five window.
-
-Noncollinear tactical partner evidence updates the invariant stream. Keep this mode optional because it is more expensive and game-specific.
-
-### 20.5 Controls
-
-Provide:
-
-- pair messages off;
-- current-legal only;
-- post-action prospective cells;
-- optional degree/axis-distribution-preserving random rewiring diagnostic.
-
----
-
 ## 21. Action-set latents
 
-Use two invariant latent queries over the legal action set after counterfactual initialization and pair messages:
+Use two invariant latent queries over the legal action set after counterfactual initialization:
 
 ```text
 read all actions -> latent self-mix -> broadcast to all actions
@@ -921,11 +984,10 @@ Each of two default action blocks performs:
 
 ```text
 1. broadcast state latent context
-2. optional same-turn partner messages
-3. optional action-set latent read/mix/broadcast
-4. AxisMix
-5. invariant and shared-axis FFNs
-6. phase FiLM
+2. optional action-set latent read/mix/broadcast
+3. AxisMix
+4. invariant and shared-axis FFNs
+5. phase FiLM
 ```
 
 Action embeddings may read state cells, windows, and latents but must not write back into them.
@@ -1001,6 +1063,10 @@ Potential dense labels over every legal action:
 
 If an exact deterministic feature is already fed as input, do not also claim its auxiliary prediction as useful representation learning. Either mask that auxiliary or run the learned-only input ablation.
 
+Any proposal to remove or redefine one of these labels requires a census
+stratified over OPENING, FIRST, and SECOND positions from a validated corpus.
+A census confined to FIRST phase does not justify a label-contract amendment.
+
 ### 24.2 Window-fate auxiliary
 
 Retain the previous future fate head only as an optional experiment and apply it only to live windows. Mixed windows are masked because they are already dead for both players.
@@ -1009,57 +1075,92 @@ Retain the previous future fate head only as an optional experiment and apply it
 
 ## 25. Internal packed input/output
 
-Suggested packed input:
+The production input is a `PackedACTBatch`. Its graph columns are:
 
 ```python
 @dataclass
-class PackedACTInput:
+class PackedACTBatch:
+    packed_schema_version: int
     position_count: int
     cell_offsets: Tensor
     window_offsets: Tensor
     legal_offsets: Tensor
+    adjacency_offsets: Tensor
+    radius_offsets: Tensor
 
     cell_occupancy: Tensor
     cell_is_legal: Tensor
     cell_nearest_bucket: Tensor
     legal_to_cell_index: Tensor
 
+    window_id: Tensor                  # [Nw, 3], metadata/join key only
     window_pattern_class: Tensor
     window_status: Tensor
     window_axis: Tensor
     window_numeric: Tensor
     window_cell_index: Tensor          # [Nw, 6], -1 allowed
-    window_incidence_class: Tensor     # [Nw, 6]
+    window_incidence_class: Tensor     # [Nw, 6], -1 where masked
     window_incidence_mask: Tensor      # [Nw, 6]
 
     adjacency_src: Tensor
     adjacency_dst: Tensor
     adjacency_axis: Tensor
-
     radius_src: Tensor
     radius_dst: Tensor
     radius_orbit: Tensor
     radius_axis_or_neg1: Tensor
 
-    action_window_index: Tensor        # [Na, 3, 6]
+    action_window_index: Tensor        # [Na, 3, 6], -1 allowed
     action_post1_class: Tensor         # [Na, 3, 6]
     action_pre_status: Tensor          # [Na, 3, 6]
     action_tactical_numeric: Tensor
 
-    pair_dst_action: Tensor
-    pair_src_action_or_neg1: Tensor
-    pair_axis_or_neg1: Tensor
-    pair_distance: Tensor
-    pair_post2_pattern: Tensor
-    pair_evidence_kind: Tensor
-    pair_src_is_current_legal: Tensor
-
     phase_id: Tensor
     moves_remaining: Tensor
     global_numeric: Tensor
+    radius_orbit_bound: int
+
+    plans: ACTPlans
+    builder_fingerprint: str
 ```
 
-Suggested output:
+The graph builder and collation boundary constructs `ACTPlans` before the batch
+enters the model hot path. A consuming operator may gather/reduce from these
+plans, but may not rediscover them with a sort, `unique`, or histogram in a
+forward or backward pass. Plans have these consuming-operation contracts:
+
+| Plan family | Required semantics | Consuming operation |
+|---|---|---|
+| incidence, adjacency, and radius message CSR | stable destination-, source-, and relation-major views; tied rows retain packed order | `segment_message` relation reducers and their backwards |
+| routed radius subset | stable subset of on-axis radius rows with source, destination, relation, and axis | axis-routed radius message path |
+| cell/window initial class rows | class-major CSR plus blocks of at most 128 rows, never crossing a class | embedding gather and table-gradient reduction |
+| action `post1` and `pre_status` rows | class-major CSR plus the same 128-row block partition | post-row embedding and table-gradient reduction |
+| action source-window rows | source-window-major CSR plus explicit sentinel rows | counterfactual post-placement gather/backward |
+| action base-cell rows | represented-source-cell-major CSR | base action cell gather/backward |
+| row ownership and phase | exact packed-row to position and phase mappings | phase FiLM, heads, and segment routing |
+| state/action latent segments | contiguous segment ranges, bases, counts, and row ownership | latent read, mix, and broadcast |
+
+All plan indices and pointers are signed 32-bit integers unless they also serve
+as ordinary framework gather indices, in which case they are signed 64-bit.
+Every plan sort is stable. Empty optional edge families have well-formed empty
+plans rather than absent fields.
+
+`builder_fingerprint` binds a batch and its plans to exactly these ordered
+inputs: `architecture_id`, `window_scope`, `cell_scope`,
+`use_axis_channels`, `use_global_numeric_features`,
+`use_window_numeric_features`, `use_action_tactical_features`,
+`d6_relation_mode`, `d_max`, `use_cell_adjacency`,
+`use_occupied_radius_edges`, `occupied_radius`, and
+`route_on_axis_radius_messages`. Encode each as `name=repr(value)` with a
+trailing newline, hash the concatenation with SHA-256, and store the first 16
+lowercase hexadecimal digits. Every plan consumer compares the supplied
+fingerprint with the model's resolved builder fingerprint before arithmetic.
+
+`packed_schema_version` is `MANTIS_ACT_PACKED_SCHEMA_VERSION = 2` for this
+schema. A consumer must refuse a missing or unequal discriminator before using
+any graph or plan field.
+
+The model output is:
 
 ```python
 @dataclass
@@ -1091,9 +1192,9 @@ cell adjacency edges
 radius-12 occupied edges
 legal actions
 post-action rows, exactly 18 per legal action
-pair evidence rows
 state-latent scores
 action-latent scores
+execution-plan rows and pointers by family
 ```
 
 Default asymptotic work should be approximately:
@@ -1104,13 +1205,32 @@ O(6 * N_windows)
 + O(E_radius12)
 + O(K_state * (N_cells + N_windows))
 + O(18 * N_legal)
-+ O(E_pair)
 + O(K_action * N_legal)
 ```
 
 No default path may be quadratic in all cells, windows, or actions.
 
 Profile radius-12 edges carefully; expose `occupied_radius` so radius 6 and 12 can be compared without changing relation semantics.
+
+`ACTChunkCost` is preset-sensitive and must be valid for the resolved builder
+configuration. Its unit law is:
+
+| Cell/window scope | Units per position |
+|---|---:|
+| `cell_scope="occupied_only"` | `2 * occupied_stones` |
+| `cell_scope="window_and_legal"`, `window_scope in {"live", "nonempty"}` | `2 * occupied_stones + legal_actions` |
+| `cell_scope="window_and_legal"`, `window_scope="action_relevant"` | `graph_cell_count + occupied_stones` |
+
+For `action_relevant`, `graph_cell_count` comes from stored metadata validated
+against the builder or from an exact count-only builder projection. It may not
+be replaced by `occupied_stones + legal_actions`: a legal cell at distance 8
+can seed persistent windows whose cells extend to distance 13. A preset whose
+exact count is unavailable must refuse budgeted packing rather than undercharge.
+
+Only `full_act_v4` standardizes the budget-unit thresholds used by the fitting
+protocol. Other presets use the same dimensional definition above, but must
+declare and tune their own limits; budget numbers are not portable across node
+laws.
 
 ---
 
@@ -1131,16 +1251,31 @@ Profile radius-12 edges carefully; expose `occupied_radius` so radius 6 and 12 c
 
 Axis bases are learned once and replicated over the three channels.
 
+Numerical qualification is path-specific. Eager, compiled, fused, and
+unfused bf16 implementations are each compared with a declared fp32 or fp64
+reference and tolerance for that operation. Passing the same tolerance does
+not make two bf16 paths "equidistant" from the reference, nor does it permit
+one path's error to stand in for another's qualification.
+
 ---
 
 ## 28. Checkpointing and versioning
 
-- add architecture id `mantis_act_v4`;
-- bump `MODEL_REPR_VERSION` to the next repository value;
-- save the complete resolved architecture config and stable hash;
-- strict load requires exact agreement for all shape/semantic fields;
+- the legacy MantisNet gate remains `MODEL_REPR_VERSION = 3` and is not an ACT
+  version field;
+- ACT checkpoints carry `MANTIS_ACT_REPR_VERSION = 4` and architecture id
+  `mantis_act_v4`;
+- packed batches carry `MANTIS_ACT_PACKED_SCHEMA_VERSION = 2` as specified in
+  §25; this discriminator is independent of checkpoint representation version;
+- save the complete resolved architecture config and stable hash, including
+  `dropout` and every other resolved field;
+- strict load requires exact config, representation-version, checkpoint-format,
+  and architecture-hash agreement;
 - do not auto-load old MantisNet checkpoints into this model;
-- any future graft tool must emit a manifest and numerical parity evidence;
+- `ACT_CHECKPOINT_FORMAT` is bumped whenever the state-dict key set, tensor
+  shapes, or parameter identity changes. Removing key-projection biases is one
+  such change and its implementation must update the format atomically;
+- any graft tool must emit a manifest and numerical parity evidence;
 - ordinary loading remains strict and conversion-free.
 
 ---
@@ -1160,17 +1295,12 @@ relation-gated incidence
 2 axis state latents
 2 action latents
 18-window counterfactual action encoder
-post-action collinear partners
 phase FiLM
 private policy and critic adapters
 categorical3 critic
 no direct typed window attention
 no state-value head
 ```
-
-### `full_no_pair`
-
-Full model with pair rows/messages disabled.
 
 ### `full_no_axis`
 
@@ -1214,7 +1344,18 @@ Remove private adapters and use one shared action representation before the fina
 
 ### `full_with_typed_window_attention`
 
-Add typed direct window attention. Also implement an equal-parameter extra-FFN control.
+Add typed direct window attention. `window_id` is only the deterministic join
+key used to construct the typed edges; it is never embedded or used as a
+parameter selector.
+
+### `full_extra_ffn_control`
+
+Keep typed direct window attention disabled. Set
+`extra_window_ffn_hidden_inv=111` and
+`extra_window_ffn_hidden_axis=97`. All other fields equal `full_act_v4`.
+The parameter delta must equal the typed-attention delta exactly, as asserted
+by §16; this control may not approximate equality with `ffn_mult` or by changing
+`d_inv`.
 
 ### `full_no_tactical_inputs`
 
@@ -1223,6 +1364,18 @@ Disable deterministic tactical action scalars while retaining post-placement pat
 ### `full_no_action_latents`
 
 Disable action-set latent read/broadcast.
+
+### `full_output_only_separation`
+
+Set `head_separation="separate_output_mlps"`: policy and critic have separate
+output MLPs but no private equivariant adapter blocks. This is the output-only
+arm in §35.
+
+### `full_no_axis_live_windows`
+
+Apply both `full_no_axis` and `full_live_windows` to `full_act_v4`, removing
+unused axis parameters exactly. This is the predeclared combined-candidate arm
+in §35 rather than an after-the-fact composition.
 
 ---
 
@@ -1242,10 +1395,12 @@ Disable action-set latent read/broadcast.
 12. Every legal move maps to one cell node and one output row.
 13. Every legal action has exactly 18 counterfactual post-placement rows.
 14. Counterfactual patterns match an independently constructed successor-board oracle.
-15. Pair evidence uses empty cells, correct distance/axis, and correct shared-window post-two patterns.
-16. `post_action_collinear` includes newly legal partner cells whenever the engine does.
-17. Pair evidence is absent/masked on second/opening phase and for immediate-winning first actions.
-18. No graph edge crosses a batch position.
+15. No graph or plan row crosses a batch position.
+16. Every plan is byte-identical to an independent stable reference construction.
+17. Class-row blocks contain at most 128 rows and never cross a class boundary.
+18. A missing or unequal packed-schema discriminator is refused.
+19. A builder-fingerprint mismatch is refused before plan arithmetic.
+20. Each §26 chunk-cost law matches exact builder counts for its preset family.
 
 ---
 
@@ -1261,7 +1416,7 @@ For randomized and real nonterminal positions, apply all 11 nonidentity transfor
 6. invariant latents remain invariant;
 7. axis latents permute correctly;
 8. counterfactual action rows map exactly;
-9. pair evidence rows map exactly;
+9. packed execution plans transform to the same consuming-operation results;
 10. batched and single-position forwards agree within pinned tolerance.
 
 Provide a debug forward that can expose selected intermediate tensors. Production forward need not return them.
@@ -1277,21 +1432,35 @@ Provide a debug forward that can expose selected intermediate tensors. Productio
 - disabled optional modules make exactly no contribution;
 - strict config/version mismatch loading fails loudly;
 - model summary parameter totals match `sum(p.numel())`;
+- typed window attention and `full_extra_ffn_control` have exactly equal total
+  parameter counts, with the expected 19,424 parameters per state block;
+- every softmax key projection has `bias=False`, and the named-parameter census
+  contains none of the 34 forbidden key-bias tensors;
+- changing `dropout` changes the architecture hash and is refused by strict load;
+- packed-schema and builder-fingerprint mismatches fail before model arithmetic;
+- plan-backed and independent reference consuming operations agree for random
+  and real packed chunks;
 - old MantisNet behavior and checkpoints remain unaffected.
 
 ---
 
 ## 33. Structural alias diagnostic
 
-Add a command that hashes each legal action’s builder-side structural signature:
+Add a command that computes each legal action's builder-side structural signature:
 
 ```text
 cell features
 incident persistent windows
 18 post1 classes
 nearby orbit48 relations
-pair evidence
 ```
+
+The 64-bit hash is only an index for candidate groups. Within every hash bucket,
+compare the complete canonical signature exactly before declaring an alias.
+For 17,461 signatures, the birthday approximation for at least one accidental
+collision is approximately `17,461 * 17,460 / (2 * 2^64) = 8.26e-12`.
+That probability is small but not observable from aggregate unique-hash counts,
+so a hash alone is never structural identity.
 
 Report:
 
@@ -1318,8 +1487,7 @@ legal actions
 window incidences
 cell adjacency edges
 radius edges
-pair rows
-newly legal prospective partner rows
+execution-plan rows and pointers by family
 ```
 
 Report:
@@ -1341,14 +1509,58 @@ Split important model diagnostics by OPENING/FIRST/SECOND phase:
 policy entropy
 Q standard deviation among top-policy actions
 action auxiliary accuracy
-pair row counts
 ```
+
+### 34.1 Production performance gate
+
+The performance qualification uses the named `full_act_v4` preset on an NVIDIA
+RTX 4070 Ti-class GPU with 12 GiB VRAM. Run the merged production fit path with
+bf16 autocast, `torch.compile` enabled in its production dynamic-shape mode,
+optimizer fusion enabled, fitting batch size 512 positions, and two ordinary
+CPU prefetch workers. Inputs are a frozen real self-play prefix sample whose
+corpus digest, position count, ply distribution, and §26 cost totals are recorded
+with the result. No other CPU- or GPU-intensive workload may run concurrently.
+
+Time the complete steady-state fit unit: prefix build, packed graph and plan
+construction, container wrapping, host-to-device transfer, compiled forward,
+loss, backward, and optimizer update. Warm up through at least 10 completed
+updates after compilation, then measure 50 consecutive completed updates.
+Synchronize CUDA at the start and end of the measured region, and use CUDA
+events for GPU sub-stages. Report median and p95 end-to-end latency, sustained
+positions per second, stage medians, and peak allocated and reserved VRAM.
+Record GPU model, driver, CUDA, PyTorch, compiler mode, CPU model, Rayon thread
+count, prefetch worker count, commit, resolved config hash, packed schema, and
+builder fingerprint.
+
+The v4.1 gate remains uncalibrated until the merged-tree measurement replaces
+every named placeholder below. A placeholder is not a passing threshold.
+
+| Gate | Required threshold |
+|---|---:|
+| median end-to-end fit latency | `V4_1_MAX_MEDIAN_FIT_MS_TBD` |
+| p95 end-to-end fit latency | `V4_1_MAX_P95_FIT_MS_TBD` |
+| sustained throughput | `V4_1_MIN_POSITIONS_PER_SECOND_TBD` |
+| peak allocated VRAM | `V4_1_MAX_ALLOCATED_GIB_TBD` |
+| peak reserved VRAM | `V4_1_MAX_RESERVED_GIB_TBD` |
 
 ---
 
 ## 35. Recommended first ablations
 
-Hold KLENT coefficients, collection, fitting, replay lifetime, and evaluator settings fixed.
+Use two predeclared stages. Stage 1 is a supervised screen; Stage 2 is self-play
+confirmation. Before Stage 1 begins, declare the supervised metric and direction,
+equivalence margin, train/validation/test split, seed set and seed aggregation,
+maximum survivor count, survivor cutoff, and deterministic tie-break. The test
+split is not consulted while selecting survivors. Apply that rule mechanically;
+do not promote an arm because of an unregistered secondary metric.
+
+Only Stage-1 survivors enter Stage 2. Hold KLENT coefficients, collection,
+search, fitting, replay lifetime, evaluator settings, simulator budget, and seed
+policy fixed. Predeclare the self-play metric, confirmation margin, aggregation,
+and tie-break. Report supervised and self-play outcomes in `docs/ABLATIONS.md`,
+including strength per simulator evaluation and per wall-clock time.
+
+The initial supervised arms are:
 
 1. `full_act_v4` vs `full_occupied_cells_only` — explicit relevant empty cells.
 2. `full_act_v4` vs `full_live_windows` — mixed/all nonempty windows.
@@ -1356,16 +1568,14 @@ Hold KLENT coefficients, collection, fitting, replay lifetime, and evaluator set
 4. `full_act_v4` vs `full_coarse_geometry` — 48 exact D6 buckets.
 5. radius 12 vs radius 6 — geometry range versus cost.
 6. full latents vs one latent vs no latents.
-7. `full_act_v4` vs `full_no_pair` — same-turn partner modeling.
-8. current-legal vs post-action prospective partners.
-9. relation-gated vs additive incidence.
-10. private adapters vs output-only separation vs fully shared head.
-11. deterministic tactical inputs on vs off.
-12. action-set latents on vs off.
-13. typed window attention vs no typed attention plus parameter-matched FFN.
-14. nonempty vs action-relevant persistent windows.
-
-Report both strength per simulator evaluation and strength per wall-clock time.
+7. relation-gated vs additive incidence.
+8. deterministic tactical inputs on vs off.
+9. action-set latents on vs off.
+10. `private_adapters` vs `full_output_only_separation` vs `full_shared_head`.
+11. typed window attention vs `full_extra_ffn_control`.
+12. nonempty vs action-relevant persistent windows.
+13. `full_no_axis_live_windows` as the combined-candidate arm against
+    `full_act_v4`, `full_no_axis`, and `full_live_windows`.
 
 ---
 
@@ -1380,7 +1590,8 @@ Report both strength per simulator evaluation and strength per wall-clock time.
 - relevant cell builder;
 - all nonempty window builder;
 - counterfactual 18-window action tables;
-- prospective pair builder;
+- packed collation, schema discriminator, and builder fingerprint;
+- all §25 execution plans beside collation;
 - independent oracle tests.
 
 ### Stage B — equivariant local modules
@@ -1404,7 +1615,6 @@ Report both strength per simulator evaluation and strength per wall-clock time.
 ### Stage D — action model and heads
 
 - 18-window post-placement encoder;
-- same-turn partner messages;
 - action-set latents;
 - two shared action blocks;
 - private policy/critic adapters;
@@ -1415,7 +1625,9 @@ Report both strength per simulator evaluation and strength per wall-clock time.
 - all named presets;
 - optional typed window attention;
 - optional auxiliaries;
-- parameter-matched controls;
+- exact 111/97 parameter-matched control and assertion;
+- output-only and combined-candidate presets;
+- preset-valid chunk-cost laws;
 - profiling;
 - structural alias diagnostics.
 
@@ -1435,11 +1647,14 @@ Implementation is complete only when:
 6. mixed windows are nodes in the default model;
 7. default relevant cells include empty persistent-window cells;
 8. every legal action receives all 18 post-placement rows;
-9. first-placement prospective partners include engine-newly-legal cells;
-10. the external KLENT evaluation seam is unchanged;
-11. a bf16 smoke training run is finite;
-12. node/edge/time/memory telemetry is available;
-13. the old MantisNet remains untouched and selectable.
+9. all execution plans match the reference and are consumed without hot-path sorting;
+10. packed schema and builder fingerprint mismatches fail loudly;
+11. the KLENT collect/search/evaluate seams are architecture-neutral and the
+    external evaluation result contract is unchanged;
+12. a bf16 smoke training run is finite under every qualified execution path;
+13. the calibrated §34.1 performance gate passes;
+14. node/edge/plan/time/memory telemetry is available;
+15. the old MantisNet remains untouched and selectable.
 
 ---
 
@@ -1451,10 +1666,15 @@ Implementation is complete only when:
 - Axis direction is represented by equivariant channel permutation, not absolute axis-specific parameters.
 - The 48 geometry buckets are generated from all 12 D6 transforms and asserted.
 - Every legal action is encoded from its hypothetical post-placement windows.
-- Partner modeling remains internal; policy output is still one placement.
-- Recommended partner mode includes newly legal second-placement cells.
 - Multiple fixed-count latents are the default global path.
 - Policy and critic share the trunk but have private adapters.
 - The current categorical critic remains default until separately ablated.
 - Direct typed window attention is optional, not default.
+- Its exact parameter control uses dedicated 111/97 window-FFN widths; neither
+  `d_inv` nor the production parameter count is a parity knob.
+- `window_and_legal` is retained because it differs from `occupied_only` under
+  `action_relevant`; the alias `occupied_and_legal` does not exist.
+- Key projections under softmax have no bias.
+- Packed plans are bound by both schema discriminator and builder fingerprint.
+- Dropout is strict checkpoint/config identity, not an un-hashed runtime override.
 - No absolute coordinates, fixed crop, or move-history features are introduced.
