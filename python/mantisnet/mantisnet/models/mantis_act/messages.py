@@ -262,6 +262,14 @@ class TypedEdges:
 EdgeSet = TypedEdges | PlannedEdges
 
 
+def _edge_cardinalities(edges: EdgeSet) -> tuple[int, int]:
+    """Source/destination counts without specializing planned chunk metadata."""
+    if isinstance(edges, PlannedEdges):
+        plan = edges.inv_plan
+        return plan.src_ptr.shape[0] - 1, plan.dst_ptr.shape[0] - 1
+    return edges.n_src, edges.n_dst
+
+
 def incidence_edges(batch: PackedACTBatch) -> tuple[TypedEdges, TypedEdges]:
     """The cell↔window incidence of §10, both directions (§18.1, §18.2).
 
@@ -735,33 +743,6 @@ class RelationGatedMessage(nn.Module):
 
         self.drop = nn.Dropout(cfg.dropout)
 
-    def _fused_parameters(self, *, axis: bool) -> tuple[Tensor, ...]:
-        """One stream's parameters in the whole-stage registered-op ABI."""
-        suffix = "axis" if axis else "inv"
-        norm_src = getattr(self, f"ln_src_{suffix}")
-        value = getattr(self, f"wv_{suffix}")
-        gate = getattr(self, f"wg_{suffix}")
-        bias = getattr(self, f"wb_{suffix}")
-        norm_dst = getattr(self, f"ln_dst_{suffix}")
-        update = getattr(self, f"update_{suffix}")
-        scale = getattr(self, f"scale_{suffix}")
-        return (
-            norm_src.weight,
-            norm_src.bias,
-            value.weight,
-            gate.weight,
-            gate.bias,
-            bias.weight,
-            bias.bias,
-            norm_dst.weight,
-            norm_dst.bias,
-            update.lin_in.weight,
-            update.lin_in.bias,
-            update.out.weight,
-            update.out.bias,
-            scale.gamma,
-        )
-
     def _check(
         self,
         edges: EdgeSet,
@@ -774,9 +755,10 @@ class RelationGatedMessage(nn.Module):
                 f"edge family has {edges.num_relations} relation classes against "
                 f"this module's {self.num_relations}"
             )
+        n_src, n_dst = _edge_cardinalities(edges)
         for name, state, count in (
-            ("source", source, edges.n_src),
-            ("destination", destination, edges.n_dst),
+            ("source", source, n_src),
+            ("destination", destination, n_dst),
         ):
             if state.leading_shape != (count,):
                 raise ValueError(
@@ -860,14 +842,15 @@ class RelationGatedMessage(nn.Module):
         weights are known, so this reduction keeps the ``(E, d)`` formulation
         the fused sum/mean path avoids.
         """
+        _n_src, n_dst = _edge_cardinalities(edges)
         if channels == 1:
             src_slots, dst_slots, relation = edges.src, edges.dst, edges.relation
-            n_segments = edges.n_dst
+            n_segments = n_dst
         else:
             edge_src, edge_dst, relation, edge_axis = edges.routed()
             src_slots = edge_src * channels + edge_axis
             dst_slots = edge_dst * channels + edge_axis
-            n_segments = edges.n_dst * channels
+            n_segments = n_dst * channels
         messages = values.index_select(0, src_slots)
         if gate is not None:
             messages = messages * gate.index_select(0, relation)
@@ -889,34 +872,6 @@ class RelationGatedMessage(nn.Module):
         stream unchanged rather than returning a zero for it.
         """
         self._check(edges, source, destination)
-        fused_default = (
-            isinstance(edges, PlannedEdges)
-            and self.gated
-            and self.reduce == "sum"
-            and self.route_axis
-            and source.axis is not None
-            and destination.axis is not None
-            and (not self.drop.training or self.drop.p == 0.0)
-        )
-        if fused_default:
-            from .fused_message import relation_gated_message_stage
-
-            inv, axis = relation_gated_message_stage(
-                source.inv,
-                source.axis,
-                destination.inv,
-                destination.axis,
-                self.relation.weight,
-                self._fused_parameters(axis=False),
-                self._fused_parameters(axis=True),
-                edges.plan(1),
-                edges.plan(AXIS_CHANNELS),
-                activation=self.activation,
-                source_eps=(self.ln_src_inv.eps, self.ln_src_axis.eps),
-                destination_eps=(self.ln_dst_inv.eps, self.ln_dst_axis.eps),
-            )
-            return EquivariantState(inv, axis)
-
         attending = self.reduce == "attention"
 
         aggregate = self._aggregate(
@@ -944,7 +899,7 @@ class RelationGatedMessage(nn.Module):
             gate_projection=self.wg_axis if self.gated else None,
             bias_projection=self.wb_axis,
             score_vector=self.score_axis if attending else None,
-        ).reshape(edges.n_dst, AXIS_CHANNELS, self.d_axis)
+        ).reshape(destination.inv.shape[0], AXIS_CHANNELS, self.d_axis)
         delta_axis = self.drop(
             self.update_axis(self.ln_dst_axis(destination.axis), aggregate)
         )

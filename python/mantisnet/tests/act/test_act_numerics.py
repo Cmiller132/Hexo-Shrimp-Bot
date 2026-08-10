@@ -69,7 +69,7 @@ from torch.overrides import TorchFunctionMode
 import hexo_py
 
 from mantisnet.models.mantis_act import messages as messages_module
-from mantisnet.models.mantis_act import fused_message as fused_message_module
+from mantisnet.models.mantis_act import segment_message as segment_message_module
 from mantisnet.models.mantis_act.builder import build
 from mantisnet.models.mantis_act.config import PRESETS, MantisACTConfig
 from mantisnet.models.mantis_act.equivariant import (
@@ -322,13 +322,13 @@ def test_every_softmax_gather_and_segment_reduction_runs_in_fp32(
     module = StateTrunk(FULL)
     watch = NumericsWatch()
     fused_segments: list[tuple[torch.dtype, torch.dtype, torch.dtype]] = []
-    original_segment = fused_message_module._segment_reference
+    original_segment = segment_message_module._reference
 
     def checked_segment(values, gate, bias, *args, **kwargs):
         fused_segments.append((values.dtype, gate.dtype, bias.dtype))
         return original_segment(values, gate, bias, *args, **kwargs)
 
-    monkeypatch.setattr(fused_message_module, "_segment_reference", checked_segment)
+    monkeypatch.setattr(segment_message_module, "_reference", checked_segment)
     with watch, torch.autocast("cpu", dtype=torch.bfloat16):
         out = module(batch)
     trunk_loss(out).backward()
@@ -345,10 +345,10 @@ def test_every_softmax_gather_and_segment_reduction_runs_in_fp32(
         for segment in fused_segments
         for dtype in segment
     ), fused_segments
-    # A registered whole-stage op is intentionally opaque to TorchFunctionMode.
+    # The hand-written segment op is intentionally opaque to TorchFunctionMode.
     # Each checked segment performs both its ordered gathers and its reduction;
     # count that boundary alongside ordinary torch operations so this gate stays
-    # non-vacuous after fusion.
+    # non-vacuous under the outer whole-model compile.
     reductions = sum(count for name, count in watch.seen.items() if name in _REDUCTIONS)
     reductions += len(fused_segments)
     gathers = sum(count for name, count in watch.seen.items() if name in _GATHERS)

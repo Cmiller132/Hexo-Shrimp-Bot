@@ -120,9 +120,6 @@ from torch import Tensor, nn
 
 from mantisnet.models.mantis_act import (
     class_embedding,
-    fused_equivariant,
-    fused_latent,
-    fused_message,
     latent_attention,
     post_rows,
     segment_message,
@@ -1735,8 +1732,8 @@ def test_the_suite_reports_its_own_coverage(deviations):
 # --------------------------------------------------------------------------
 # The same law on the device, where the fused kernels live (§31, §36)
 #
-# The message, equivariant, segment, latent, post-row, and class-embedding
-# families dispatch to their fused implementations only on supported CUDA
+# The segment-message, latent-attention, post-row, and class-embedding-backward
+# families dispatch to hand-written implementations only on supported CUDA
 # inputs, so a host-only suite has never put §31 to those kernels at all — and
 # a kernel that read a fixed absolute axis channel instead of the row's own
 # would pass it. The device arm uses the same detectors and samples, with every
@@ -1758,17 +1755,7 @@ def counted_fused_dispatch(*, include_post_rows: bool = False):
     launch only after the launch helper returns, so ``eligible == launched`` is
     the assertion that no eligible call fell back.
     """
-    fused_latent.reset_launch_stats()
-    latent_variants = ("state", "action") if include_post_rows else ("state",)
     families = {
-        "fused_message": (
-            fused_message,
-            ("_launch_forward", "_launch_backward"),
-        ),
-        "fused_equivariant": (
-            fused_equivariant,
-            ("_launch_forward", "_launch_backward"),
-        ),
         "segment_message": (
             segment_message,
             ("_launch_forward", "_launch_backward"),
@@ -1795,7 +1782,7 @@ def counted_fused_dispatch(*, include_post_rows: bool = False):
         )
         families["class_embedding"] = (
             class_embedding,
-            ("_launch_forward", "_launch_backward"),
+            ("_launch_backward",),
         )
 
     counts = {
@@ -1843,23 +1830,6 @@ def counted_fused_dispatch(*, include_post_rows: bool = False):
     try:
         yield counts
     finally:
-        latent_stats = fused_latent.launch_stats()
-        latent_counts = {
-            f"_launch_{variant}_{stage}": latent_stats[
-                f"{variant}_{stage}_launched"
-            ]
-            for variant in latent_variants
-            for stage in ("forward", "backward")
-        }
-        counts["fused_latent"] = {
-            "eligible": sum(
-                latent_stats[f"{variant}_{stage}_eligible"]
-                for variant in latent_variants
-                for stage in ("forward", "backward")
-            ),
-            "launched": sum(latent_counts.values()),
-            **latent_counts,
-        }
         for name, (module, family_launches) in families.items():
             module._supported = supported[name]
             for launch in family_launches:
@@ -1876,12 +1846,9 @@ def assert_successful_fused_dispatch(
     The D6 comparisons run under ``no_grad`` and therefore require every
     forward helper.  The full-model device fixture additionally performs one
     bounded training pass and sets ``require_backward=True`` so every ordered
-    recompute/segment/sentinel backward is load-bearing.
+    segment/sentinel backward is load-bearing.
     """
     modules = {
-        "fused_message": fused_message,
-        "fused_equivariant": fused_equivariant,
-        "fused_latent": fused_latent,
         "segment_message": segment_message,
         "latent_attention": latent_attention,
         "post_rows": post_rows,
@@ -2029,9 +1996,6 @@ def test_the_position_law_holds_where_the_fused_kernels_run(cuda_law, deviations
     measured, counts = cuda_law
     assert_successful_fused_dispatch(
         counts,
-        "fused_message",
-        "fused_equivariant",
-        "fused_latent",
         "segment_message",
         "latent_attention",
     )
@@ -2067,9 +2031,6 @@ def test_the_action_law_holds_through_the_full_model_on_the_device(cuda_action_l
     measured, counts = cuda_action_law
     assert_successful_fused_dispatch(
         counts,
-        "fused_message",
-        "fused_equivariant",
-        "fused_latent",
         "segment_message",
         "latent_attention",
         "post_rows",
@@ -2108,9 +2069,6 @@ def test_the_position_law_still_catches_each_construction_on_the_device(dense, n
         measured = law_deviations(trunk, on_device(dense))
     assert_successful_fused_dispatch(
         counts,
-        "fused_message",
-        "fused_equivariant",
-        "fused_latent",
         "segment_message",
         "latent_attention",
     )

@@ -4,12 +4,13 @@ The post-placement row relation is
 
 ``E_post1[action_post1_class] + E_status[action_pre_status]``.
 
-The forward gathers and adds both rows in one kernel.  The backward consumes
-the class-major CSR views built by :mod:`plans`: each class owns one contiguous
-run of original row ids, so one program sums that run in row order.  No sort or
-atomic scatter occurs in the model step, and empty classes produce exact zero
-gradients.  CPU and unsupported signatures use the literal torch formulation
-held against the kernel by the §36 parity tests.
+The forward is the literal pair of table lookups, left visible to the enclosing
+``torch.compile`` region.  The backward consumes the class-major CSR views built
+by :mod:`plans`: each class owns one contiguous run of original row ids, so one
+program sums that run in row order.  No sort or atomic scatter occurs in the
+model step, and empty classes produce exact zero gradients.  CPU and unsupported
+signatures use the literal ordered torch reduction held against the kernel by
+the §36 parity tests.
 """
 
 from __future__ import annotations
@@ -27,11 +28,9 @@ except ImportError:  # pragma: no cover - exercised only without Triton
     tl = None
 
 
-_BLOCK_M = 128
 _MAX_BLOCK_D = 256
 _WARPS = 4
 
-_FAILED_SHAPES: dict[tuple[object, ...], str] = {}
 _FAILED_BACKWARD_SHAPES: dict[tuple[object, ...], str] = {}
 
 
@@ -95,35 +94,6 @@ def _reference_backward(
 
 
 if triton is not None:
-
-    @triton.jit
-    def _pair_lookup_kernel(
-        post_weight_ptr,
-        status_weight_ptr,
-        post_index_ptr,
-        status_index_ptr,
-        out_ptr,
-        M,
-        D: tl.constexpr,
-        BLOCK_M: tl.constexpr,
-        BLOCK_D: tl.constexpr,
-    ):
-        rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-        columns = tl.arange(0, BLOCK_D)
-        live = (rows[:, None] < M) & (columns[None, :] < D)
-        post = tl.load(post_index_ptr + rows, mask=rows < M, other=0)
-        status = tl.load(status_index_ptr + rows, mask=rows < M, other=0)
-        value = tl.load(
-            post_weight_ptr + post[:, None] * D + columns[None, :],
-            mask=live,
-            other=0.0,
-        )
-        value += tl.load(
-            status_weight_ptr + status[:, None] * D + columns[None, :],
-            mask=live,
-            other=0.0,
-        )
-        tl.store(out_ptr + rows[:, None] * D + columns[None, :], value, mask=live)
 
     @triton.jit
     def _class_sum_kernel(
@@ -237,30 +207,6 @@ def _shape_key(sample: Tensor, *rest: object) -> tuple[object, ...]:
     return (sample.device.type, sample.device.index, sample.dtype, *rest)
 
 
-def _launch_forward(
-    post_weight: Tensor,
-    status_weight: Tensor,
-    post_index: Tensor,
-    status_index: Tensor,
-) -> Tensor:
-    rows = int(post_index.numel())
-    width = int(post_weight.shape[1])
-    out = torch.empty(rows, width, dtype=post_weight.dtype, device=post_weight.device)
-    _pair_lookup_kernel[(triton.cdiv(rows, _BLOCK_M),)](
-        post_weight,
-        status_weight,
-        post_index,
-        status_index,
-        out,
-        rows,
-        D=width,
-        BLOCK_M=_BLOCK_M,
-        BLOCK_D=triton.next_power_of_2(width),
-        num_warps=_WARPS,
-    )
-    return out
-
-
 def _launch_backward(
     post_weight: Tensor,
     status_weight: Tensor,
@@ -293,68 +239,6 @@ def _launch_backward(
         num_warps=_WARPS,
     )
     return d_post, d_status
-
-
-@torch.library.custom_op("mantisnet::act_class_pair_embedding", mutates_args=())
-def _class_pair_op(
-    post_weight: Tensor,
-    status_weight: Tensor,
-    post_index: Tensor,
-    status_index: Tensor,
-    post_ptr: Tensor,
-    post_rows: Tensor,
-    status_ptr: Tensor,
-    status_rows: Tensor,
-) -> Tensor:
-    _validate(
-        post_weight,
-        status_weight,
-        post_index,
-        status_index,
-        post_ptr,
-        post_rows,
-        status_ptr,
-        status_rows,
-    )
-    reference = lambda: _reference(  # noqa: E731
-        post_weight, status_weight, post_index, status_index
-    )
-    rows, width = int(post_index.numel()), int(post_weight.shape[1])
-    if not _supported(post_weight, width, rows):
-        return reference()
-    key = _shape_key(
-        post_weight,
-        width,
-        int(post_weight.shape[0]),
-        int(status_weight.shape[0]),
-    )
-    if key in _FAILED_SHAPES:
-        return reference()
-    try:
-        return _launch_forward(post_weight, status_weight, post_index, status_index)
-    except Exception as exc:
-        _FAILED_SHAPES[key] = f"{type(exc).__name__}: {exc}"
-        warnings.warn(
-            f"fused class-pair lookup failed for width={width}; using the two "
-            f"torch lookups for this shape: {_FAILED_SHAPES[key]}",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return reference()
-
-
-@_class_pair_op.register_fake
-def _(
-    post_weight: Tensor,
-    status_weight: Tensor,
-    post_index: Tensor,
-    status_index: Tensor,
-    post_ptr: Tensor,
-    post_rows: Tensor,
-    status_ptr: Tensor,
-    status_rows: Tensor,
-) -> Tensor:
-    return post_weight.new_empty((post_index.numel(), post_weight.shape[1]))
 
 
 @torch.library.custom_op(
@@ -424,18 +308,30 @@ def _(
     return torch.empty_like(post_weight), torch.empty_like(status_weight)
 
 
-def _setup_context(ctx, inputs, output) -> None:
-    ctx.save_for_backward(
-        inputs[0], inputs[1], inputs[4], inputs[5], inputs[6], inputs[7]
-    )
+class _ClassPairEmbedding(torch.autograd.Function):
+    """Traceable lookup forward with the ordered reduction as its only op wall."""
 
+    @staticmethod
+    def forward(
+        ctx,
+        post_weight: Tensor,
+        status_weight: Tensor,
+        post_index: Tensor,
+        status_index: Tensor,
+        post_ptr: Tensor,
+        post_rows: Tensor,
+        status_ptr: Tensor,
+        status_rows: Tensor,
+    ) -> Tensor:
+        ctx.save_for_backward(
+            post_weight, status_weight, post_ptr, post_rows, status_ptr, status_rows
+        )
+        return _reference(post_weight, status_weight, post_index, status_index)
 
-def _dispatch_backward(ctx, grad_out: Tensor):
-    d_post, d_status = _class_pair_backward_op(*ctx.saved_tensors, grad_out)
-    return d_post, d_status, None, None, None, None, None, None
-
-
-_class_pair_op.register_autograd(_dispatch_backward, setup_context=_setup_context)
+    @staticmethod
+    def backward(ctx, grad_out: Tensor):
+        d_post, d_status = _class_pair_backward_op(*ctx.saved_tensors, grad_out)
+        return d_post, d_status, None, None, None, None, None, None
 
 
 def class_pair_embedding(
@@ -455,7 +351,7 @@ def class_pair_embedding(
     plan: ``rows[ptr[c]:ptr[c+1]]`` names every flattened row of class ``c`` in
     original row order.
     """
-    return _class_pair_op(
+    inputs = (
         post_weight.contiguous(),
         status_weight.contiguous(),
         post_index.contiguous(),
@@ -465,6 +361,8 @@ def class_pair_embedding(
         status_ptr.contiguous(),
         status_rows.contiguous(),
     )
+    _validate(*inputs)
+    return _ClassPairEmbedding.apply(*inputs)
 
 
 __all__ = ["class_pair_embedding"]

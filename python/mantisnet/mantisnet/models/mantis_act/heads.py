@@ -222,11 +222,11 @@ def compose_acting_q(
     # total, enforcing on the device that the offsets end where the critic's
     # rows do.
     segment = (
-        row_positions(legal_offsets, int(critic_logits.shape[0]))
+        row_positions(legal_offsets, critic_logits.shape[0])
         if row_position is None
         else row_position
     )
-    positions = int(legal_offsets.shape[0]) - 1
+    positions = legal_offsets.shape[0] - 1
     scale = _segment_max(p_pos + p_neg, segment, positions).clamp(min=mass_floor)
     return (p_pos - p_neg) / scale.index_select(0, segment)
 
@@ -888,7 +888,7 @@ class ActionHeads(nn.Module):
                 "the private adapters read the state latents, but none were given"
             )
         if row_position is None:
-            row_position = row_positions(legal_offsets, int(actions.inv.shape[0]))
+            row_position = row_positions(legal_offsets, actions.inv.shape[0])
         return self._fork(actions, row_position, latents)
 
     def _fork(
@@ -924,7 +924,7 @@ class ActionHeads(nn.Module):
                 "the private adapters read the state latents, but none were given"
             )
         if row_position is None:
-            row_position = row_positions(legal_offsets, int(actions.inv.shape[0]))
+            row_position = row_positions(legal_offsets, actions.inv.shape[0])
         policy_logits, critic_logits = self._fork(actions, row_position, latents)
         q_value, q_score, mass = self.critic.compose(
             critic_logits,

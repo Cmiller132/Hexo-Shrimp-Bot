@@ -4,7 +4,7 @@ The two class grids contain many duplicate ids.  Forward is only two table
 lookups, but backward is the important part: every class must receive an
 ordered reduction over the flattened action rows, with no atomic scatter.
 The oracle below builds its class buckets in Python and accumulates rows one
-at a time; it does not use either implementation helper from the custom op.
+at a time; it does not use the registered backward op's implementation helper.
 
 Float64 CPU data is dyadic, so its forward and gradients are required to be
 bit exact.  CUDA fp32 is held to the same fp32-accumulation oracle.  Bfloat16
@@ -190,7 +190,7 @@ def test_cpu_forward_and_table_gradients_are_exact_against_the_oracle():
     assert torch.equal(got_grad[1], want_grad[1])
 
 
-def test_gradcheck_of_the_registered_recompute_backward():
+def test_gradcheck_of_the_registered_ordered_backward():
     case = fixed_case(width=3)
     post = (case[0] / 7).requires_grad_(True)
     status = (case[1] / 11).requires_grad_(True)
@@ -234,7 +234,79 @@ def test_structurally_invalid_inputs_fail_loudly():
 
 
 # ---------------------------------------------------------------------------
-# The Triton forward and ordered reduction against the independent oracle
+# Composition with the whole-model compiler
+
+
+def test_outer_compile_sees_the_plain_forward_across_dynamic_row_counts():
+    """The lookup/add stays traceable instead of becoming another Python op wall."""
+    graphs = []
+
+    def backend(graph, _example_inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = torch.compile(
+        class_pair_embedding, backend=backend, dynamic=True, fullgraph=True
+    )
+    for rows in (263, 521):
+        case = random_case(rows=rows, width=8)
+        got = compiled(*case)
+        want = oracle_forward(case[0], case[1], case[2], case[3])
+        assert torch.equal(got, want)
+
+    assert len(graphs) == 1
+    graph_code = graphs[0].code
+    assert "act_class_pair_embedding" not in graph_code
+    assert graph_code.count("index_select") >= 2
+
+
+def test_outer_aot_autograd_composes_with_the_ordered_backward():
+    """AOTAutograd may inline the lookup while retaining the backward op node."""
+    case = random_case(rows=263, width=8)
+    generator = torch.Generator().manual_seed(SEED + 3)
+    grad_out = torch.randn(263, 8, generator=generator)
+
+    def loss(
+        post,
+        status,
+        post_index,
+        status_index,
+        post_ptr,
+        post_rows,
+        status_ptr,
+        status_rows,
+        gradient,
+    ):
+        return (
+            class_pair_embedding(
+                post,
+                status,
+                post_index,
+                status_index,
+                post_ptr,
+                post_rows,
+                status_ptr,
+                status_rows,
+            )
+            * gradient
+        ).sum()
+
+    def capture(call):
+        post = case[0].clone().requires_grad_(True)
+        status = case[1].clone().requires_grad_(True)
+        value = call(post, status, *case[2:], grad_out)
+        value.backward()
+        return value.detach(), post.grad, status.grad
+
+    eager = capture(loss)
+    compiled = torch.compile(loss, backend="aot_eager", dynamic=True, fullgraph=True)
+    actual = capture(compiled)
+    for got, want in zip(actual, eager):
+        torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+
+
+# ---------------------------------------------------------------------------
+# The traceable forward and Triton ordered reduction against the independent oracle
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
@@ -302,9 +374,8 @@ def test_repeated_class_gradients_are_bitwise_deterministic_in_fp32():
 
 
 @_CUDA
-def test_supported_cuda_signature_really_launches_forward_and_backward(monkeypatch):
+def test_supported_cuda_signature_really_launches_ordered_backward(monkeypatch):
     """A cached/reference fallback cannot satisfy the device acceptance test."""
-    assert kernel._FAILED_SHAPES == {}
     assert kernel._FAILED_BACKWARD_SHAPES == {}
     host = random_case(rows=263, width=64)
     post, status, *plans = on_device(host, "cuda", torch.float32)
@@ -312,25 +383,17 @@ def test_supported_cuda_signature_really_launches_forward_and_backward(monkeypat
     status.requires_grad_(True)
     assert kernel._supported(post, 64, 263)
 
-    calls = {"forward": 0, "backward": 0}
-    original_forward = kernel._launch_forward
+    calls = {"backward": 0}
     original_backward = kernel._launch_backward
-
-    def counted_forward(*args, **kwargs):
-        result = original_forward(*args, **kwargs)
-        calls["forward"] += 1
-        return result
 
     def counted_backward(*args, **kwargs):
         result = original_backward(*args, **kwargs)
         calls["backward"] += 1
         return result
 
-    monkeypatch.setattr(kernel, "_launch_forward", counted_forward)
     monkeypatch.setattr(kernel, "_launch_backward", counted_backward)
     class_pair_embedding(post, status, *plans).square().sum().backward()
     torch.cuda.synchronize()
 
-    assert calls == {"forward": 1, "backward": 1}
-    assert kernel._FAILED_SHAPES == {}
+    assert calls == {"backward": 1}
     assert kernel._FAILED_BACKWARD_SHAPES == {}

@@ -44,32 +44,41 @@ def _synchronisation_detections(
 
 @pytest.fixture()
 def batch():
+    return _batch_with_positions(2)
+
+
+def _batch_with_positions(positions: int):
     # The generic packed-batch fixtures deliberately use small arbitrary
     # feature widths when testing transport alone. This fixture reaches the
     # default model, so make it obey all frozen builder feature schemas.
+    templates = (
+        graph_a(
+            window_numeric=np.zeros(
+                (2, WINDOW_NUMERIC_FEATURES), dtype=np.float32
+            ),
+            action_tactical_numeric=np.zeros(
+                (2, TACTICAL_FEATURES), dtype=np.float32
+            ),
+            global_numeric=np.zeros(GLOBAL_NUMERIC_FEATURES, dtype=np.float32),
+        ),
+        graph_b(
+            window_numeric=np.zeros(
+                (1, WINDOW_NUMERIC_FEATURES), dtype=np.float32
+            ),
+            action_tactical_numeric=np.zeros(
+                (2, TACTICAL_FEATURES), dtype=np.float32
+            ),
+            global_numeric=np.zeros(GLOBAL_NUMERIC_FEATURES, dtype=np.float32),
+        ),
+    )
     return collate(
-        [
-            graph_a(
-                window_numeric=np.zeros(
-                    (2, WINDOW_NUMERIC_FEATURES), dtype=np.float32
-                ),
-                action_tactical_numeric=np.zeros(
-                    (2, TACTICAL_FEATURES), dtype=np.float32
-                ),
-                global_numeric=np.zeros(GLOBAL_NUMERIC_FEATURES, dtype=np.float32),
-            ),
-            graph_b(
-                window_numeric=np.zeros(
-                    (1, WINDOW_NUMERIC_FEATURES), dtype=np.float32
-                ),
-                action_tactical_numeric=np.zeros(
-                    (2, TACTICAL_FEATURES), dtype=np.float32
-                ),
-                global_numeric=np.zeros(GLOBAL_NUMERIC_FEATURES, dtype=np.float32),
-            ),
-        ],
+        [templates[index % len(templates)] for index in range(positions)],
         FULL,
     )
+
+
+def _is_dim0_dynamic(value: torch.Tensor) -> bool:
+    return 0 in getattr(value, "_dynamo_dynamic_indices", set())
 
 
 def _ptr(keys: list[int], size: int) -> list[int]:
@@ -187,6 +196,72 @@ def test_action_class_and_source_window_csrs_are_stable_and_exact(batch):
     ]
 
 
+def test_collate_and_transport_mark_chunk_rows_but_not_fixed_pointers_dynamic():
+    batch = _batch_with_positions(3)
+
+    def assert_annotations(candidate):
+        state = candidate.plans.state_edges.to_windows
+        action = candidate.plans.action_rows
+        for tensor in (
+            candidate.global_numeric,
+            candidate.cell_offsets,
+            candidate.cell_occupancy,
+            state.src,
+            state.inv_plan.dst_ptr,
+            state.inv_plan.dst_src,
+            state.inv_plan.rel_src,
+            action.post1.rows,
+            action.source_window.ptr,
+            candidate.plans.state_segments.counts,
+            candidate.plans.state_segments.row_pos,
+        ):
+            assert tensor.shape[0] > 1
+            assert _is_dim0_dynamic(tensor), tensor.shape
+
+        # Vocabulary cardinalities are architecture constants, even though
+        # these pointer arrays happen to be longer than the >2 row cutoff.
+        assert state.inv_plan.rel_ptr.shape[0] > 2
+        assert action.post1.ptr.shape[0] > 2
+        assert action.pre_status.ptr.shape[0] > 2
+        assert not _is_dim0_dynamic(state.inv_plan.rel_ptr)
+        assert not _is_dim0_dynamic(action.post1.ptr)
+        assert not _is_dim0_dynamic(action.pre_status.ptr)
+
+    assert_annotations(batch)
+    assert_annotations(batch.to("cpu"))
+
+
+def test_nested_plan_rows_share_one_fullgraph_dynamic_compile_across_chunks():
+    # Start at two to guard the exact cardinality that the deleted per-stage
+    # compilers used to specialize into accidental equality constraints.
+    batches = (_batch_with_positions(2), _batch_with_positions(3))
+    graphs = []
+
+    def backend(graph, _example_inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    def plan_probe(candidate):
+        state = candidate.plans.state_edges.to_windows.inv_plan
+        action = candidate.plans.action_rows
+        segments = candidate.plans.state_segments
+        return (
+            candidate.global_numeric.sum()
+            + state.dst_ptr.float().sum()
+            + state.dst_src.float().sum()
+            + state.rel_ptr.float().sum()
+            + action.post1.ptr.float().sum()
+            + action.post1.rows.float().sum()
+            + segments.counts.float().sum()
+            + segments.row_pos.float().sum()
+        )
+
+    compiled = torch.compile(plan_probe, backend=backend, dynamic=True, fullgraph=True)
+    for candidate in batches:
+        torch.testing.assert_close(compiled(candidate), plan_probe(candidate))
+    assert len(graphs) == 1
+
+
 def _owners(offsets: torch.Tensor) -> list[int]:
     values = offsets.tolist()
     return [
@@ -251,6 +326,8 @@ def test_plan_pinning_is_recursive(batch):
     assert pinned.plans.state_edges.radius.routed_src.is_pinned()
     assert pinned.plans.action_rows.post1.rows.is_pinned()
     assert pinned.plans.state_segments.ranges.is_pinned()
+    assert _is_dim0_dynamic(pinned.plans.state_edges.radius.inv_plan.dst_ptr)
+    assert _is_dim0_dynamic(pinned.plans.action_rows.post1.rows)
 
 
 @pytest.mark.skipif(

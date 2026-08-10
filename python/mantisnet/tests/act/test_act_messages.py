@@ -367,44 +367,6 @@ def test_aggregation_matches_a_per_edge_loop():
     torch.testing.assert_close(got.axis, want.axis, atol=1e-5, rtol=1e-5)
 
 
-def test_fused_dispatch_follows_the_dropout_submodule_mode(monkeypatch):
-    import mantisnet.models.mantis_act.fused_message as fused_message
-
-    message = RelationGatedMessage(config(dropout=0.5), 8).eval()
-    message.drop.train()
-    source, destination = states(N_CELLS, 3, 20260809)
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("active dropout must keep the literal path")
-
-    monkeypatch.setattr(
-        fused_message, "relation_gated_message_stage", forbidden
-    )
-    updated = message(planned_edge_set(), source, destination)
-    assert updated.inv.shape == destination.inv.shape
-    assert updated.axis.shape == destination.axis.shape
-
-
-def test_inactive_message_dropout_can_fuse_with_a_training_parent(monkeypatch):
-    import mantisnet.models.mantis_act.fused_message as fused_message
-
-    message = RelationGatedMessage(config(dropout=0.5), 8).train()
-    message.drop.eval()
-    source, destination = states(N_CELLS, 3, 20260810)
-    called = False
-
-    def identity(src_inv, src_axis, dst_inv, dst_axis, *args, **kwargs):
-        nonlocal called
-        called = True
-        return dst_inv, dst_axis
-
-    monkeypatch.setattr(fused_message, "relation_gated_message_stage", identity)
-    updated = message(planned_edge_set(), source, destination)
-    assert called
-    assert updated.inv is destination.inv
-    assert updated.axis is destination.axis
-
-
 def test_aggregation_matches_a_per_edge_loop_without_gates():
     torch.manual_seed(0)
     message = RelationGatedMessage(config(incidence_message="additive"), 8).eval()

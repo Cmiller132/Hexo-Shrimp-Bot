@@ -250,9 +250,18 @@ class StateEdges:
     window_window: WindowWindowEdges | None
 
 
-def state_edges(batch: PackedACTBatch, cfg: MantisACTConfig) -> StateEdges | StatePlans:
+def state_edges(
+    batch: PackedACTBatch,
+    cfg: MantisACTConfig,
+    *,
+    expected_fingerprint: str | None = None,
+) -> StateEdges | StatePlans:
     """The §18 edge families of ``batch`` under ``cfg`` (§10, §15, §16)."""
-    expected = builder_fingerprint(cfg)
+    expected = (
+        builder_fingerprint(cfg)
+        if expected_fingerprint is None
+        else expected_fingerprint
+    )
     if batch.plans is not None:
         if batch.builder_fingerprint != expected:
             raise ValueError(
@@ -579,7 +588,11 @@ class StateTrunk(nn.Module):
         cells = self.cell_embedding(batch)
         windows = self.window_embedding(batch)
         latents = self.latents.initial(batch.global_numeric)
-        edges = state_edges(batch, self.cfg)
+        edges = state_edges(
+            batch,
+            self.cfg,
+            expected_fingerprint=self.builder_fingerprint,
+        )
 
         # Which position owns each cell row and each window row, built once for
         # the whole forward: the latent read, the latent broadcast, and the
@@ -638,7 +651,7 @@ class StateTrunk(nn.Module):
             cells=cells,
             windows=windows,
             latents=latents,
-            position_count=int(batch.position_count),
+            position_count=batch.global_numeric.shape[0],
         )
 
 

@@ -12,13 +12,14 @@ leading zero.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 
 import numpy as np
 import torch
 
 from .config import MantisACTConfig
-from .plans import ACTPlans, build_plans, builder_fingerprint
+from .plans import ACTPlans, ClassRowPlan, build_plans, builder_fingerprint
+from .segment_message import MessagePlan
 from .pattern_classes import (
     ALL_CELL_WINDOW_REL_CLASSES,
     ALL_WINDOW_PATTERN_CLASSES,
@@ -34,6 +35,50 @@ WINDOW_LEN = 6
 NUM_AXES = 3
 # 3 axes x 6 candidate slots through every legal cell (§19.2).
 POST_ACTION_ROWS = NUM_AXES * WINDOW_LEN
+
+
+def _mark_chunk_dynamic(value, seen: set[int]) -> None:
+    """Mark one packed input tree's chunk-varying leading dimensions.
+
+    Dynamo does not recursively inherit a dynamic hint from a dataclass, and
+    both :meth:`Tensor.to` and the plan containers' ``to`` methods create new
+    tensors.  Walk the concrete transport tree after each construction so the
+    outer whole-model compile sees the same symbolic row dimensions on every
+    chunk.
+
+    Relation CSR pointers and class CSR pointers are the exceptions: their
+    lengths are vocabulary sizes fixed by the model architecture.  Marking
+    those dynamic would turn true architecture constants into unnecessary
+    symbolic inputs and can introduce false equality constraints.
+    """
+    if isinstance(value, torch.Tensor):
+        identity = id(value)
+        if identity in seen:
+            return
+        seen.add(identity)
+        # Dynamo necessarily specializes the degenerate 0/1 cases because
+        # those cardinalities change tensor semantics.  Size two is a normal
+        # dynamic row count now that the inner stage compilers (and their
+        # accidental equal-dimension constraints) are gone.
+        if value.ndim and value.shape[0] > 1:
+            torch._dynamo.mark_dynamic(value, 0)
+        return
+
+    if isinstance(value, MessagePlan):
+        for name, child in vars(value).items():
+            if name != "rel_ptr":
+                _mark_chunk_dynamic(child, seen)
+        return
+
+    if isinstance(value, ClassRowPlan):
+        # ``ptr`` has n_classes + 1 rows; only the class-sorted row order grows
+        # with a packed chunk.
+        _mark_chunk_dynamic(value.rows, seen)
+        return
+
+    if is_dataclass(value):
+        for field in fields(value):
+            _mark_chunk_dynamic(getattr(value, field.name), seen)
 
 # The rules' legality radius, and the §8.2 nearest-stone bucket vocabulary it
 # fixes: one bucket per hex distance 0..LEGAL_RADIUS, plus one for a cell no
@@ -571,6 +616,16 @@ class PackedACTBatch:
     plans: ACTPlans | None = None
     builder_fingerprint: str = ""
 
+    def mark_dynamic(self) -> "PackedACTBatch":
+        """Annotate every chunk-varying tensor row for the outer compiler.
+
+        The batch and its plans are immutable in shape for one step, so these
+        annotations alter no model value.  They only state that another packed
+        step may carry different position, node, edge, or action row counts.
+        """
+        _mark_chunk_dynamic(self, set())
+        return self
+
     def to(self, device) -> "PackedACTBatch":
         """The same batch with every tensor on ``device``."""
         moved = {}
@@ -581,7 +636,7 @@ class PackedACTBatch:
                 moved[name] = value.to(device, non_blocking=True)
             else:
                 moved[name] = value
-        return PackedACTBatch(**moved)
+        return PackedACTBatch(**moved).mark_dynamic()
 
     def pin_memory(self) -> "PackedACTBatch":
         """The same batch in pinned host memory, so ``to`` is a true async DMA.
@@ -597,7 +652,7 @@ class PackedACTBatch:
                 pinned[name] = value.pin_memory()
             else:
                 pinned[name] = value
-        return PackedACTBatch(**pinned)
+        return PackedACTBatch(**pinned).mark_dynamic()
 
 
 def _offsets(counts: np.ndarray) -> np.ndarray:
@@ -718,7 +773,7 @@ def collate(graphs: Sequence[ACTGraph], cfg: MantisACTConfig) -> PackedACTBatch:
         plans=plans,
         builder_fingerprint=builder_fingerprint(cfg),
         **packed,
-    )
+    ).mark_dynamic()
 
 
 # The graph-cell budget a fitting chunk is packed under (§26), in graph cells

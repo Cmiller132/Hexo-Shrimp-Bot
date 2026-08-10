@@ -200,7 +200,7 @@ class MessagePlan:
         """The destination of each row of the destination-major view."""
         counts = (self.dst_ptr[1:] - self.dst_ptr[:-1]).long()
         return torch.repeat_interleave(
-            torch.arange(self.n_dst, device=self.device), counts
+            torch.arange(self.dst_ptr.shape[0] - 1, device=self.device), counts
         )
 
     def destination_counts(self) -> Tensor:
@@ -214,7 +214,9 @@ class MessagePlan:
             return (self.dst_ptr[1:] - self.dst_ptr[:-1]).float()
         slots = self.edge_destinations() * self.channels + self.dst_axis.long()
         return torch.zeros(
-            self.n_dst * self.channels, dtype=torch.float32, device=self.device
+            (self.dst_ptr.shape[0] - 1) * self.channels,
+            dtype=torch.float32,
+            device=self.device,
         ).index_add_(0, slots, torch.ones_like(slots, dtype=torch.float32))
 
 
@@ -965,15 +967,17 @@ def relation_gated_message(
     for §14's additive control. The result is ``(N_dst * channels, D)`` in fp32
     (§27).
     """
-    if plan.n_relations != bias.shape[0]:
+    relation_count = plan.rel_ptr.shape[0] - 1
+    source_count = plan.src_ptr.shape[0] - 1
+    if relation_count != bias.shape[0]:
         raise ValueError(
-            f"the plan has {plan.n_relations} relation classes against the "
+            f"the plan has {relation_count} relation classes against the "
             f"{bias.shape[0]}-row table"
         )
-    if values.shape[0] != plan.n_src * plan.channels:
+    if values.shape[0] != source_count * plan.channels:
         raise ValueError(
             f"values has {values.shape[0]} rows against the plan's "
-            f"{plan.n_src} sources over {plan.channels} channels"
+            f"{source_count} sources over {plan.channels} channels"
         )
     return _segment_message_op(
         values.contiguous(),

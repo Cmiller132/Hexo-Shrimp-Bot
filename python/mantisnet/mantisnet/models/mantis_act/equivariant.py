@@ -655,115 +655,17 @@ def run_equivariant_stage(
     film: PhaseFiLM | None = None,
     phase_id: Tensor | None = None,
 ) -> EquivariantState:
-    """Run one whole AxisMix/FFN/FiLM stage through its registered op.
+    """Run one traceable AxisMix/FFN/FiLM stage in the specified order.
 
-    This is the single parameter-packing seam for every symmetric entity
-    family.  Keeping the order here avoids separate cell, window, action, and
-    head call sites acquiring subtly different operator ABIs.  Unsupported
-    ablations retain the literal module formulation.
+    The stage intentionally stays as ordinary torch code.  The production
+    compile boundary surrounds the whole model, allowing Inductor to fuse this
+    composition with its neighbours while preserving one shared ordering seam
+    for cells, windows, actions, and private heads.
     """
     if (film is None) != (phase_id is None):
         raise ValueError("film and phase_id must be supplied together")
-
-    # Device-law mutation tests deliberately replace one stage with an
-    # arbitrary wrapper module.  Such a wrapper has no registered-op parameter
-    # ABI; executing the literal composition preserves both the mutation and
-    # the detector that is meant to catch it.
-    if not isinstance(mix, AxisMix) or not isinstance(ffn, EquivariantFFN):
-        result = ffn(mix(state))
-        return result if film is None else film(result, phase_id)
-
-    if mix.activation != ffn.activation:
-        raise ValueError(
-            "AxisMix and EquivariantFFN activation disagree: "
-            f"{mix.activation!r} versus {ffn.activation!r}"
-        )
-
-    if state.axis is None or not mix.d_axis:
-        result = ffn(mix(state))
-        return result if film is None else film(result, phase_id)
-
-    stochastic = (
-        (mix.drop.training and mix.drop.p != 0.0)
-        or (ffn.drop.training and ffn.drop.p != 0.0)
-    )
-    if stochastic:
-        result = ffn(mix(state))
-        return result if film is None else film(result, phase_id)
-
-    if mix.norm.axis is None or mix.residual.axis is None:
-        raise ValueError("AxisMix has an axis width but lacks axis modules")
-    if ffn.norm.axis is None or ffn.axis is None or ffn.residual.axis is None:
-        raise ValueError("EquivariantFFN has an axis width but lacks axis modules")
-
-    mix_parameters = (
-        mix.norm.inv.weight,
-        mix.norm.inv.bias,
-        mix.norm.axis.weight,
-        mix.norm.axis.bias,
-        mix.inv_to_axis.weight,
-        mix.inv_to_axis.bias,
-        mix.mlp_axis[0].weight,
-        mix.mlp_axis[0].bias,
-        mix.mlp_axis[2].weight,
-        mix.mlp_axis[2].bias,
-        mix.phi_axis[0].weight,
-        mix.phi_axis[0].bias,
-        mix.mlp_inv[0].weight,
-        mix.mlp_inv[0].bias,
-        mix.mlp_inv[2].weight,
-        mix.mlp_inv[2].bias,
-        mix.residual.inv.gamma,
-        mix.residual.axis.gamma,
-    )
-    ffn_parameters = (
-        ffn.norm.inv.weight,
-        ffn.norm.inv.bias,
-        ffn.norm.axis.weight,
-        ffn.norm.axis.bias,
-        ffn.inv[0].weight,
-        ffn.inv[0].bias,
-        ffn.inv[2].weight,
-        ffn.inv[2].bias,
-        ffn.axis[0].weight,
-        ffn.axis[0].bias,
-        ffn.axis[2].weight,
-        ffn.axis[2].bias,
-        ffn.residual.inv.gamma,
-        ffn.residual.axis.gamma,
-    )
-
-    film_parameters = None
-    phase_row = None
-    if film is not None:
-        if film.to_axis is None:
-            raise ValueError("phase FiLM lacks the required axis projection")
-        film_parameters = (
-            film.embed.weight,
-            film.phase_mlp[0].weight,
-            film.phase_mlp[0].bias,
-            film.to_inv.weight,
-            film.to_inv.bias,
-            film.to_axis.weight,
-            film.to_axis.bias,
-        )
-        phase_row = film.phase_row
-
-    from .fused_equivariant import equivariant_stage
-
-    out_inv, out_axis = equivariant_stage(
-        state.inv,
-        state.axis,
-        mix_parameters,
-        ffn_parameters,
-        phase_id=phase_id,
-        phase_row=phase_row,
-        film=film_parameters,
-        activation=mix.activation,
-        mix_eps=(mix.norm.inv.eps, mix.norm.axis.eps),
-        ffn_eps=(ffn.norm.inv.eps, ffn.norm.axis.eps),
-    )
-    return EquivariantState(out_inv, out_axis)
+    result = ffn(mix(state))
+    return result if film is None else film(result, phase_id)
 
 
 __all__ = [

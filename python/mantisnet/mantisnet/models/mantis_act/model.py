@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
 from typing import Sequence
 
+import torch
 from torch import Tensor, nn
 
 from .action_encoder import ActionEncoder, ActionOutput
@@ -255,24 +256,36 @@ class MantisACT(nn.Module):
                 f"{self.builder_fingerprint!r}; rebuild it with "
                 "collate(graphs, model.cfg)"
             )
-        positions = int(batch.position_count)
-        if positions < 1:
-            raise ValueError(f"a batch must hold at least one position, got {positions}")
+        # The tensor row count is symbolic under the outer dynamic compile;
+        # ``position_count`` is retained as transport metadata and checked only
+        # in eager mode so it cannot become a per-chunk constant guard.
+        compiling = torch.compiler.is_compiling()
+        positions = (
+            batch.global_numeric.shape[0] if compiling else batch.position_count
+        )
+        if not compiling:
+            if positions < 1:
+                raise ValueError(
+                    f"a batch must hold at least one position, got {positions}"
+                )
         for name in _OFFSET_FIELDS:
             offsets = getattr(batch, name)
-            if offsets.ndim != 1 or int(offsets.shape[0]) != positions + 1:
+            if offsets.ndim != 1 or offsets.shape[0] != positions + 1:
                 raise ValueError(
                     f"{name} must be ({positions + 1},) for a {positions}-position "
                     f"batch, got {tuple(offsets.shape)}"
                 )
         for name in ("phase_id", "moves_remaining"):
             values = getattr(batch, name)
-            if values.ndim != 1 or int(values.shape[0]) != positions:
+            if values.ndim != 1 or values.shape[0] != positions:
                 raise ValueError(
                     f"{name} must be ({positions},) for a {positions}-position "
                     f"batch, got {tuple(values.shape)}"
                 )
-        if batch.global_numeric.ndim != 2 or int(batch.global_numeric.shape[0]) != positions:
+        if (
+            batch.global_numeric.ndim != 2
+            or batch.global_numeric.shape[0] != positions
+        ):
             raise ValueError(
                 f"global_numeric must be ({positions}, G) for a {positions}-position "
                 f"batch, got {tuple(batch.global_numeric.shape)}"

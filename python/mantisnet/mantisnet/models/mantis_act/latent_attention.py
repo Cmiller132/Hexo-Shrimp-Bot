@@ -1286,15 +1286,17 @@ def latent_read(
     ``k`` and ``v`` are the ``(N, C, heads, head_dim)`` rows of ``segments``'
     concatenated families, in the order those families were given.
     """
-    if int(q.shape[0]) != segments.positions:
+    segment_positions = segments.counts.shape[0]
+    segment_rows = segments.row_pos.shape[0]
+    if q.shape[0] != segment_positions:
         raise ValueError(
             f"q holds {q.shape[0]} positions but the segments describe "
-            f"{segments.positions}"
+            f"{segment_positions}"
         )
-    if int(k.shape[0]) != segments.n_rows:
+    if k.shape[0] != segment_rows:
         raise ValueError(
             f"k holds {k.shape[0]} rows but the segments describe "
-            f"{segments.n_rows}"
+            f"{segment_rows}"
         )
     out, _m, _total = _latent_read_op(
         q.contiguous(),
@@ -1318,10 +1320,10 @@ def latent_broadcast(
     ``(P + 1,)`` CSR offsets — the same information as ``node_pos``, in the
     ordering the gradient sweep reduces over.
     """
-    if int(offsets.shape[0]) - 1 != int(k.shape[0]):
+    if offsets.shape[0] - 1 != k.shape[0]:
         raise ValueError(
-            f"offsets describe {int(offsets.shape[0]) - 1} positions against "
-            f"the context's {int(k.shape[0])}"
+            f"offsets describe {offsets.shape[0] - 1} positions against "
+            f"the context's {k.shape[0]}"
         )
     return _latent_broadcast_op(
         q.contiguous(), k.contiguous(), v.contiguous(), node_pos, offsets

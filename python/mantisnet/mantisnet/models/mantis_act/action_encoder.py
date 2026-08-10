@@ -121,8 +121,8 @@ class ActionBaseState(nn.Module):
 
     def forward(self, batch: PackedACTBatch, cells: EquivariantState) -> EquivariantState:
         index = batch.legal_to_cell_index
-        n_cells = int(cells.inv.shape[0])
-        _require_family_size("cell", n_cells, int(batch.cell_occupancy.shape[0]))
+        n_cells = cells.inv.shape[0]
+        _require_family_size("cell", n_cells, batch.cell_occupancy.shape[0])
         if index.ndim != 1:
             raise ValueError(
                 f"legal_to_cell_index must be (N_legal,), got {tuple(index.shape)}"
@@ -233,11 +233,11 @@ class PostPlacementEncoder(nn.Module):
         derived from the row's flattened ``(window, channel)`` grid position.
         """
         index = batch.action_window_index
-        n_windows = int(windows.inv.shape[0])
-        n_legal = int(batch.legal_to_cell_index.shape[0])
+        n_windows = windows.inv.shape[0]
+        n_legal = batch.legal_to_cell_index.shape[0]
         _require_rows("action_window_index", index, n_legal)
         _require_family_size(
-            "window", n_windows, int(batch.window_pattern_class.shape[0])
+            "window", n_windows, batch.window_pattern_class.shape[0]
         )
 
         if batch.plans is None:
@@ -272,7 +272,7 @@ class PostPlacementEncoder(nn.Module):
         windows: EquivariantState,
     ) -> EquivariantState:
         """``actions`` plus the eighteen rows' contribution (§19.2)."""
-        n_legal = int(actions.inv.shape[0])
+        n_legal = actions.inv.shape[0]
         _require_rows("action_post1_class", batch.action_post1_class, n_legal)
         _require_rows("action_pre_status", batch.action_pre_status, n_legal)
 
@@ -463,7 +463,7 @@ class StateContextBroadcast(nn.Module):
     ) -> EquivariantState:
         inv, axis = self._require(latents)
         heads = self.cfg.num_heads
-        n_legal = int(actions.inv.shape[0])
+        n_legal = actions.inv.shape[0]
 
         context = [self.norm_src_inv(inv) + self.type_src[0]]
         if self.has_axis:
@@ -659,12 +659,13 @@ class ActionEncoder(nn.Module):
                 "collate(graphs, model.cfg)"
             )
         plans = batch.plans
-        if trunk.position_count != int(batch.position_count):
+        position_count = batch.global_numeric.shape[0]
+        if trunk.position_count != position_count:
             raise ValueError(
                 f"the trunk output describes {trunk.position_count} positions "
-                f"against this batch's {int(batch.position_count)}"
+                f"against this batch's {position_count}"
             )
-        n_legal = int(batch.legal_to_cell_index.shape[0])
+        n_legal = batch.legal_to_cell_index.shape[0]
         # ATen refuses an `output_size` that disagrees with the offsets' own
         # total, so this enforces `legal_offsets[-1] == n_legal` on the device.
         positions = plans.legal_row_pos
@@ -684,7 +685,7 @@ class ActionEncoder(nn.Module):
 
         action_phase = plans.action_phase
         latents = self.latents.initial(
-            int(batch.position_count),
+            position_count,
             device=actions.inv.device,
             dtype=actions.inv.dtype,
         )
@@ -704,7 +705,7 @@ class ActionEncoder(nn.Module):
             actions=self.final(actions),
             latents=latents,
             legal_offsets=batch.legal_offsets,
-            position_count=int(batch.position_count),
+            position_count=position_count,
         )
 
 

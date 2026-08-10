@@ -1,23 +1,19 @@
-"""End-to-end parity for the registered whole-stage ACT operators.
+"""End-to-end parity for ACT's one outer ``torch.compile`` boundary.
 
 Section 36 permits an optimized path only when random weights and a real
-checkpoint are held against a reference implementation.  This file restores
-the literal pre-fusion compositions at their Python dispatch seams while
-leaving the production model and its parameter names untouched:
+checkpoint are held against a reference implementation.  ACT's optimized path
+is now the same shape as production MantisNet's: the complete model is ordinary
+traceable torch code inside one ``torch.compile(dynamic=True)`` callable, while
+only the four hand-written Triton families remain opaque registered operators.
 
-* planned messages take ``RelationGatedMessage``'s eager formulation;
-* cell/window/action/head stages run ``AxisMix -> FFN -> optional FiLM``;
-* the two action relation tables use literal indexed lookups; and
-* state/action latent passes reject their whole-pass fusion eligibility.
-
-The fused and literal models are exact state-dict clones over real stack-939
-prefixes.  In fp32 the only expected disagreement is floating-point
-reassociation, so every forward tensor and every named parameter gradient is
-gated at 2e-4 relative.  Mathematically zero gradients (the latent key biases)
-are measured against the model-wide gradient scale, as the numerical register
-requires, rather than divided by zero.  The bf16 arm is deliberately not a
-fused-vs-reference gate: it reports one fused run against its fp32 anchor and
-gates only finiteness and successful fused dispatch.
+The compiled and eager models are exact state-dict clones over real stack-939
+prefixes.  In fp32 the only expected disagreement is compiler reassociation, so
+every forward tensor and every named parameter gradient is gated at 2e-4
+relative.  Mathematically zero gradients (the latent key biases) are measured
+against the model-wide gradient scale rather than divided by zero.  The bf16
+arm reports the compiled bf16 run against a compiled fp32 anchor and gates
+finiteness plus successful hand-kernel dispatch.  A separate null control
+requires compiled fp32 outputs and gradients to repeat bitwise.
 """
 
 from __future__ import annotations
@@ -33,14 +29,10 @@ import torch
 from torch import Tensor
 
 from mantisnet.models.mantis_act import (
-    action_encoder,
     class_embedding,
-    fused_equivariant,
-    fused_latent,
-    fused_message,
-    heads,
-    messages,
-    state_trunk,
+    latent_attention,
+    post_rows,
+    segment_message,
 )
 from mantisnet.models.mantis_act.builder import build
 from mantisnet.models.mantis_act.config import PRESETS, MantisACTConfig
@@ -61,10 +53,11 @@ ZERO_GRADIENT_ULPS = 32
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
-    reason="whole-stage parity must exercise the registered CUDA operators",
+    reason="outer-compiled parity must exercise the registered CUDA kernels",
 )
 
 ModelFactory = Callable[[], MantisACT]
+ModelForward = Callable[[MantisACT, PackedACTBatch], ACTOutput]
 
 
 @dataclass(frozen=True)
@@ -100,63 +93,15 @@ def _factory_from_state(
     return factory
 
 
-def _literal_equivariant_stage(
-    state,
-    mix,
-    ffn,
-    *,
-    film=None,
-    phase_id=None,
-):
-    """Sections 12.4/13.2 as the three original module calls."""
-    if (film is None) != (phase_id is None):
-        raise ValueError("film and phase_id must be supplied together")
-    result = ffn(mix(state))
-    return result if film is None else film(result, phase_id)
+def _outer_forward(model: MantisACT, batch: PackedACTBatch) -> ACTOutput:
+    """The sole compile boundary, matching the production whole-model seam."""
+    return model(batch, MASS_FLOOR)
 
 
-def _literal_class_pair_embedding(
-    post_weight: Tensor,
-    status_weight: Tensor,
-    post_index: Tensor,
-    status_index: Tensor,
-    _post_ptr: Tensor,
-    _post_rows: Tensor,
-    _status_ptr: Tensor,
-    _status_rows: Tensor,
-) -> Tensor:
-    """Section 19.2's two table lookups, independent of the CSR backward."""
-    return post_weight.index_select(0, post_index.long()) + status_weight.index_select(
-        0, status_index.long()
-    )
-
-
-class _NeverPlanned:
-    """A type no production edge object has, forcing the eager message branch."""
-
-
-def _forbidden_class_launch(*_args, **_kwargs):
-    raise AssertionError("the literal reference reached the fused class-pair kernel")
-
-
-@contextmanager
-def _literal_reference_path():
-    """Restore every whole-stage pre-fusion composition for one scoped run."""
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(messages, "PlannedEdges", _NeverPlanned)
-        for module in (state_trunk, action_encoder, heads):
-            patch.setattr(module, "run_equivariant_stage", _literal_equivariant_stage)
-        patch.setattr(
-            action_encoder, "class_pair_embedding", _literal_class_pair_embedding
-        )
-        patch.setattr(class_embedding, "_launch_forward", _forbidden_class_launch)
-        patch.setattr(class_embedding, "_launch_backward", _forbidden_class_launch)
-
-        # These predicates are LatentPass's production dispatch boundary;
-        # refusing eligibility preserves its literal read/mix/broadcast body.
-        for name in ("supports_state_pass", "supports_action_pass"):
-            patch.setattr(fused_latent, name, lambda _module: False)
-        yield
+@pytest.fixture(scope="module")
+def compiled_forward() -> ModelForward:
+    """One unbroken shape-polymorphic graph shared by the parity battery."""
+    return torch.compile(_outer_forward, dynamic=True, fullgraph=True)
 
 
 def _output_tensors(output: ACTOutput) -> dict[str, Tensor]:
@@ -183,16 +128,154 @@ def _loss(output: ACTOutput) -> Tensor:
     return sum(terms)
 
 
+_HAND_KERNELS = {
+    "segment_message": (
+        segment_message,
+        ("_launch_forward", "_launch_backward"),
+    ),
+    "latent_attention": (
+        latent_attention,
+        (
+            "_launch_read",
+            "_launch_read_backward",
+            "_launch_broadcast",
+            "_launch_broadcast_backward",
+        ),
+    ),
+    "post_rows": (
+        post_rows,
+        (
+            "_launch_gather",
+            "_launch_gather_backward",
+            "_launch_row_gate",
+            "_launch_row_gate_backward",
+        ),
+    ),
+}
+
+
+def _clear_hand_kernel_failures() -> None:
+    for module, _launches in (*_HAND_KERNELS.values(), (class_embedding, ())):
+        for name in (
+            "_FAILED_SHAPES",
+            "_FAILED_FORWARD_SHAPES",
+            "_FAILED_BACKWARD_SHAPES",
+        ):
+            cache = getattr(module, name, None)
+            if cache is not None:
+                cache.clear()
+
+
+def _assert_no_hand_kernel_failures() -> None:
+    failures = {}
+    for family, (module, _launches) in {
+        **_HAND_KERNELS,
+        "class_embedding": (class_embedding, ()),
+    }.items():
+        for name in (
+            "_FAILED_SHAPES",
+            "_FAILED_FORWARD_SHAPES",
+            "_FAILED_BACKWARD_SHAPES",
+        ):
+            cache = getattr(module, name, None)
+            if cache:
+                failures[f"{family}.{name}"] = dict(cache)
+    assert not failures, failures
+
+
+@contextmanager
+def _count_hand_kernel_launches():
+    """Prove that every eligible default call reaches its real Triton helper."""
+    originals = {}
+    counts = {}
+    for family, (module, launches) in _HAND_KERNELS.items():
+        counts[family] = {"eligible": 0, **{name: 0 for name in launches}}
+        originals[(family, "_supported")] = module._supported
+        for name in launches:
+            originals[(family, name)] = getattr(module, name)
+
+    # Class lookup's forward is ordinary torch.  Its class-sorted ordered
+    # backward remains the required hand kernel, so hold backward eligibility
+    # and successful launch against each other exactly like the other families.
+    counts["class_embedding"] = {"eligible": 0, "_launch_backward": 0}
+    originals[("class_embedding", "_supported")] = class_embedding._supported
+    originals[("class_embedding", "_launch_backward")] = (
+        class_embedding._launch_backward
+    )
+
+    def count_supported(family, original):
+        def wrapped(*args, **kwargs):
+            accepted = original(*args, **kwargs)
+            counts[family]["eligible"] += int(bool(accepted))
+            return accepted
+
+        return wrapped
+
+    def count_launch(family, name, original):
+        def wrapped(*args, **kwargs):
+            result = original(*args, **kwargs)
+            counts[family][name] += 1
+            return result
+
+        return wrapped
+
+    for family, (module, launches) in _HAND_KERNELS.items():
+        module._supported = count_supported(
+            family, originals[(family, "_supported")]
+        )
+        for name in launches:
+            setattr(
+                module,
+                name,
+                count_launch(family, name, originals[(family, name)]),
+            )
+    class_embedding._launch_backward = count_launch(
+        "class_embedding",
+        "_launch_backward",
+        originals[("class_embedding", "_launch_backward")],
+    )
+    class_embedding._supported = count_supported(
+        "class_embedding",
+        originals[("class_embedding", "_supported")],
+    )
+
+    try:
+        yield counts
+    finally:
+        for family, (module, launches) in _HAND_KERNELS.items():
+            module._supported = originals[(family, "_supported")]
+            for name in launches:
+                setattr(module, name, originals[(family, name)])
+        class_embedding._launch_backward = originals[
+            ("class_embedding", "_launch_backward")
+        ]
+        class_embedding._supported = originals[("class_embedding", "_supported")]
+
+
+def _assert_successful_hand_kernel_launches(counts) -> None:
+    for family, (_module, launches) in _HAND_KERNELS.items():
+        launched = sum(counts[family][name] for name in launches)
+        assert counts[family]["eligible"] == launched and launched > 0, counts
+        assert all(counts[family][name] > 0 for name in launches), counts
+    assert (
+        counts["class_embedding"]["eligible"]
+        == counts["class_embedding"]["_launch_backward"]
+        > 0
+    ), counts
+    _assert_no_hand_kernel_failures()
+
+
 def _capture(
     factory: ModelFactory,
     batch: PackedACTBatch,
+    forward: ModelForward,
     *,
     bf16: bool = False,
 ) -> Snapshot:
     model = factory().to("cuda").eval()
     model.zero_grad(set_to_none=True)
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bf16):
-        output = model(batch, MASS_FLOOR)
+        output = forward(model, batch)
         loss = _loss(output)
     loss.backward()
     torch.cuda.synchronize()
@@ -222,113 +305,21 @@ def _capture(
     return Snapshot(outputs, gradients)
 
 
-def _reset_whole_stage_proof() -> None:
-    for module in (fused_message, fused_equivariant, fused_latent):
-        module.clear_failure_caches()
-        module.reset_launch_stats()
-    class_embedding._FAILED_SHAPES.clear()
-    class_embedding._FAILED_BACKWARD_SHAPES.clear()
+def _eager_capture(factory: ModelFactory, batch: PackedACTBatch) -> Snapshot:
+    return _capture(factory, batch, _outer_forward)
 
 
-def _assert_empty_whole_stage_failures() -> None:
-    for name, module in (
-        ("fused_message", fused_message),
-        ("fused_equivariant", fused_equivariant),
-        ("fused_latent", fused_latent),
-    ):
-        for cache_name in ("_FAILED_FORWARD_SHAPES", "_FAILED_BACKWARD_SHAPES"):
-            cache = getattr(module, cache_name)
-            assert not cache, {"family": name, "cache": cache_name, "failures": cache}
-    assert not class_embedding._FAILED_SHAPES
-    assert not class_embedding._FAILED_BACKWARD_SHAPES
-
-
-def _assert_no_whole_stage_launches() -> None:
-    for name, module in (
-        ("fused_message", fused_message),
-        ("fused_equivariant", fused_equivariant),
-        ("fused_latent", fused_latent),
-    ):
-        stats = module.launch_stats()
-        assert all(count == 0 for count in stats.values()), {name: stats}
-    _assert_empty_whole_stage_failures()
-
-
-def _assert_successful_whole_stage_launches() -> None:
-    for name, module in (
-        ("fused_message", fused_message),
-        ("fused_equivariant", fused_equivariant),
-    ):
-        stats = module.launch_stats()
-        for stage in ("forward", "backward"):
-            eligible = stats[f"{stage}_eligible"]
-            launched = stats[f"{stage}_launched"]
-            assert eligible == launched and launched > 0, {name: stats}
-
-    latent_stats = fused_latent.launch_stats()
-    for variant in ("state", "action"):
-        for stage in ("forward", "backward"):
-            eligible = latent_stats[f"{variant}_{stage}_eligible"]
-            launched = latent_stats[f"{variant}_{stage}_launched"]
-            assert eligible == launched and launched > 0, {
-                "fused_latent": latent_stats
-            }
-    _assert_empty_whole_stage_failures()
-
-
-@contextmanager
-def _count_class_embedding_launches():
-    originals = {
-        "_supported": class_embedding._supported,
-        "_launch_forward": class_embedding._launch_forward,
-        "_launch_backward": class_embedding._launch_backward,
-    }
-    counts = {"eligible": 0, "forward": 0, "backward": 0}
-
-    def supported(*args, **kwargs):
-        accepted = originals["_supported"](*args, **kwargs)
-        counts["eligible"] += int(bool(accepted))
-        return accepted
-
-    def launch(kind: str):
-        original = originals[f"_launch_{kind}"]
-
-        def wrapped(*args, **kwargs):
-            result = original(*args, **kwargs)
-            counts[kind] += 1
-            return result
-
-        return wrapped
-
-    class_embedding._supported = supported
-    class_embedding._launch_forward = launch("forward")
-    class_embedding._launch_backward = launch("backward")
-    try:
-        yield counts
-    finally:
-        for name, original in originals.items():
-            setattr(class_embedding, name, original)
-
-
-def _reference_capture(factory: ModelFactory, batch: PackedACTBatch) -> Snapshot:
-    _reset_whole_stage_proof()
-    with _literal_reference_path():
-        snapshot = _capture(factory, batch)
-    _assert_no_whole_stage_launches()
-    return snapshot
-
-
-def _fused_capture(
-    factory: ModelFactory, batch: PackedACTBatch, *, bf16: bool = False
+def _compiled_capture(
+    factory: ModelFactory,
+    batch: PackedACTBatch,
+    compiled_forward: ModelForward,
+    *,
+    bf16: bool = False,
 ) -> Snapshot:
-    _reset_whole_stage_proof()
-    with _count_class_embedding_launches() as class_counts:
-        snapshot = _capture(factory, batch, bf16=bf16)
-    _assert_successful_whole_stage_launches()
-    assert class_counts["forward"] > 0 and class_counts["backward"] > 0, class_counts
-    assert class_counts["eligible"] == (
-        class_counts["forward"] + class_counts["backward"]
-    ), class_counts
+    _clear_hand_kernel_failures()
+    with _count_hand_kernel_launches() as counts:
+        snapshot = _capture(factory, batch, compiled_forward, bf16=bf16)
+    _assert_successful_hand_kernel_launches(counts)
     return snapshot
 
 
@@ -399,12 +390,34 @@ def _assert_fp32_parity(actual: Snapshot, expected: Snapshot) -> None:
     )
 
 
+def _assert_bitwise(actual: Snapshot, expected: Snapshot) -> None:
+    assert set(actual.outputs) == set(expected.outputs)
+    assert set(actual.gradients) == set(expected.gradients)
+    failures = [
+        f"output.{name}"
+        for name, reference in expected.outputs.items()
+        if not torch.equal(actual.outputs[name], reference)
+    ]
+    failures.extend(
+        f"parameter.{name}"
+        for name, reference in expected.gradients.items()
+        if not torch.equal(actual.gradients[name], reference)
+    )
+    assert not failures, "compiled fp32 was not bitwise deterministic: " + ", ".join(
+        failures[:20]
+    )
+
+
 def _run_parity(
-    factory: ModelFactory, cfg: MantisACTConfig, ply: int, batch_size: int
+    factory: ModelFactory,
+    cfg: MantisACTConfig,
+    ply: int,
+    batch_size: int,
+    compiled_forward: ModelForward,
 ) -> None:
     batch = _real_batch(cfg, ply, batch_size).to("cuda")
-    expected = _reference_capture(factory, batch)
-    actual = _fused_capture(factory, batch)
+    expected = _eager_capture(factory, batch)
+    actual = _compiled_capture(factory, batch, compiled_forward)
     _assert_fp32_parity(actual, expected)
     del batch, expected, actual
     torch.cuda.empty_cache()
@@ -413,28 +426,39 @@ def _run_parity(
 @requires_cuda
 @pytest.mark.parametrize("ply", PLIES)
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
-def test_random_weight_fp32_whole_model_matches_literal_stages(
-    random_state: Mapping[str, Tensor], ply: int, batch_size: int
+def test_random_weight_fp32_outer_compiled_model_matches_eager(
+    random_state: Mapping[str, Tensor],
+    compiled_forward: ModelForward,
+    ply: int,
+    batch_size: int,
 ) -> None:
     """Only fp32 reassociation may separate the two exact state-dict clones."""
-    _run_parity(_factory_from_state(FULL, random_state), FULL, ply, batch_size)
+    _run_parity(
+        _factory_from_state(FULL, random_state),
+        FULL,
+        ply,
+        batch_size,
+        compiled_forward,
+    )
 
 
 @requires_cuda
-def test_real_checkpoint_fp32_whole_model_matches_literal_stages() -> None:
-    """Run the §36 checkpoint oracle when its owner supplies the artifact."""
+def test_real_checkpoint_fp32_outer_compiled_model_matches_eager(
+    compiled_forward: ModelForward,
+) -> None:
+    """Run the section 36 checkpoint oracle when its owner supplies the artifact."""
     raw_path = os.environ.get("MANTIS_ACT_CHECKPOINT", "").strip()
     if not raw_path:
         pytest.skip(
             "MANTIS_ACT_CHECKPOINT is unset; set it to a full_act_v4 checkpoint "
-            "to run the required real-checkpoint whole-stage oracle"
+            "to run the required real-checkpoint outer-compile oracle"
         )
     path = Path(raw_path)
     assert path.is_file(), f"MANTIS_ACT_CHECKPOINT does not name a file: {path}"
     payload = torch.load(path, map_location="cpu", weights_only=False)
     probe = MantisACT.from_checkpoint(payload).eval()
     assert probe.cfg == FULL, (
-        "the whole-stage checkpoint oracle requires full_act_v4, got "
+        "the whole-model checkpoint oracle requires full_act_v4, got "
         f"{probe.cfg}"
     )
 
@@ -442,18 +466,20 @@ def test_real_checkpoint_fp32_whole_model_matches_literal_stages() -> None:
         return MantisACT.from_checkpoint(payload).eval()
 
     del probe
-    _run_parity(factory, FULL, ply=161, batch_size=8)
+    _run_parity(factory, FULL, 161, 8, compiled_forward)
 
 
 @requires_cuda
-def test_bf16_error_is_reported_against_fp32_anchor_not_itself(
-    random_state: Mapping[str, Tensor], record_property
+def test_bf16_error_is_reported_against_compiled_fp32_anchor_not_itself(
+    random_state: Mapping[str, Tensor],
+    compiled_forward: ModelForward,
+    record_property,
 ) -> None:
-    """Document bf16 drift; only finiteness and real fused launches are gates."""
+    """Document bf16 drift; only finiteness and real kernel launches are gates."""
     factory = _factory_from_state(FULL, random_state)
     batch = _real_batch(FULL, ply=161, batch_size=8).to("cuda")
-    anchor = _fused_capture(factory, batch)
-    bf16 = _fused_capture(factory, batch, bf16=True)
+    anchor = _compiled_capture(factory, batch, compiled_forward)
+    bf16 = _compiled_capture(factory, batch, compiled_forward, bf16=True)
     output_metrics, gradient_metrics = _parity_metrics(bf16, anchor)
     worst_output = max(output_metrics.items(), key=lambda item: item[1])
     worst_gradient = max(gradient_metrics.items(), key=lambda item: item[1])
@@ -462,4 +488,18 @@ def test_bf16_error_is_reported_against_fp32_anchor_not_itself(
     record_property("bf16_fp32_worst_gradient", worst_gradient[1])
     record_property("bf16_fp32_worst_gradient_name", worst_gradient[0])
     del batch, anchor, bf16
+    torch.cuda.empty_cache()
+
+
+@requires_cuda
+def test_outer_compiled_fp32_outputs_and_gradients_are_bitwise_deterministic(
+    random_state: Mapping[str, Tensor], compiled_forward: ModelForward
+) -> None:
+    """The compiler may reassociate against eager, but repeated runs are exact."""
+    factory = _factory_from_state(FULL, random_state)
+    batch = _real_batch(FULL, ply=161, batch_size=8).to("cuda")
+    first = _compiled_capture(factory, batch, compiled_forward)
+    second = _compiled_capture(factory, batch, compiled_forward)
+    _assert_bitwise(second, first)
+    del batch, first, second
     torch.cuda.empty_cache()
