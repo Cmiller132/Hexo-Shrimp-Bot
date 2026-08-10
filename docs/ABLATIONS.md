@@ -919,6 +919,37 @@ once in this file's preamble.
 | Disposition | `v_hat`, `kl`, and the entropy behind `norm_entropy` divide by their segment's summed $\pi'$, which is what an expectation under a normalized distribution means; the bound then holds to a few ulps at any segment width. Retained on every configuration. The range check keeps a 1e-4 slack. |
 | Detection history | The check first refused a legitimate corpus at `brm-939` iteration 0 under an exact bound, then again at `tail-939` iteration 56 under the 1e-4 slack. Its message named neither the value nor which of its two conditions failed, and two manager hypotheses — a non-finite value from bf16 or `torch.compile`, and a slack too small for the sample size — were measured and contradicted before the third measurement located the cause. Both refusals now name the entry, its value, and the count of each condition, and every optimizer step is followed by a fused finiteness check over the parameters. |
 
+## Graft campaign
+
+Per-step records of `docs/MANTIS_GRAFT_SPEC.md`. Speed harness: WSL ext4
+clone, `bench fit --corpus mnorm-late-v1 --split val --device cuda --compile
+--seed 7 --steady-warmup 20 --steady-measure 50`, default budgets; the
+campaign corpus is `mnorm-late-v1` (SHA-256 `cd5f5d0a…`, 1M/100k/100k
+realized). The corpus-mode fit number is a gate metric over the frozen
+distribution, not production throughput. Baseline at Step 0:
+205.45 samples/s median (six runs across two Adam arms, spread ±0.2%),
+peak 10.06 GiB.
+
+### Step 0 — `perf-foundation`
+
+| Field | Record |
+| --- | --- |
+| Commits | `5bab833` (ports), `b4d09cf` (§2.2 steady-window instrument) |
+| Content | fused-Adam execution policy (`mantisnet.optim`, recorded and reapplied after checkpoint loads); fit batches pinned on the KLENT prefetch worker; `bbe64ca` not ported (production has no `torch.segment_reduce`) |
+| Speed | fused 205.45 samples/s median (3 reps) vs foreach — the pre-port corpus-path equivalent — 205.42 (2 reps); spread ±0.2%; VRAM 10.057 GiB in all six. Fused-vs-foreach is a null at production's tensor layout; the donor's gain was ACT-layout-specific. The klent-path prefetch pin is mechanism-documented, not campaign-measured (owner ruling 2026-08-10: accepted without a pre-tree A/B). |
+| Verification | full pytest and `cargo xtask verify` green at each commit |
+| Disposition | **Baked** (owner, 2026-08-10). Windows-native measurement disqualified during calibration (same-arm 188→114 samples/s swings at 10.06 GiB under WDDM); harness pinned to the WSL environment and the VRAM ceiling amended to 10.25 GiB in the same ruling. |
+
+### Step 1 — `dead-key-bias`
+
+| Field | Record |
+| --- | --- |
+| Commit | `d2bab78` |
+| Content | `wk.bias` and `wk_wa.bias` removed from every block (8 tensors, 1,024 scalars): a constant key bias shifts each query's score row uniformly and cancels in the softmax, so the parameters were gradient-dead. Census test refuses any softmax key bias by name; theorem test asserts bias-shifted keys leave both CPU attention reference paths unchanged; the lab family loader drops the two keys from historical checkpoints (exact), ordinary KLENT loading stays strict. |
+| Gate | parity in place of a screen (functionally exact change); speed pro forma. Parameter count 1,944,165 → 1,943,141. The fp32 open-interval assertion on composed Q in `test_model.py` was corrected to closed-interval (strict bound retained on the float64 composition): fp32 softmax legitimately reaches ±1.0 past a ~17 logit gap, exposed by the shifted init stream. |
+| Verification | full pytest (376) and `cargo xtask verify` green |
+| Disposition | **Baked** (owner, 2026-08-10). |
+
 ## Provenance
 
 | Source | Use in this record |

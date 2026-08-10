@@ -75,24 +75,38 @@ numbers from the same session on the same machine.
 The feature's cost must be paid for by the step's own kernel, plan, and layout
 work; a step that cannot hold the line does not land, regardless of strength.
 
-Harness (fixed for the whole campaign):
+Harness (pinned by owner ruling, 2026-08-10, after the Step 0 calibration
+runs; Windows-native measurement showed ±40% same-arm swings and is
+disqualified):
 
-- **Fit:** the production fit path via `lab bench fit` — frozen real prefix
-  sample (the §2.3 campaign corpus), batch 512 positions, bf16 autocast,
-  `torch.compile` dynamic, fused optimizer and pinned prefetch once Step 0
-  lands, 2 prefetch workers, RTX 4070 Ti 12 GiB, no concurrent load.
+- **Environment:** the WSL ext4 clone of the graft branch on this machine
+  (`~/graft-bench`, venv `~/graft-venv`), RTX 4070 Ti 12 GiB, no concurrent
+  CPU- or GPU-intensive load.
+- **Fit:** `lab bench fit --corpus <campaign corpus> --split val --device
+  cuda --compile --seed 7 --steady-warmup 20 --steady-measure 50` at the
+  default budgets — the §2.2 steady window: warm-up chunks absorb
+  compilation untimed, then exactly 50 CUDA-synchronized chunks are timed.
+  Baseline at Step 0: **≈205 samples/s, rep spread ±0.2%**.
 - **Collect:** `lab bench collect` over a production-shaped cohort at the
   production collection budgets.
-- Warm up ≥ 10 completed updates after compilation; measure 50 consecutive
-  updates; CUDA-synchronize the measured region. Repeat ≥ 3 times.
+- Repeat ≥ 3 times per arm; identical seed so packing, chunk order, and
+  recompile points pair exactly across arms.
+
+The corpus-mode fit number is a **gate metric, not production throughput**:
+it times the supervised path (all heads) over the frozen corpus
+distribution. Production KLENT iterations pipeline collection with fitting
+and report far higher combined rates; the gate compares like with like
+across arms and steps, nothing else.
 
 Pass rule, all four required:
 
-1. median fit positions/s within **2%** of the baseline median;
-2. fit p95 step latency not worse than baseline by more than **5%**;
+1. median fit samples/s within **2%** of the baseline median;
+2. fit p95 chunk latency not worse than baseline by more than **5%**;
 3. median collect positions/s within **2%** of the baseline median;
 4. peak reserved VRAM not above baseline + 256 MiB and never above
-   **10.0 GiB** (the WDDM paging cliff on this card is ~10.5 GiB).
+   **10.25 GiB** (owner-amended 2026-08-10: the Step 0 baseline peaks at
+   10.06 GiB, and the WSL harness showed no paging cliff there; the ~10.5
+   GiB WDDM cliff is a Windows-native phenomenon).
 
 Removal-trial steps (marked in §4) invert the expectation: they must show a
 speed *gain* to be worth their strength risk.
@@ -102,8 +116,11 @@ versions, compile mode, prefetch worker count, corpus digest.
 
 ### 2.3 Strength screen — supervised, paired, multi-metric
 
-One frozen **campaign corpus** is created at Step 0 (via `lab freeze`, digest
-and split recorded in `docs/ABLATIONS.md`) and reused unchanged by every step.
+The campaign corpus is **`mnorm-late-v1`** (owner ruling 2026-08-10): 1M
+train / 100k val / 100k test realized samples from `joint-mnorm` iterations
+100–149, archive SHA-256
+`cd5f5d0a0bc53c76aba6a1fe6d9a02f57f51ce8a46732a0a5e0ea1c560cec80c`. It is
+reused unchanged by every step.
 
 Each screen:
 
