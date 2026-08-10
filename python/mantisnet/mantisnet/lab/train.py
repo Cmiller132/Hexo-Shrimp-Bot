@@ -19,6 +19,7 @@ from ..builder import MODEL_REPR_VERSION, Batch
 from ..fitloop import FitBudgets, fit_epoch
 from ..klent.train import KlentConfig, _gpu_lock
 from ..losses import policy_loss, value_loss
+from ..optim import make_adam, resolve_adam_implementation
 from .corpus import FrozenCorpus, SampleSplit, load_corpus
 from .variants import (
     build_variant,
@@ -39,6 +40,7 @@ class TrainConfig:
     collect_pair_budget: int = KlentConfig.collect_pair_budget
     collect_cell_budget: int = KlentConfig.collect_cell_budget
     lr: float = KlentConfig.lr
+    adam_impl: str = KlentConfig.adam_impl
     lr_schedule: str = "constant"
     ema_decay: float = 0.0
     device: str = "cpu"
@@ -46,6 +48,7 @@ class TrainConfig:
     compile: bool = False
 
     def __post_init__(self) -> None:
+        resolve_adam_implementation(self.adam_impl, self.device)
         expected_autocast = torch.device(self.device).type == "cuda"
         if self.autocast is None:
             object.__setattr__(self, "autocast", expected_autocast)
@@ -422,6 +425,7 @@ def train_cell(
     epochs: int | None = None,
     lr_schedule: str | None = None,
     ema_decay: float | None = None,
+    adam_impl: str | None = None,
     device: str | None = None,
     compile: bool | None = None,
     cell_budget: int | None = None,
@@ -445,6 +449,8 @@ def train_cell(
         updates["lr_schedule"] = lr_schedule
     if ema_decay is not None:
         updates["ema_decay"] = ema_decay
+    if adam_impl is not None:
+        updates["adam_impl"] = adam_impl
     if device is not None:
         updates["device"] = device
         updates["autocast"] = torch.device(device).type == "cuda"
@@ -466,7 +472,12 @@ def train_cell(
     destination.mkdir(parents=True, exist_ok=True)
 
     model = model.to(cfg.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    optimizer, adam_resolved = make_adam(
+        model.parameters(),
+        lr=cfg.lr,
+        device=cfg.device,
+        implementation=cfg.adam_impl,
+    )
     ema_parameters = None
     if cfg.ema_decay > 0:
         named_parameters = list(model.named_parameters())
@@ -487,6 +498,7 @@ def train_cell(
         "recipe": {
             **asdict(cfg),
             "optimizer": "Adam",
+            "adam_resolved": adam_resolved,
             "loss_weights": {"policy": 1.0, "critic": 1.0, "state_value": 1.0},
         },
         "seed": seed,

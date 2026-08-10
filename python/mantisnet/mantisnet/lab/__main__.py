@@ -14,6 +14,21 @@ def _device(parser: argparse.ArgumentParser) -> None:
     )
 
 
+_ADAM_IMPLEMENTATIONS = ("auto", "fused", "foreach", "scalar")
+
+
+def _adam_impl(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--adam-impl",
+        choices=_ADAM_IMPLEMENTATIONS,
+        default="auto",
+        help=(
+            "Adam execution policy; auto is fused on CUDA and scalar on CPU. "
+            "Fused/foreach may differ only in last-bit reduction order"
+        ),
+    )
+
+
 def _model_kw(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model-kw",
@@ -78,6 +93,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr-schedule", choices=("constant", "cosine"), default="constant"
     )
     train.add_argument("--ema-decay", type=float, default=0.0)
+    _adam_impl(train)
     train.add_argument(
         "--cell-budget",
         type=int,
@@ -144,6 +160,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--seed", type=int, default=7)
     fit.add_argument("--pair-budget", type=int)
     fit.add_argument("--cell-budget", type=int)
+    _adam_impl(fit)
     _model_kw(fit)
     _device(fit)
 
@@ -179,6 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit_profile.add_argument("--seed", type=int, default=7)
     fit_profile.add_argument("--pair-budget", type=int)
     fit_profile.add_argument("--cell-budget", type=int)
+    _adam_impl(fit_profile)
     _model_kw(fit_profile)
     _device(fit_profile)
 
@@ -272,6 +290,7 @@ def main(argv=None) -> None:
                 epochs=args.epochs,
                 lr_schedule=args.lr_schedule,
                 ema_decay=args.ema_decay,
+                adam_impl=args.adam_impl,
                 device=args.device,
                 compile=args.compile,
                 cell_budget=args.cell_budget,

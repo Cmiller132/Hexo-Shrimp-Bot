@@ -21,6 +21,7 @@ from ..builder import collate_prefixes
 from ..fitloop import FitBudgets, fit_epoch, pack_chunks
 from ..losses import policy_loss
 from ..model import compose_acting_q, compose_q
+from ..optim import resolve_adam_implementation
 from .selfplay import Collector, Sample, collection_stats
 
 
@@ -45,6 +46,10 @@ class KlentConfig:
     envs: int = 1024  # persistent self-play slots (the reference's env count)
     batch_size: int = 4096  # paper's *effective* batch: chunks accumulate to it
     lr: float = 1e-3  # paper's Adam rate
+    # Execution policy only: all choices implement the same Adam recipe. Auto
+    # resolves to fused on CUDA and scalar on CPU, and the resolved choice is
+    # recorded beside the run config.
+    adam_impl: str = "auto"
     device: str = "cpu"
     autocast: bool = False  # bf16 autocast for the network passes
     compile: bool = False  # torch.compile the policy/Q pass (one-time cost)
@@ -57,6 +62,9 @@ class KlentConfig:
     cell_budget: int = 800_000  # fit: legal cells (decoder rows) per batch
     collect_pair_budget: int = 24_000_000  # collection (no_grad) equivalents
     collect_cell_budget: int = 2_400_000
+
+    def __post_init__(self) -> None:
+        resolve_adam_implementation(self.adam_impl, self.device)
 
 
 def _policy_q(model, batch):
@@ -159,20 +167,30 @@ def fit(
     model.train()
     policy_q = _policy_q_fn(cfg)
 
+    pin = torch.device(cfg.device).type == "cuda"
+
     def prep(indices: list[int]):
         chunk = [samples[i] for i in indices]
         batch = _rebuild(chunk)
         target = torch.from_numpy(np.concatenate([s.improved for s in chunk]))
         ranks = torch.tensor([s.rank for s in chunk])
         returns = torch.tensor([s.g for s in chunk], dtype=torch.float32)
+        if pin:
+            # Pinned here, on the prefetch worker, so the step's ``.to`` is a
+            # true async DMA; from pageable memory every transfer degrades to
+            # a staged synchronous copy on the training thread.
+            batch = batch.pin_memory()
+            target = target.pin_memory()
+            ranks = ranks.pin_memory()
+            returns = returns.pin_memory()
         return batch, target, ranks, returns
 
     def fit_step(payload):
         batch, target, ranks, returns = payload
         batch = batch.to(cfg.device)
-        target = target.to(cfg.device)
-        ranks = ranks.to(cfg.device)
-        returns = returns.to(cfg.device)
+        target = target.to(cfg.device, non_blocking=True)
+        ranks = ranks.to(cfg.device, non_blocking=True)
+        returns = returns.to(cfg.device, non_blocking=True)
 
         with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
             policy_logits, critic_logits = policy_q(model, batch)
