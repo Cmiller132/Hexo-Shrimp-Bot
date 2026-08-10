@@ -9,7 +9,7 @@ offset that is applied to the wrong family, or not applied at all, visible.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 
 import numpy as np
 import pytest
@@ -28,6 +28,7 @@ from mantisnet.models.mantis_act.packed import (
     packed_from_arrays,
     telemetry,
 )
+from mantisnet.models.mantis_act.plans import _RUST_PLAN_ARRAY_NAMES
 
 FULL = MantisACTConfig()
 
@@ -134,12 +135,175 @@ def replaced(array: np.ndarray, index, value) -> np.ndarray:
     return out
 
 
+def _numpy(value: torch.Tensor) -> np.ndarray:
+    return value.detach().cpu().numpy()
+
+
+def _reference_plan_arrays(batch: PackedACTBatch) -> dict[str, np.ndarray]:
+    """Serialize Python ``build_plans`` output into Rust's closed wire schema."""
+
+    plans = batch.plans
+    if plans is None:
+        raise ValueError("the reference batch has no execution plans")
+    state = plans.state_edges
+    incidence = state.to_windows
+    incidence_inv = incidence.inv_plan
+    incidence_axis = incidence.axis_plan
+    adjacency = state.adjacency
+    radius = state.radius
+    if incidence_axis is None or adjacency is None or adjacency.axis_plan is None:
+        raise ValueError("the FULL reference must carry incidence and adjacency axis plans")
+    if radius is None or radius.axis_plan is None:
+        raise ValueError("the FULL reference must carry a routed radius axis plan")
+
+    out = {
+        "plan_incidence_cell": _numpy(incidence.src),
+        "plan_incidence_window": _numpy(incidence.dst),
+        "plan_incidence_relation": _numpy(incidence.relation),
+        "plan_incidence_axis": _numpy(incidence.axis),
+        "plan_incidence_dst_ptr": _numpy(incidence_inv.dst_ptr),
+        "plan_incidence_dst_cell": _numpy(incidence_inv.dst_src),
+        "plan_incidence_dst_relation": _numpy(incidence_inv.dst_rel),
+        "plan_incidence_dst_axis": _numpy(incidence_axis.dst_axis),
+        "plan_incidence_src_ptr": _numpy(incidence_inv.src_ptr),
+        "plan_incidence_src_window": _numpy(incidence_inv.src_dst),
+        "plan_incidence_src_relation": _numpy(incidence_inv.src_rel),
+        "plan_incidence_src_axis": _numpy(incidence_axis.src_axis),
+        "plan_incidence_rel_ptr": _numpy(incidence_inv.rel_ptr),
+        "plan_incidence_rel_cell": _numpy(incidence_inv.rel_src),
+        "plan_incidence_rel_window": _numpy(incidence_inv.rel_dst),
+        "plan_incidence_rel_axis": _numpy(incidence_axis.rel_axis),
+        "plan_adjacency_relation": _numpy(adjacency.relation),
+        "plan_adjacency_dst_ptr": _numpy(adjacency.inv_plan.dst_ptr),
+        "plan_adjacency_dst_src": _numpy(adjacency.inv_plan.dst_src),
+        "plan_adjacency_dst_relation": _numpy(adjacency.inv_plan.dst_rel),
+        "plan_adjacency_dst_axis": _numpy(adjacency.axis_plan.dst_axis),
+        "plan_adjacency_src_ptr": _numpy(adjacency.inv_plan.src_ptr),
+        "plan_adjacency_src_dst": _numpy(adjacency.inv_plan.src_dst),
+        "plan_adjacency_src_relation": _numpy(adjacency.inv_plan.src_rel),
+        "plan_adjacency_src_axis": _numpy(adjacency.axis_plan.src_axis),
+        "plan_adjacency_rel_ptr": _numpy(adjacency.inv_plan.rel_ptr),
+        "plan_adjacency_rel_src": _numpy(adjacency.inv_plan.rel_src),
+        "plan_adjacency_rel_dst": _numpy(adjacency.inv_plan.rel_dst),
+        "plan_adjacency_rel_axis": _numpy(adjacency.axis_plan.rel_axis),
+        "plan_radius_relation": _numpy(radius.relation),
+        "plan_radius_axis_rows": _numpy(radius.axis_rows),
+        "plan_radius_routed_src": _numpy(radius.routed_src),
+        "plan_radius_routed_dst": _numpy(radius.routed_dst),
+        "plan_radius_routed_relation": _numpy(radius.routed_relation),
+        "plan_radius_routed_axis": _numpy(radius.routed_axis),
+        "plan_radius_dst_ptr": _numpy(radius.inv_plan.dst_ptr),
+        "plan_radius_dst_src": _numpy(radius.inv_plan.dst_src),
+        "plan_radius_dst_relation": _numpy(radius.inv_plan.dst_rel),
+        "plan_radius_src_ptr": _numpy(radius.inv_plan.src_ptr),
+        "plan_radius_src_dst": _numpy(radius.inv_plan.src_dst),
+        "plan_radius_src_relation": _numpy(radius.inv_plan.src_rel),
+        "plan_radius_rel_ptr": _numpy(radius.inv_plan.rel_ptr),
+        "plan_radius_rel_src": _numpy(radius.inv_plan.rel_src),
+        "plan_radius_rel_dst": _numpy(radius.inv_plan.rel_dst),
+        "plan_radius_axis_dst_ptr": _numpy(radius.axis_plan.dst_ptr),
+        "plan_radius_axis_dst_src": _numpy(radius.axis_plan.dst_src),
+        "plan_radius_axis_dst_relation": _numpy(radius.axis_plan.dst_rel),
+        "plan_radius_axis_dst_axis": _numpy(radius.axis_plan.dst_axis),
+        "plan_radius_axis_src_ptr": _numpy(radius.axis_plan.src_ptr),
+        "plan_radius_axis_src_dst": _numpy(radius.axis_plan.src_dst),
+        "plan_radius_axis_src_relation": _numpy(radius.axis_plan.src_rel),
+        "plan_radius_axis_src_axis": _numpy(radius.axis_plan.src_axis),
+        "plan_radius_axis_rel_ptr": _numpy(radius.axis_plan.rel_ptr),
+        "plan_radius_axis_rel_src": _numpy(radius.axis_plan.rel_src),
+        "plan_radius_axis_rel_dst": _numpy(radius.axis_plan.rel_dst),
+        "plan_radius_axis_rel_axis": _numpy(radius.axis_plan.rel_axis),
+        "plan_action_source_window_ptr": _numpy(plans.action_rows.source_window.ptr),
+        "plan_action_source_window_rows": _numpy(plans.action_rows.source_window.rows),
+        "plan_action_source_window_sentinel_rows": _numpy(
+            plans.action_rows.source_window.sentinel_rows
+        ),
+        "plan_action_base_cell_ptr": _numpy(plans.action_rows.base_cell.ptr),
+        "plan_action_base_cell_rows": _numpy(plans.action_rows.base_cell.rows),
+        "plan_cell_row_pos": _numpy(plans.cell_row_pos),
+        "plan_window_row_pos": _numpy(plans.window_row_pos),
+        "plan_legal_row_pos": _numpy(plans.legal_row_pos),
+        "plan_cell_phase": _numpy(plans.cell_phase),
+        "plan_window_phase": _numpy(plans.window_phase),
+        "plan_action_phase": _numpy(plans.action_phase),
+        "plan_state_segment_ranges": _numpy(plans.state_segments.ranges),
+        "plan_state_segment_range_base": _numpy(plans.state_segments.range_base),
+        "plan_state_segment_counts": _numpy(plans.state_segments.counts),
+        "plan_state_segment_row_pos": _numpy(plans.state_segments.row_pos),
+        "plan_action_segment_ranges": _numpy(plans.action_segments.ranges),
+        "plan_action_segment_range_base": _numpy(plans.action_segments.range_base),
+        "plan_action_segment_counts": _numpy(plans.action_segments.counts),
+        "plan_action_segment_row_pos": _numpy(plans.action_segments.row_pos),
+    }
+    class_plans = {
+        "cell_occupancy": plans.embedding_rows.cell_occupancy,
+        "cell_legal": plans.embedding_rows.cell_legal,
+        "cell_nearest": plans.embedding_rows.cell_nearest,
+        "window_pattern": plans.embedding_rows.window_pattern,
+        "window_status": plans.embedding_rows.window_status,
+        "action_post1": plans.action_rows.post1,
+        "action_pre_status": plans.action_rows.pre_status,
+    }
+    for family, plan in class_plans.items():
+        for column in (
+            "ptr",
+            "rows",
+            "block_ptr",
+            "block_starts",
+            "block_lengths",
+        ):
+            out[f"plan_class_{family}_{column}"] = _numpy(getattr(plan, column))
+    assert set(out) == set(_RUST_PLAN_ARRAY_NAMES)
+    return out
+
+
 def packed_arrays(batch: PackedACTBatch) -> dict[str, object]:
-    """The exact NumPy/scalar dictionary emitted by the Rust batch boundary."""
-    return {
+    """The exact NumPy/scalar dictionary emitted by the Rust batch boundary.
+
+    The plan arrays are serialized from the retained Python reference builder;
+    only ``builder_fingerprint`` is derived after crossing the wire.
+    """
+    out = {
         name: value.numpy() if isinstance(value, torch.Tensor) else value
         for name, value in vars(batch).items()
+        if name not in ("plans", "builder_fingerprint")
     }
+    out.update(_reference_plan_arrays(batch))
+    return out
+
+
+def _nested_tensor_addresses(value: object) -> set[int]:
+    if isinstance(value, torch.Tensor):
+        return {value.data_ptr()} if value.numel() else set()
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            address
+            for description in fields(value)
+            for address in _nested_tensor_addresses(
+                getattr(value, description.name)
+            )
+        }
+    return set()
+
+
+def _assert_rust_plan_aliases(batch: PackedACTBatch) -> None:
+    plans = batch.plans
+    assert plans is not None
+    adjacency = plans.state_edges.adjacency
+    radius = plans.state_edges.radius
+    assert adjacency is not None and radius is not None
+    assert adjacency.src is batch.adjacency_src
+    assert adjacency.dst is batch.adjacency_dst
+    assert adjacency.axis is batch.adjacency_axis
+    assert radius.src is batch.radius_src
+    assert radius.dst is batch.radius_dst
+    assert radius.axis is batch.radius_axis_or_neg1
+
+    to_windows = plans.state_edges.to_windows
+    to_cells = plans.state_edges.to_cells
+    assert to_windows.inv_plan.dst_ptr is to_cells.inv_plan.src_ptr
+    assert to_windows.inv_plan.src_ptr is to_cells.inv_plan.dst_ptr
+    assert to_windows.inv_plan.rel_ptr is to_cells.inv_plan.rel_ptr
 
 
 def test_hand_built_graphs_are_valid():
@@ -588,6 +752,53 @@ def test_packed_from_arrays_preserves_the_container_contract_without_copies():
             assert torch.equal(getattr(actual, name), value), name
             expected_address = fields[name].__array_interface__["data"][0]
             assert getattr(actual, name).data_ptr() == expected_address
+    plan_addresses = _nested_tensor_addresses(actual.plans)
+    for name in _RUST_PLAN_ARRAY_NAMES:
+        array = fields[name]
+        if array.size:
+            assert array.__array_interface__["data"][0] in plan_addresses, name
+    _assert_rust_plan_aliases(actual)
+
+
+def test_packed_from_arrays_enforces_the_closed_plan_wire() -> None:
+    expected = collate([graph_a(), graph_b()], FULL)
+
+    missing = packed_arrays(expected)
+    del missing["plan_radius_relation"]
+    with pytest.raises(ValueError, match=r"missing \['plan_radius_relation'\]"):
+        packed_from_arrays(missing, FULL)
+
+    wrong_dtype = packed_arrays(expected)
+    wrong_dtype["plan_radius_dst_ptr"] = wrong_dtype[
+        "plan_radius_dst_ptr"
+    ].astype(np.int64)
+    with pytest.raises(TypeError, match=r"plan_radius_dst_ptr must be int32"):
+        packed_from_arrays(wrong_dtype, FULL)
+
+    wrong_shape = packed_arrays(expected)
+    starts = wrong_shape["plan_class_action_post1_block_starts"]
+    wrong_shape["plan_class_action_post1_block_starts"] = starts.reshape(-1, 1)
+    with pytest.raises(
+        ValueError,
+        match=r"plan_class_action_post1_block_starts must have shape",
+    ):
+        packed_from_arrays(wrong_shape, FULL)
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "plan_incidence_cell",
+        "plan_radius_axis_rows",
+        "plan_class_action_post1_block_starts",
+        "plan_action_source_window_rows",
+    ),
+)
+def test_packed_from_arrays_rejects_scalar_plan_vectors(name: str) -> None:
+    fields = packed_arrays(collate([graph_a(), graph_b()], FULL))
+    fields[name] = np.empty((), dtype=fields[name].dtype)
+    with pytest.raises(ValueError, match=rf"{name} must have shape"):
+        packed_from_arrays(fields, FULL)
 
 
 def test_packed_from_arrays_retains_batch_value_range_checks():
@@ -642,13 +853,15 @@ def test_batch_moves_to_a_device():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinning needs a CUDA host")
 def test_batch_pins_every_tensor():
-    pinned = collate([graph_a(), graph_b()], FULL).pin_memory()
+    reference = collate([graph_a(), graph_b()], FULL)
+    pinned = packed_from_arrays(packed_arrays(reference), FULL).pin_memory()
     assert pinned.position_count == 2
     assert all(
         value.is_pinned()
         for value in vars(pinned).values()
         if isinstance(value, torch.Tensor)
     )
+    _assert_rust_plan_aliases(pinned)
 
 
 def test_telemetry_counts_every_budget_exactly():

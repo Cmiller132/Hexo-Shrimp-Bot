@@ -42,6 +42,14 @@ the five CSR offset tables, and shift indices into the batch frame in Rust.
 The PyO3 batch boundary exposes that packed representation directly; the
 singular graph entry point remains position-local for diagnostics and tests.
 
+The adjacent `act_plans` module derives the packed model's execution views:
+destination/source/relation CSR message orders, class-row reduction blocks,
+routed radius rows, action gathers, ownership vectors, and latent segments.
+Its bounded-key scatters are stable, so rows tied on a key retain the packed
+encoder order. `build_planned_batch` and `build_planned_batch_prefixes` return
+the graph arrays and these plan arrays together; this is the PyO3 fitting
+boundary.
+
 The ACT encoder has its own configuration and tables but does not change or
 claim `MODEL_REPR_VERSION`, which remains the legacy MantisNet representation
 gate.
@@ -131,6 +139,7 @@ Parses the two string grammars the container passes into MantisNet:
 | --- | --- |
 | `lib.rs` | Crate root; re-exports the public surface and declares `MODEL_REPR_VERSION`, `PACKAGE_VERSION`, and `PACKAGE_NAME`. |
 | `act_encoder.rs` | MantisNet-ACT graph builder, ternary/D6 tables, Rust batch collation, and parallel position/prefix entry points. |
+| `act_plans.rs` | Stable CSR/class execution-plan construction for packed MantisNet-ACT batches. |
 | `encoder.rs` | Position-to-graph builder, wire serialisation/deserialisation, batch collation, and the `RawBatch` layout. |
 | `forward.rs` | The `Forward` and `ForwardLoader` traits plus the `RawOutputs` and `BoxError` types. |
 | `improvement.rs` | Closed-form KLENT policy improvement (`improve_policy`, `ImprovedPolicy`, `ImprovementError`). |

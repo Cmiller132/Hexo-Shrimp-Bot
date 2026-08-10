@@ -2,15 +2,17 @@
 
 The public singular builder must preserve the validated ``ACTGraph`` contract,
 and the production batch builder must match Python collation of those graphs
-field for field. Real self-play prefixes matter here: random playouts have a
-very different cell and edge density from the positions the fitting path sees.
+field for field.  Its Rust-built execution plans must also match the retained
+Python ``build_plans`` oracle recursively, including every CSR ordering and
+class block partition. Real self-play prefixes matter here: random playouts
+have a very different cell and edge density from the fitting path.
 """
 
 from __future__ import annotations
 
 import json
 import warnings
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 
 import hexo_py
@@ -106,6 +108,18 @@ BUILDER_CONFIGS: tuple[tuple[str, MantisACTConfig], ...] = (
             use_window_numeric_features=False,
             use_action_tactical_features=False,
         ),
+    ),
+)
+
+# These switches alter only the execution plans, not the ACT graph arrays the
+# original builder matrix covers.  Keep them separate so all nineteen
+# pre-fusion detector cases remain intact while the new Rust plan boundary is
+# forced through both optional-plan branches.
+PLAN_ONLY_CONFIGS: tuple[tuple[str, MantisACTConfig], ...] = (
+    ("full_no_axis", PRESETS["full_no_axis"]),
+    (
+        "radius_axis_routing_off",
+        replace(FULL, route_on_axis_radius_messages=False),
     ),
 )
 
@@ -281,6 +295,13 @@ def _compare_batches(
     differences: dict[str, tuple[float, float]] = {}
     for description in fields(PackedACTBatch):
         field = description.name
+        if field == "plans":
+            _compare_plan_tree(
+                getattr(actual, field),
+                getattr(expected, field),
+                context=f"{context}.plans",
+            )
+            continue
         rust_value, python_value = getattr(actual, field), getattr(expected, field)
         if isinstance(python_value, torch.Tensor):
             if not isinstance(rust_value, torch.Tensor):
@@ -302,6 +323,62 @@ def _compare_batches(
                 f"{context}.{field}: Rust {rust_value!r} != Python {python_value!r}"
             )
     return differences
+
+
+def _compare_plan_tree(actual: object, expected: object, *, context: str) -> None:
+    """Compare every nested execution-plan field without a hand-maintained list.
+
+    The dataclasses in ``plans.py`` and ``MessagePlan`` are the public schema.
+    Walking their declared fields makes a newly added plan artifact fail here
+    automatically until Rust emits it, while tensor comparison remains exact:
+    all plan arrays are integer index, pointer, ownership, or partition data.
+    """
+
+    if isinstance(expected, torch.Tensor):
+        if not isinstance(actual, torch.Tensor):
+            raise AssertionError(
+                f"{context}: Rust value is {type(actual).__name__}, not a tensor"
+            )
+        if actual.dtype != expected.dtype:
+            raise AssertionError(
+                f"{context}: Rust dtype {actual.dtype} != Python {expected.dtype}"
+            )
+        if actual.device != expected.device:
+            raise AssertionError(
+                f"{context}: Rust device {actual.device} != Python {expected.device}"
+            )
+        if actual.shape != expected.shape:
+            raise AssertionError(
+                f"{context}: Rust shape {tuple(actual.shape)} != "
+                f"Python {tuple(expected.shape)}"
+            )
+        if not actual.is_contiguous():
+            raise AssertionError(f"{context}: Rust tensor is not contiguous")
+        np.testing.assert_array_equal(
+            actual.detach().cpu().numpy(),
+            expected.detach().cpu().numpy(),
+            err_msg=f"{context} differs between Rust and Python plan builders",
+        )
+        return
+
+    if is_dataclass(expected) and not isinstance(expected, type):
+        if type(actual) is not type(expected):
+            raise AssertionError(
+                f"{context}: Rust type {type(actual).__name__} != "
+                f"Python {type(expected).__name__}"
+            )
+        for description in fields(expected):
+            _compare_plan_tree(
+                getattr(actual, description.name),
+                getattr(expected, description.name),
+                context=f"{context}.{description.name}",
+            )
+        return
+
+    if actual != expected:
+        raise AssertionError(
+            f"{context}: Rust {actual!r} != Python {expected!r}"
+        )
 
 
 def test_the_harness_names_every_act_graph_field() -> None:
@@ -350,4 +427,31 @@ def test_rust_prefix_batch_matches_collated_python_reference(
     )
     singular = collate([build(case.position, cfg) for case in selected], cfg)
     differences = _compare_batches(rust, singular, context=f"{config_name}[batch]")
+    _report_float_differences(f"{config_name} batch", differences)
+
+
+@pytest.mark.parametrize(
+    ("config_name", "cfg"),
+    PLAN_ONLY_CONFIGS,
+    ids=[name for name, _cfg in PLAN_ONLY_CONFIGS],
+)
+def test_rust_plan_only_configurations_match_python_reference(
+    config_name: str,
+    cfg: MantisACTConfig,
+    real_cases: tuple[RealCase, ...],
+) -> None:
+    """Cover switches that change plans while leaving graph arrays unchanged."""
+
+    selected = real_cases
+    rust = collate_prefixes(
+        [case.game for case in selected],
+        [case.ply for case in selected],
+        cfg,
+    )
+    python = collate([build(case.position, cfg) for case in selected], cfg)
+    differences = _compare_batches(
+        rust,
+        python,
+        context=f"{config_name}[batch]",
+    )
     _report_float_differences(f"{config_name} batch", differences)

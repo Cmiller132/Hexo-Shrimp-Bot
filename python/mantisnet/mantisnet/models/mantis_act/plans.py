@@ -20,7 +20,7 @@ otherwise lower to atomic scatters.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 import hashlib
 
 import numpy as np
@@ -52,6 +52,119 @@ WINDOW_PATTERN_CLASSES = ALL_WINDOW_PATTERN_CLASSES
 # maximum block length one contract.  Blocks never cross a class boundary.
 CLASS_REDUCTION_BLOCK_ROWS = 128
 _INT32_MAX = np.iinfo(np.int32).max
+
+# The Rust packed boundary emits these derived execution-plan arrays beside
+# the graph columns.  The names are a closed wire format: production assembly
+# accepts no missing or unknown member.  Disabled graph edge families
+# (adjacency or radius) are represented by empty arrays for all of their names.
+# Axis views are different: Rust emits that superset unconditionally because
+# the two plan-only switches are not builder inputs, and assembly below simply
+# leaves those arrays out of the public plan tree when the configuration does.
+_CLASS_WIRE_FAMILIES = (
+    "cell_occupancy",
+    "cell_legal",
+    "cell_nearest",
+    "window_pattern",
+    "window_status",
+    "action_post1",
+    "action_pre_status",
+)
+_CLASS_WIRE_COLUMNS = (
+    "ptr",
+    "rows",
+    "block_ptr",
+    "block_starts",
+    "block_lengths",
+)
+_RUST_PLAN_INT64_ARRAYS = (
+    "plan_incidence_cell",
+    "plan_incidence_window",
+    "plan_incidence_relation",
+    "plan_incidence_axis",
+    "plan_adjacency_relation",
+    "plan_radius_relation",
+    "plan_radius_axis_rows",
+    "plan_radius_routed_src",
+    "plan_radius_routed_dst",
+    "plan_radius_routed_relation",
+    "plan_radius_routed_axis",
+    "plan_cell_row_pos",
+    "plan_window_row_pos",
+    "plan_legal_row_pos",
+    "plan_cell_phase",
+    "plan_window_phase",
+    "plan_action_phase",
+    "plan_state_segment_row_pos",
+    "plan_action_segment_row_pos",
+)
+_RUST_PLAN_INT32_ARRAYS = (
+    "plan_incidence_dst_ptr",
+    "plan_incidence_dst_cell",
+    "plan_incidence_dst_relation",
+    "plan_incidence_dst_axis",
+    "plan_incidence_src_ptr",
+    "plan_incidence_src_window",
+    "plan_incidence_src_relation",
+    "plan_incidence_src_axis",
+    "plan_incidence_rel_ptr",
+    "plan_incidence_rel_cell",
+    "plan_incidence_rel_window",
+    "plan_incidence_rel_axis",
+    "plan_adjacency_dst_ptr",
+    "plan_adjacency_dst_src",
+    "plan_adjacency_dst_relation",
+    "plan_adjacency_dst_axis",
+    "plan_adjacency_src_ptr",
+    "plan_adjacency_src_dst",
+    "plan_adjacency_src_relation",
+    "plan_adjacency_src_axis",
+    "plan_adjacency_rel_ptr",
+    "plan_adjacency_rel_src",
+    "plan_adjacency_rel_dst",
+    "plan_adjacency_rel_axis",
+    "plan_radius_dst_ptr",
+    "plan_radius_dst_src",
+    "plan_radius_dst_relation",
+    "plan_radius_src_ptr",
+    "plan_radius_src_dst",
+    "plan_radius_src_relation",
+    "plan_radius_rel_ptr",
+    "plan_radius_rel_src",
+    "plan_radius_rel_dst",
+    "plan_radius_axis_dst_ptr",
+    "plan_radius_axis_dst_src",
+    "plan_radius_axis_dst_relation",
+    "plan_radius_axis_dst_axis",
+    "plan_radius_axis_src_ptr",
+    "plan_radius_axis_src_dst",
+    "plan_radius_axis_src_relation",
+    "plan_radius_axis_src_axis",
+    "plan_radius_axis_rel_ptr",
+    "plan_radius_axis_rel_src",
+    "plan_radius_axis_rel_dst",
+    "plan_radius_axis_rel_axis",
+    *(
+        f"plan_class_{family}_{column}"
+        for family in _CLASS_WIRE_FAMILIES
+        for column in _CLASS_WIRE_COLUMNS
+    ),
+    "plan_action_source_window_ptr",
+    "plan_action_source_window_rows",
+    "plan_action_source_window_sentinel_rows",
+    "plan_action_base_cell_ptr",
+    "plan_action_base_cell_rows",
+    "plan_state_segment_ranges",
+    "plan_state_segment_range_base",
+    "plan_state_segment_counts",
+    "plan_action_segment_ranges",
+    "plan_action_segment_range_base",
+    "plan_action_segment_counts",
+)
+_RUST_PLAN_ARRAY_DTYPES = {
+    **{name: np.int64 for name in _RUST_PLAN_INT64_ARRAYS},
+    **{name: np.int32 for name in _RUST_PLAN_INT32_ARRAYS},
+}
+_RUST_PLAN_ARRAY_NAMES = tuple(_RUST_PLAN_ARRAY_DTYPES)
 
 # Exactly the switches consumed while enumerating an ACTGraph or deriving the
 # plans in this file.  Model-only widths, depths, heads, and auxiliary outputs
@@ -137,9 +250,72 @@ def _tensor(
     return value.device
 
 
+def _trusted_dataclass(cls, /, **values):
+    """Construct an already-validated immutable transport without rescanning it.
+
+    Public plan constructors remain the strict gate for hand-built plans.  A
+    plan received from the Rust batch builder, or a transport-only clone of a
+    plan that has already passed that gate, must not repeat the class sorts,
+    permutations, range scans, and CSR walks in ``__post_init__``.  In
+    particular, pinning runs on the fitting prefetch worker and is part of the
+    hot path.
+    """
+
+    descriptions = fields(cls)
+    expected = {description.name for description in descriptions}
+    supplied = set(values)
+    if supplied != expected:
+        missing = sorted(expected - supplied)
+        extra = sorted(supplied - expected)
+        raise TypeError(
+            f"trusted {cls.__name__} fields disagree: missing {missing}, extra {extra}"
+        )
+    value = object.__new__(cls)
+    for description in descriptions:
+        object.__setattr__(value, description.name, values[description.name])
+    return value
+
+
+def _transport_plan(value, tensor_transform, memo: dict[int, Tensor] | None = None):
+    """Clone one validated plan tree while preserving shared tensor storage."""
+
+    if memo is None:
+        memo = {}
+    if isinstance(value, Tensor):
+        identity = id(value)
+        transformed = memo.get(identity)
+        if transformed is None:
+            transformed = tensor_transform(value)
+            memo[identity] = transformed
+        return transformed
+    if is_dataclass(value):
+        return _trusted_dataclass(
+            type(value),
+            **{
+                description.name: _transport_plan(
+                    getattr(value, description.name), tensor_transform, memo
+                )
+                for description in fields(value)
+            },
+        )
+    return value
+
+
 def _move(value, device, non_blocking: bool):
     if isinstance(value, Tensor):
         return value.to(device, non_blocking=non_blocking)
+    if isinstance(value, MessagePlan):
+        return _trusted_dataclass(
+            MessagePlan,
+            **{
+                name: (
+                    child.to(device, non_blocking=non_blocking)
+                    if isinstance(child, Tensor)
+                    else child
+                )
+                for name, child in vars(value).items()
+            },
+        )
     if hasattr(value, "to"):
         return value.to(device, non_blocking=non_blocking)
     return value
@@ -148,6 +324,14 @@ def _move(value, device, non_blocking: bool):
 def _pin(value):
     if isinstance(value, Tensor):
         return value.pin_memory()
+    if isinstance(value, MessagePlan):
+        return _trusted_dataclass(
+            MessagePlan,
+            **{
+                name: child.pin_memory() if isinstance(child, Tensor) else child
+                for name, child in vars(value).items()
+            },
+        )
     if hasattr(value, "pin_memory"):
         return value.pin_memory()
     return value
@@ -234,7 +418,8 @@ class LatentSegments:
         return self.ranges.device
 
     def to(self, device, *, non_blocking: bool = True) -> "LatentSegments":
-        return LatentSegments(
+        return _trusted_dataclass(
+            LatentSegments,
             **{
                 name: _move(value, device, non_blocking)
                 for name, value in vars(self).items()
@@ -242,7 +427,10 @@ class LatentSegments:
         )
 
     def pin_memory(self) -> "LatentSegments":
-        return LatentSegments(**{name: _pin(value) for name, value in vars(self).items()})
+        return _trusted_dataclass(
+            LatentSegments,
+            **{name: _pin(value) for name, value in vars(self).items()},
+        )
 
 
 @dataclass(frozen=True, eq=False)
@@ -442,7 +630,8 @@ class PlannedEdges:
         raise ValueError(f"{self.name} has no precomputed axis plan")
 
     def to(self, device, *, non_blocking: bool = True) -> "PlannedEdges":
-        return PlannedEdges(
+        return _trusted_dataclass(
+            PlannedEdges,
             **{
                 name: _move(value, device, non_blocking)
                 for name, value in vars(self).items()
@@ -450,7 +639,10 @@ class PlannedEdges:
         )
 
     def pin_memory(self) -> "PlannedEdges":
-        return PlannedEdges(**{name: _pin(value) for name, value in vars(self).items()})
+        return _trusted_dataclass(
+            PlannedEdges,
+            **{name: _pin(value) for name, value in vars(self).items()},
+        )
 
 
 @dataclass(frozen=True, eq=False)
@@ -480,7 +672,8 @@ class StatePlans:
                 )
 
     def to(self, device, *, non_blocking: bool = True) -> "StatePlans":
-        return StatePlans(
+        return _trusted_dataclass(
+            StatePlans,
             **{
                 name: _move(value, device, non_blocking)
                 for name, value in vars(self).items()
@@ -488,7 +681,10 @@ class StatePlans:
         )
 
     def pin_memory(self) -> "StatePlans":
-        return StatePlans(**{name: _pin(value) for name, value in vars(self).items()})
+        return _trusted_dataclass(
+            StatePlans,
+            **{name: _pin(value) for name, value in vars(self).items()},
+        )
 
 
 @dataclass(frozen=True, eq=False)
@@ -605,27 +801,29 @@ class ClassRowPlan:
         return self.ptr.device
 
     def to(self, device, *, non_blocking: bool = True) -> "ClassRowPlan":
-        return ClassRowPlan(
-            self.n_rows,
-            self.n_classes,
-            self.ptr.to(device, non_blocking=non_blocking),
-            self.rows.to(device, non_blocking=non_blocking),
-            self.block_ptr.to(device, non_blocking=non_blocking),
-            self.block_starts.to(device, non_blocking=non_blocking),
-            self.block_lengths.to(device, non_blocking=non_blocking),
-            self.name,
+        return _trusted_dataclass(
+            ClassRowPlan,
+            n_rows=self.n_rows,
+            n_classes=self.n_classes,
+            ptr=self.ptr.to(device, non_blocking=non_blocking),
+            rows=self.rows.to(device, non_blocking=non_blocking),
+            block_ptr=self.block_ptr.to(device, non_blocking=non_blocking),
+            block_starts=self.block_starts.to(device, non_blocking=non_blocking),
+            block_lengths=self.block_lengths.to(device, non_blocking=non_blocking),
+            name=self.name,
         )
 
     def pin_memory(self) -> "ClassRowPlan":
-        return ClassRowPlan(
-            self.n_rows,
-            self.n_classes,
-            self.ptr.pin_memory(),
-            self.rows.pin_memory(),
-            self.block_ptr.pin_memory(),
-            self.block_starts.pin_memory(),
-            self.block_lengths.pin_memory(),
-            self.name,
+        return _trusted_dataclass(
+            ClassRowPlan,
+            n_rows=self.n_rows,
+            n_classes=self.n_classes,
+            ptr=self.ptr.pin_memory(),
+            rows=self.rows.pin_memory(),
+            block_ptr=self.block_ptr.pin_memory(),
+            block_starts=self.block_starts.pin_memory(),
+            block_lengths=self.block_lengths.pin_memory(),
+            name=self.name,
         )
 
 
@@ -653,7 +851,8 @@ class EmbeddingRowPlans:
         return self.cell_occupancy.device
 
     def to(self, device, *, non_blocking: bool = True) -> "EmbeddingRowPlans":
-        return EmbeddingRowPlans(
+        return _trusted_dataclass(
+            EmbeddingRowPlans,
             **{
                 name: value.to(device, non_blocking=non_blocking)
                 for name, value in vars(self).items()
@@ -661,7 +860,8 @@ class EmbeddingRowPlans:
         )
 
     def pin_memory(self) -> "EmbeddingRowPlans":
-        return EmbeddingRowPlans(
+        return _trusted_dataclass(
+            EmbeddingRowPlans,
             **{name: value.pin_memory() for name, value in vars(self).items()}
         )
 
@@ -706,21 +906,23 @@ class GatherRowPlan:
         return self.ptr.device
 
     def to(self, device, *, non_blocking: bool = True) -> "GatherRowPlan":
-        return GatherRowPlan(
-            self.n_rows,
-            self.n_sources,
-            self.ptr.to(device, non_blocking=non_blocking),
-            self.rows.to(device, non_blocking=non_blocking),
-            self.name,
+        return _trusted_dataclass(
+            GatherRowPlan,
+            n_rows=self.n_rows,
+            n_sources=self.n_sources,
+            ptr=self.ptr.to(device, non_blocking=non_blocking),
+            rows=self.rows.to(device, non_blocking=non_blocking),
+            name=self.name,
         )
 
     def pin_memory(self) -> "GatherRowPlan":
-        return GatherRowPlan(
-            self.n_rows,
-            self.n_sources,
-            self.ptr.pin_memory(),
-            self.rows.pin_memory(),
-            self.name,
+        return _trusted_dataclass(
+            GatherRowPlan,
+            n_rows=self.n_rows,
+            n_sources=self.n_sources,
+            ptr=self.ptr.pin_memory(),
+            rows=self.rows.pin_memory(),
+            name=self.name,
         )
 
 
@@ -776,21 +978,23 @@ class SourceWindowPlan:
         return self.ptr.device
 
     def to(self, device, *, non_blocking: bool = True) -> "SourceWindowPlan":
-        return SourceWindowPlan(
-            self.n_rows,
-            self.n_windows,
-            self.ptr.to(device, non_blocking=non_blocking),
-            self.rows.to(device, non_blocking=non_blocking),
-            self.sentinel_rows.to(device, non_blocking=non_blocking),
+        return _trusted_dataclass(
+            SourceWindowPlan,
+            n_rows=self.n_rows,
+            n_windows=self.n_windows,
+            ptr=self.ptr.to(device, non_blocking=non_blocking),
+            rows=self.rows.to(device, non_blocking=non_blocking),
+            sentinel_rows=self.sentinel_rows.to(device, non_blocking=non_blocking),
         )
 
     def pin_memory(self) -> "SourceWindowPlan":
-        return SourceWindowPlan(
-            self.n_rows,
-            self.n_windows,
-            self.ptr.pin_memory(),
-            self.rows.pin_memory(),
-            self.sentinel_rows.pin_memory(),
+        return _trusted_dataclass(
+            SourceWindowPlan,
+            n_rows=self.n_rows,
+            n_windows=self.n_windows,
+            ptr=self.ptr.pin_memory(),
+            rows=self.rows.pin_memory(),
+            sentinel_rows=self.sentinel_rows.pin_memory(),
         )
 
 
@@ -819,19 +1023,21 @@ class ActionRowPlans:
         return self.post1.device
 
     def to(self, device, *, non_blocking: bool = True) -> "ActionRowPlans":
-        return ActionRowPlans(
-            self.post1.to(device, non_blocking=non_blocking),
-            self.pre_status.to(device, non_blocking=non_blocking),
-            self.source_window.to(device, non_blocking=non_blocking),
-            self.base_cell.to(device, non_blocking=non_blocking),
+        return _trusted_dataclass(
+            ActionRowPlans,
+            post1=self.post1.to(device, non_blocking=non_blocking),
+            pre_status=self.pre_status.to(device, non_blocking=non_blocking),
+            source_window=self.source_window.to(device, non_blocking=non_blocking),
+            base_cell=self.base_cell.to(device, non_blocking=non_blocking),
         )
 
     def pin_memory(self) -> "ActionRowPlans":
-        return ActionRowPlans(
-            self.post1.pin_memory(),
-            self.pre_status.pin_memory(),
-            self.source_window.pin_memory(),
-            self.base_cell.pin_memory(),
+        return _trusted_dataclass(
+            ActionRowPlans,
+            post1=self.post1.pin_memory(),
+            pre_status=self.pre_status.pin_memory(),
+            source_window=self.source_window.pin_memory(),
+            base_cell=self.base_cell.pin_memory(),
         )
 
 
@@ -931,15 +1137,13 @@ class ACTPlans:
         return self.cell_row_pos.device
 
     def to(self, device, *, non_blocking: bool = True) -> "ACTPlans":
-        return ACTPlans(
-            **{
-                name: _move(value, device, non_blocking)
-                for name, value in vars(self).items()
-            }
+        return _transport_plan(
+            self,
+            lambda value: value.to(device, non_blocking=non_blocking),
         )
 
     def pin_memory(self) -> "ACTPlans":
-        return ACTPlans(**{name: _pin(value) for name, value in vars(self).items()})
+        return _transport_plan(self, Tensor.pin_memory)
 
 
 def _as_int32(name: str, values: np.ndarray) -> np.ndarray:
@@ -1384,6 +1588,656 @@ def build_plans(
             (cell_offsets, window_offsets), (cell_row_pos, window_row_pos)
         ),
         action_segments=_latent_segments((legal_offsets,), (legal_row_pos,)),
+    )
+
+
+def _rust_plan_tensors(
+    cfg: MantisACTConfig,
+    arrays: Mapping[str, np.ndarray],
+    *,
+    position_count: int,
+    n_cells: int,
+    n_windows: int,
+    n_legal: int,
+    n_adjacency: int,
+    n_radius: int,
+) -> dict[str, Tensor]:
+    """Validate the Rust plan wire's transport shape and share its allocations.
+
+    Rust has already proved plan contents while constructing them.  This seam
+    deliberately checks only the closed names, dtypes, contiguity, dimensions,
+    and mutually implied row counts.  It performs no value scan or sort.
+    """
+
+    supplied = set(arrays)
+    expected = set(_RUST_PLAN_ARRAY_NAMES)
+    if supplied != expected:
+        missing = sorted(expected - supplied)
+        extra = sorted(supplied - expected)
+        raise ValueError(
+            f"Rust ACT plan fields disagree: missing {missing}, unknown {extra}"
+        )
+    for name, dtype in _RUST_PLAN_ARRAY_DTYPES.items():
+        value = arrays[name]
+        if not isinstance(value, np.ndarray):
+            raise TypeError(
+                f"{name} must be a numpy array, got {type(value).__name__}"
+            )
+        if value.dtype != dtype:
+            raise TypeError(f"{name} must be {np.dtype(dtype)}, got {value.dtype}")
+        if not value.flags.c_contiguous:
+            raise ValueError(f"{name} must be C-contiguous")
+
+    def shape(name: str, expected_shape: tuple[int, ...]) -> None:
+        actual = arrays[name].shape
+        if actual != expected_shape:
+            raise ValueError(f"{name} must have shape {expected_shape}, got {actual}")
+
+    def same_vectors(names: tuple[str, ...], rows: int) -> None:
+        for name in names:
+            shape(name, (rows,))
+
+    def vector_rows(name: str) -> int:
+        actual = arrays[name].shape
+        if len(actual) != 1:
+            raise ValueError(f"{name} must have shape (*,), got {actual}")
+        return int(actual[0])
+
+    incidence_rows = vector_rows("plan_incidence_cell")
+    same_vectors(
+        (
+            "plan_incidence_cell",
+            "plan_incidence_window",
+            "plan_incidence_relation",
+            "plan_incidence_axis",
+            "plan_incidence_dst_cell",
+            "plan_incidence_dst_relation",
+            "plan_incidence_dst_axis",
+            "plan_incidence_src_window",
+            "plan_incidence_src_relation",
+            "plan_incidence_src_axis",
+            "plan_incidence_rel_cell",
+            "plan_incidence_rel_window",
+            "plan_incidence_rel_axis",
+        ),
+        incidence_rows,
+    )
+    shape("plan_incidence_dst_ptr", (n_windows + 1,))
+    shape("plan_incidence_src_ptr", (n_cells + 1,))
+    shape("plan_incidence_rel_ptr", (INCIDENCE_RELATIONS + 1,))
+
+    adjacency_names = tuple(
+        name for name in _RUST_PLAN_ARRAY_NAMES if name.startswith("plan_adjacency_")
+    )
+    if cfg.use_cell_adjacency:
+        same_vectors(
+            tuple(name for name in adjacency_names if not name.endswith("_ptr")),
+            n_adjacency,
+        )
+        shape("plan_adjacency_dst_ptr", (n_cells + 1,))
+        shape("plan_adjacency_src_ptr", (n_cells + 1,))
+        shape(
+            "plan_adjacency_rel_ptr", (relation_vocabulary_size(cfg) + 1,)
+        )
+    else:
+        same_vectors(adjacency_names, 0)
+
+    radius_names = tuple(
+        name for name in _RUST_PLAN_ARRAY_NAMES if name.startswith("plan_radius_")
+    )
+    if cfg.use_occupied_radius_edges:
+        full_radius_names = (
+            "plan_radius_relation",
+            "plan_radius_dst_src",
+            "plan_radius_dst_relation",
+            "plan_radius_src_dst",
+            "plan_radius_src_relation",
+            "plan_radius_rel_src",
+            "plan_radius_rel_dst",
+        )
+        same_vectors(full_radius_names, n_radius)
+        shape("plan_radius_dst_ptr", (n_cells + 1,))
+        shape("plan_radius_src_ptr", (n_cells + 1,))
+        shape("plan_radius_rel_ptr", (radius_relation_count(cfg) + 1,))
+
+        routed_rows = vector_rows("plan_radius_axis_rows")
+        same_vectors(
+            (
+                "plan_radius_axis_rows",
+                "plan_radius_routed_src",
+                "plan_radius_routed_dst",
+                "plan_radius_routed_relation",
+                "plan_radius_routed_axis",
+                "plan_radius_axis_dst_src",
+                "plan_radius_axis_dst_relation",
+                "plan_radius_axis_dst_axis",
+                "plan_radius_axis_src_dst",
+                "plan_radius_axis_src_relation",
+                "plan_radius_axis_src_axis",
+                "plan_radius_axis_rel_src",
+                "plan_radius_axis_rel_dst",
+                "plan_radius_axis_rel_axis",
+            ),
+            routed_rows,
+        )
+        shape("plan_radius_axis_dst_ptr", (n_cells + 1,))
+        shape("plan_radius_axis_src_ptr", (n_cells + 1,))
+        shape(
+            "plan_radius_axis_rel_ptr", (radius_relation_count(cfg) + 1,)
+        )
+    else:
+        same_vectors(radius_names, 0)
+
+    class_shapes = {
+        "cell_occupancy": (n_cells, CELL_OCCUPANCY_CLASSES),
+        "cell_legal": (n_cells, CELL_LEGAL_CLASSES),
+        "cell_nearest": (n_cells, CELL_NEAREST_CLASSES),
+        "window_pattern": (n_windows, WINDOW_PATTERN_CLASSES),
+        "window_status": (n_windows, WINDOW_STATUSES),
+        "action_post1": (n_legal * AXIS_CHANNELS * 6, POST1_REL_CLASSES),
+        "action_pre_status": (n_legal * AXIS_CHANNELS * 6, WINDOW_STATUSES),
+    }
+    for family, (rows, classes) in class_shapes.items():
+        shape(f"plan_class_{family}_ptr", (classes + 1,))
+        shape(f"plan_class_{family}_rows", (rows,))
+        shape(f"plan_class_{family}_block_ptr", (classes + 1,))
+        block_rows = vector_rows(f"plan_class_{family}_block_starts")
+        shape(f"plan_class_{family}_block_starts", (block_rows,))
+        shape(f"plan_class_{family}_block_lengths", (block_rows,))
+
+    shape("plan_action_source_window_ptr", (n_windows + 1,))
+    live_action_rows = vector_rows("plan_action_source_window_rows")
+    sentinel_action_rows = vector_rows(
+        "plan_action_source_window_sentinel_rows"
+    )
+    shape("plan_action_source_window_rows", (live_action_rows,))
+    shape(
+        "plan_action_source_window_sentinel_rows", (sentinel_action_rows,)
+    )
+    if live_action_rows + sentinel_action_rows != n_legal * AXIS_CHANNELS * 6:
+        raise ValueError(
+            "action source-window live and sentinel wire rows do not cover "
+            f"{n_legal * AXIS_CHANNELS * 6} rows"
+        )
+    shape("plan_action_base_cell_ptr", (n_cells + 2,))
+    shape("plan_action_base_cell_rows", (n_legal,))
+
+    shape("plan_cell_row_pos", (n_cells,))
+    shape("plan_window_row_pos", (n_windows,))
+    shape("plan_legal_row_pos", (n_legal,))
+    shape("plan_cell_phase", (n_cells,))
+    shape("plan_window_phase", (n_windows,))
+    shape("plan_action_phase", (n_legal,))
+    shape("plan_state_segment_ranges", (position_count, 2, 2))
+    shape("plan_state_segment_range_base", (position_count, 2))
+    shape("plan_state_segment_counts", (position_count,))
+    shape("plan_state_segment_row_pos", (n_cells + n_windows,))
+    shape("plan_action_segment_ranges", (position_count, 1, 2))
+    shape("plan_action_segment_range_base", (position_count, 1))
+    shape("plan_action_segment_counts", (position_count,))
+    shape("plan_action_segment_row_pos", (n_legal,))
+    return {name: torch.from_numpy(value) for name, value in arrays.items()}
+
+
+def _wire_message_plan(
+    tensors: Mapping[str, Tensor],
+    *,
+    n_src: int,
+    n_dst: int,
+    n_relations: int,
+    n_edges: int,
+    dst_ptr: str,
+    dst_src: str,
+    dst_rel: str,
+    src_ptr: str,
+    src_dst: str,
+    src_rel: str,
+    rel_ptr: str,
+    rel_src: str,
+    rel_dst: str,
+    dst_axis: str | None = None,
+    src_axis: str | None = None,
+    rel_axis: str | None = None,
+) -> MessagePlan:
+    channels = AXIS_CHANNELS if dst_axis is not None else 1
+    if (src_axis is None) != (dst_axis is None) or (rel_axis is None) != (
+        dst_axis is None
+    ):
+        raise ValueError("a Rust axis message view must name all three axis columns")
+    return _trusted_dataclass(
+        MessagePlan,
+        n_src=n_src,
+        n_dst=n_dst,
+        n_relations=n_relations,
+        n_edges=n_edges,
+        channels=channels,
+        dst_ptr=tensors[dst_ptr],
+        dst_src=tensors[dst_src],
+        dst_rel=tensors[dst_rel],
+        dst_axis=None if dst_axis is None else tensors[dst_axis],
+        src_ptr=tensors[src_ptr],
+        src_dst=tensors[src_dst],
+        src_rel=tensors[src_rel],
+        src_axis=None if src_axis is None else tensors[src_axis],
+        rel_ptr=tensors[rel_ptr],
+        rel_src=tensors[rel_src],
+        rel_dst=tensors[rel_dst],
+        rel_axis=None if rel_axis is None else tensors[rel_axis],
+    )
+
+
+def _wire_class_plan(
+    tensors: Mapping[str, Tensor],
+    family: str,
+    *,
+    n_rows: int,
+    n_classes: int,
+    name: str,
+) -> ClassRowPlan:
+    prefix = f"plan_class_{family}_"
+    return _trusted_dataclass(
+        ClassRowPlan,
+        n_rows=n_rows,
+        n_classes=n_classes,
+        ptr=tensors[prefix + "ptr"],
+        rows=tensors[prefix + "rows"],
+        block_ptr=tensors[prefix + "block_ptr"],
+        block_starts=tensors[prefix + "block_starts"],
+        block_lengths=tensors[prefix + "block_lengths"],
+        name=name,
+    )
+
+
+def _plans_from_rust_arrays(
+    cfg: MantisACTConfig,
+    plan_arrays: Mapping[str, np.ndarray],
+    packed_tensors: Mapping[str, Tensor],
+    *,
+    position_count: int,
+    n_cells: int,
+    n_windows: int,
+    n_legal: int,
+    n_adjacency: int,
+    n_radius: int,
+) -> ACTPlans:
+    """Assemble Rust-validated execution plans without deriving or sorting rows."""
+
+    tensors = _rust_plan_tensors(
+        cfg,
+        plan_arrays,
+        position_count=position_count,
+        n_cells=n_cells,
+        n_windows=n_windows,
+        n_legal=n_legal,
+        n_adjacency=n_adjacency,
+        n_radius=n_radius,
+    )
+    incidence_rows = int(tensors["plan_incidence_cell"].shape[0])
+    incidence_inv = _wire_message_plan(
+        tensors,
+        n_src=n_cells,
+        n_dst=n_windows,
+        n_relations=INCIDENCE_RELATIONS,
+        n_edges=incidence_rows,
+        dst_ptr="plan_incidence_dst_ptr",
+        dst_src="plan_incidence_dst_cell",
+        dst_rel="plan_incidence_dst_relation",
+        src_ptr="plan_incidence_src_ptr",
+        src_dst="plan_incidence_src_window",
+        src_rel="plan_incidence_src_relation",
+        rel_ptr="plan_incidence_rel_ptr",
+        rel_src="plan_incidence_rel_cell",
+        rel_dst="plan_incidence_rel_window",
+    )
+    incidence_axis = (
+        _wire_message_plan(
+            tensors,
+            n_src=n_cells,
+            n_dst=n_windows,
+            n_relations=INCIDENCE_RELATIONS,
+            n_edges=incidence_rows,
+            dst_ptr="plan_incidence_dst_ptr",
+            dst_src="plan_incidence_dst_cell",
+            dst_rel="plan_incidence_dst_relation",
+            dst_axis="plan_incidence_dst_axis",
+            src_ptr="plan_incidence_src_ptr",
+            src_dst="plan_incidence_src_window",
+            src_rel="plan_incidence_src_relation",
+            src_axis="plan_incidence_src_axis",
+            rel_ptr="plan_incidence_rel_ptr",
+            rel_src="plan_incidence_rel_cell",
+            rel_dst="plan_incidence_rel_window",
+            rel_axis="plan_incidence_rel_axis",
+        )
+        if cfg.use_axis_channels
+        else None
+    )
+    to_windows = _trusted_dataclass(
+        PlannedEdges,
+        src=tensors["plan_incidence_cell"],
+        dst=tensors["plan_incidence_window"],
+        relation=tensors["plan_incidence_relation"],
+        axis=tensors["plan_incidence_axis"],
+        n_src=n_cells,
+        n_dst=n_windows,
+        num_relations=INCIDENCE_RELATIONS,
+        dst_sorted=True,
+        fully_routed=True,
+        name="incidence cells->windows",
+        axis_rows=None,
+        routed_src=None,
+        routed_dst=None,
+        routed_relation=None,
+        routed_axis=None,
+        inv_plan=incidence_inv,
+        axis_plan=incidence_axis,
+    )
+
+    reverse_inv = _wire_message_plan(
+        tensors,
+        n_src=n_windows,
+        n_dst=n_cells,
+        n_relations=INCIDENCE_RELATIONS,
+        n_edges=incidence_rows,
+        dst_ptr="plan_incidence_src_ptr",
+        dst_src="plan_incidence_src_window",
+        dst_rel="plan_incidence_src_relation",
+        src_ptr="plan_incidence_dst_ptr",
+        src_dst="plan_incidence_dst_cell",
+        src_rel="plan_incidence_dst_relation",
+        rel_ptr="plan_incidence_rel_ptr",
+        rel_src="plan_incidence_rel_window",
+        rel_dst="plan_incidence_rel_cell",
+    )
+    reverse_axis = (
+        _wire_message_plan(
+            tensors,
+            n_src=n_windows,
+            n_dst=n_cells,
+            n_relations=INCIDENCE_RELATIONS,
+            n_edges=incidence_rows,
+            dst_ptr="plan_incidence_src_ptr",
+            dst_src="plan_incidence_src_window",
+            dst_rel="plan_incidence_src_relation",
+            dst_axis="plan_incidence_src_axis",
+            src_ptr="plan_incidence_dst_ptr",
+            src_dst="plan_incidence_dst_cell",
+            src_rel="plan_incidence_dst_relation",
+            src_axis="plan_incidence_dst_axis",
+            rel_ptr="plan_incidence_rel_ptr",
+            rel_src="plan_incidence_rel_window",
+            rel_dst="plan_incidence_rel_cell",
+            rel_axis="plan_incidence_rel_axis",
+        )
+        if cfg.use_axis_channels
+        else None
+    )
+    to_cells = _trusted_dataclass(
+        PlannedEdges,
+        src=tensors["plan_incidence_window"],
+        dst=tensors["plan_incidence_cell"],
+        relation=tensors["plan_incidence_relation"],
+        axis=tensors["plan_incidence_axis"],
+        n_src=n_windows,
+        n_dst=n_cells,
+        num_relations=INCIDENCE_RELATIONS,
+        dst_sorted=False,
+        fully_routed=True,
+        name="incidence windows->cells",
+        axis_rows=None,
+        routed_src=None,
+        routed_dst=None,
+        routed_relation=None,
+        routed_axis=None,
+        inv_plan=reverse_inv,
+        axis_plan=reverse_axis,
+    )
+
+    adjacency = None
+    if cfg.use_cell_adjacency:
+        adjacency_inv = _wire_message_plan(
+            tensors,
+            n_src=n_cells,
+            n_dst=n_cells,
+            n_relations=relation_vocabulary_size(cfg),
+            n_edges=n_adjacency,
+            dst_ptr="plan_adjacency_dst_ptr",
+            dst_src="plan_adjacency_dst_src",
+            dst_rel="plan_adjacency_dst_relation",
+            src_ptr="plan_adjacency_src_ptr",
+            src_dst="plan_adjacency_src_dst",
+            src_rel="plan_adjacency_src_relation",
+            rel_ptr="plan_adjacency_rel_ptr",
+            rel_src="plan_adjacency_rel_src",
+            rel_dst="plan_adjacency_rel_dst",
+        )
+        adjacency_axis = (
+            _wire_message_plan(
+                tensors,
+                n_src=n_cells,
+                n_dst=n_cells,
+                n_relations=relation_vocabulary_size(cfg),
+                n_edges=n_adjacency,
+                dst_ptr="plan_adjacency_dst_ptr",
+                dst_src="plan_adjacency_dst_src",
+                dst_rel="plan_adjacency_dst_relation",
+                dst_axis="plan_adjacency_dst_axis",
+                src_ptr="plan_adjacency_src_ptr",
+                src_dst="plan_adjacency_src_dst",
+                src_rel="plan_adjacency_src_relation",
+                src_axis="plan_adjacency_src_axis",
+                rel_ptr="plan_adjacency_rel_ptr",
+                rel_src="plan_adjacency_rel_src",
+                rel_dst="plan_adjacency_rel_dst",
+                rel_axis="plan_adjacency_rel_axis",
+            )
+            if cfg.use_axis_channels
+            else None
+        )
+        adjacency = _trusted_dataclass(
+            PlannedEdges,
+            src=packed_tensors["adjacency_src"],
+            dst=packed_tensors["adjacency_dst"],
+            relation=tensors["plan_adjacency_relation"],
+            axis=packed_tensors["adjacency_axis"],
+            n_src=n_cells,
+            n_dst=n_cells,
+            num_relations=relation_vocabulary_size(cfg),
+            dst_sorted=True,
+            fully_routed=True,
+            name="hex adjacency",
+            axis_rows=None,
+            routed_src=None,
+            routed_dst=None,
+            routed_relation=None,
+            routed_axis=None,
+            inv_plan=adjacency_inv,
+            axis_plan=adjacency_axis,
+        )
+
+    radius = None
+    if cfg.use_occupied_radius_edges:
+        radius_inv = _wire_message_plan(
+            tensors,
+            n_src=n_cells,
+            n_dst=n_cells,
+            n_relations=radius_relation_count(cfg),
+            n_edges=n_radius,
+            dst_ptr="plan_radius_dst_ptr",
+            dst_src="plan_radius_dst_src",
+            dst_rel="plan_radius_dst_relation",
+            src_ptr="plan_radius_src_ptr",
+            src_dst="plan_radius_src_dst",
+            src_rel="plan_radius_src_relation",
+            rel_ptr="plan_radius_rel_ptr",
+            rel_src="plan_radius_rel_src",
+            rel_dst="plan_radius_rel_dst",
+        )
+        build_radius_axis = (
+            cfg.use_axis_channels and cfg.route_on_axis_radius_messages
+        )
+        routed_rows = int(tensors["plan_radius_axis_rows"].shape[0])
+        radius_axis = (
+            _wire_message_plan(
+                tensors,
+                n_src=n_cells,
+                n_dst=n_cells,
+                n_relations=radius_relation_count(cfg),
+                n_edges=routed_rows,
+                dst_ptr="plan_radius_axis_dst_ptr",
+                dst_src="plan_radius_axis_dst_src",
+                dst_rel="plan_radius_axis_dst_relation",
+                dst_axis="plan_radius_axis_dst_axis",
+                src_ptr="plan_radius_axis_src_ptr",
+                src_dst="plan_radius_axis_src_dst",
+                src_rel="plan_radius_axis_src_relation",
+                src_axis="plan_radius_axis_src_axis",
+                rel_ptr="plan_radius_axis_rel_ptr",
+                rel_src="plan_radius_axis_rel_src",
+                rel_dst="plan_radius_axis_rel_dst",
+                rel_axis="plan_radius_axis_rel_axis",
+            )
+            if build_radius_axis
+            else None
+        )
+        radius = _trusted_dataclass(
+            PlannedEdges,
+            src=packed_tensors["radius_src"],
+            dst=packed_tensors["radius_dst"],
+            relation=tensors["plan_radius_relation"],
+            axis=(
+                packed_tensors["radius_axis_or_neg1"]
+                if cfg.route_on_axis_radius_messages
+                else None
+            ),
+            n_src=n_cells,
+            n_dst=n_cells,
+            num_relations=radius_relation_count(cfg),
+            dst_sorted=True,
+            fully_routed=not cfg.route_on_axis_radius_messages,
+            name="occupied radius",
+            axis_rows=(tensors["plan_radius_axis_rows"] if build_radius_axis else None),
+            routed_src=(tensors["plan_radius_routed_src"] if build_radius_axis else None),
+            routed_dst=(tensors["plan_radius_routed_dst"] if build_radius_axis else None),
+            routed_relation=(
+                tensors["plan_radius_routed_relation"] if build_radius_axis else None
+            ),
+            routed_axis=(tensors["plan_radius_routed_axis"] if build_radius_axis else None),
+            inv_plan=radius_inv,
+            axis_plan=radius_axis,
+        )
+
+    embedding_rows = _trusted_dataclass(
+        EmbeddingRowPlans,
+        cell_occupancy=_wire_class_plan(
+            tensors,
+            "cell_occupancy",
+            n_rows=n_cells,
+            n_classes=CELL_OCCUPANCY_CLASSES,
+            name="cell occupancy",
+        ),
+        cell_legal=_wire_class_plan(
+            tensors,
+            "cell_legal",
+            n_rows=n_cells,
+            n_classes=CELL_LEGAL_CLASSES,
+            name="cell legal",
+        ),
+        cell_nearest=_wire_class_plan(
+            tensors,
+            "cell_nearest",
+            n_rows=n_cells,
+            n_classes=CELL_NEAREST_CLASSES,
+            name="cell nearest",
+        ),
+        window_pattern=_wire_class_plan(
+            tensors,
+            "window_pattern",
+            n_rows=n_windows,
+            n_classes=WINDOW_PATTERN_CLASSES,
+            name="window pattern",
+        ),
+        window_status=_wire_class_plan(
+            tensors,
+            "window_status",
+            n_rows=n_windows,
+            n_classes=WINDOW_STATUSES,
+            name="window status",
+        ),
+    )
+    action_grid_rows = n_legal * AXIS_CHANNELS * 6
+    action_rows = _trusted_dataclass(
+        ActionRowPlans,
+        post1=_wire_class_plan(
+            tensors,
+            "action_post1",
+            n_rows=action_grid_rows,
+            n_classes=POST1_REL_CLASSES,
+            name="action post1",
+        ),
+        pre_status=_wire_class_plan(
+            tensors,
+            "action_pre_status",
+            n_rows=action_grid_rows,
+            n_classes=WINDOW_STATUSES,
+            name="action pre_status",
+        ),
+        source_window=_trusted_dataclass(
+            SourceWindowPlan,
+            n_rows=action_grid_rows,
+            n_windows=n_windows,
+            ptr=tensors["plan_action_source_window_ptr"],
+            rows=tensors["plan_action_source_window_rows"],
+            sentinel_rows=tensors["plan_action_source_window_sentinel_rows"],
+        ),
+        base_cell=_trusted_dataclass(
+            GatherRowPlan,
+            n_rows=n_legal,
+            n_sources=n_cells + 1,
+            ptr=tensors["plan_action_base_cell_ptr"],
+            rows=tensors["plan_action_base_cell_rows"],
+            name="action base cell",
+        ),
+    )
+    state_segments = _trusted_dataclass(
+        LatentSegments,
+        ranges=tensors["plan_state_segment_ranges"],
+        range_base=tensors["plan_state_segment_range_base"],
+        counts=tensors["plan_state_segment_counts"],
+        row_pos=tensors["plan_state_segment_row_pos"],
+        n_rows=n_cells + n_windows,
+        positions=position_count,
+        families=2,
+    )
+    action_segments = _trusted_dataclass(
+        LatentSegments,
+        ranges=tensors["plan_action_segment_ranges"],
+        range_base=tensors["plan_action_segment_range_base"],
+        counts=tensors["plan_action_segment_counts"],
+        row_pos=tensors["plan_action_segment_row_pos"],
+        n_rows=n_legal,
+        positions=position_count,
+        families=1,
+    )
+    return _trusted_dataclass(
+        ACTPlans,
+        state_edges=_trusted_dataclass(
+            StatePlans,
+            to_windows=to_windows,
+            to_cells=to_cells,
+            adjacency=adjacency,
+            radius=radius,
+        ),
+        embedding_rows=embedding_rows,
+        action_rows=action_rows,
+        cell_row_pos=tensors["plan_cell_row_pos"],
+        window_row_pos=tensors["plan_window_row_pos"],
+        legal_row_pos=tensors["plan_legal_row_pos"],
+        cell_phase=tensors["plan_cell_phase"],
+        window_phase=tensors["plan_window_phase"],
+        action_phase=tensors["plan_action_phase"],
+        state_segments=state_segments,
+        action_segments=action_segments,
     )
 
 

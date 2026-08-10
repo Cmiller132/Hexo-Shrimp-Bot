@@ -9,7 +9,7 @@
 //! engine makes for itself.
 
 use hexo_engine as engine;
-use hexo_model_mantisnet::{MODEL_REPR_VERSION, act_encoder, encoder};
+use hexo_model_mantisnet::{MODEL_REPR_VERSION, act_encoder, act_plans, encoder};
 use numpy::PyArray1;
 use numpy::PyArrayMethods;
 use pyo3::exceptions::PyValueError;
@@ -592,6 +592,349 @@ fn packed_act_to_dict<'py>(
     Ok(d)
 }
 
+fn plan_view_to_dict<'py>(
+    py: Python<'py>,
+    d: &Bound<'py, PyDict>,
+    view: act_plans::StableEdgeView,
+    names: (&str, &str, &str, Option<&str>),
+) -> PyResult<()> {
+    let (ptr, left, right, axis) = names;
+    d.set_item(ptr, PyArray1::from_vec(py, view.ptr))?;
+    d.set_item(left, PyArray1::from_vec(py, view.left))?;
+    d.set_item(right, PyArray1::from_vec(py, view.right))?;
+    match axis {
+        Some(name) => d.set_item(name, PyArray1::from_vec(py, view.axis))?,
+        None if view.axis.is_empty() => {}
+        None => {
+            return Err(PyValueError::new_err(format!(
+                "invariant plan view unexpectedly carries {} axis rows",
+                view.axis.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn class_plan_to_dict<'py>(
+    py: Python<'py>,
+    d: &Bound<'py, PyDict>,
+    family: &str,
+    plan: act_plans::ClassRowPlanArrays,
+) -> PyResult<()> {
+    d.set_item(
+        format!("plan_class_{family}_ptr"),
+        PyArray1::from_vec(py, plan.ptr),
+    )?;
+    d.set_item(
+        format!("plan_class_{family}_rows"),
+        PyArray1::from_vec(py, plan.rows),
+    )?;
+    d.set_item(
+        format!("plan_class_{family}_block_ptr"),
+        PyArray1::from_vec(py, plan.block_ptr),
+    )?;
+    d.set_item(
+        format!("plan_class_{family}_block_starts"),
+        PyArray1::from_vec(py, plan.block_starts),
+    )?;
+    d.set_item(
+        format!("plan_class_{family}_block_lengths"),
+        PyArray1::from_vec(py, plan.block_lengths),
+    )?;
+    Ok(())
+}
+
+/// Add the closed execution-plan wire fields to an already packed dictionary.
+fn plan_arrays_to_dict<'py>(
+    py: Python<'py>,
+    d: &Bound<'py, PyDict>,
+    plans: act_plans::ActPlanArrays,
+    positions: usize,
+) -> PyResult<()> {
+    let incidence = plans.incidence;
+    d.set_item(
+        "plan_incidence_cell",
+        PyArray1::from_vec(py, incidence.cell),
+    )?;
+    d.set_item(
+        "plan_incidence_window",
+        PyArray1::from_vec(py, incidence.window),
+    )?;
+    d.set_item(
+        "plan_incidence_relation",
+        PyArray1::from_vec(py, incidence.relation),
+    )?;
+    d.set_item(
+        "plan_incidence_axis",
+        PyArray1::from_vec(py, incidence.axis),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        incidence.dst,
+        (
+            "plan_incidence_dst_ptr",
+            "plan_incidence_dst_cell",
+            "plan_incidence_dst_relation",
+            Some("plan_incidence_dst_axis"),
+        ),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        incidence.src,
+        (
+            "plan_incidence_src_ptr",
+            "plan_incidence_src_window",
+            "plan_incidence_src_relation",
+            Some("plan_incidence_src_axis"),
+        ),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        incidence.rel,
+        (
+            "plan_incidence_rel_ptr",
+            "plan_incidence_rel_cell",
+            "plan_incidence_rel_window",
+            Some("plan_incidence_rel_axis"),
+        ),
+    )?;
+
+    let adjacency = plans.adjacency;
+    d.set_item(
+        "plan_adjacency_relation",
+        PyArray1::from_vec(py, adjacency.relation),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        adjacency.dst,
+        (
+            "plan_adjacency_dst_ptr",
+            "plan_adjacency_dst_src",
+            "plan_adjacency_dst_relation",
+            Some("plan_adjacency_dst_axis"),
+        ),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        adjacency.src,
+        (
+            "plan_adjacency_src_ptr",
+            "plan_adjacency_src_dst",
+            "plan_adjacency_src_relation",
+            Some("plan_adjacency_src_axis"),
+        ),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        adjacency.rel,
+        (
+            "plan_adjacency_rel_ptr",
+            "plan_adjacency_rel_src",
+            "plan_adjacency_rel_dst",
+            Some("plan_adjacency_rel_axis"),
+        ),
+    )?;
+
+    let radius = plans.radius;
+    d.set_item(
+        "plan_radius_relation",
+        PyArray1::from_vec(py, radius.relation),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        radius.dst,
+        (
+            "plan_radius_dst_ptr",
+            "plan_radius_dst_src",
+            "plan_radius_dst_relation",
+            None,
+        ),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        radius.src,
+        (
+            "plan_radius_src_ptr",
+            "plan_radius_src_dst",
+            "plan_radius_src_relation",
+            None,
+        ),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        radius.rel,
+        (
+            "plan_radius_rel_ptr",
+            "plan_radius_rel_src",
+            "plan_radius_rel_dst",
+            None,
+        ),
+    )?;
+    d.set_item(
+        "plan_radius_axis_rows",
+        PyArray1::from_vec(py, radius.axis_rows),
+    )?;
+    d.set_item(
+        "plan_radius_routed_src",
+        PyArray1::from_vec(py, radius.routed_src),
+    )?;
+    d.set_item(
+        "plan_radius_routed_dst",
+        PyArray1::from_vec(py, radius.routed_dst),
+    )?;
+    d.set_item(
+        "plan_radius_routed_relation",
+        PyArray1::from_vec(py, radius.routed_relation),
+    )?;
+    d.set_item(
+        "plan_radius_routed_axis",
+        PyArray1::from_vec(py, radius.routed_axis),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        radius.axis_dst,
+        (
+            "plan_radius_axis_dst_ptr",
+            "plan_radius_axis_dst_src",
+            "plan_radius_axis_dst_relation",
+            Some("plan_radius_axis_dst_axis"),
+        ),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        radius.axis_src,
+        (
+            "plan_radius_axis_src_ptr",
+            "plan_radius_axis_src_dst",
+            "plan_radius_axis_src_relation",
+            Some("plan_radius_axis_src_axis"),
+        ),
+    )?;
+    plan_view_to_dict(
+        py,
+        d,
+        radius.axis_rel,
+        (
+            "plan_radius_axis_rel_ptr",
+            "plan_radius_axis_rel_src",
+            "plan_radius_axis_rel_dst",
+            Some("plan_radius_axis_rel_axis"),
+        ),
+    )?;
+
+    for (family, plan) in [
+        ("cell_occupancy", plans.class_cell_occupancy),
+        ("cell_legal", plans.class_cell_legal),
+        ("cell_nearest", plans.class_cell_nearest),
+        ("window_pattern", plans.class_window_pattern),
+        ("window_status", plans.class_window_status),
+        ("action_post1", plans.class_action_post1),
+        ("action_pre_status", plans.class_action_pre_status),
+    ] {
+        class_plan_to_dict(py, d, family, plan)?;
+    }
+
+    d.set_item(
+        "plan_action_source_window_ptr",
+        PyArray1::from_vec(py, plans.action_source_window.ptr),
+    )?;
+    d.set_item(
+        "plan_action_source_window_rows",
+        PyArray1::from_vec(py, plans.action_source_window.rows),
+    )?;
+    d.set_item(
+        "plan_action_source_window_sentinel_rows",
+        PyArray1::from_vec(py, plans.action_source_window.sentinel_rows),
+    )?;
+    d.set_item(
+        "plan_action_base_cell_ptr",
+        PyArray1::from_vec(py, plans.action_base_cell.ptr),
+    )?;
+    d.set_item(
+        "plan_action_base_cell_rows",
+        PyArray1::from_vec(py, plans.action_base_cell.rows),
+    )?;
+
+    d.set_item(
+        "plan_cell_row_pos",
+        PyArray1::from_vec(py, plans.cell_row_pos),
+    )?;
+    d.set_item(
+        "plan_window_row_pos",
+        PyArray1::from_vec(py, plans.window_row_pos),
+    )?;
+    d.set_item(
+        "plan_legal_row_pos",
+        PyArray1::from_vec(py, plans.legal_row_pos),
+    )?;
+    d.set_item("plan_cell_phase", PyArray1::from_vec(py, plans.cell_phase))?;
+    d.set_item(
+        "plan_window_phase",
+        PyArray1::from_vec(py, plans.window_phase),
+    )?;
+    d.set_item(
+        "plan_action_phase",
+        PyArray1::from_vec(py, plans.action_phase),
+    )?;
+
+    let state = plans.state_segment;
+    d.set_item(
+        "plan_state_segment_ranges",
+        PyArray1::from_vec(py, state.ranges).reshape([positions, 2, 2])?,
+    )?;
+    d.set_item(
+        "plan_state_segment_range_base",
+        PyArray1::from_vec(py, state.range_base).reshape([positions, 2])?,
+    )?;
+    d.set_item(
+        "plan_state_segment_counts",
+        PyArray1::from_vec(py, state.counts),
+    )?;
+    d.set_item(
+        "plan_state_segment_row_pos",
+        PyArray1::from_vec(py, state.row_pos),
+    )?;
+    let action = plans.action_segment;
+    d.set_item(
+        "plan_action_segment_ranges",
+        PyArray1::from_vec(py, action.ranges).reshape([positions, 1, 2])?,
+    )?;
+    d.set_item(
+        "plan_action_segment_range_base",
+        PyArray1::from_vec(py, action.range_base).reshape([positions, 1])?,
+    )?;
+    d.set_item(
+        "plan_action_segment_counts",
+        PyArray1::from_vec(py, action.counts),
+    )?;
+    d.set_item(
+        "plan_action_segment_row_pos",
+        PyArray1::from_vec(py, action.row_pos),
+    )?;
+    Ok(())
+}
+
+fn planned_act_to_dict<'py>(
+    py: Python<'py>,
+    planned: act_plans::PlannedActBatch,
+) -> PyResult<Bound<'py, PyDict>> {
+    let positions = planned.packed.position_count;
+    let d = packed_act_to_dict(py, planned.packed)?;
+    plan_arrays_to_dict(py, &d, planned.plans, positions)?;
+    Ok(d)
+}
+
 /// Build a collated MantisNet batch from positions, in parallel.
 ///
 /// The production twin of `mantisnet.builder`'s Python path, held equal to it
@@ -663,9 +1006,9 @@ fn build_act_batch<'py>(
     let config = parse_act_config(config)?;
     let owned: Vec<engine::Position> = positions.iter().map(|p| p.inner.clone()).collect();
     let packed = py
-        .detach(|| act_encoder::build_packed_batch(&owned, &config))
+        .detach(|| act_plans::build_planned_batch(&owned, &config))
         .map_err(PyValueError::new_err)?;
-    packed_act_to_dict(py, packed)
+    planned_act_to_dict(py, packed)
 }
 
 /// Replay move prefixes and build and collate MantisNet-ACT graphs in parallel.
@@ -678,9 +1021,9 @@ fn build_act_batch_prefixes<'py>(
 ) -> PyResult<Bound<'py, PyDict>> {
     let config = parse_act_config(config)?;
     let packed = py
-        .detach(|| act_encoder::build_packed_batch_prefixes(&games, &ts, &config))
+        .detach(|| act_plans::build_planned_batch_prefixes(&games, &ts, &config))
         .map_err(PyValueError::new_err)?;
-    packed_act_to_dict(py, packed)
+    planned_act_to_dict(py, packed)
 }
 
 /// The module: `Position`, the batch builders, and the version constants a

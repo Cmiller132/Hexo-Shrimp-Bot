@@ -4,6 +4,7 @@
 //! extension and the container package.
 
 pub mod act_encoder;
+pub mod act_plans;
 mod config;
 pub mod encoder;
 mod forward;

@@ -5,11 +5,14 @@ Run from ``python/mantisnet`` after rebuilding ``hexo_py`` from this worktree::
     python tests/act/bench_act_rust_builder.py
     python tests/act/bench_act_rust_builder.py --workers 2
     python tests/act/bench_act_rust_builder.py --profile-lifetime
-    python tests/act/bench_act_rust_builder.py --require-target
+    python tests/act/bench_act_rust_builder.py --require-batch-ms
 
 The timed region is the public ``collate_prefixes`` call, including replay,
-parallel graph construction and Rust collation, packed validation, and the
-zero-copy NumPy-to-PyTorch boundary.
+parallel graph construction, Rust collation and execution-plan construction,
+packed validation, and the zero-copy NumPy-to-PyTorch boundary.  The default
+43-position chunk and 40 ms ceiling are the fit-path acceptance workload.
+Output destruction happens after the main timer and is reported separately by
+``--profile-lifetime``.
 """
 
 from __future__ import annotations
@@ -29,9 +32,10 @@ from mantisnet.models.mantis_act import PRESETS, collate_prefixes
 
 
 REAL_GAMES = Path(__file__).resolve().parents[2] / "scratch" / "real_games.json"
-DEFAULT_POSITIONS = 64
+DEFAULT_POSITIONS = 43
 DEFAULT_MAX_PLY = 200
 DEFAULT_TARGET = 3_000.0
+DEFAULT_MAX_BATCH_MS = 40.0
 
 
 def _arguments() -> argparse.Namespace:
@@ -54,9 +58,20 @@ def _arguments() -> argparse.Namespace:
     )
     parser.add_argument("--target", type=float, default=DEFAULT_TARGET)
     parser.add_argument(
+        "--max-batch-ms",
+        type=float,
+        default=DEFAULT_MAX_BATCH_MS,
+        help="full build-plus-plan-plus-wrap median ceiling",
+    )
+    parser.add_argument(
         "--require-target",
         action="store_true",
         help="exit nonzero when median throughput is below --target",
+    )
+    parser.add_argument(
+        "--require-batch-ms",
+        action="store_true",
+        help="exit nonzero when median wall time exceeds --max-batch-ms",
     )
     parser.add_argument(
         "--profile-lifetime",
@@ -79,6 +94,8 @@ def _arguments() -> argparse.Namespace:
         parser.error("--workers must be at least 1")
     if args.target <= 0:
         parser.error("--target must be positive")
+    if args.max_batch_ms <= 0:
+        parser.error("--max-batch-ms must be positive")
     if args.profile_lifetime and args.workers != 1:
         parser.error("--profile-lifetime requires --workers 1")
     return args
@@ -111,24 +128,25 @@ def _buffer(count: int, max_ply: int, *, stream: int = 0):
     return games, plies
 
 
-def _build(games, plies, cfg) -> tuple[int, int]:
+def _build(games, plies, cfg):
     batch = collate_prefixes(games, plies, cfg)
     if batch.position_count != len(games):
         raise RuntimeError(
             f"collator returned {batch.position_count} positions for "
             f"{len(games)} inputs"
         )
-    legal = int(batch.legal_offsets[-1])
-    windows = int(batch.window_offsets[-1])
-    del batch
-    return legal, windows
+    return batch
 
 
 def _one(games, plies, cfg) -> tuple[float, int, int]:
     gc.collect()
     started = time.perf_counter()
-    legal, windows = _build(games, plies, cfg)
-    return time.perf_counter() - started, legal, windows
+    batch = _build(games, plies, cfg)
+    elapsed = time.perf_counter() - started
+    legal = int(batch.legal_offsets[-1])
+    windows = int(batch.window_offsets[-1])
+    del batch
+    return elapsed, legal, windows
 
 
 def _concurrent_one(
@@ -139,7 +157,7 @@ def _concurrent_one(
     workers = len(workloads)
     gate = threading.Barrier(workers + 1)
 
-    def ready_then_build(games, plies) -> tuple[int, int]:
+    def ready_then_build(games, plies):
         gate.wait()
         return _build(games, plies, cfg)
 
@@ -148,11 +166,12 @@ def _concurrent_one(
     ]
     started = time.perf_counter()
     gate.wait()
-    results = [future.result() for future in futures]
+    batches = [future.result() for future in futures]
     elapsed = time.perf_counter() - started
-    return elapsed, sum(result[0] for result in results), sum(
-        result[1] for result in results
-    )
+    legal = sum(int(batch.legal_offsets[-1]) for batch in batches)
+    windows = sum(int(batch.window_offsets[-1]) for batch in batches)
+    del batches
+    return elapsed, legal, windows
 
 
 def _lifetime_one(games, plies, cfg) -> tuple[float, float, float, float]:
@@ -246,6 +265,13 @@ def main() -> int:
         f"best={max(rates):.1f} worst={min(rates):.1f} "
         f"median_batch_ms={median_seconds * 1e3:.3f}"
     )
+    median_batch_ms = median_seconds * 1e3
+    print(
+        "fit_path_acceptance="
+        f"{'PASS' if median_batch_ms <= args.max_batch_ms else 'FAIL'} "
+        f"build_plans_wrap_ms={median_batch_ms:.3f} "
+        f"ceiling_ms={args.max_batch_ms:.3f}"
+    )
 
     if args.profile_lifetime:
         for _ in range(args.warmup):
@@ -253,7 +279,12 @@ def main() -> int:
         lifetime = [
             _lifetime_one(games, plies, cfg) for _ in range(args.repeats)
         ]
-        labels = ("rust_pyo3", "packed_wrap", "fields_drop", "batch_drop")
+        labels = (
+            "rust_build_plans_pyo3",
+            "packed_plan_wrap",
+            "fields_drop",
+            "batch_drop",
+        )
         print(
             "lifetime_median_ms="
             + ",".join(
@@ -267,6 +298,13 @@ def main() -> int:
         print(
             f"FAIL: median {median_rate:.1f} positions/s is below target "
             f"{args.target:.1f}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.require_batch_ms and median_batch_ms > args.max_batch_ms:
+        print(
+            f"FAIL: median build+plans+wrap {median_batch_ms:.3f} ms exceeds "
+            f"ceiling {args.max_batch_ms:.3f} ms",
             file=sys.stderr,
         )
         return 1

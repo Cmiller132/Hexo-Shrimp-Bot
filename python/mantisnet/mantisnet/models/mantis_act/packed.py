@@ -18,7 +18,15 @@ import numpy as np
 import torch
 
 from .config import MantisACTConfig
-from .plans import ACTPlans, ClassRowPlan, build_plans, builder_fingerprint
+from .plans import (
+    ACTPlans,
+    ClassRowPlan,
+    _RUST_PLAN_ARRAY_NAMES,
+    _plans_from_rust_arrays,
+    _transport_plan,
+    build_plans,
+    builder_fingerprint,
+)
 from .segment_message import MessagePlan
 from .pattern_classes import (
     ALL_CELL_WINDOW_REL_CLASSES,
@@ -693,12 +701,22 @@ class PackedACTBatch:
 
     def to(self, device) -> "PackedACTBatch":
         """The same batch with every tensor on ``device``."""
+        memo: dict[int, torch.Tensor] = {}
+
+        def move(value: torch.Tensor) -> torch.Tensor:
+            identity = id(value)
+            moved_value = memo.get(identity)
+            if moved_value is None:
+                moved_value = value.to(device, non_blocking=True)
+                memo[identity] = moved_value
+            return moved_value
+
         moved = {}
         for name, value in vars(self).items():
             if isinstance(value, torch.Tensor):
-                moved[name] = value.to(device, non_blocking=True)
+                moved[name] = move(value)
             elif isinstance(value, ACTPlans):
-                moved[name] = value.to(device, non_blocking=True)
+                moved[name] = _transport_plan(value, move, memo)
             else:
                 moved[name] = value
         return PackedACTBatch(**moved).mark_dynamic()
@@ -709,12 +727,22 @@ class PackedACTBatch:
         ``non_blocking`` silently degrades to a synchronous staged copy from
         pageable memory; a prefetch worker pins ahead of the transfer instead.
         """
+        memo: dict[int, torch.Tensor] = {}
+
+        def pin(value: torch.Tensor) -> torch.Tensor:
+            identity = id(value)
+            pinned_value = memo.get(identity)
+            if pinned_value is None:
+                pinned_value = value.pin_memory()
+                memo[identity] = pinned_value
+            return pinned_value
+
         pinned = {}
         for name, value in vars(self).items():
             if isinstance(value, torch.Tensor):
-                pinned[name] = value.pin_memory()
+                pinned[name] = pin(value)
             elif isinstance(value, ACTPlans):
-                pinned[name] = value.pin_memory()
+                pinned[name] = _transport_plan(value, pin, memo)
             else:
                 pinned[name] = value
         return PackedACTBatch(**pinned).mark_dynamic()
@@ -822,8 +850,8 @@ def packed_from_arrays(
     Rust owns concatenation and index shifting on the production batch path.
     This boundary accepts exactly :class:`PackedACTBatch`'s array fields,
     checks the wire format and the cheap batch-wide guards that protect model
-    table lookups, derives the CPU execution plans the trunk consumes, then
-    shares the NumPy allocations with PyTorch.  In particular,
+    table lookups, assembles Rust's CPU execution plans, then shares every
+    NumPy allocation with PyTorch.  In particular,
     `_refuse_crossing` remains an independent check of the collation frame even
     though Rust constructs that frame, while no per-position ``ACTGraph`` or
     NumPy concatenation is created here.  ``cfg`` is the configuration the
@@ -836,7 +864,11 @@ def packed_from_arrays(
         )
 
     scalar_names = {"position_count", "radius_orbit_bound"}
-    expected_names = set(_PACKED_FROM_ARRAYS_SPECS) | scalar_names
+    expected_names = (
+        set(_PACKED_FROM_ARRAYS_SPECS)
+        | scalar_names
+        | set(_RUST_PLAN_ARRAY_NAMES)
+    )
     supplied_names = set(fields)
     missing = expected_names - supplied_names
     extra = supplied_names - expected_names
@@ -873,6 +905,7 @@ def packed_from_arrays(
         if not array.flags.c_contiguous:
             raise ValueError(f"{name} must be C-contiguous")
         arrays[name] = array
+    plan_arrays = {name: fields[name] for name in _RUST_PLAN_ARRAY_NAMES}
 
     offsets: dict[str, np.ndarray] = {}
     for family, name in _OFFSET_FIELDS.items():
@@ -947,15 +980,18 @@ def packed_from_arrays(
             f"requires {expected_orbit_bound}"
         )
 
-    plans = build_plans(
-        cfg,
-        arrays=arrays,
-        cell_offsets=offsets[_CELLS],
-        window_offsets=offsets[_WINDOWS],
-        legal_offsets=offsets[_LEGAL],
-        phase_id=arrays["phase_id"],
-    )
     tensors = {name: torch.from_numpy(array) for name, array in arrays.items()}
+    plans = _plans_from_rust_arrays(
+        cfg,
+        plan_arrays,
+        tensors,
+        position_count=position_count,
+        n_cells=sizes[_CELLS],
+        n_windows=sizes[_WINDOWS],
+        n_legal=sizes[_LEGAL],
+        n_adjacency=sizes[_ADJACENCY],
+        n_radius=sizes[_RADIUS],
+    )
     return PackedACTBatch(
         position_count=position_count,
         radius_orbit_bound=radius_orbit_bound,
