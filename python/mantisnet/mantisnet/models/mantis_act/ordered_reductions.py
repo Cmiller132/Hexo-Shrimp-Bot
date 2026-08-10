@@ -42,6 +42,46 @@ def ordered_segment_sum(values: Tensor, offsets: Tensor) -> Tensor:
     return reduced
 
 
+def ordered_two_stage_segment_sum(
+    values: Tensor, block_offsets: Tensor, block_lengths: Tensor
+) -> Tensor:
+    """Reduce compact contiguous row blocks, then their owning segments.
+
+    ``values`` is already in owner-major order.  ``block_lengths`` partitions
+    that row order into nonempty fixed-size blocks, while
+    ``block_offsets[c]:block_offsets[c + 1]`` names class ``c``'s consecutive
+    block partials.  Both stages therefore have a fixed association, including
+    empty classes, and need neither a scatter nor an atomic destination update.
+
+    This traceable formulation is the CPU/oracle counterpart of the hand
+    kernels used by the high-volume action-table backwards.
+    """
+    if values.ndim < 1:
+        raise ValueError(f"values must have a row dimension, got {values.shape}")
+    for name, tensor in (
+        ("block_offsets", block_offsets),
+        ("block_lengths", block_lengths),
+    ):
+        if tensor.ndim != 1 or tensor.dtype not in (torch.int32, torch.int64):
+            raise TypeError(f"{name} must be a one-dimensional integer tensor")
+        if tensor.device != values.device:
+            raise ValueError(f"{name} and values must share a device")
+
+    if block_lengths.shape[0] == 0:
+        return values.new_zeros(
+            (block_offsets.shape[0] - 1, *values.shape[1:]),
+            dtype=_accumulate_dtype(values),
+        )
+
+    partials = torch.segment_reduce(
+        values.to(_accumulate_dtype(values)),
+        "sum",
+        lengths=block_lengths.long(),
+        initial=0.0,
+    )
+    return ordered_segment_sum(partials, block_offsets)
+
+
 class _OrderedIndexSelect(torch.autograd.Function):
     """A traceable gather whose table gradient follows a stable class CSR."""
 
@@ -167,4 +207,5 @@ __all__ = [
     "ordered_row_broadcast",
     "ordered_segment_max",
     "ordered_segment_sum",
+    "ordered_two_stage_segment_sum",
 ]

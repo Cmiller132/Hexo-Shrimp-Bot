@@ -292,6 +292,74 @@ def test_the_planned_gather_backward_is_bitwise_deterministic(batches):
 
 
 @_CUDA
+def test_the_sentinel_base_backward_really_uses_two_ordered_stages(
+    batches, monkeypatch
+):
+    """A long sentinel run is split into fixed slices, then combined once."""
+    source, base, index, window_ptr, window_rows, sentinel_rows = gather_inputs(
+        batches[60], AXIS_CHANNELS, "cuda", torch.float32
+    )
+    assert int(sentinel_rows.numel()) > kernel._GATHER_BASE_BLOCK_ROWS
+
+    launches: dict[str, list[object]] = {"partial": [], "combine": []}
+
+    class CountedKernel:
+        def __init__(self, name, inner):
+            self.name = name
+            self.inner = inner
+
+        def __getitem__(self, grid):
+            launch = self.inner[grid]
+
+            def counted(*args, **kwargs):
+                launches[self.name].append(grid)
+                return launch(*args, **kwargs)
+
+            return counted
+
+    monkeypatch.setattr(
+        kernel,
+        "_gather_base_backward_partial_kernel",
+        CountedKernel("partial", kernel._gather_base_backward_partial_kernel),
+    )
+    monkeypatch.setattr(
+        kernel,
+        "_gather_base_backward_combine_kernel",
+        CountedKernel("combine", kernel._gather_base_backward_combine_kernel),
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(SEED + 29)
+    grad = torch.randn(
+        int(index.numel()),
+        int(base.shape[0]),
+        generator=generator,
+        device="cuda",
+    )
+    _d_source, d_base = kernel._launch_gather_backward(
+        source,
+        base,
+        index,
+        AXIS_CHANNELS,
+        window_ptr,
+        window_rows,
+        sentinel_rows,
+        grad,
+    )
+
+    partial_count = max(
+        1,
+        math.ceil(int(sentinel_rows.numel()) / kernel._GATHER_BASE_BLOCK_ROWS),
+    )
+    assert launches == {"partial": [(partial_count,)], "combine": [(1,)]}
+
+    exact = grad[sentinel_rows.long()].double().sum(dim=0)
+    error = (d_base.double() - exact).abs().max() / exact.abs().max().clamp(
+        min=1e-30
+    )
+    assert error < 1e-3
+
+
+@_CUDA
 @pytest.mark.parametrize(
     "width,rel_width", ((FULL.d_inv, FULL.d_rel), (FULL.d_axis, FULL.d_rel))
 )

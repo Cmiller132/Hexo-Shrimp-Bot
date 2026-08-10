@@ -5,12 +5,13 @@ The post-placement row relation is
 ``E_post1[action_post1_class] + E_status[action_pre_status]``.
 
 The forward is the literal pair of table lookups, left visible to the enclosing
-``torch.compile`` region.  The backward consumes the class-major CSR views built
-by :mod:`plans`: each class owns one contiguous run of original row ids, so one
-program sums that run in row order.  No sort or atomic scatter occurs in the
+``torch.compile`` region.  The backward consumes the class-major CSR views and
+their compact fixed-size block partition built by :mod:`plans`.  Grid-parallel
+programs reduce contiguous row blocks first; one owner per class then combines
+those partials in their fixed order.  No sort or atomic scatter occurs in the
 model step, and empty classes produce exact zero gradients.  CPU and unsupported
-signatures use the literal ordered torch reduction held against the kernel by
-the §36 parity tests.
+signatures use the literal two-stage ordered reduction held against the kernel
+by the §36 parity tests.
 """
 
 from __future__ import annotations
@@ -19,6 +20,9 @@ import warnings
 
 import torch
 from torch import Tensor
+
+from .ordered_reductions import ordered_two_stage_segment_sum
+from .plans import CLASS_REDUCTION_BLOCK_ROWS
 
 try:
     import triton
@@ -51,17 +55,23 @@ def _reference(
 
 
 def _class_sum_reference(
-    grad_out: Tensor, ptr: Tensor, rows: Tensor, classes: int, dtype: torch.dtype
+    grad_out: Tensor,
+    ptr: Tensor,
+    rows: Tensor,
+    block_ptr: Tensor,
+    block_lengths: Tensor,
+    classes: int,
+    dtype: torch.dtype,
 ) -> Tensor:
-    """Ordered class reductions from a class-major CSR view.
+    """Two-stage ordered class reductions from a blocked class-major CSR.
 
-    ``torch.segment_reduce`` is the reference counterpart of the kernel's
-    contiguous walk.  Unlike ``EmbeddingBackward``/``index_add_`` it neither
-    sorts in the step nor scatters duplicate classes through atomics.
+    The first segment reduction forms the same contiguous block partials as the
+    grid-parallel kernel; the second combines each class's consecutive blocks.
+    Unlike ``EmbeddingBackward``/``index_add_`` neither stage sorts in the step
+    nor scatters duplicate classes through atomics.
     """
     ordered = grad_out.index_select(0, rows.long()).to(_accumulate_dtype(grad_out))
-    lengths = (ptr[1:] - ptr[:-1]).long()
-    reduced = torch.segment_reduce(ordered, "sum", lengths=lengths, initial=0.0)
+    reduced = ordered_two_stage_segment_sum(ordered, block_ptr, block_lengths)
     if reduced.shape[0] != classes:
         raise ValueError(
             f"class CSR produced {reduced.shape[0]} rows for a {classes}-row table"
@@ -76,17 +86,31 @@ def _reference_backward(
     post_rows: Tensor,
     status_ptr: Tensor,
     status_rows: Tensor,
+    post_block_ptr: Tensor,
+    post_block_starts: Tensor,
+    post_block_lengths: Tensor,
+    status_block_ptr: Tensor,
+    status_block_starts: Tensor,
+    status_block_lengths: Tensor,
     grad_out: Tensor,
 ) -> tuple[Tensor, Tensor]:
     """The lookup gradients, reduced through the supplied stable CSR views."""
     return (
         _class_sum_reference(
-            grad_out, post_ptr, post_rows, int(post_weight.shape[0]), post_weight.dtype
+            grad_out,
+            post_ptr,
+            post_rows,
+            post_block_ptr,
+            post_block_lengths,
+            int(post_weight.shape[0]),
+            post_weight.dtype,
         ),
         _class_sum_reference(
             grad_out,
             status_ptr,
             status_rows,
+            status_block_ptr,
+            status_block_lengths,
             int(status_weight.shape[0]),
             status_weight.dtype,
         ),
@@ -96,27 +120,55 @@ def _reference_backward(
 if triton is not None:
 
     @triton.jit
-    def _class_sum_kernel(
+    def _class_block_sum_kernel(
         grad_ptr,
-        ptr,
         class_rows,
+        block_starts,
+        block_lengths,
+        partial_ptr,
+        D: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_ROWS: tl.constexpr,
+    ):
+        # One program owns one compact slice of one class run. Its scalar row
+        # loop follows the stable original-row order exactly; many such slices
+        # fill the GPU even for the four-class pre-status table.
+        block = tl.program_id(0)
+        columns = tl.arange(0, BLOCK_D)
+        live_d = columns < D
+        start = tl.load(block_starts + block)
+        length = tl.load(block_lengths + block)
+        end = tl.minimum(length, BLOCK_ROWS)
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+        for offset in tl.range(0, end):
+            row = tl.load(class_rows + start + offset)
+            acc += tl.load(
+                grad_ptr + row * D + columns,
+                mask=live_d,
+                other=0.0,
+            ).to(tl.float32)
+        tl.store(partial_ptr + block * D + columns, acc, mask=live_d)
+
+    @triton.jit
+    def _class_block_combine_kernel(
+        partial_ptr,
+        block_ptr,
         out_ptr,
         D: tl.constexpr,
         BLOCK_D: tl.constexpr,
     ):
-        # One program owns one class. Its loop follows the stable original-row
-        # order encoded by the CSR, so both stages of the reduction have a
-        # fixed association and no destination is written by two programs.
+        # One program owns one final class row and visits its contiguous block
+        # partials in ascending order. Empty classes retain the exact zero
+        # identity and no output has multiple writers.
         cls = tl.program_id(0)
         columns = tl.arange(0, BLOCK_D)
         live_d = columns < D
-        start = tl.load(ptr + cls)
-        end = tl.load(ptr + cls + 1)
+        start = tl.load(block_ptr + cls)
+        end = tl.load(block_ptr + cls + 1)
         acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-        for entry in tl.range(start, end):
-            row = tl.load(class_rows + entry)
+        for block in tl.range(start, end):
             acc += tl.load(
-                grad_ptr + row * D + columns, mask=live_d, other=0.0
+                partial_ptr + block * D + columns, mask=live_d, other=0.0
             ).to(tl.float32)
         tl.store(out_ptr + cls * D + columns, acc, mask=live_d)
 
@@ -130,6 +182,12 @@ def _validate(
     post_rows: Tensor,
     status_ptr: Tensor,
     status_rows: Tensor,
+    post_block_ptr: Tensor,
+    post_block_starts: Tensor,
+    post_block_lengths: Tensor,
+    status_block_ptr: Tensor,
+    status_block_starts: Tensor,
+    status_block_lengths: Tensor,
 ) -> None:
     if post_weight.ndim != 2 or status_weight.ndim != 2:
         raise ValueError("relation weights must both be (classes, width)")
@@ -153,6 +211,12 @@ def _validate(
         ("post_rows", post_rows),
         ("status_ptr", status_ptr),
         ("status_rows", status_rows),
+        ("post_block_ptr", post_block_ptr),
+        ("post_block_starts", post_block_starts),
+        ("post_block_lengths", post_block_lengths),
+        ("status_block_ptr", status_block_ptr),
+        ("status_block_starts", status_block_starts),
+        ("status_block_lengths", status_block_lengths),
     ):
         if value.ndim != 1:
             raise ValueError(f"{name} must be 1-D, got {tuple(value.shape)}")
@@ -178,6 +242,20 @@ def _validate(
             f"status_ptr must have {status_weight.shape[0] + 1} entries, got "
             f"{status_ptr.numel()}"
         )
+    if post_block_ptr.numel() != post_weight.shape[0] + 1:
+        raise ValueError(
+            f"post_block_ptr must have {post_weight.shape[0] + 1} entries, got "
+            f"{post_block_ptr.numel()}"
+        )
+    if status_block_ptr.numel() != status_weight.shape[0] + 1:
+        raise ValueError(
+            f"status_block_ptr must have {status_weight.shape[0] + 1} entries, got "
+            f"{status_block_ptr.numel()}"
+        )
+    if post_block_starts.numel() != post_block_lengths.numel():
+        raise ValueError("post block starts and lengths must have equal size")
+    if status_block_starts.numel() != status_block_lengths.numel():
+        raise ValueError("status block starts and lengths must have equal size")
     tensors = (
         post_weight,
         status_weight,
@@ -187,6 +265,12 @@ def _validate(
         post_rows,
         status_ptr,
         status_rows,
+        post_block_ptr,
+        post_block_starts,
+        post_block_lengths,
+        status_block_ptr,
+        status_block_starts,
+        status_block_lengths,
     )
     if any(t.device != post_weight.device for t in tensors):
         raise ValueError("every class-pair embedding input must be on one device")
@@ -214,29 +298,61 @@ def _launch_backward(
     post_rows: Tensor,
     status_ptr: Tensor,
     status_rows: Tensor,
+    post_block_ptr: Tensor,
+    post_block_starts: Tensor,
+    post_block_lengths: Tensor,
+    status_block_ptr: Tensor,
+    status_block_starts: Tensor,
+    status_block_lengths: Tensor,
     grad_out: Tensor,
 ) -> tuple[Tensor, Tensor]:
     width = int(post_weight.shape[1])
     block_d = triton.next_power_of_2(width)
-    d_post = torch.empty_like(post_weight)
-    d_status = torch.empty_like(status_weight)
-    _class_sum_kernel[(int(post_weight.shape[0]),)](
-        grad_out,
-        post_ptr,
-        post_rows,
-        d_post,
-        D=width,
-        BLOCK_D=block_d,
-        num_warps=_WARPS,
+
+    def table_gradient(
+        weight: Tensor,
+        rows: Tensor,
+        block_ptr: Tensor,
+        block_starts: Tensor,
+        block_lengths: Tensor,
+    ) -> Tensor:
+        block_count = int(block_starts.numel())
+        if block_count < 1:
+            raise ValueError("a nonempty class row grid needs at least one reduction block")
+        partial = torch.empty(
+            block_count, width, dtype=torch.float32, device=grad_out.device
+        )
+        _class_block_sum_kernel[(block_count,)](
+            grad_out,
+            rows,
+            block_starts,
+            block_lengths,
+            partial,
+            D=width,
+            BLOCK_D=block_d,
+            BLOCK_ROWS=CLASS_REDUCTION_BLOCK_ROWS,
+            num_warps=_WARPS,
+        )
+        result = torch.empty_like(weight)
+        _class_block_combine_kernel[(int(weight.shape[0]),)](
+            partial,
+            block_ptr,
+            result,
+            D=width,
+            BLOCK_D=block_d,
+            num_warps=_WARPS,
+        )
+        return result
+
+    d_post = table_gradient(
+        post_weight, post_rows, post_block_ptr, post_block_starts, post_block_lengths
     )
-    _class_sum_kernel[(int(status_weight.shape[0]),)](
-        grad_out,
-        status_ptr,
+    d_status = table_gradient(
+        status_weight,
         status_rows,
-        d_status,
-        D=width,
-        BLOCK_D=block_d,
-        num_warps=_WARPS,
+        status_block_ptr,
+        status_block_starts,
+        status_block_lengths,
     )
     return d_post, d_status
 
@@ -251,6 +367,12 @@ def _class_pair_backward_op(
     post_rows: Tensor,
     status_ptr: Tensor,
     status_rows: Tensor,
+    post_block_ptr: Tensor,
+    post_block_starts: Tensor,
+    post_block_lengths: Tensor,
+    status_block_ptr: Tensor,
+    status_block_starts: Tensor,
+    status_block_lengths: Tensor,
     grad_out: Tensor,
 ) -> tuple[Tensor, Tensor]:
     reference = lambda: _reference_backward(  # noqa: E731
@@ -260,6 +382,12 @@ def _class_pair_backward_op(
         post_rows,
         status_ptr,
         status_rows,
+        post_block_ptr,
+        post_block_starts,
+        post_block_lengths,
+        status_block_ptr,
+        status_block_starts,
+        status_block_lengths,
         grad_out,
     )
     rows, width = int(grad_out.shape[0]), int(post_weight.shape[1])
@@ -281,6 +409,12 @@ def _class_pair_backward_op(
             post_rows,
             status_ptr,
             status_rows,
+            post_block_ptr,
+            post_block_starts,
+            post_block_lengths,
+            status_block_ptr,
+            status_block_starts,
+            status_block_lengths,
             grad_out.contiguous(),
         )
     except Exception as exc:
@@ -303,6 +437,12 @@ def _(
     post_rows: Tensor,
     status_ptr: Tensor,
     status_rows: Tensor,
+    post_block_ptr: Tensor,
+    post_block_starts: Tensor,
+    post_block_lengths: Tensor,
+    status_block_ptr: Tensor,
+    status_block_starts: Tensor,
+    status_block_lengths: Tensor,
     grad_out: Tensor,
 ) -> tuple[Tensor, Tensor]:
     return torch.empty_like(post_weight), torch.empty_like(status_weight)
@@ -322,16 +462,33 @@ class _ClassPairEmbedding(torch.autograd.Function):
         post_rows: Tensor,
         status_ptr: Tensor,
         status_rows: Tensor,
+        post_block_ptr: Tensor,
+        post_block_starts: Tensor,
+        post_block_lengths: Tensor,
+        status_block_ptr: Tensor,
+        status_block_starts: Tensor,
+        status_block_lengths: Tensor,
     ) -> Tensor:
         ctx.save_for_backward(
-            post_weight, status_weight, post_ptr, post_rows, status_ptr, status_rows
+            post_weight,
+            status_weight,
+            post_ptr,
+            post_rows,
+            status_ptr,
+            status_rows,
+            post_block_ptr,
+            post_block_starts,
+            post_block_lengths,
+            status_block_ptr,
+            status_block_starts,
+            status_block_lengths,
         )
         return _reference(post_weight, status_weight, post_index, status_index)
 
     @staticmethod
     def backward(ctx, grad_out: Tensor):
         d_post, d_status = _class_pair_backward_op(*ctx.saved_tensors, grad_out)
-        return d_post, d_status, None, None, None, None, None, None
+        return d_post, d_status, *(None for _ in range(12))
 
 
 def class_pair_embedding(
@@ -343,13 +500,21 @@ def class_pair_embedding(
     post_rows: Tensor,
     status_ptr: Tensor,
     status_rows: Tensor,
+    post_block_ptr: Tensor,
+    post_block_starts: Tensor,
+    post_block_lengths: Tensor,
+    status_block_ptr: Tensor,
+    status_block_starts: Tensor,
+    status_block_lengths: Tensor,
 ) -> Tensor:
     """Return both relation lookups summed, with ordered table gradients.
 
     ``post_index`` and ``status_index`` are the flattened ``[legal, 3, 6]``
     class grids.  Each ``ptr``/``rows`` pair is the matching class-major CSR
     plan: ``rows[ptr[c]:ptr[c+1]]`` names every flattened row of class ``c`` in
-    original row order.
+    original row order.  Each appended ``block_ptr``/``block_starts``/
+    ``block_lengths`` triple is the compact, class-major partition used by the
+    two-stage deterministic table-gradient reduction.
     """
     inputs = (
         post_weight.contiguous(),
@@ -360,6 +525,12 @@ def class_pair_embedding(
         post_rows.contiguous(),
         status_ptr.contiguous(),
         status_rows.contiguous(),
+        post_block_ptr.contiguous(),
+        post_block_starts.contiguous(),
+        post_block_lengths.contiguous(),
+        status_block_ptr.contiguous(),
+        status_block_starts.contiguous(),
+        status_block_lengths.contiguous(),
     )
     _validate(*inputs)
     return _ClassPairEmbedding.apply(*inputs)

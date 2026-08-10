@@ -47,6 +47,10 @@ CELL_OCCUPANCY_CLASSES = 3
 CELL_LEGAL_CLASSES = 2
 CELL_NEAREST_CLASSES = 10
 WINDOW_PATTERN_CLASSES = ALL_WINDOW_PATTERN_CLASSES
+# Backward table gradients are reduced by compact, class-major row blocks.
+# Keeping this a plan constant makes the CPU partition and the hand kernel's
+# maximum block length one contract.  Blocks never cross a class boundary.
+CLASS_REDUCTION_BLOCK_ROWS = 128
 _INT32_MAX = np.iinfo(np.int32).max
 
 # Exactly the switches consumed while enumerating an ACTGraph or deriving the
@@ -489,12 +493,23 @@ class StatePlans:
 
 @dataclass(frozen=True, eq=False)
 class ClassRowPlan:
-    """A flat row grid stably grouped by one embedding class."""
+    """A flat row grid stably grouped by one embedding class.
+
+    ``block_ptr`` groups a second, compact row-block grid by class.
+    ``block_starts[b]`` and ``block_lengths[b]`` describe one contiguous slice
+    of ``rows`` no longer than :data:`CLASS_REDUCTION_BLOCK_ROWS`.  The slices
+    partition every class run in order.  Hand table-gradient kernels reduce
+    those blocks in parallel, then combine each class's partials in this fixed
+    order without atomics.
+    """
 
     n_rows: int
     n_classes: int
     ptr: Tensor
     rows: Tensor
+    block_ptr: Tensor
+    block_starts: Tensor
+    block_lengths: Tensor
     name: str
 
     def __post_init__(self) -> None:
@@ -513,6 +528,28 @@ class ClassRowPlan:
             rows=self.n_rows,
             device=device,
         )
+        _tensor(
+            f"{self.name}.block_ptr",
+            self.block_ptr,
+            dtype=torch.int32,
+            rows=self.n_classes + 1,
+            device=device,
+        )
+        block_count = int(self.block_starts.shape[0])
+        _tensor(
+            f"{self.name}.block_starts",
+            self.block_starts,
+            dtype=torch.int32,
+            rows=block_count,
+            device=device,
+        )
+        _tensor(
+            f"{self.name}.block_lengths",
+            self.block_lengths,
+            dtype=torch.int32,
+            rows=block_count,
+            device=device,
+        )
         if device.type == "cpu":
             if int(self.ptr[0]) != 0 or int(self.ptr[-1]) != self.n_rows:
                 raise ValueError(
@@ -527,6 +564,41 @@ class ClassRowPlan:
                 expected = torch.arange(self.n_rows, dtype=torch.int32)
                 if not torch.equal(self.rows.sort().values, expected):
                     raise ValueError(f"{self.name}.rows must be a permutation of the row grid")
+            if int(self.block_ptr[0]) != 0 or int(self.block_ptr[-1]) != block_count:
+                raise ValueError(
+                    f"{self.name}.block_ptr must span 0..{block_count}, got "
+                    f"{int(self.block_ptr[0])}..{int(self.block_ptr[-1])}"
+                )
+            if bool((self.block_ptr[1:] < self.block_ptr[:-1]).any()):
+                raise ValueError(f"{self.name}.block_ptr must be monotone")
+            if block_count and bool(
+                ((self.block_lengths < 1)
+                | (self.block_lengths > CLASS_REDUCTION_BLOCK_ROWS)).any()
+            ):
+                raise ValueError(
+                    f"{self.name}.block_lengths must lie in "
+                    f"1..{CLASS_REDUCTION_BLOCK_ROWS}"
+                )
+            for cls in range(self.n_classes):
+                first = int(self.block_ptr[cls])
+                last = int(self.block_ptr[cls + 1])
+                cursor = int(self.ptr[cls])
+                class_end = int(self.ptr[cls + 1])
+                for block in range(first, last):
+                    start = int(self.block_starts[block])
+                    length = int(self.block_lengths[block])
+                    if start != cursor:
+                        raise ValueError(
+                            f"{self.name} class {cls} block {block} starts at "
+                            f"{start}, expected {cursor}"
+                        )
+                    cursor += length
+                if cursor != class_end:
+                    raise ValueError(
+                        f"{self.name} class {cls} blocks span "
+                        f"{int(self.ptr[cls])}..{cursor}, expected "
+                        f"{int(self.ptr[cls])}..{class_end}"
+                    )
 
     @property
     def device(self) -> torch.device:
@@ -538,6 +610,9 @@ class ClassRowPlan:
             self.n_classes,
             self.ptr.to(device, non_blocking=non_blocking),
             self.rows.to(device, non_blocking=non_blocking),
+            self.block_ptr.to(device, non_blocking=non_blocking),
+            self.block_starts.to(device, non_blocking=non_blocking),
+            self.block_lengths.to(device, non_blocking=non_blocking),
             self.name,
         )
 
@@ -547,6 +622,9 @@ class ClassRowPlan:
             self.n_classes,
             self.ptr.pin_memory(),
             self.rows.pin_memory(),
+            self.block_ptr.pin_memory(),
+            self.block_starts.pin_memory(),
+            self.block_lengths.pin_memory(),
             self.name,
         )
 
@@ -1058,11 +1136,26 @@ def _class_rows(values: np.ndarray, n_classes: int, name: str) -> ClassRowPlan:
         rows = order[int(ptr[cls]) : int(ptr[cls + 1])]
         if rows.size and not np.all(values[rows] == cls):
             raise ValueError(f"{name} CSR run {cls} contains another class")
+    block_ptr = [0]
+    block_starts: list[int] = []
+    block_lengths: list[int] = []
+    for cls in range(n_classes):
+        class_start = int(ptr[cls])
+        class_end = int(ptr[cls + 1])
+        for start in range(class_start, class_end, CLASS_REDUCTION_BLOCK_ROWS):
+            block_starts.append(start)
+            block_lengths.append(
+                min(CLASS_REDUCTION_BLOCK_ROWS, class_end - start)
+            )
+        block_ptr.append(len(block_starts))
     return ClassRowPlan(
         n_rows=int(values.size),
         n_classes=int(n_classes),
         ptr=_torch_int32(name, ptr),
         rows=_torch_int32(name, order),
+        block_ptr=_torch_int32(name, block_ptr),
+        block_starts=_torch_int32(name, block_starts),
+        block_lengths=_torch_int32(name, block_lengths),
         name=name,
     )
 
@@ -1357,6 +1450,7 @@ def build_plans_from_cpu_batch(cfg: MantisACTConfig, batch) -> ACTPlans:
 __all__ = [
     "ACTPlans",
     "ActionRowPlans",
+    "CLASS_REDUCTION_BLOCK_ROWS",
     "ClassRowPlan",
     "EmbeddingRowPlans",
     "GatherRowPlan",
