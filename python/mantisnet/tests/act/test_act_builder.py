@@ -32,7 +32,6 @@ from mantisnet.models.mantis_act import (
     PRESETS,
     MantisACTConfig,
     build,
-    build_from_arrays,
     collate,
     collate_positions,
     collate_prefixes,
@@ -121,13 +120,6 @@ def builder_signature(cfg: MantisACTConfig) -> tuple:
 def owning_position(offsets, index) -> np.ndarray:
     """The batch position each index of a family falls in."""
     return np.searchsorted(np.asarray(offsets), np.asarray(index), side="right") - 1
-
-
-def engine_arrays(pos: hexo_py.Position):
-    """A position as the ``(stone_qr, stone_owner, mover, legal_qr)`` build takes."""
-    stones = np.asarray(pos.stones(), dtype=np.int64).reshape(-1, 3)
-    legal = np.asarray(pos.legal_moves(), dtype=np.int64).reshape(-1, 2)
-    return stones[:, :2], stones[:, 2], pos.current_player, legal
 
 
 # --------------------------------------------------------------------------
@@ -419,35 +411,11 @@ def test_collate_positions_and_collate_prefixes_agree(act_moves, act_positions):
 # Refusals
 
 
-def test_a_terminal_position_is_refused(act_positions):
+def test_a_terminal_position_is_refused():
     pos = won_position(axis=0)
     assert pos.is_terminal
     with pytest.raises(ValueError, match="terminal position"):
         build(pos, FULL)
-    # And through the array path, where an empty legal list is the only
-    # evidence available before any stage runs.
-    stone_qr, stone_owner, mover, _legal = engine_arrays(act_positions[20])
-    with pytest.raises(ValueError, match="terminal position"):
-        build_from_arrays(
-            stone_qr, stone_owner, mover, np.empty((0, 2), dtype=np.int64), 1, FULL
-        )
-
-
-def test_malformed_input_is_refused_by_name():
-    stone_qr = np.array([[0, 0], [1, 0]], dtype=np.int64)
-    owners = np.array([0, 1], dtype=np.int64)
-    legal = np.array([[2, 0]], dtype=np.int64)
-
-    with pytest.raises(ValueError, match="2 stone coordinates against 1 owners"):
-        build_from_arrays(stone_qr, owners[:1], 0, legal, 1, FULL)
-    with pytest.raises(ValueError, match="mover must be player 0 or 1, got 2"):
-        build_from_arrays(stone_qr, owners, 2, legal, 1, FULL)
-    with pytest.raises(ValueError, match=r"stone_owner\[1\] = 5 is neither player"):
-        build_from_arrays(
-            stone_qr, np.array([0, 5], dtype=np.int64), 0, legal, 1, FULL
-        )
-    with pytest.raises(ValueError, match="moves_remaining must be 1 or 2, got 3"):
-        build_from_arrays(stone_qr, owners, 0, legal, 3, FULL)
 
 
 def test_collate_prefixes_refuses_a_length_that_is_not_a_prefix(act_moves):
@@ -456,3 +424,9 @@ def test_collate_prefixes_refuses_a_length_that_is_not_a_prefix(act_moves):
         collate_prefixes([moves], [1, 2], FULL)
     with pytest.raises(ValueError, match="prefix 0 asks for 21 moves of a 20-move"):
         collate_prefixes([moves], [21], FULL)
+
+
+def test_collate_prefixes_does_not_parse_the_suffix(act_moves):
+    moves = [*act_moves[20][:5], object()]
+    batch = collate_prefixes([moves], [5], FULL)
+    assert batch.position_count == 1

@@ -30,6 +30,26 @@ The encoder has three output paths:
 `RawBatch` is the flat, globally-indexed tensor layout the forward boundary
 accepts.
 
+### MantisNet-ACT position encoder (`act_encoder`)
+
+Builds every position-local array in the MantisNet-ACT graph representation.
+It supports the closed window, cell, D6-relation, radius, edge, and numeric
+feature configuration used by the ACT presets. `build_batch` and
+`build_batch_prefixes` parallelize positions with rayon; prefix replay always
+goes through `hexo-engine`. `build_packed_batch` and
+`build_packed_batch_prefixes` additionally concatenate the graphs, construct
+the five CSR offset tables, and shift indices into the batch frame in Rust.
+The PyO3 batch boundary exposes that packed representation directly; the
+singular graph entry point remains position-local for diagnostics and tests.
+
+The ACT encoder has its own configuration and tables but does not change or
+claim `MODEL_REPR_VERSION`, which remains the legacy MantisNet representation
+gate.
+
+`build_aux_labels` derives section 24.1's six deterministic action labels from
+the same Rust counterfactual rows, so diagnostics do not retain a second
+Python window/action enumerator.
+
 ### Forward boundary (`forward`)
 
 Defines the runtime-independent interface between this crate and whatever
@@ -110,6 +130,7 @@ Parses the two string grammars the container passes into MantisNet:
 | File | Description |
 | --- | --- |
 | `lib.rs` | Crate root; re-exports the public surface and declares `MODEL_REPR_VERSION`, `PACKAGE_VERSION`, and `PACKAGE_NAME`. |
+| `act_encoder.rs` | MantisNet-ACT graph builder, ternary/D6 tables, Rust batch collation, and parallel position/prefix entry points. |
 | `encoder.rs` | Position-to-graph builder, wire serialisation/deserialisation, batch collation, and the `RawBatch` layout. |
 | `forward.rs` | The `Forward` and `ForwardLoader` traits plus the `RawOutputs` and `BoxError` types. |
 | `improvement.rs` | Closed-form KLENT policy improvement (`improve_policy`, `ImprovedPolicy`, `ImprovementError`). |

@@ -667,9 +667,9 @@ def phase_diagnostics(
 
     ``output`` is an `model.ACTOutput`, ``phase_id`` the batch's own
     per-position phase, and ``labels`` the §24.1 labels of every legal action
-    of the batch in the same flat order (`aux_labels.action_aux_labels`
-    computes them). A model holding auxiliary heads without labels to score
-    them against is refused.
+    of the batch in the same flat order (`aux_labels.position_aux_labels`
+    computes them per position). A model holding auxiliary heads without
+    labels to score them against is refused.
     """
     if top < 1:
         raise ValueError(f"top={top} must be at least 1")
@@ -687,7 +687,7 @@ def phase_diagnostics(
         raise ValueError(
             f"the model holds §24.1 head(s) {missing} and no label was given for "
             "them, so §34's accuracy column would silently omit a head that is "
-            "training; `aux_labels.action_aux_labels` computes them"
+            "training; `aux_labels.position_aux_labels` computes them"
         )
     for name, value in labels.items():
         if len(value) != int(offsets[-1]):

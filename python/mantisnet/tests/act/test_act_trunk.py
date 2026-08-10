@@ -46,7 +46,6 @@ import torch
 from torch import nn
 
 from mantisnet.models.mantis_act.builder import build
-from mantisnet.models.mantis_act.cells import relevant_cells
 from mantisnet.models.mantis_act.config import PRESETS, MantisACTConfig
 from mantisnet.models.mantis_act.equivariant import (
     AXIS_CHANNELS,
@@ -715,11 +714,8 @@ def test_every_class_index_the_embeddings_read_is_bounded_before_they_read_it():
     the check is the packer's and reaches every producer rather than living in
     one builder helper.
     """
-    stones = np.array([[0, 0], [1, 0]], dtype=np.int64)
-    own = np.array([0, 1], dtype=np.int64)
-    legal = np.array([[0, 1], [1, 1]], dtype=np.int64)
-    good = relevant_cells(stones, own, legal, stones, FULL)
-    assert int(good.nearest_bucket.max()) < NEAREST_BUCKETS
+    good = build(hexo_py.Position.replay([(0, 0), (1, 0)]), FULL)
+    assert int(good.cell_nearest_bucket.max()) < NEAREST_BUCKETS
 
     # The vocabularies each table is sized by, against the packer's own ranges.
     assert (CELL_OCCUPANCY_CLASSES, CELL_LEGAL_CLASSES) == (3, 2)

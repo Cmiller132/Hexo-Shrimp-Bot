@@ -24,6 +24,7 @@ from mantisnet.models.mantis_act.packed import (
     ACTGraph,
     PackedACTBatch,
     collate,
+    packed_from_arrays,
     telemetry,
 )
 
@@ -128,6 +129,14 @@ def replaced(array: np.ndarray, index, value) -> np.ndarray:
     out = array.copy()
     out[index] = value
     return out
+
+
+def packed_arrays(batch: PackedACTBatch) -> dict[str, object]:
+    """The exact NumPy/scalar dictionary emitted by the Rust batch boundary."""
+    return {
+        name: value.numpy() if isinstance(value, torch.Tensor) else value
+        for name, value in vars(batch).items()
+    }
 
 
 def test_hand_built_graphs_are_valid():
@@ -437,14 +446,23 @@ def test_the_cross_position_check_catches_a_shift_by_the_wrong_family():
     cells = batch.cell_offsets.numpy()
     windows = batch.window_offsets.numpy()
     assert cells[1] != windows[1], "the two families must offset differently"
-    rows = np.repeat([0, 1], [a.n_adjacency, b.n_adjacency])
+    rows = batch.adjacency_offsets.numpy()
 
     wrong = np.concatenate([a.adjacency_dst, b.adjacency_dst + windows[1]])
     with pytest.raises(ValueError, match=r"adjacency_dst crosses a batch position"):
-        _refuse_crossing("adjacency_dst", wrong, rows, cells)
+        _refuse_crossing("adjacency_dst", wrong, rows, cells, sentinel=False)
 
     right = np.concatenate([a.adjacency_dst, b.adjacency_dst + cells[1]])
-    _refuse_crossing("adjacency_dst", right, rows, cells)
+    _refuse_crossing("adjacency_dst", right, rows, cells, sentinel=False)
+
+
+def test_the_cross_position_check_skips_empty_intermediate_segments():
+    rows = _int(0, 1, 1, 2)
+    targets = _int(0, 2, 2, 4)
+    _refuse_crossing("index", _int(1, 3), rows, targets, sentinel=False)
+
+    with pytest.raises(ValueError, match=r"index crosses a batch position"):
+        _refuse_crossing("index", _int(1, 1), rows, targets, sentinel=False)
 
 
 def test_a_graph_cannot_reach_collate_unvalidated():
@@ -551,6 +569,62 @@ def test_collate_records_the_batch_s_own_orbit_ceiling():
         radius_axis_or_neg1=_int(),
     )
     assert collate([empty]).radius_orbit_bound == 0
+
+
+def test_packed_from_arrays_preserves_the_container_contract_without_copies():
+    expected = collate([graph_a(), graph_b()])
+    fields = packed_arrays(expected)
+    actual = packed_from_arrays(fields)
+
+    assert actual.position_count == expected.position_count
+    assert actual.radius_orbit_bound == expected.radius_orbit_bound
+    for name, value in vars(expected).items():
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(getattr(actual, name), value), name
+            expected_address = fields[name].__array_interface__["data"][0]
+            assert getattr(actual, name).data_ptr() == expected_address
+
+
+def test_packed_from_arrays_retains_batch_value_range_checks():
+    fields = packed_arrays(collate([graph_a(), graph_b()]))
+    fields["window_status"] = fields["window_status"].copy()
+    fields["window_status"][0] = 4
+    with pytest.raises(ValueError, match=r"window_status must be <= 3"):
+        packed_from_arrays(fields)
+
+    fields = packed_arrays(collate([graph_a(), graph_b()]))
+    fields["cell_nearest_bucket"] = fields["cell_nearest_bucket"].copy()
+    fields["cell_nearest_bucket"][0] = -1
+    with pytest.raises(ValueError, match=r"cell_nearest_bucket must be >= 0"):
+        packed_from_arrays(fields)
+
+
+def test_packed_from_arrays_retains_cross_position_checks():
+    fields = packed_arrays(collate([graph_a(), graph_b()]))
+    fields["adjacency_dst"] = fields["adjacency_dst"].copy()
+    first_b_edge = int(fields["adjacency_offsets"][1])
+    fields["adjacency_dst"][first_b_edge] = 0
+    with pytest.raises(ValueError, match=r"adjacency_dst crosses a batch position"):
+        packed_from_arrays(fields)
+
+
+def test_packed_from_arrays_checks_crossing_around_a_sentinel():
+    fields = packed_arrays(collate([graph_a(), graph_b()]))
+    fields["window_cell_index"] = fields["window_cell_index"].copy()
+    first_b_window = int(fields["window_offsets"][1])
+    fields["window_cell_index"][first_b_window, 0] = 0
+    with pytest.raises(
+        ValueError, match=r"window_cell_index crosses a batch position"
+    ):
+        packed_from_arrays(fields)
+
+
+def test_packed_from_arrays_rejects_a_foreign_negative_sentinel():
+    fields = packed_arrays(collate([graph_a(), graph_b()]))
+    fields["action_window_index"] = fields["action_window_index"].copy()
+    fields["action_window_index"][0, 0, 1] = -2
+    with pytest.raises(ValueError, match=r"action_window_index must be >= -1"):
+        packed_from_arrays(fields)
 
 
 def test_batch_moves_to_a_device():

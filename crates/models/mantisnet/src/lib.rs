@@ -3,6 +3,7 @@
 //! [`encoder`] implements the position representation used by both the PyO3
 //! extension and the container package.
 
+pub mod act_encoder;
 mod config;
 pub mod encoder;
 mod forward;

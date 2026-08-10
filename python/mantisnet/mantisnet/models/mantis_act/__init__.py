@@ -15,7 +15,6 @@ from .builder import (
     GLOBAL_NUMERIC_FEATURES,
     GLOBAL_NUMERIC_NAMES,
     build,
-    build_from_arrays,
     collate_positions,
     collate_prefixes,
 )
@@ -80,7 +79,6 @@ __all__ = [
     "parameter_summary",
     # Builder entry points (§7, §26).
     "build",
-    "build_from_arrays",
     "collate_positions",
     "collate_prefixes",
     "GLOBAL_NUMERIC_NAMES",

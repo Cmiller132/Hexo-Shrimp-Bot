@@ -22,12 +22,11 @@ representation reads. The two cells must be reported as an alias group, the
 group's sampled geometry must name the stone that separates them, and the same
 diagnostic must stay silent on real self-play boards.
 
-**The labels are the rules.** `aux_labels` derives §24.1's six labels from the
-eighteen pre- and post-placement window codes `actions.py` gathers. The oracle
-here is the *engine's* own window walk, `Position.windows_through`, which the
-builder is forbidden to call — so the two agree only if both read the board
-correctly. The two partner labels get a second oracle that plays the second
-placement and asks the engine whether the game ended.
+**The labels are the rules.** Rust derives §24.1's six labels from the same
+eighteen counterfactual windows as the action rows. The oracle here is the
+*engine's* own window walk, `Position.windows_through`, so the two agree only
+if both read the board correctly. The two partner labels get a second oracle
+that plays the second placement and asks the engine whether the game ended.
 """
 
 from __future__ import annotations
@@ -40,11 +39,9 @@ import torch
 
 import hexo_py
 
-from mantisnet.models.mantis_act.aux_labels import (
-    action_aux_labels,
-    position_aux_labels,
-)
-from mantisnet.models.mantis_act.builder import build, build_from_arrays
+from mantisnet.models.mantis_act.actions import TACTICAL_FEATURES
+from mantisnet.models.mantis_act.aux_labels import position_aux_labels
+from mantisnet.models.mantis_act.builder import build
 from mantisnet.models.mantis_act.config import PRESETS
 from mantisnet.models.mantis_act.diagnostics import (
     KIND_IN_WINDOW,
@@ -63,7 +60,9 @@ from mantisnet.models.mantis_act.model import MantisACT
 from mantisnet.models.mantis_act.packed import (
     NUM_AXES,
     PHASE_FIRST,
+    PHASE_SECOND,
     WINDOW_LEN,
+    ACTGraph,
     collate,
 )
 
@@ -105,27 +104,66 @@ WIN_GAME = [*THREAT_GAME, (4, 7)]
 
 @pytest.fixture(scope="module")
 def planted():
-    return build_from_arrays(PLANTED_STONES, PLANTED_OWNERS, 0, PLANTED_LEGAL, 1, FULL)
+    """A valid graph with two deliberately duplicated action bundles."""
+    coords = sorted(
+        {tuple(row) for row in np.concatenate([PLANTED_STONES, PLANTED_LEGAL])}
+    )
+    cell_qr = np.array(coords, dtype=np.int64)
+    row_of = {coord: row for row, coord in enumerate(coords)}
+    occupancy = np.zeros(len(cell_qr), dtype=np.int64)
+    for coordinate, owner in zip(PLANTED_STONES, PLANTED_OWNERS):
+        occupancy[row_of[tuple(coordinate)]] = int(owner) + 1
+    legal_to_cell = np.array(
+        [row_of[tuple(coordinate)] for coordinate in PLANTED_LEGAL], dtype=np.int64
+    )
+    legal = np.zeros(len(cell_qr), dtype=np.int64)
+    legal[legal_to_cell] = True
+    occupied = (occupancy != 0).astype(np.int64)
+    nearest = np.array([0, 1, 2, 0, 1, 2, 0], dtype=np.int64)
+    empty = np.empty(0, dtype=np.int64)
+    empty_windows = np.empty((0, WINDOW_LEN), dtype=np.int64)
+    action_shape = (len(legal_to_cell), NUM_AXES, WINDOW_LEN)
+    post = np.zeros(action_shape, dtype=np.int64)
+    post[1] = 1
+    post[3] = 1
+    return ACTGraph(
+        cell_qr=cell_qr,
+        cell_occupancy=occupancy,
+        cell_is_legal=legal,
+        cell_is_occupied=occupied,
+        cell_nearest_bucket=nearest,
+        legal_to_cell_index=legal_to_cell,
+        window_id=np.empty((0, 3), dtype=np.int64),
+        window_pattern_class=empty.copy(),
+        window_status=empty.copy(),
+        window_axis=empty.copy(),
+        window_numeric=np.empty((0, 5), dtype=np.float32),
+        window_cell_index=empty_windows.copy(),
+        window_incidence_class=empty_windows.copy(),
+        window_incidence_mask=np.empty((0, WINDOW_LEN), dtype=bool),
+        adjacency_src=empty.copy(),
+        adjacency_dst=empty.copy(),
+        adjacency_axis=empty.copy(),
+        radius_src=empty.copy(),
+        radius_dst=empty.copy(),
+        radius_orbit=empty.copy(),
+        radius_axis_or_neg1=empty.copy(),
+        action_window_index=np.full(action_shape, -1, dtype=np.int64),
+        action_post1_class=post,
+        action_pre_status=np.zeros(action_shape, dtype=np.int64),
+        action_tactical_numeric=np.zeros(
+            (len(legal_to_cell), TACTICAL_FEATURES), dtype=np.float32
+        ),
+        global_numeric=np.zeros(8, dtype=np.float32),
+        moves_remaining=1,
+        phase_id=PHASE_SECOND,
+    )
 
 
 @pytest.fixture(scope="module")
 def graphs():
     """One real graph per (game, ply), plus the planted board."""
     return [build(position(game, ply), FULL) for game in (0, 1) for ply in PLIES]
-
-
-@pytest.fixture(scope="module")
-def prefix_tables():
-    """One real position's §19.2 action tables and its legal coordinates."""
-    from mantisnet.models.mantis_act.actions import action_tables
-    from mantisnet.models.mantis_act.windows import enumerate_windows
-
-    pos = position(0, 21)
-    stones = np.asarray(pos.stones(), dtype=np.int64).reshape(-1, 3)
-    legal = np.asarray(pos.legal_moves(), dtype=np.int64).reshape(-1, 2)
-    own = (stones[:, 2] != int(pos.current_player)).astype(np.int64)
-    window_set = enumerate_windows(stones[:, :2], own, legal, FULL)
-    return action_tables(window_set, stones[:, :2], own, legal, FULL), legal
 
 
 # --------------------------------------------------------------------------
@@ -452,13 +490,6 @@ def test_the_partner_labels_match_playing_the_second_placement():
             f"action {action} at {tuple(move)}: {count} winning replies"
         )
         assert labels["winning_partner_exists"][action] == int(count > 0)
-
-
-def test_the_labels_refuse_coordinates_that_are_not_the_tables(prefix_tables):
-    """The partner labels read the coordinates, so a mismatched list is a fault."""
-    tables, legal = prefix_tables
-    with pytest.raises(ValueError, match="legal coordinates"):
-        action_aux_labels(tables, legal[:-1])
 
 
 # --------------------------------------------------------------------------

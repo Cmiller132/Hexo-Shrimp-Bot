@@ -11,7 +11,7 @@ leading zero.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -188,6 +188,52 @@ _PACKED_ARRAYS: tuple[str, ...] = (
 
 _INDEX_TARGETS = {name: (target, sentinel) for name, _, target, sentinel in _INDEX_FIELDS}
 
+# The Rust batch boundary is deliberately the packed container's exact wire
+# shape.  The builder has already established every per-position invariant;
+# these specs close the batch frame without rebuilding an ``ACTGraph`` for
+# each position.  ``None`` is a configuration-selected feature width.
+_PACKED_FROM_ARRAYS_SPECS: dict[str, tuple[type, tuple[object, ...]]] = {
+    "cell_offsets": (np.int64, (None,)),
+    "window_offsets": (np.int64, (None,)),
+    "legal_offsets": (np.int64, (None,)),
+    "adjacency_offsets": (np.int64, (None,)),
+    "radius_offsets": (np.int64, (None,)),
+    "cell_occupancy": (np.int64, (_CELLS,)),
+    "cell_is_legal": (np.int64, (_CELLS,)),
+    "cell_nearest_bucket": (np.int64, (_CELLS,)),
+    "legal_to_cell_index": (np.int64, (_LEGAL,)),
+    "window_id": (np.int64, (_WINDOWS, 3)),
+    "window_pattern_class": (np.int64, (_WINDOWS,)),
+    "window_status": (np.int64, (_WINDOWS,)),
+    "window_axis": (np.int64, (_WINDOWS,)),
+    "window_numeric": (np.float32, (_WINDOWS, None)),
+    "window_cell_index": (np.int64, (_WINDOWS, WINDOW_LEN)),
+    "window_incidence_class": (np.int64, (_WINDOWS, WINDOW_LEN)),
+    "window_incidence_mask": (np.bool_, (_WINDOWS, WINDOW_LEN)),
+    "adjacency_src": (np.int64, (_ADJACENCY,)),
+    "adjacency_dst": (np.int64, (_ADJACENCY,)),
+    "adjacency_axis": (np.int64, (_ADJACENCY,)),
+    "radius_src": (np.int64, (_RADIUS,)),
+    "radius_dst": (np.int64, (_RADIUS,)),
+    "radius_orbit": (np.int64, (_RADIUS,)),
+    "radius_axis_or_neg1": (np.int64, (_RADIUS,)),
+    "action_window_index": (np.int64, (_LEGAL, NUM_AXES, WINDOW_LEN)),
+    "action_post1_class": (np.int64, (_LEGAL, NUM_AXES, WINDOW_LEN)),
+    "action_pre_status": (np.int64, (_LEGAL, NUM_AXES, WINDOW_LEN)),
+    "action_tactical_numeric": (np.float32, (_LEGAL, None)),
+    "phase_id": (np.int64, ("positions",)),
+    "moves_remaining": (np.int64, ("positions",)),
+    "global_numeric": (np.float32, ("positions", None)),
+}
+
+_OFFSET_FIELDS = {
+    _CELLS: "cell_offsets",
+    _WINDOWS: "window_offsets",
+    _LEGAL: "legal_offsets",
+    _ADJACENCY: "adjacency_offsets",
+    _RADIUS: "radius_offsets",
+}
+
 
 def _lex_steps(columns: tuple[np.ndarray, ...]) -> tuple[np.ndarray, np.ndarray]:
     """Compare consecutive rows of a lexicographic key, major column first.
@@ -221,20 +267,36 @@ def _check_sorted(
     )
 
 
-def _check_range(name: str, values: np.ndarray, low: int, high: int | None) -> None:
-    """Refuse a field carrying a value outside its fixed range."""
+def _check_range(
+    name: str, values: np.ndarray, low: int, high: int | None
+) -> int | None:
+    """Refuse a value outside its fixed range and return the observed maximum."""
     if values.size == 0:
-        return
-    if int(values.min()) < low:
+        return None
+
+    # All range-checked arrays are int64.  For a vocabulary whose floor is
+    # zero, the unsigned maximum proves both ends in one pass: any negative
+    # signed value maps above 2**63, while every valid value keeps its exact
+    # magnitude.  The slow path below is retained for the precise field/index
+    # diagnostic when that combined proof fails.
+    if low == 0:
+        maximum = int(values.view(np.uint64).max())
+        if maximum < 1 << 63 and (high is None or maximum <= high):
+            return maximum
+
+    minimum = int(values.min())
+    if minimum < low:
         flat = int(values.argmin())
         raise ValueError(
-            f"{name} must be >= {low}: found {int(values.min())} at flat index {flat}"
+            f"{name} must be >= {low}: found {minimum} at flat index {flat}"
         )
-    if high is not None and int(values.max()) > high:
+    maximum = int(values.max())
+    if high is not None and maximum > high:
         flat = int(values.argmax())
         raise ValueError(
-            f"{name} must be <= {high}: found {int(values.max())} at flat index {flat}"
+            f"{name} must be <= {high}: found {maximum} at flat index {flat}"
         )
+    return maximum
 
 
 def _to_global(index: np.ndarray, offset: int, *, sentinel: bool) -> np.ndarray:
@@ -589,13 +651,13 @@ def _offsets(counts: np.ndarray) -> np.ndarray:
     return np.concatenate([[0], np.cumsum(counts)]).astype(np.int64)
 
 
-def _row_positions(offsets: np.ndarray) -> np.ndarray:
-    """The position owning each row of a family."""
-    return np.repeat(np.arange(len(offsets) - 1, dtype=np.int64), np.diff(offsets))
-
-
 def _refuse_crossing(
-    name: str, index: np.ndarray, row_positions: np.ndarray, target_offsets: np.ndarray
+    name: str,
+    index: np.ndarray,
+    row_offsets: np.ndarray,
+    target_offsets: np.ndarray,
+    *,
+    sentinel: bool,
 ) -> None:
     """Refuse an index whose target lies in another position (§26, §30.18).
 
@@ -605,24 +667,212 @@ def _refuse_crossing(
     position in practice — is caught here instead of aliasing silently onto a
     neighbour's node.
     """
+    if index.shape[0] != int(row_offsets[-1]):
+        raise ValueError(
+            f"{name} has {index.shape[0]} rows against row offsets ending at "
+            f"{int(row_offsets[-1])}"
+        )
     if index.size == 0:
         # An empty family has no endpoint to cross a position with. It is
         # reachable: the opening board holds no window at all, so a batch of
         # only that position gives `window_cell_index` shape (0, 6), whose
         # `-1` extent numpy cannot infer against a zero row count.
         return
-    flat = index.reshape(len(row_positions), -1) if index.ndim > 1 else index[:, None]
-    live = flat >= 0
-    target_positions = np.searchsorted(target_offsets, flat, side="right") - 1
-    crossing = live & (target_positions != row_positions[:, None])
-    if not crossing.any():
+    # Reduce every nonempty row segment in one NumPy call.  The previous
+    # position loop issued two reductions per segment, after a separate global
+    # range scan; on real 64-position batches that made hundreds of small
+    # NumPy calls and read the dominant radius tables twice.  ``reduceat``
+    # proves the same bounds with O(position_count) temporaries and two table
+    # scans (three where a sentinel is legal).
+    starts = row_offsets[:-1]
+    stops = row_offsets[1:]
+    positions = np.flatnonzero(starts < stops)
+    segment_starts = starts[positions]
+    flat = index.reshape(index.shape[0], -1)
+
+    minima = np.minimum.reduceat(flat, segment_starts, axis=0).min(axis=1)
+    maxima = np.maximum.reduceat(flat, segment_starts, axis=0).max(axis=1)
+
+    # Preserve the global index bounds formerly checked by the caller.  They
+    # are already present in the segment extrema, so an additional full-array
+    # `_check_range` would only repeat the reads.  On the exceptional path the
+    # helper is called to retain its precise field/index diagnostic.
+    floor = SENTINEL if sentinel else 0
+    ceiling = int(target_offsets[-1]) - 1
+    if int(minima.min()) < floor or int(maxima.max()) > ceiling:
+        _check_range(name, index, floor, ceiling)
+
+    lowers = target_offsets[:-1][positions]
+    uppers = target_offsets[1:][positions]
+    if sentinel:
+        # In two's-complement int64, viewing -1 as uint64 maps just the
+        # sentinel to the largest value while preserving every live index's
+        # order.  A segmented unsigned minimum therefore finds the least live
+        # endpoint without allocating a table-sized live mask.  The signed
+        # extrema above already reject every value below the sole -1 sentinel.
+        live_minima = np.minimum.reduceat(
+            flat.view(np.uint64), segment_starts, axis=0
+        ).min(axis=1)
+        crossing_segments = (live_minima < lowers.astype(np.uint64, copy=False)) | (
+            maxima >= uppers
+        )
+    else:
+        crossing_segments = (minima < lowers) | (maxima >= uppers)
+    if not bool(crossing_segments.any()):
         return
+
+    position = int(positions[int(np.flatnonzero(crossing_segments)[0])])
+    start, stop = int(starts[position]), int(stops[position])
+    chunk = flat[start:stop]
+    lower, upper = int(target_offsets[position]), int(target_offsets[position + 1])
+    crossing = (chunk < lower) | (chunk >= upper)
+    if sentinel:
+        crossing &= chunk != SENTINEL
     rows, columns = crossing.nonzero()
-    row, column = int(rows[0]), int(columns[0])
+    local_row, column = int(rows[0]), int(columns[0])
+    row = start + local_row
+    value = int(chunk[local_row, column])
+    target_position = int(np.searchsorted(target_offsets, value, side="right") - 1)
     raise ValueError(
         f"{name} crosses a batch position: row {row} of position "
-        f"{int(row_positions[row])} points at {int(flat[row, column])}, which is "
-        f"in position {int(target_positions[row, column])}"
+        f"{position} points at {value}, which is in position "
+        f"{target_position}"
+    )
+
+
+def packed_from_arrays(fields: Mapping[str, object]) -> PackedACTBatch:
+    """Wrap one Rust-collated batch without rebuilding its position graphs.
+
+    Rust owns concatenation and index shifting on the production batch path.
+    This boundary accepts exactly :class:`PackedACTBatch`'s fields, checks the
+    array wire format and the cheap batch-wide guards that protect model table
+    lookups, then shares the NumPy allocations with PyTorch.  In particular,
+    `_refuse_crossing` remains an independent check of the collation frame even
+    though Rust constructs that frame, while no per-position ``ACTGraph`` or
+    NumPy concatenation is created here.
+    """
+    if not isinstance(fields, Mapping):
+        raise TypeError(
+            f"packed ACT arrays must be a mapping, got {type(fields).__name__}"
+        )
+
+    scalar_names = {"position_count", "radius_orbit_bound"}
+    expected_names = set(_PACKED_FROM_ARRAYS_SPECS) | scalar_names
+    supplied_names = set(fields)
+    missing = expected_names - supplied_names
+    extra = supplied_names - expected_names
+    if missing or extra:
+        details = []
+        if missing:
+            details.append(f"missing {sorted(missing)}")
+        if extra:
+            details.append(f"unknown {sorted(extra)}")
+        raise ValueError(
+            "packed ACT fields do not match the closed format: " + "; ".join(details)
+        )
+
+    for name in scalar_names:
+        value = fields[name]
+        if type(value) is not int:
+            raise TypeError(f"{name} must be int, got {type(value).__name__}")
+    position_count = int(fields["position_count"])
+    radius_orbit_bound = int(fields["radius_orbit_bound"])
+    if position_count <= 0:
+        raise ValueError("empty batch: packed ACT arrays need at least one position")
+    if radius_orbit_bound < 0:
+        raise ValueError(
+            f"radius_orbit_bound must be >= 0, got {radius_orbit_bound}"
+        )
+
+    arrays: dict[str, np.ndarray] = {}
+    for name, (dtype, _shape) in _PACKED_FROM_ARRAYS_SPECS.items():
+        array = fields[name]
+        if not isinstance(array, np.ndarray):
+            raise TypeError(f"{name} must be a numpy array, got {type(array).__name__}")
+        if array.dtype != dtype:
+            raise TypeError(f"{name} must be {np.dtype(dtype)}, got {array.dtype}")
+        if not array.flags.c_contiguous:
+            raise ValueError(f"{name} must be C-contiguous")
+        arrays[name] = array
+
+    offsets: dict[str, np.ndarray] = {}
+    for family, name in _OFFSET_FIELDS.items():
+        offset = arrays[name]
+        if offset.shape != (position_count + 1,):
+            raise ValueError(
+                f"{name} must have shape ({position_count + 1},), got {offset.shape}"
+            )
+        if int(offset[0]) != 0:
+            raise ValueError(f"{name} must start at 0, got {int(offset[0])}")
+        descending = np.flatnonzero(offset[1:] < offset[:-1])
+        if descending.size:
+            row = int(descending[0]) + 1
+            raise ValueError(
+                f"{name} must be nondecreasing: entry {row} is "
+                f"{int(offset[row])} after {int(offset[row - 1])}"
+            )
+        offsets[family] = offset
+
+    sizes = {
+        "positions": position_count,
+        **{family: int(offset[-1]) for family, offset in offsets.items()},
+    }
+    for name, (_dtype, shape) in _PACKED_FROM_ARRAYS_SPECS.items():
+        if name in _OFFSET_FIELDS.values():
+            continue
+        expected = tuple(
+            sizes[extent] if isinstance(extent, str) else extent for extent in shape
+        )
+        actual = arrays[name].shape
+        if len(actual) != len(expected) or any(
+            extent is not None and found != extent
+            for found, extent in zip(actual, expected)
+        ):
+            shown = tuple("*" if extent is None else extent for extent in expected)
+            raise ValueError(f"{name} must have shape {shown}, got {actual}")
+
+    # These are the closed vocabularies consumed by embedding tables.  The
+    # builder no longer passes through ACTGraph._validate on the batch path, so
+    # retain their guards once over the already-concatenated arrays.
+    value_maxima: dict[str, int | None] = {}
+    for name, low, high in _VALUE_RANGES:
+        if name in arrays:
+            value_maxima[name] = _check_range(name, arrays[name], low, high)
+    _check_range(
+        "window_incidence_class",
+        arrays["window_incidence_class"],
+        SENTINEL,
+        ALL_CELL_WINDOW_REL_CLASSES - 1,
+    )
+    _check_range("phase_id", arrays["phase_id"], PHASE_OPENING, PHASE_SECOND)
+    _check_range("moves_remaining", arrays["moves_remaining"], 1, 2)
+
+    # `_refuse_crossing` proves both the global floor/ceiling and that every
+    # live endpoint lands in the same position as its owning row.  Keeping the
+    # two checks in one segmented reduction avoids scanning the large index
+    # families twice while retaining the independent collation-frame guard.
+    for name, row_family, target_family, sentinel in _INDEX_FIELDS:
+        _refuse_crossing(
+            name,
+            arrays[name],
+            offsets[row_family],
+            offsets[target_family],
+            sentinel=sentinel,
+        )
+
+    maximum_orbit = value_maxima["radius_orbit"]
+    expected_orbit_bound = 0 if maximum_orbit is None else maximum_orbit + 1
+    if radius_orbit_bound != expected_orbit_bound:
+        raise ValueError(
+            f"radius_orbit_bound is {radius_orbit_bound}, but radius_orbit "
+            f"requires {expected_orbit_bound}"
+        )
+
+    tensors = {name: torch.from_numpy(array) for name, array in arrays.items()}
+    return PackedACTBatch(
+        position_count=position_count,
+        radius_orbit_bound=radius_orbit_bound,
+        **tensors,
     )
 
 
@@ -662,12 +912,13 @@ def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
             )
         packed[name] = torch.from_numpy(np.ascontiguousarray(np.concatenate(parts)))
 
-    for name, row_family, target_family, _sentinel in _INDEX_FIELDS:
+    for name, row_family, target_family, sentinel in _INDEX_FIELDS:
         _refuse_crossing(
             name,
             packed[name].numpy(),
-            _row_positions(offsets[row_family]),
+            offsets[row_family],
             offsets[target_family],
+            sentinel=sentinel,
         )
 
     global_numeric = np.stack([g.global_numeric for g in graphs])

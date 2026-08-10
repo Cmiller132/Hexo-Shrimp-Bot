@@ -630,9 +630,10 @@ def test_every_d6_transform_maps_the_action_states(
 
     The relabel above permutes the action tables that a correct builder would
     have emitted. This replays the game itself through each of the twelve
-    transforms and rebuilds both positions, so the axis `actions.action_tables`
-    assigns to each of the eighteen rows, the reversal-canonical post-placement
-    class, and the model's routing are all in the chain being checked.
+    transforms and rebuilds both positions, so the axis the Rust action-row
+    builder assigns to each of the eighteen rows, the reversal-canonical
+    post-placement class, and the model's routing are all in the chain being
+    checked.
     """
     moves = move_lists[21]
     base = build(hexo_py.Position.replay(moves), FULL)

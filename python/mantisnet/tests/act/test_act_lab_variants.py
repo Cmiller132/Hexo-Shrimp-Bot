@@ -26,9 +26,9 @@ independent of:
   field must have a stated direction, and one whose delta does not must collate
   a batch structurally identical to the full model's. A new preset therefore
   cannot be added without landing on one side or the other.
-- **The refused override set is read off the builder's source**, so a builder
-  that starts reading another configuration field fails here rather than
-  leaving that field silently overridable.
+- **The refused override set is read off the builder's Rust projection**, so a
+  builder that starts forwarding another configuration field fails here rather
+  than leaving that field silently overridable.
 
 Positions are the real stack-939 self-play games `test_act_numerics.py`
 embeds, replayed as stored prefixes because that is what a corpus sample is
@@ -45,8 +45,6 @@ the pair that can disagree.
 
 from __future__ import annotations
 
-import inspect
-import re
 from dataclasses import fields
 
 import pytest
@@ -61,10 +59,7 @@ from mantisnet.lab.variants import (
     variant_spec,
 )
 from mantisnet.model import MantisConfig
-from mantisnet.models.mantis_act import actions as actions_module
 from mantisnet.models.mantis_act import builder as builder_module
-from mantisnet.models.mantis_act import cells as cells_module
-from mantisnet.models.mantis_act import windows as windows_module
 from mantisnet.models.mantis_act.config import (
     PRESET_DELTAS,
     PRESETS,
@@ -295,15 +290,14 @@ def test_every_arm_refuses_the_overrides_its_own_collator_cannot_honour():
 
 
 def test_the_refused_override_set_is_the_set_the_builder_reads():
-    """The registry's list against the builder's source, not against a memory.
+    """The registry's list against the Rust-boundary projection, not a memory.
 
-    A builder that starts reading another configuration field would otherwise
-    leave that field overridable, and a cell whose graph and model describe
-    different boards produces no shape disagreement at all.
+    ``_rust_config`` is the closed dictionary handed to ``hexo_py``. A builder
+    that starts projecting another configuration field would otherwise leave
+    that field overridable, and a cell whose graph and model describe different
+    boards produces no shape disagreement at all.
     """
-    read: set[str] = set()
-    for module in (builder_module, windows_module, cells_module, actions_module):
-        read |= set(re.findall(r"\bcfg\.([a-z_0-9]+)", inspect.getsource(module)))
+    read = set(builder_module._rust_config(MantisACTConfig()))
     known = {f.name for f in fields(MantisACTConfig)}
     assert read <= known, sorted(read - known)
     assert read == set(ACT_BUILDER_FIELDS)
