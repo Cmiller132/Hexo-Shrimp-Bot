@@ -466,6 +466,7 @@ def test_the_labels_refuse_coordinates_that_are_not_the_tables(prefix_tables):
 
 
 AUX_WEIGHTS = {"winning_partner_exists": 1.0, "winning_partner_count": 1.0}
+AUX_CFG = replace(FULL, enable_action_aux_heads=True)
 
 
 @pytest.fixture(scope="module")
@@ -478,9 +479,7 @@ def aux_model():
     """
     torch.manual_seed(SEED)
     return randomise_(
-        MantisACT(
-            replace(FULL, enable_action_aux_heads=True), aux_weights=AUX_WEIGHTS
-        ),
+        MantisACT(AUX_CFG, aux_weights=AUX_WEIGHTS),
         SEED,
     ).eval()
 
@@ -491,13 +490,13 @@ def phase_batch():
     positions = [hexo_py.Position()]
     for ply in (20, 21, 60, 61):
         positions.append(position(0, ply))
-    graphs = [build(pos, FULL) for pos in positions]
-    labels_per_position = [position_aux_labels(pos, FULL) for pos in positions]
+    graphs = [build(pos, AUX_CFG) for pos in positions]
+    labels_per_position = [position_aux_labels(pos, AUX_CFG) for pos in positions]
     labels = {
         name: np.concatenate([entry[name] for entry in labels_per_position])
         for name in labels_per_position[0]
     }
-    return collate(graphs), labels
+    return collate(graphs, AUX_CFG), labels
 
 
 def test_the_split_covers_every_phase_the_batch_holds(aux_model, phase_batch):

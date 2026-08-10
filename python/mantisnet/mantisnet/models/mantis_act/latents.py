@@ -256,8 +256,38 @@ class LatentPass(nn.Module):
             raise ValueError("this pass has axis latents but got LatentState.axis=None")
         return latents.inv, latents.axis
 
+    def _segments(self, streams, inv: Tensor, segments):
+        """Build or validate the shared ragged view used by a latent read."""
+        positions = int(streams[0].offsets.shape[0]) - 1
+        if segments is None:
+            return latent_segments(
+                [stream.offsets for stream in streams],
+                [stream.row_pos for stream in streams],
+            )
+        expected_rows = sum(stream.rows for stream in streams)
+        if (
+            segments.positions != positions
+            or segments.families != len(streams)
+            or segments.n_rows != expected_rows
+        ):
+            raise ValueError(
+                "the precomputed latent segments describe "
+                f"P={segments.positions}, F={segments.families}, "
+                f"N={segments.n_rows} against P={positions}, "
+                f"F={len(streams)}, N={expected_rows}"
+            )
+        if segments.device != inv.device:
+            raise ValueError(
+                f"latent segments are on {segments.device}, states on {inv.device}"
+            )
+        return segments
+
     def read(
-        self, latents: LatentState, entities: Mapping[str, RaggedStream]
+        self,
+        latents: LatentState,
+        entities: Mapping[str, RaggedStream],
+        *,
+        segments=None,
     ) -> LatentState:
         """Latents attend over every node of their own position (§17.2)."""
         if not self.enabled:
@@ -268,9 +298,7 @@ class LatentPass(nn.Module):
         heads = self.cfg.num_heads
         # One multi-range view shared by both streams; the ranges depend only
         # on the offsets.
-        segments = latent_segments(
-            [s.offsets for s in streams], [s.row_pos for s in streams]
-        )
+        segments = self._segments(streams, inv, segments)
         normed = [self.norm_src[i](s.state) for i, s in enumerate(streams)]
 
         keys = []
@@ -440,12 +468,97 @@ class LatentPass(nn.Module):
         return updated
 
     def forward(
-        self, latents: LatentState, entities: Mapping[str, RaggedStream]
+        self,
+        latents: LatentState,
+        entities: Mapping[str, RaggedStream],
+        *,
+        segments=None,
     ) -> tuple[LatentState, dict[str, RaggedStream]]:
         """Read, mix, then broadcast — steps 6 to 8 of the §18 block."""
         if not self.enabled:
             return latents, dict(entities)
-        latents = self.mix(self.read(latents, entities))
+
+        # Whole-pass fusion is deliberately coupled to collate-built plans.
+        # Ablations and direct module callers without plans retain the literal
+        # formulation below, including its public validation behaviour.
+        if segments is not None:
+            from .fused_latent import (
+                action_eps,
+                action_latent_pass,
+                action_parameters,
+                state_eps,
+                state_latent_pass,
+                state_parameters,
+                supports_action_pass,
+                supports_state_pass,
+            )
+
+            if supports_state_pass(self):
+                streams = self._ordered(entities)
+                inv, axis = self._require(latents)
+                segments = self._segments(streams, inv, segments)
+                assert axis is not None
+                cell, window = streams
+                result = state_latent_pass(
+                    inv,
+                    axis,
+                    cell.state.inv,
+                    cell.state.axis,
+                    window.state.inv,
+                    window.state.axis,
+                    segments=segments,
+                    cell_offsets=cell.offsets,
+                    cell_row_pos=cell.row_pos,
+                    window_offsets=window.offsets,
+                    window_row_pos=window.row_pos,
+                    params=state_parameters(self),
+                    heads=self.cfg.num_heads,
+                    activation=self.cfg.activation,
+                    eps=state_eps(self),
+                    dropout=self.cfg.dropout,
+                    axis_pool_mode=self.cfg.axis_pool_mode,
+                )
+                return LatentState(result[0], result[1]), {
+                    "cell": RaggedStream(
+                        EquivariantState(result[2], result[3]),
+                        cell.offsets,
+                        cell.row_pos,
+                    ),
+                    "window": RaggedStream(
+                        EquivariantState(result[4], result[5]),
+                        window.offsets,
+                        window.row_pos,
+                    ),
+                }
+
+            if supports_action_pass(self):
+                streams = self._ordered(entities)
+                inv, axis = self._require(latents)
+                segments = self._segments(streams, inv, segments)
+                action = streams[0]
+                result = action_latent_pass(
+                    inv,
+                    action.state.inv,
+                    action.state.axis,
+                    segments=segments,
+                    action_offsets=action.offsets,
+                    action_row_pos=action.row_pos,
+                    params=action_parameters(self),
+                    heads=self.cfg.num_heads,
+                    activation=self.cfg.activation,
+                    eps=action_eps(self),
+                    dropout=self.cfg.dropout,
+                    axis_pool_mode=self.cfg.axis_pool_mode,
+                )
+                return LatentState(result[0], axis), {
+                    "action": RaggedStream(
+                        EquivariantState(result[1], action.state.axis),
+                        action.offsets,
+                        action.row_pos,
+                    )
+                }
+
+        latents = self.mix(self.read(latents, entities, segments=segments))
         return latents, self.broadcast(latents, entities)
 
 

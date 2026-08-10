@@ -67,14 +67,15 @@ that matrix records and that no single detector would have shown:
 
 Where each detector runs. Detectors 2 and 3 read parameters and modules, so a
 device would tell them nothing. Detector 1 reads arithmetic, and this package's
-arithmetic is not the same code on the two devices: `segment_message` and
-`latent_attention` dispatch to Triton only when their inputs are on CUDA, so a
-host-only run of the position law has never put §31 to a fused kernel at all —
-and a kernel that read a fixed absolute axis channel instead of the row's own
-would pass it. The law therefore runs twice where a device exists, once per
-device, with the fused acceptances counted so a silent fallback to the torch
-reference cannot pass as a device run, and with the same forbidden
-constructions introduced under the kernels.
+   arithmetic is not the same code on the two devices: the registered message,
+   equivariant, latent, segment, post-row, and class-embedding families dispatch
+   to their optimized paths only for supported CUDA inputs. A host-only run of
+   the position law has therefore never put §31 to those kernels at all — and a
+   kernel that read a fixed absolute axis channel instead of the row's own would
+   pass it. The law runs twice where a device exists, once per device, with every
+   fused acceptance counted so a silent fallback to the torch reference cannot
+   pass as a device run, and with the same forbidden constructions introduced
+   under the kernels.
 
 Positions come from two generators, both engine play.
 
@@ -117,7 +118,15 @@ import pytest
 import torch
 from torch import Tensor, nn
 
-from mantisnet.models.mantis_act import latent_attention, segment_message
+from mantisnet.models.mantis_act import (
+    class_embedding,
+    fused_equivariant,
+    fused_latent,
+    fused_message,
+    latent_attention,
+    post_rows,
+    segment_message,
+)
 from mantisnet.models.mantis_act.builder import build
 from mantisnet.models.mantis_act.config import PRESETS, MantisACTConfig
 from mantisnet.models.mantis_act.equivariant import (
@@ -129,6 +138,7 @@ from mantisnet.models.mantis_act.equivariant import (
 )
 from mantisnet.models.mantis_act.latents import LatentState
 from mantisnet.models.mantis_act.messages import TypedEdges
+from mantisnet.models.mantis_act.model import MantisACT
 from mantisnet.models.mantis_act.packed import (
     PHASE_FIRST,
     PHASE_SECOND,
@@ -350,7 +360,7 @@ def make_sample(name: str, moves: list[tuple[int, int]]) -> Sample:
         name=name,
         graphs=graphs,
         legal_qr=legal_qr,
-        batch=collate(list(graphs)),
+        batch=collate(list(graphs), FULL),
         cells=tuple(
             cell_correspondence(base, graphs[t], t) for t in range(len(graphs))
         ),
@@ -831,7 +841,7 @@ def reassociation_deviations(trunk: StateTrunk, sample: Sample) -> dict[str, flo
     worst: dict[str, float] = {}
     for t in (0, 1, 5):
         with torch.no_grad():
-            _out, alone = trunk.debug_forward(collate([sample.graphs[t]]))
+            _out, alone = trunk.debug_forward(collate([sample.graphs[t]], FULL))
         for key, got in alone.items():
             family = key.split(".")[1]
             if family == "latent":
@@ -882,7 +892,7 @@ def test_batched_and_single_position_forwards_agree(trunk, samples):
             packed = trunk(batch)
         for t in (0,) + TRANSFORMS[:3]:
             with torch.no_grad():
-                single = trunk(collate([sample.graphs[t]]))
+                single = trunk(collate([sample.graphs[t]], FULL))
             for got, want in (
                 (single.cells.inv, _slice(packed.cells.inv, batch.cell_offsets, t)),
                 (single.cells.axis, _slice(packed.cells.axis, batch.cell_offsets, t)),
@@ -1725,13 +1735,13 @@ def test_the_suite_reports_its_own_coverage(deviations):
 # --------------------------------------------------------------------------
 # The same law on the device, where the fused kernels live (§31, §36)
 #
-# `segment_message` and `latent_attention` both dispatch to Triton only when
-# their inputs are on CUDA, so a suite that runs on the host alone has never
-# put §31 to a fused kernel at all — and a kernel that read a fixed absolute
-# axis channel instead of the row's own would pass it. The device arm is the
-# same three detectors' first one, on the same samples, with the fused
-# acceptances counted so the run cannot be a silent fallback to the reference
-# the CPU arm already covers.
+# The message, equivariant, segment, latent, post-row, and class-embedding
+# families dispatch to their fused implementations only on supported CUDA
+# inputs, so a host-only suite has never put §31 to those kernels at all — and
+# a kernel that read a fixed absolute axis channel instead of the row's own
+# would pass it. The device arm uses the same detectors and samples, with every
+# eligible forward/backward launch counted so a silent reference fallback
+# cannot pass as the device run the CPU arm already covers.
 
 
 requires_cuda = pytest.mark.skipif(
@@ -1740,35 +1750,234 @@ requires_cuda = pytest.mark.skipif(
 
 
 @contextmanager
-def counted_fused_dispatch():
-    """Count each kernel family's fused acceptances over the block."""
-    counts = {"segment_message": 0, "latent_attention": 0}
-    modules = {"segment_message": segment_message, "latent_attention": latent_attention}
-    originals = {name: module._supported for name, module in modules.items()}
+def counted_fused_dispatch(*, include_post_rows: bool = False):
+    """Count eligible calls and successful fused forward/backward launches.
 
-    def counting(name):
-        def wrapped(*args):
-            accepted = originals[name](*args)
-            counts[name] += int(bool(accepted))
+    Eligibility alone is not acceptance: each dispatcher consults a failure
+    cache after ``_supported`` and may silently use its torch reference. Count a
+    launch only after the launch helper returns, so ``eligible == launched`` is
+    the assertion that no eligible call fell back.
+    """
+    fused_latent.reset_launch_stats()
+    latent_variants = ("state", "action") if include_post_rows else ("state",)
+    families = {
+        "fused_message": (
+            fused_message,
+            ("_launch_forward", "_launch_backward"),
+        ),
+        "fused_equivariant": (
+            fused_equivariant,
+            ("_launch_forward", "_launch_backward"),
+        ),
+        "segment_message": (
+            segment_message,
+            ("_launch_forward", "_launch_backward"),
+        ),
+        "latent_attention": (
+            latent_attention,
+            (
+                "_launch_read",
+                "_launch_read_backward",
+                "_launch_broadcast",
+                "_launch_broadcast_backward",
+            ),
+        ),
+    }
+    if include_post_rows:
+        families["post_rows"] = (
+            post_rows,
+            (
+                "_launch_gather",
+                "_launch_gather_backward",
+                "_launch_row_gate",
+                "_launch_row_gate_backward",
+            ),
+        )
+        families["class_embedding"] = (
+            class_embedding,
+            ("_launch_forward", "_launch_backward"),
+        )
+
+    counts = {
+        name: {
+            "eligible": 0,
+            "launched": 0,
+            **{launch: 0 for launch in family_launches},
+        }
+        for name, (_module, family_launches) in families.items()
+    }
+    supported = {
+        name: module._supported for name, (module, _launches) in families.items()
+    }
+    launches = {
+        (name, launch): getattr(module, launch)
+        for name, (module, family_launches) in families.items()
+        for launch in family_launches
+    }
+
+    def counting_supported(name, original):
+        def wrapped(*args, **kwargs):
+            accepted = original(*args, **kwargs)
+            counts[name]["eligible"] += int(bool(accepted))
             return accepted
 
         return wrapped
 
-    for name, module in modules.items():
-        module._supported = counting(name)
+    def counting_launch(name, launch, original):
+        def wrapped(*args, **kwargs):
+            result = original(*args, **kwargs)
+            counts[name]["launched"] += 1
+            counts[name][launch] += 1
+            return result
+
+        return wrapped
+
+    for name, (module, family_launches) in families.items():
+        module._supported = counting_supported(name, supported[name])
+        for launch in family_launches:
+            setattr(
+                module,
+                launch,
+                counting_launch(name, launch, launches[(name, launch)]),
+            )
     try:
         yield counts
     finally:
-        for name, module in modules.items():
-            module._supported = originals[name]
+        latent_stats = fused_latent.launch_stats()
+        latent_counts = {
+            f"_launch_{variant}_{stage}": latent_stats[
+                f"{variant}_{stage}_launched"
+            ]
+            for variant in latent_variants
+            for stage in ("forward", "backward")
+        }
+        counts["fused_latent"] = {
+            "eligible": sum(
+                latent_stats[f"{variant}_{stage}_eligible"]
+                for variant in latent_variants
+                for stage in ("forward", "backward")
+            ),
+            "launched": sum(latent_counts.values()),
+            **latent_counts,
+        }
+        for name, (module, family_launches) in families.items():
+            module._supported = supported[name]
+            for launch in family_launches:
+                setattr(module, launch, launches[(name, launch)])
+
+
+def assert_successful_fused_dispatch(
+    counts: dict[str, dict[str, int]],
+    *families: str,
+    require_backward: bool = False,
+) -> None:
+    """Require every eligible call to have returned from its fused launch.
+
+    The D6 comparisons run under ``no_grad`` and therefore require every
+    forward helper.  The full-model device fixture additionally performs one
+    bounded training pass and sets ``require_backward=True`` so every ordered
+    recompute/segment/sentinel backward is load-bearing.
+    """
+    modules = {
+        "fused_message": fused_message,
+        "fused_equivariant": fused_equivariant,
+        "fused_latent": fused_latent,
+        "segment_message": segment_message,
+        "latent_attention": latent_attention,
+        "post_rows": post_rows,
+        "class_embedding": class_embedding,
+    }
+    for name in families:
+        eligible = counts[name]["eligible"]
+        launched = counts[name]["launched"]
+        assert eligible == launched and launched > 0, counts
+        launch_counts = {
+            launch: count
+            for launch, count in counts[name].items()
+            if launch.startswith("_launch_")
+        }
+        required_launches = {
+            launch: count
+            for launch, count in launch_counts.items()
+            if require_backward or "backward" not in launch
+        }
+        assert required_launches and all(
+            count > 0 for count in required_launches.values()
+        ), counts
+        module = modules[name]
+        for cache_name in (
+            "_FAILED_SHAPES",
+            "_FAILED_FORWARD_SHAPES",
+            "_FAILED_BACKWARD_SHAPES",
+        ):
+            cache = getattr(module, cache_name, None)
+            if cache is not None:
+                assert not cache, {
+                    "family": name,
+                    "cache": cache_name,
+                    "failures": dict(cache),
+                }
 
 
 def on_device(sample: Sample, device: str = "cuda") -> Sample:
     return replace(sample, batch=sample.batch.to(device))
 
 
+def action_law_deviations(
+    model: MantisACT, sample: Sample
+) -> dict[str, tuple[float, float]]:
+    """§31 over the action stack and its full-model policy/critic outputs."""
+    with torch.no_grad():
+        output, tensors = model.debug_forward(
+            sample.batch,
+            mass_floor=None,
+            capture=("action.state", "action.latent"),
+        )
+    batch = sample.batch
+    device = batch.legal_offsets.device
+    into: dict[str, tuple[float, float]] = {}
+
+    def index(array: np.ndarray) -> Tensor:
+        return torch.from_numpy(array).to(device)
+
+    for t in TRANSFORMS:
+        permutation = axis_permutation(t)
+        legal = index(sample.legal[t])
+
+        # Action states are already reduced from the eighteen post-placement
+        # rows to one row per engine-ordered legal action. The independently
+        # built legal correspondence is therefore their complete node map.
+        for stream in ("inv", "axis"):
+            tensor = tensors[f"action.state.{stream}"]
+            want = _slice(tensor, batch.legal_offsets, 0)
+            got = _slice(tensor, batch.legal_offsets, t).index_select(0, legal)
+            if stream == "axis":
+                want = permute_axis_channels(want, permutation)
+            _record(into, f"action.state.{stream}", got, want)
+
+        # §21 action latents are invariant and position-indexed, so no node
+        # correspondence or channel permutation is entitled here.
+        latent = tensors["action.latent.inv"]
+        _record(into, "action.latent.inv", latent[t], latent[0])
+
+        # The public full-model rows stay in engine legal order. Checking both
+        # raw heads and their fp32 critic compositions carries the same legal
+        # correspondence through the complete action path.
+        for name in ("policy_logits", "critic_logits", "q_value", "q_score"):
+            tensor = getattr(output, name)
+            want = _slice(tensor, batch.legal_offsets, 0)
+            got = _slice(tensor, batch.legal_offsets, t).index_select(0, legal)
+            _record(into, f"output.{name}", got, want)
+
+    return into
+
+
 @pytest.fixture(scope="module")
-def cuda_law(samples) -> tuple[dict[str, dict[str, tuple[float, float]]], dict[str, int]]:
+def cuda_law(
+    samples,
+) -> tuple[
+    dict[str, dict[str, tuple[float, float]]], dict[str, dict[str, int]]
+]:
     if not torch.cuda.is_available():
         pytest.skip("the fused kernels need a CUDA device")
     trunk = fresh_trunk().cuda()
@@ -1776,7 +1985,36 @@ def cuda_law(samples) -> tuple[dict[str, dict[str, tuple[float, float]]], dict[s
         measured = {
             sample.name: law_deviations(trunk, on_device(sample)) for sample in samples
         }
-    return measured, dict(counts)
+        torch.cuda.synchronize()
+    return measured, {name: dict(family) for name, family in counts.items()}
+
+
+@pytest.fixture(scope="module")
+def cuda_action_law(
+    dense,
+) -> tuple[dict[str, tuple[float, float]], dict[str, dict[str, int]]]:
+    if not torch.cuda.is_available():
+        pytest.skip("the fused kernels need a CUDA device")
+    torch.manual_seed(SEED)
+    model = randomise_(MantisACT(FULL), SEED).cuda()
+    with counted_fused_dispatch(include_post_rows=True) as counts:
+        measured = action_law_deviations(model, on_device(dense))
+        # The law itself is intentionally no-grad: retaining the twelve-image
+        # dense orbit for backward would turn a symmetry test into a memory
+        # stress test. One independently collated base position still traverses
+        # the identical default full model and makes every recompute backward,
+        # ordered class reduction, and planned sentinel gather load-bearing.
+        training_batch = collate([dense.base], FULL).to("cuda")
+        model.zero_grad(set_to_none=True)
+        output = model(training_batch, mass_floor=None)
+        loss = (
+            output.policy_logits.float().square().mean()
+            + output.critic_logits.float().square().mean()
+        )
+        assert torch.isfinite(loss)
+        loss.backward()
+        torch.cuda.synchronize()
+    return measured, {name: dict(family) for name, family in counts.items()}
 
 
 @requires_cuda
@@ -1784,12 +2022,19 @@ def test_the_position_law_holds_where_the_fused_kernels_run(cuda_law, deviations
     """§31 on the device, over every comparison the host arm makes.
 
     The assertion that this is not the host arm again under another name is the
-    acceptance count: both kernel families must have taken the fused path, and
-    the set of comparisons must be exactly the host arm's, so neither a silent
-    fallback nor a shortened comparison can pass as a device run.
+    acceptance count: every trunk kernel family must have taken the fused path,
+    and the set of comparisons must be exactly the host arm's, so neither a
+    silent fallback nor a shortened comparison can pass as a device run.
     """
     measured, counts = cuda_law
-    assert counts["segment_message"] > 0 and counts["latent_attention"] > 0, counts
+    assert_successful_fused_dispatch(
+        counts,
+        "fused_message",
+        "fused_equivariant",
+        "fused_latent",
+        "segment_message",
+        "latent_attention",
+    )
     assert {name: set(checks) for name, checks in measured.items()} == {
         name: set(checks) for name, checks in deviations.items()
     }
@@ -1817,6 +2062,35 @@ def test_the_device_drift_stays_well_inside_the_budget(cuda_law):
 
 
 @requires_cuda
+def test_the_action_law_holds_through_the_full_model_on_the_device(cuda_action_law):
+    """§31 and a training pass reach every default fused forward/backward."""
+    measured, counts = cuda_action_law
+    assert_successful_fused_dispatch(
+        counts,
+        "fused_message",
+        "fused_equivariant",
+        "fused_latent",
+        "segment_message",
+        "latent_attention",
+        "post_rows",
+        "class_embedding",
+        require_backward=True,
+    )
+    expected = {
+        "action.state.inv",
+        "action.state.axis",
+        "action.latent.inv",
+        "output.policy_logits",
+        "output.critic_logits",
+        "output.q_value",
+        "output.q_score",
+    }
+    assert set(measured) == expected
+    failures = over_budget(measured, "")
+    assert not failures, "\n".join(failures)
+
+
+@requires_cuda
 @pytest.mark.parametrize(
     "name", sorted(n for n, m in MUTATIONS.items() if "law" in m.detectors)
 )
@@ -1832,7 +2106,14 @@ def test_the_position_law_still_catches_each_construction_on_the_device(dense, n
     trunk = mutated_trunk(name, MUTATION_MAGNITUDE).cuda()
     with counted_fused_dispatch() as counts:
         measured = law_deviations(trunk, on_device(dense))
-    assert counts["segment_message"] > 0 and counts["latent_attention"] > 0, counts
+    assert_successful_fused_dispatch(
+        counts,
+        "fused_message",
+        "fused_equivariant",
+        "fused_latent",
+        "segment_message",
+        "latent_attention",
+    )
 
     over = {
         check: (deviation, allowed)

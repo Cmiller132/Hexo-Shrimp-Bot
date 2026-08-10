@@ -35,19 +35,14 @@ from .equivariant import (
 )
 from .latent_attention import row_positions
 from .packed import PackedACTBatch
-from .pattern_classes import ALL_CELL_WINDOW_REL_CLASSES
-from .segment_message import MessagePlan, message_plan, relation_gated_message
-from .symmetry import (
-    RELATION_PAD,
-    coarse_relation,
-    coarse_relation_count,
-    orbit_table,
+from .plans import (
+    INCIDENCE_RELATIONS,
+    PlannedEdges,
+    adjacency_relation_id,
+    radius_relation_count,
+    relation_vocabulary_size,
 )
-
-# §10.1's one joint (pattern, slot) relation table. The `nonempty` window scope
-# never emits the three all-empty classes; the table is still the 2187-row one,
-# so a scope change does not renumber a relation.
-INCIDENCE_RELATIONS = ALL_CELL_WINDOW_REL_CLASSES
+from .segment_message import MessagePlan, message_plan, relation_gated_message
 
 # §16's typed collinear/crossing vocabulary: 11 collinear offsets, 36 crossing
 # fold products, and the self loop. Read off `window_pairs`, which generates the
@@ -59,42 +54,6 @@ WINDOW_WINDOW_RELATIONS = WA_CLASSES
 EMBEDDING_INIT_STD = 0.02
 
 _REDUCTIONS = ("sum", "mean", "attention")
-
-
-def relation_vocabulary_size(cfg: MantisACTConfig) -> int:
-    """The geometry relation vocabulary of ``cfg``'s ``d6_relation_mode``.
-
-    Under ``orbit48`` that is the 48 exact orbits plus the four reserved ids of
-    §11.2, whatever ``d_max`` is: a smaller radius leaves the unused orbit ids
-    empty rather than shifting the reserved band down, so one embedding shape
-    serves every radius. Under ``coarse_distance_axis`` it is that scheme's own
-    space, which reserves nothing.
-    """
-    if cfg.d6_relation_mode == "orbit48":
-        return RELATION_PAD + 1
-    if cfg.d6_relation_mode == "coarse_distance_axis":
-        return coarse_relation_count(cfg.d_max)
-    raise ValueError(f"unknown d6_relation_mode {cfg.d6_relation_mode!r}")
-
-
-def radius_relation_count(cfg: MantisACTConfig) -> int:
-    """The joint ``(geometry class, source colour)`` vocabulary of §15.2."""
-    return 2 * relation_vocabulary_size(cfg)
-
-
-def adjacency_relation_id(cfg: MantisACTConfig) -> int:
-    """The one relation class a hex step belongs to, from the orbit table.
-
-    Every distance-one displacement is a single D6 orbit, so hex adjacency is
-    one relation and the id is read from the same table the radius edges use
-    rather than written down. Sharing the space means an adjacency edge and a
-    distance-one radius edge name the same class.
-    """
-    if cfg.d6_relation_mode == "orbit48":
-        return int(orbit_table(cfg.d_max).lookup(1, 0))
-    if cfg.d6_relation_mode == "coarse_distance_axis":
-        return int(coarse_relation(1, 0, cfg.d_max))
-    raise ValueError(f"unknown d6_relation_mode {cfg.d6_relation_mode!r}")
 
 
 def make_relation_embedding(num_relations: int, d_rel: int) -> nn.Embedding:
@@ -298,6 +257,9 @@ class TypedEdges:
             dst_sorted=self.dst_sorted,
         )
         return self._plans[channels]
+
+
+EdgeSet = TypedEdges | PlannedEdges
 
 
 def incidence_edges(batch: PackedACTBatch) -> tuple[TypedEdges, TypedEdges]:
@@ -721,6 +683,7 @@ class RelationGatedMessage(nn.Module):
         self.num_relations = int(num_relations)
         self.d_inv = cfg.d_inv
         self.d_axis = cfg.d_axis
+        self.activation = cfg.activation
         self.reduce = cfg.incidence_reduce
         self.gated = cfg.incidence_message == "relation_gated"
         self.route_axis = bool(route_axis and cfg.use_axis_channels)
@@ -772,9 +735,36 @@ class RelationGatedMessage(nn.Module):
 
         self.drop = nn.Dropout(cfg.dropout)
 
+    def _fused_parameters(self, *, axis: bool) -> tuple[Tensor, ...]:
+        """One stream's parameters in the whole-stage registered-op ABI."""
+        suffix = "axis" if axis else "inv"
+        norm_src = getattr(self, f"ln_src_{suffix}")
+        value = getattr(self, f"wv_{suffix}")
+        gate = getattr(self, f"wg_{suffix}")
+        bias = getattr(self, f"wb_{suffix}")
+        norm_dst = getattr(self, f"ln_dst_{suffix}")
+        update = getattr(self, f"update_{suffix}")
+        scale = getattr(self, f"scale_{suffix}")
+        return (
+            norm_src.weight,
+            norm_src.bias,
+            value.weight,
+            gate.weight,
+            gate.bias,
+            bias.weight,
+            bias.bias,
+            norm_dst.weight,
+            norm_dst.bias,
+            update.lin_in.weight,
+            update.lin_in.bias,
+            update.out.weight,
+            update.out.bias,
+            scale.gamma,
+        )
+
     def _check(
         self,
-        edges: TypedEdges,
+        edges: EdgeSet,
         source: EquivariantState,
         destination: EquivariantState,
     ) -> None:
@@ -816,7 +806,7 @@ class RelationGatedMessage(nn.Module):
     def _aggregate(
         self,
         values: Tensor,
-        edges: TypedEdges,
+        edges: EdgeSet,
         channels: int,
         *,
         gate_projection: nn.Linear | None,
@@ -858,7 +848,7 @@ class RelationGatedMessage(nn.Module):
     def _attend(
         self,
         values: Tensor,
-        edges: TypedEdges,
+        edges: EdgeSet,
         channels: int,
         gate: Tensor | None,
         bias: Tensor,
@@ -887,7 +877,7 @@ class RelationGatedMessage(nn.Module):
 
     def forward(
         self,
-        edges: TypedEdges,
+        edges: EdgeSet,
         source: EquivariantState,
         destination: EquivariantState,
     ) -> EquivariantState:
@@ -899,6 +889,34 @@ class RelationGatedMessage(nn.Module):
         stream unchanged rather than returning a zero for it.
         """
         self._check(edges, source, destination)
+        fused_default = (
+            isinstance(edges, PlannedEdges)
+            and self.gated
+            and self.reduce == "sum"
+            and self.route_axis
+            and source.axis is not None
+            and destination.axis is not None
+            and (not self.drop.training or self.drop.p == 0.0)
+        )
+        if fused_default:
+            from .fused_message import relation_gated_message_stage
+
+            inv, axis = relation_gated_message_stage(
+                source.inv,
+                source.axis,
+                destination.inv,
+                destination.axis,
+                self.relation.weight,
+                self._fused_parameters(axis=False),
+                self._fused_parameters(axis=True),
+                edges.plan(1),
+                edges.plan(AXIS_CHANNELS),
+                activation=self.activation,
+                source_eps=(self.ln_src_inv.eps, self.ln_src_axis.eps),
+                destination_eps=(self.ln_dst_inv.eps, self.ln_dst_axis.eps),
+            )
+            return EquivariantState(inv, axis)
+
         attending = self.reduce == "attention"
 
         aggregate = self._aggregate(

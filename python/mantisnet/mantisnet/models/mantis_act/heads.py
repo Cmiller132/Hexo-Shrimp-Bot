@@ -29,6 +29,7 @@ from .equivariant import (
     LayerScale,
     activation_module,
     at_least_fp32,
+    run_equivariant_stage,
 )
 from .latents import LatentState, row_positions
 from .packed import PHASE_FIRST
@@ -191,7 +192,11 @@ def _segment_max(values: Tensor, segment: Tensor, positions: int) -> Tensor:
 
 
 def compose_acting_q(
-    critic_logits: Tensor, legal_offsets: Tensor, mass_floor: float
+    critic_logits: Tensor,
+    legal_offsets: Tensor,
+    mass_floor: float,
+    *,
+    row_position: Tensor | None = None,
 ) -> Tensor:
     """Return Q divided by the position's floored maximum committed mass, fp32.
 
@@ -216,7 +221,11 @@ def compose_acting_q(
     # ATen refuses an `output_size` that disagrees with the offsets' own
     # total, enforcing on the device that the offsets end where the critic's
     # rows do.
-    segment = row_positions(legal_offsets, int(critic_logits.shape[0]))
+    segment = (
+        row_positions(legal_offsets, int(critic_logits.shape[0]))
+        if row_position is None
+        else row_position
+    )
     positions = int(legal_offsets.shape[0]) - 1
     scale = _segment_max(p_pos + p_neg, segment, positions).clamp(min=mass_floor)
     return (p_pos - p_neg) / scale.index_select(0, segment)
@@ -373,7 +382,7 @@ class PrivateAdapterBlock(nn.Module):
                     "this adapter block reads latents but none were given"
                 )
             state = self.context(state, latents, row_position)
-        return self.ffn(self.mix(state))
+        return run_equivariant_stage(state, self.mix, self.ffn)
 
 
 class PrivateAdapter(nn.Module):
@@ -464,6 +473,7 @@ class CriticHead(nn.Module):
         *,
         legal_offsets: Tensor,
         mass_floor: float | None,
+        row_position: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor | None]:
         """``(q_value, q_score, committed_mass)`` in fp32 (§23.2, §25, §27).
 
@@ -493,7 +503,12 @@ class CriticHead(nn.Module):
         mass = committed_mass(critic_logits)
         if mass_floor is None:
             return q_value, q_value, mass
-        q_score = compose_acting_q(critic_logits, legal_offsets, mass_floor)
+        q_score = compose_acting_q(
+            critic_logits,
+            legal_offsets,
+            mass_floor,
+            row_position=row_position,
+        )
         return q_value, q_score, mass
 
 
@@ -859,6 +874,7 @@ class ActionHeads(nn.Module):
         *,
         legal_offsets: Tensor,
         latents: LatentState | None = None,
+        row_position: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         """The raw ``(policy_logits, critic_logits)`` of §23, uncomposed.
 
@@ -871,11 +887,9 @@ class ActionHeads(nn.Module):
             raise ValueError(
                 "the private adapters read the state latents, but none were given"
             )
-        return self._fork(
-            actions,
-            row_positions(legal_offsets, int(actions.inv.shape[0])),
-            latents,
-        )
+        if row_position is None:
+            row_position = row_positions(legal_offsets, int(actions.inv.shape[0]))
+        return self._fork(actions, row_position, latents)
 
     def _fork(
         self,
@@ -901,6 +915,7 @@ class ActionHeads(nn.Module):
         phase_id: Tensor | None = None,
         windows: EquivariantState | None = None,
         window_status: Tensor | None = None,
+        row_position: Tensor | None = None,
     ) -> HeadOutput:
         """Every head this configuration holds, for one packed batch."""
         self._check_state("the action state", actions)
@@ -908,10 +923,14 @@ class ActionHeads(nn.Module):
             raise ValueError(
                 "the private adapters read the state latents, but none were given"
             )
-        row_position = row_positions(legal_offsets, int(actions.inv.shape[0]))
+        if row_position is None:
+            row_position = row_positions(legal_offsets, int(actions.inv.shape[0]))
         policy_logits, critic_logits = self._fork(actions, row_position, latents)
         q_value, q_score, mass = self.critic.compose(
-            critic_logits, legal_offsets=legal_offsets, mass_floor=mass_floor
+            critic_logits,
+            legal_offsets=legal_offsets,
+            mass_floor=mass_floor,
+            row_position=row_position,
         )
 
         aux: dict[str, Tensor] = {}

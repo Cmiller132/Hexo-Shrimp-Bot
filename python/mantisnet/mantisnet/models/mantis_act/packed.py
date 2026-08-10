@@ -17,6 +17,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from .config import MantisACTConfig
+from .plans import ACTPlans, build_plans, builder_fingerprint
 from .pattern_classes import (
     ALL_CELL_WINDOW_REL_CLASSES,
     ALL_WINDOW_PATTERN_CLASSES,
@@ -563,12 +565,22 @@ class PackedACTBatch:
     # different ``d6_relation_mode``/``d_max`` settings.
     radius_orbit_bound: int
 
+    # CPU-built execution views. Hand-built batches used by module-level tests
+    # may omit them, but every model entry point refuses that omission before
+    # arithmetic; :func:`collate` always supplies both fields.
+    plans: ACTPlans | None = None
+    builder_fingerprint: str = ""
+
     def to(self, device) -> "PackedACTBatch":
         """The same batch with every tensor on ``device``."""
-        moved = {
-            name: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            for name, v in vars(self).items()
-        }
+        moved = {}
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                moved[name] = value.to(device, non_blocking=True)
+            elif isinstance(value, ACTPlans):
+                moved[name] = value.to(device, non_blocking=True)
+            else:
+                moved[name] = value
         return PackedACTBatch(**moved)
 
     def pin_memory(self) -> "PackedACTBatch":
@@ -577,10 +589,14 @@ class PackedACTBatch:
         ``non_blocking`` silently degrades to a synchronous staged copy from
         pageable memory; a prefetch worker pins ahead of the transfer instead.
         """
-        pinned = {
-            name: (v.pin_memory() if isinstance(v, torch.Tensor) else v)
-            for name, v in vars(self).items()
-        }
+        pinned = {}
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                pinned[name] = value.pin_memory()
+            elif isinstance(value, ACTPlans):
+                pinned[name] = value.pin_memory()
+            else:
+                pinned[name] = value
         return PackedACTBatch(**pinned)
 
 
@@ -626,7 +642,7 @@ def _refuse_crossing(
     )
 
 
-def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
+def collate(graphs: Sequence[ACTGraph], cfg: MantisACTConfig) -> PackedACTBatch:
     """Concatenate position graphs into one packed batch (§25, §26).
 
     Every index is shifted by its target family's offset, ``-1`` sentinels are
@@ -645,7 +661,13 @@ def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
     }
     offsets = {family: _offsets(count) for family, count in counts.items()}
 
-    packed: dict[str, torch.Tensor] = {}
+    if not isinstance(cfg, MantisACTConfig):
+        raise TypeError(
+            f"collate needs the MantisACTConfig that built its graphs, got "
+            f"{type(cfg).__name__}"
+        )
+
+    packed_numpy: dict[str, np.ndarray] = {}
     for name in _PACKED_ARRAYS:
         target = _INDEX_TARGETS.get(name)
         parts = []
@@ -660,29 +682,41 @@ def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
             raise ValueError(
                 f"{name} has inconsistent feature widths across positions: {widths}"
             )
-        packed[name] = torch.from_numpy(np.ascontiguousarray(np.concatenate(parts)))
+        packed_numpy[name] = np.ascontiguousarray(np.concatenate(parts))
 
     for name, row_family, target_family, _sentinel in _INDEX_FIELDS:
         _refuse_crossing(
             name,
-            packed[name].numpy(),
+            packed_numpy[name],
             _row_positions(offsets[row_family]),
             offsets[target_family],
         )
 
     global_numeric = np.stack([g.global_numeric for g in graphs])
-    orbits = packed["radius_orbit"]
+    phase_id = np.asarray([g.phase_id for g in graphs], dtype=np.int64)
+    plans = build_plans(
+        cfg,
+        arrays=packed_numpy,
+        cell_offsets=offsets[_CELLS],
+        window_offsets=offsets[_WINDOWS],
+        legal_offsets=offsets[_LEGAL],
+        phase_id=phase_id,
+    )
+    packed = {name: torch.from_numpy(value) for name, value in packed_numpy.items()}
+    orbits = packed_numpy["radius_orbit"]
     return PackedACTBatch(
         position_count=len(graphs),
-        radius_orbit_bound=0 if orbits.numel() == 0 else int(orbits.max()) + 1,
+        radius_orbit_bound=0 if orbits.size == 0 else int(orbits.max()) + 1,
         cell_offsets=torch.from_numpy(offsets[_CELLS]),
         window_offsets=torch.from_numpy(offsets[_WINDOWS]),
         legal_offsets=torch.from_numpy(offsets[_LEGAL]),
         adjacency_offsets=torch.from_numpy(offsets[_ADJACENCY]),
         radius_offsets=torch.from_numpy(offsets[_RADIUS]),
-        phase_id=torch.tensor([g.phase_id for g in graphs], dtype=torch.long),
+        phase_id=torch.from_numpy(phase_id),
         moves_remaining=torch.tensor([g.moves_remaining for g in graphs], dtype=torch.long),
         global_numeric=torch.from_numpy(np.ascontiguousarray(global_numeric)),
+        plans=plans,
+        builder_fingerprint=builder_fingerprint(cfg),
         **packed,
     )
 

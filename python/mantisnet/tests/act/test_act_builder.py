@@ -319,7 +319,7 @@ def mixed_batch(act_positions):
     """Positions of four sizes and all three phases, and their packed batch."""
     chosen = [act_positions[plies] for plies in (0, 1, 2, 5, 20, 60)]
     graphs = [build(pos, FULL) for pos in chosen]
-    return chosen, graphs, collate(graphs)
+    return chosen, graphs, collate(graphs, FULL)
 
 
 def test_the_offsets_slice_each_position_back_out(mixed_batch):

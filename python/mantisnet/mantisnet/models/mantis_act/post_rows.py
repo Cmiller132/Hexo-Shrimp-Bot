@@ -14,6 +14,8 @@ import warnings
 import torch
 from torch import Tensor
 
+from .equivariant import AXIS_CHANNELS
+
 try:
     import triton
     import triton.language as tl
@@ -97,51 +99,62 @@ if triton is not None:
         )
 
     @triton.jit
-    def _gather_backward_kernel(
-        index_ptr,
+    def _gather_source_backward_kernel(
+        window_ptr,
+        window_rows,
         grad_ptr,
         d_source_ptr,
-        partial_base_ptr,
-        M,
         D: tl.constexpr,
         BLOCK_D: tl.constexpr,
-        BLOCK_M: tl.constexpr,
         CHANNELS: tl.constexpr,
         SLOTS: tl.constexpr,
         AXES: tl.constexpr,
     ):
-        # The mirror of the gather. A present row adds into its own window
-        # slot; an absent row adds into this program's own base partial, which
-        # the caller then sums in program order rather than scattering every
-        # sentinel row onto one address.
-        program = tl.program_id(0)
+        # One program owns one source slot. The CPU plan groups live flattened
+        # action rows by persistent window in their original order; an axis
+        # slot keeps only rows whose grid axis names that slot. Two programs
+        # therefore never write one destination, and every sum has a fixed
+        # association without an atomic scatter.
+        slot = tl.program_id(0)
+        window = slot // CHANNELS
+        wanted_axis = slot % CHANNELS
         offs = tl.arange(0, BLOCK_D)
         live_d = offs < D
-        base_acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-
-        start = program * BLOCK_M
-        stride = tl.num_programs(0) * BLOCK_M
-        for tile in tl.range(start, M, stride):
-            rows = tile + tl.arange(0, BLOCK_M)
-            live_m = rows < M
-            index = tl.load(index_ptr + rows, mask=live_m, other=-1)
-            present = index >= 0
-            axis = (rows // SLOTS) % AXES if CHANNELS > 1 else rows * 0
-            slot = index * CHANNELS + axis
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+        start = tl.load(window_ptr + window)
+        end = tl.load(window_ptr + window + 1)
+        for entry in tl.range(start, end):
+            row = tl.load(window_rows + entry)
+            axis = (row // SLOTS) % AXES
+            selected = (axis == wanted_axis) if CHANNELS > 1 else True
             grad = tl.load(
-                grad_ptr + rows[:, None] * D + offs[None, :],
-                mask=live_m[:, None] & live_d[None, :],
+                grad_ptr + row * D + offs,
+                mask=selected & live_d,
                 other=0.0,
             ).to(tl.float32)
-            tl.atomic_add(
-                d_source_ptr + slot[:, None] * D + offs[None, :],
-                grad,
-                mask=present[:, None] & live_m[:, None] & live_d[None, :],
-            )
-            base_acc += tl.sum(
-                tl.where(live_m[:, None] & ~present[:, None], grad, 0.0), axis=0
-            )
-        tl.store(partial_base_ptr + program * D + offs, base_acc, mask=live_d)
+            acc += grad
+        tl.store(d_source_ptr + slot * D + offs, acc, mask=live_d)
+
+    @triton.jit
+    def _gather_base_backward_kernel(
+        sentinel_rows,
+        grad_ptr,
+        d_base_ptr,
+        sentinel_count,
+        D: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        # The sentinel list is ascending flattened-row order. A single program
+        # walks it once, so the shared base gradient is deterministic too.
+        offs = tl.arange(0, BLOCK_D)
+        live_d = offs < D
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+        for entry in tl.range(0, sentinel_count):
+            row = tl.load(sentinel_rows + entry)
+            acc += tl.load(
+                grad_ptr + row * D + offs, mask=live_d, other=0.0
+            ).to(tl.float32)
+        tl.store(d_base_ptr + offs, acc, mask=live_d)
 
     @triton.jit
     def _row_gate_kernel(
@@ -631,9 +644,20 @@ def _row_gate_reference_backward(
 # Guards, launches, and the custom ops
 
 
-def _validate_gather(source: Tensor, base: Tensor, index: Tensor, channels: int) -> None:
-    if channels < 1:
-        raise ValueError(f"channels must be at least 1, got {channels}")
+def _validate_gather(
+    source: Tensor,
+    base: Tensor,
+    index: Tensor,
+    channels: int,
+    window_ptr: Tensor,
+    window_rows: Tensor,
+    sentinel_rows: Tensor,
+) -> None:
+    if channels not in (1, AXIS_CHANNELS):
+        raise ValueError(
+            f"channels must be scalar or the {AXIS_CHANNELS} ACT axes, "
+            f"got {channels}"
+        )
     if source.ndim != 2:
         raise ValueError(
             f"source must be (n_rows * channels, D), got {tuple(source.shape)}"
@@ -647,14 +671,35 @@ def _validate_gather(source: Tensor, base: Tensor, index: Tensor, channels: int)
             f"base must be ({source.shape[1]},) beside the source's width, got "
             f"{tuple(base.shape)}"
         )
-    if index.ndim != 3:
+    if index.ndim != 3 or index.shape[1] != AXIS_CHANNELS:
         raise ValueError(
-            f"index must be (N, axes, slots), got {tuple(index.shape)}"
+            f"index must be (N, {AXIS_CHANNELS}, slots), got "
+            f"{tuple(index.shape)}"
         )
     if index.dtype != torch.long:
         raise ValueError(f"index must be int64, got {index.dtype}")
     if base.device != source.device or index.device != source.device:
         raise ValueError("every post-row gather input must be on one device")
+    windows = int(source.shape[0]) // channels
+    total = int(index.numel())
+    for name, value, rows in (
+        ("window_ptr", window_ptr, windows + 1),
+        ("window_rows", window_rows, None),
+        ("sentinel_rows", sentinel_rows, None),
+    ):
+        if value.dtype != torch.int32:
+            raise TypeError(f"{name} must be int32, got {value.dtype}")
+        if value.ndim != 1 or (rows is not None and int(value.shape[0]) != rows):
+            expected = "1-D" if rows is None else f"({rows},)"
+            raise ValueError(f"{name} must be {expected}, got {tuple(value.shape)}")
+        if not value.is_contiguous():
+            raise ValueError(f"{name} must be contiguous")
+        if value.device != source.device:
+            raise ValueError("every post-row gather input must be on one device")
+    if int(window_rows.numel()) + int(sentinel_rows.numel()) != total:
+        raise ValueError(
+            "window_rows and sentinel_rows must cover every flattened action row"
+        )
 
 
 def _validate_row_gate(
@@ -745,30 +790,41 @@ def _launch_gather(
 
 
 def _launch_gather_backward(
-    source: Tensor, base: Tensor, index: Tensor, channels: int, grad_out: Tensor
+    source: Tensor,
+    base: Tensor,
+    index: Tensor,
+    channels: int,
+    window_ptr: Tensor,
+    window_rows: Tensor,
+    sentinel_rows: Tensor,
+    grad_out: Tensor,
 ) -> tuple[Tensor, Tensor]:
     width = int(source.shape[1])
     _rows, axes, slots = index.shape
-    total = int(grad_out.shape[0])
-    programs = min(_ROW_PROGRAMS, max(1, triton.cdiv(total, _BLOCK_M)))
-    d_source = torch.zeros(
-        source.shape, dtype=torch.float32, device=source.device
-    )
-    partial = torch.empty(programs, width, dtype=torch.float32, device=source.device)
-    _gather_backward_kernel[(programs,)](
-        index.reshape(-1),
+    block_d = triton.next_power_of_2(width)
+    d_source = torch.empty_like(source)
+    if source.shape[0]:
+        _gather_source_backward_kernel[(int(source.shape[0]),)](
+            window_ptr,
+            window_rows,
+            grad_out,
+            d_source,
+            D=width,
+            BLOCK_D=block_d,
+            CHANNELS=channels,
+            SLOTS=slots,
+            AXES=axes,
+        )
+    d_base = torch.empty_like(base)
+    _gather_base_backward_kernel[(1,)](
+        sentinel_rows,
         grad_out,
-        d_source,
-        partial,
-        total,
+        d_base,
+        int(sentinel_rows.numel()),
         D=width,
-        BLOCK_D=triton.next_power_of_2(width),
-        BLOCK_M=_BLOCK_M,
-        CHANNELS=channels,
-        SLOTS=slots,
-        AXES=axes,
+        BLOCK_D=block_d,
     )
-    return d_source.to(source.dtype), partial.sum(dim=0).to(base.dtype)
+    return d_source, d_base
 
 
 def _row_gate_partial_width(width: int, rel_width: int) -> tuple[int, int, int]:
@@ -924,9 +980,23 @@ def _launch_row_gate_backward(
 
 @torch.library.custom_op("mantisnet::act_post_gather", mutates_args=())
 def _gather_op(
-    source: Tensor, base: Tensor, index: Tensor, channels: int
+    source: Tensor,
+    base: Tensor,
+    index: Tensor,
+    channels: int,
+    window_ptr: Tensor,
+    window_rows: Tensor,
+    sentinel_rows: Tensor,
 ) -> Tensor:
-    _validate_gather(source, base, index, channels)
+    _validate_gather(
+        source,
+        base,
+        index,
+        channels,
+        window_ptr,
+        window_rows,
+        sentinel_rows,
+    )
     reference = lambda: _gather_reference(source, base, index, channels)  # noqa: E731
     total = int(index.numel())
     if not _supported(source, int(source.shape[1]), total):
@@ -949,14 +1019,29 @@ def _gather_op(
 
 
 @_gather_op.register_fake
-def _(source: Tensor, base: Tensor, index: Tensor, channels: int) -> Tensor:
+def _(
+    source: Tensor,
+    base: Tensor,
+    index: Tensor,
+    channels: int,
+    window_ptr: Tensor,
+    window_rows: Tensor,
+    sentinel_rows: Tensor,
+) -> Tensor:
     rows, axes, slots = index.shape
     return source.new_empty((rows, axes, slots, source.shape[1]))
 
 
 @torch.library.custom_op("mantisnet::act_post_gather_backward", mutates_args=())
 def _gather_backward_op(
-    source: Tensor, base: Tensor, index: Tensor, channels: int, grad_out: Tensor
+    source: Tensor,
+    base: Tensor,
+    index: Tensor,
+    channels: int,
+    window_ptr: Tensor,
+    window_rows: Tensor,
+    sentinel_rows: Tensor,
+    grad_out: Tensor,
 ) -> tuple[Tensor, Tensor]:
     reference = lambda: _gather_reference_backward(  # noqa: E731
         source, base, index, channels, grad_out
@@ -972,6 +1057,9 @@ def _gather_backward_op(
             base,
             index,
             channels,
+            window_ptr,
+            window_rows,
+            sentinel_rows,
             grad_out.reshape(-1, int(source.shape[1])).contiguous().float(),
         )
     except Exception as exc:
@@ -988,22 +1076,36 @@ def _gather_backward_op(
 
 @_gather_backward_op.register_fake
 def _(
-    source: Tensor, base: Tensor, index: Tensor, channels: int, grad_out: Tensor
+    source: Tensor,
+    base: Tensor,
+    index: Tensor,
+    channels: int,
+    window_ptr: Tensor,
+    window_rows: Tensor,
+    sentinel_rows: Tensor,
+    grad_out: Tensor,
 ) -> tuple[Tensor, Tensor]:
     return torch.empty_like(source), torch.empty_like(base)
 
 
 def _gather_setup(ctx, inputs, output) -> None:
     ctx.channels = inputs[3]
-    ctx.save_for_backward(inputs[0], inputs[1], inputs[2])
+    ctx.save_for_backward(inputs[0], inputs[1], inputs[2], inputs[4], inputs[5], inputs[6])
 
 
 def _gather_dispatch(ctx, grad_out: Tensor):
-    source, base, index = ctx.saved_tensors
+    source, base, index, window_ptr, window_rows, sentinel_rows = ctx.saved_tensors
     d_source, d_base = _gather_backward_op(
-        source, base, index, ctx.channels, grad_out
+        source,
+        base,
+        index,
+        ctx.channels,
+        window_ptr,
+        window_rows,
+        sentinel_rows,
+        grad_out,
     )
-    return d_source, d_base, None, None
+    return d_source, d_base, None, None, None, None, None
 
 
 _gather_op.register_autograd(_gather_dispatch, setup_context=_gather_setup)
@@ -1158,7 +1260,13 @@ _row_gate_op.register_autograd(_row_gate_dispatch, setup_context=_row_gate_setup
 
 
 def sentinel_gather(
-    source: Tensor, base: Tensor, index: Tensor, channels: int
+    source: Tensor,
+    base: Tensor,
+    index: Tensor,
+    channels: int,
+    window_ptr: Tensor,
+    window_rows: Tensor,
+    sentinel_rows: Tensor,
 ) -> Tensor:
     """§19.2's row states: ``source[index]``, or ``base`` where ``index < 0``.
 
@@ -1170,6 +1278,12 @@ def sentinel_gather(
     the structural native axis", computed in the kernel rather than assembled
     from an ``arange``.
 
+    ``window_ptr``/``window_rows`` are the CPU-planned stable CSR of present
+    flattened rows by source window; ``sentinel_rows`` is the ascending list
+    of absent rows. The forward needs only ``index``, but carrying these views
+    through the registered op lets its backward reduce every repeated source
+    deterministically without atomics.
+
     The result is ``(N, 3, 6, D)`` in ``source``'s dtype.
     """
     return _gather_op(
@@ -1177,6 +1291,9 @@ def sentinel_gather(
         base.to(source.dtype).contiguous(),
         index,
         channels,
+        window_ptr,
+        window_rows,
+        sentinel_rows,
     )
 
 

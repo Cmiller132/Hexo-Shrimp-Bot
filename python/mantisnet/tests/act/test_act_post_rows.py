@@ -80,13 +80,15 @@ def playout(plies: int, seed: int) -> list[tuple[int, int]]:
 @pytest.fixture(scope="module")
 def batches() -> dict[int, object]:
     return {
-        plies: collate([build(hexo_py.Position.replay(playout(plies, SEED)), FULL)])
+        plies: collate(
+            [build(hexo_py.Position.replay(playout(plies, SEED)), FULL)], FULL
+        )
         for plies in PLIES
     }
 
 
 def gather_inputs(batch, channels: int, device, dtype):
-    """A source table, a base, and the batch's own ``(N, 3, 6)`` row grid."""
+    """A source table, base, row grid, and its precomputed source CSR."""
     rows = int(batch.window_pattern_class.shape[0])
     width = FULL.d_inv if channels == 1 else FULL.d_axis
     generator = torch.Generator().manual_seed(SEED + channels)
@@ -98,10 +100,36 @@ def gather_inputs(batch, channels: int, device, dtype):
     if rows == 0:
         # An empty board persists no window at all, and every row is sentinel.
         source = source[:0]
+    assert batch.plans is not None
+    plan = batch.plans.action_rows.source_window.to(device)
     return (
         source[: rows * channels].to(device=device, dtype=dtype),
         base.to(device=device, dtype=dtype),
         index,
+        plan.ptr,
+        plan.rows,
+        plan.sentinel_rows,
+    )
+
+
+def stable_source_plan(index: torch.Tensor, windows: int):
+    """Independent stable Python grouping for a sliced gradcheck grid."""
+    buckets: list[list[int]] = [[] for _ in range(windows)]
+    sentinel: list[int] = []
+    for row, value in enumerate(index.reshape(-1).tolist()):
+        value = int(value)
+        if value < 0:
+            sentinel.append(row)
+        else:
+            buckets[value].append(row)
+    ptr = [0]
+    rows: list[int] = []
+    for bucket in buckets:
+        rows.extend(bucket)
+        ptr.append(len(rows))
+    return tuple(
+        torch.tensor(values, dtype=torch.int32)
+        for values in (ptr, rows, sentinel)
     )
 
 
@@ -180,7 +208,7 @@ def oracle_gate(source, ln_weight, ln_bias, wv, relation, wb, bb, wg, bg, eps):
 @pytest.mark.parametrize("plies", SMALL_PLIES)
 @pytest.mark.parametrize("channels", (1, AXIS_CHANNELS))
 def test_the_reference_gather_is_the_per_row_oracle(batches, plies, channels):
-    source, base, index = gather_inputs(
+    source, base, index, *_plan = gather_inputs(
         batches[plies], channels, "cpu", torch.float64
     )
     torch.testing.assert_close(
@@ -220,7 +248,7 @@ def test_the_fused_gather_matches_the_padded_table(batches, plies, channels):
     supplied = gather_inputs(batches[plies], channels, "cuda", torch.float32)
     fused, reference = leaves(supplied[:2]), leaves(supplied[:2])
     index = supplied[2]
-    got = sentinel_gather(*fused, index, channels)
+    got = sentinel_gather(*fused, index, channels, *supplied[3:])
     want = kernel._gather_reference(*reference, index, channels)
     torch.testing.assert_close(got, want, atol=0, rtol=0)
 
@@ -229,14 +257,10 @@ def test_the_fused_gather_matches_the_padded_table(batches, plies, channels):
     want.backward(upstream)
     torch.testing.assert_close(fused[0].grad, reference[0].grad, atol=TOL, rtol=TOL)
 
-    # The base's gradient is the one quantity the two paths cannot agree on to
-    # fp32 reassociation: it is a sum of every sentinel row — 89% of the grid
-    # at ply 21 — and the summands are signed, so the total is small against
-    # them and the relative disagreement is large whatever the order. The two
-    # are therefore both held against the same sum taken in float64, which is
-    # the only comparison that says which one is right; the fused answer is a
-    # tree over a fixed grid of programs, the reference's is `index_add_`,
-    # whose atomic order is not even the same twice.
+    # The base gradient is a signed sum over most of the row grid. Hold both
+    # paths against a float64 anchor: the fused reducer walks the plan's stable
+    # sentinel order, while the literal reference retains `index_add_`, whose
+    # CUDA atomic association is deliberately not trusted.
     exact = (
         upstream.double()
         .reshape(-1, upstream.shape[-1])[index.reshape(-1) < 0]
@@ -246,6 +270,25 @@ def test_the_fused_gather_matches_the_padded_table(batches, plies, channels):
     fused_error = (fused[1].grad.double() - exact).abs().max() / scale
     eager_error = (reference[1].grad.double() - exact).abs().max() / scale
     assert fused_error < 1e-3 and fused_error <= eager_error * 4
+
+
+@_CUDA
+def test_the_planned_gather_backward_is_bitwise_deterministic(batches):
+    supplied = gather_inputs(batches[60], AXIS_CHANNELS, "cuda", torch.float32)
+    source, base, index, *plan = supplied
+    generator = torch.Generator(device="cuda").manual_seed(SEED + 17)
+    upstream = torch.randn(
+        (*index.shape, source.shape[1]), generator=generator, device="cuda"
+    )
+    runs = []
+    for _ in range(3):
+        leaves_ = leaves((source, base))
+        out = sentinel_gather(*leaves_, index, AXIS_CHANNELS, *plan)
+        gradients = torch.autograd.grad(out, leaves_, upstream)
+        runs.append((out.detach(), *(gradient.detach() for gradient in gradients)))
+    for later in runs[1:]:
+        for first, other in zip(runs[0], later, strict=True):
+            assert torch.equal(first, other)
 
 
 @_CUDA
@@ -301,11 +344,34 @@ def test_an_unsupported_width_answers_from_the_reference():
 
 def test_gradcheck_of_the_analytic_gather_backward(batches):
     """float64 falls back to the reference, so this checks the formula itself."""
-    source, base, index = gather_inputs(batches[2], AXIS_CHANNELS, "cpu", torch.float64)
+    source, base, index, *_plan = gather_inputs(
+        batches[2], AXIS_CHANNELS, "cpu", torch.float64
+    )
     trimmed = index[:6]
+    plan = stable_source_plan(trimmed, source.shape[0] // AXIS_CHANNELS)
     supplied = tuple(leaves([source, base]))
-    run = lambda s, b: sentinel_gather(s, b, trimmed, AXIS_CHANNELS)  # noqa: E731
+    run = lambda s, b: sentinel_gather(  # noqa: E731
+        s, b, trimmed, AXIS_CHANNELS, *plan
+    )
     assert torch.autograd.gradcheck(run, supplied, eps=1e-6, atol=1e-8)
+
+
+def test_gather_rejects_a_non_act_channel_count_before_dispatch():
+    source = torch.zeros(2, 4)
+    base = torch.zeros(4)
+    index = torch.zeros(1, AXIS_CHANNELS, 1, dtype=torch.long)
+    empty = torch.empty(0, dtype=torch.int32)
+    with pytest.raises(ValueError, match="channels must be scalar"):
+        sentinel_gather(source, base, index, 2, empty, empty, empty)
+
+
+def test_gather_rejects_a_row_grid_without_all_three_axes():
+    source = torch.zeros(1, 4)
+    base = torch.zeros(4)
+    index = torch.zeros(1, 2, 1, dtype=torch.long)
+    empty = torch.empty(0, dtype=torch.int32)
+    with pytest.raises(ValueError, match=r"index must be \(N, 3, slots\)"):
+        sentinel_gather(source, base, index, 1, empty, empty, empty)
 
 
 def test_gradcheck_of_the_analytic_gate_backward():

@@ -17,6 +17,7 @@ import torch
 from torch import Tensor, nn
 
 from .actions import TACTICAL_FEATURES
+from .class_embedding import class_pair_embedding
 from .config import MantisACTConfig
 from .equivariant import (
     AXIS_CHANNELS,
@@ -30,13 +31,15 @@ from .equivariant import (
     PhaseFiLM,
     activation_module,
     at_least_fp32,
+    run_equivariant_stage,
 )
 from .latent_attention import latent_broadcast
-from .latents import ActionLatents, LatentPass, LatentState, RaggedStream, row_positions
+from .latents import ActionLatents, LatentPass, LatentState, RaggedStream
 from .messages import make_relation_embedding
 from .packed import POST_ACTION_ROWS, WINDOW_LEN, PackedACTBatch
 from .pattern_classes import POST1_REL_CLASSES
 from .post_rows import row_gate, sentinel_gather
+from .plans import builder_fingerprint
 from .state_trunk import (
     EMBEDDING_INIT_STD,
     WINDOW_STATUSES,
@@ -237,7 +240,18 @@ class PostPlacementEncoder(nn.Module):
             "window", n_windows, int(batch.window_pattern_class.shape[0])
         )
 
-        inv = sentinel_gather(windows.inv, self.pre_empty_inv, index, 1)
+        if batch.plans is None:
+            raise ValueError("post-placement rows require collate-built ACT plans")
+        source_plan = batch.plans.action_rows.source_window
+        inv = sentinel_gather(
+            windows.inv,
+            self.pre_empty_inv,
+            index,
+            1,
+            source_plan.ptr,
+            source_plan.rows,
+            source_plan.sentinel_rows,
+        )
         if windows.axis is None:
             return WindowRows(inv, None)
         axis = sentinel_gather(
@@ -245,6 +259,9 @@ class PostPlacementEncoder(nn.Module):
             self.pre_empty_axis,
             index,
             AXIS_CHANNELS,
+            source_plan.ptr,
+            source_plan.rows,
+            source_plan.sentinel_rows,
         )
         return WindowRows(inv, axis)
 
@@ -260,11 +277,25 @@ class PostPlacementEncoder(nn.Module):
         _require_rows("action_pre_status", batch.action_pre_status, n_legal)
 
         source = self.window_rows(batch, windows)
-        relation = self.post1(batch.action_post1_class) + self.pre_status(
-            batch.action_pre_status
-        )
         grid = (n_legal, AXIS_CHANNELS, WINDOW_LEN)
-        flat_relation = relation.reshape(-1, self.cfg.d_rel)
+        if batch.plans is None:
+            relation = self.post1(batch.action_post1_class) + self.pre_status(
+                batch.action_pre_status
+            )
+            flat_relation = relation.reshape(-1, self.cfg.d_rel)
+        else:
+            post_plan = batch.plans.action_rows.post1
+            status_plan = batch.plans.action_rows.pre_status
+            flat_relation = class_pair_embedding(
+                self.post1.weight,
+                self.pre_status.weight,
+                batch.action_post1_class.reshape(-1),
+                batch.action_pre_status.reshape(-1),
+                post_plan.ptr,
+                post_plan.rows,
+                status_plan.ptr,
+                status_plan.rows,
+            )
 
         gated = row_gate(
             source.inv.reshape(-1, self.cfg.d_inv),
@@ -525,6 +556,7 @@ class ActionBlock(nn.Module):
         *,
         state_latents: LatentState,
         latent_pass: LatentPass,
+        latent_segments=None,
         legal_offsets: Tensor,
         positions: Tensor,
         action_phase: Tensor,
@@ -538,11 +570,18 @@ class ActionBlock(nn.Module):
         action_latents, entities = latent_pass(
             action_latents,
             {"action": RaggedStream(actions, legal_offsets, positions)},
+            segments=latent_segments,
         )
         actions = entities["action"].state
 
-        actions = self.ffn(self.mix(actions))
-        return self.film(actions, action_phase), action_latents
+        actions = run_equivariant_stage(
+            actions,
+            self.mix,
+            self.ffn,
+            film=self.film,
+            phase_id=action_phase,
+        )
+        return actions, action_latents
 
 
 # --------------------------------------------------------------------------
@@ -587,6 +626,7 @@ class ActionEncoder(nn.Module):
         super().__init__()
         refuse_unimplemented_paths(cfg)
         self.cfg = cfg
+        self.builder_fingerprint = builder_fingerprint(cfg)
 
         self.base = ActionBaseState(cfg)
         self.post = (
@@ -606,6 +646,19 @@ class ActionEncoder(nn.Module):
 
     def forward(self, batch: PackedACTBatch, trunk: TrunkOutput) -> ActionOutput:
         """One `EquivariantState` per legal action, in engine order."""
+        if batch.plans is None:
+            raise ValueError(
+                "PackedACTBatch.plans is missing; build batches with "
+                "collate(graphs, cfg) so execution plans are made on the CPU"
+            )
+        if batch.builder_fingerprint != self.builder_fingerprint:
+            raise ValueError(
+                f"the batch was planned for builder config "
+                f"{batch.builder_fingerprint!r}, but this action encoder expects "
+                f"{self.builder_fingerprint!r}; rebuild it with "
+                "collate(graphs, model.cfg)"
+            )
+        plans = batch.plans
         if trunk.position_count != int(batch.position_count):
             raise ValueError(
                 f"the trunk output describes {trunk.position_count} positions "
@@ -614,7 +667,7 @@ class ActionEncoder(nn.Module):
         n_legal = int(batch.legal_to_cell_index.shape[0])
         # ATen refuses an `output_size` that disagrees with the offsets' own
         # total, so this enforces `legal_offsets[-1] == n_legal` on the device.
-        positions = row_positions(batch.legal_offsets, n_legal)
+        positions = plans.legal_row_pos
 
         actions = self.base(batch, trunk.cells)
         if self.post is not None:
@@ -629,7 +682,7 @@ class ActionEncoder(nn.Module):
                 "block must be absent rather than ignored"
             )
 
-        action_phase = batch.phase_id.index_select(0, positions)
+        action_phase = plans.action_phase
         latents = self.latents.initial(
             int(batch.position_count),
             device=actions.inv.device,
@@ -641,6 +694,7 @@ class ActionEncoder(nn.Module):
                 latents,
                 state_latents=trunk.latents,
                 latent_pass=self.latents[index],
+                latent_segments=plans.action_segments,
                 legal_offsets=batch.legal_offsets,
                 positions=positions,
                 action_phase=action_phase,

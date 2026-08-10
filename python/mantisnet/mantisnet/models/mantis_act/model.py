@@ -31,6 +31,7 @@ from .config import (
 )
 from .heads import ActionHeads
 from .packed import ACTChunkCost, PackedACTBatch
+from .plans import builder_fingerprint
 from .state_trunk import StateTrunk, TrunkOutput, refuse_unimplemented_paths
 
 # The on-disk shape of an ACT checkpoint. Formats here are not backward
@@ -209,6 +210,7 @@ class MantisACT(nn.Module):
         # refused with the missing input named rather than half-constructed.
         refuse_unimplemented_paths(cfg)
         self.cfg = cfg
+        self.builder_fingerprint = builder_fingerprint(cfg)
 
         self.aux_weights = {
             str(name): float(weight) for name, weight in dict(aux_weights or {}).items()
@@ -240,6 +242,18 @@ class MantisACT(nn.Module):
                 f"MantisACT consumes a PackedACTBatch, got "
                 f"{type(batch).__name__}; `builder.collate_positions` and "
                 "`packed.collate` are what produce one"
+            )
+        if batch.plans is None:
+            raise ValueError(
+                "PackedACTBatch.plans is missing; build batches with "
+                "collate(graphs, cfg)"
+            )
+        if batch.builder_fingerprint != self.builder_fingerprint:
+            raise ValueError(
+                f"the batch was planned for builder config "
+                f"{batch.builder_fingerprint!r}, but this model expects "
+                f"{self.builder_fingerprint!r}; rebuild it with "
+                "collate(graphs, model.cfg)"
             )
         positions = int(batch.position_count)
         if positions < 1:
@@ -288,6 +302,7 @@ class MantisACT(nn.Module):
             phase_id=batch.phase_id,
             windows=trunk.windows,
             window_status=batch.window_status,
+            row_position=batch.plans.legal_row_pos,
         )
         aux = dict(head.aux)
         if head.committed_mass is not None:
@@ -318,6 +333,7 @@ class MantisACT(nn.Module):
             actions.actions,
             legal_offsets=batch.legal_offsets,
             latents=trunk.latents,
+            row_position=batch.plans.legal_row_pos,
         )
 
     # §29 gives this architecture no binned state-value head (§23.3's optional

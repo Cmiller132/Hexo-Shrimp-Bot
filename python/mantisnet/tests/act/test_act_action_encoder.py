@@ -82,6 +82,10 @@ from mantisnet.models.mantis_act.packed import (
     collate,
 )
 from mantisnet.models.mantis_act.pattern_classes import POST1_REL_CLASSES
+from mantisnet.models.mantis_act.plans import (
+    build_plans_from_cpu_batch,
+    builder_fingerprint,
+)
 from mantisnet.models.mantis_act.state_trunk import WINDOW_STATUSES, StateTrunk
 from mantisnet.models.mantis_act.summary import parameter_summary
 from mantisnet.models.mantis_act.symmetry import (
@@ -137,7 +141,7 @@ def graphs(move_lists):
 
 @pytest.fixture(scope="module")
 def batch(graphs):
-    return collate([graphs[plies] for plies in PLIES])
+    return collate([graphs[plies] for plies in PLIES], FULL)
 
 
 def excited(module):
@@ -167,9 +171,18 @@ def encoder() -> ActionEncoder:
     return excited(ActionEncoder(FULL))
 
 
-def one(graph) -> PackedACTBatch:
+def one(graph, cfg=FULL) -> PackedACTBatch:
     """One position as a batch of one."""
-    return collate([graph])
+    return collate([graph], cfg)
+
+
+def replan(packed: PackedACTBatch, cfg) -> PackedACTBatch:
+    """Bind an intentionally malformed/reordered CPU batch to ``cfg``."""
+    return replace(
+        packed,
+        plans=build_plans_from_cpu_batch(cfg, packed),
+        builder_fingerprint=builder_fingerprint(cfg),
+    )
 
 
 def run(trunk, encoder, packed) -> ActionOutput:
@@ -262,7 +275,8 @@ def test_the_occupied_only_arm_starts_every_action_from_the_shared_base(move_lis
 
     torch.manual_seed(SEED)
     module = ActionBaseState(cfg)
-    state = module(one(graph), StateTrunk(cfg)(one(graph)).cells)
+    packed = one(graph, cfg)
+    state = module(packed, StateTrunk(cfg)(packed).cells)
     first = state.inv[:1].expand_as(state.inv)
     torch.testing.assert_close(state.inv, first)
     torch.testing.assert_close(state.inv[0], module.no_cell_inv)
@@ -357,6 +371,7 @@ def test_perturbing_one_of_the_eighteen_rows_moves_that_action_and_that_axis(gra
     broken = replace(packed, action_post1_class=packed.action_post1_class.clone())
     original = int(broken.action_post1_class[action, axis, slot])
     broken.action_post1_class[action, axis, slot] = (original + 17) % POST1_REL_CLASSES
+    broken = replan(broken, FULL)
     after = post(broken, base, state.windows)
 
     moved = ~torch.isclose(before.inv, after.inv).all(dim=1)
@@ -485,7 +500,7 @@ def permute_actions(packed: PackedACTBatch, order) -> PackedACTBatch:
     supported input; what it asks is whether an action's answer depends on
     where its alternatives sit in the list.
     """
-    return replace(
+    permuted = replace(
         packed,
         legal_to_cell_index=packed.legal_to_cell_index[order],
         action_window_index=packed.action_window_index[order],
@@ -493,6 +508,7 @@ def permute_actions(packed: PackedACTBatch, order) -> PackedACTBatch:
         action_pre_status=packed.action_pre_status[order],
         action_tactical_numeric=packed.action_tactical_numeric[order],
     )
+    return replace(permuted, plans=build_plans_from_cpu_batch(FULL, permuted))
 
 
 def test_permuting_the_action_set_permutes_the_outputs_and_nothing_else(
@@ -539,7 +555,7 @@ def relabel(packed: PackedACTBatch, permutation) -> PackedACTBatch:
     """
     table = torch.tensor(permutation, dtype=torch.long)
     route = packed.radius_axis_or_neg1
-    return replace(
+    relabelled = replace(
         packed,
         window_axis=table[packed.window_axis],
         adjacency_axis=table[packed.adjacency_axis],
@@ -548,6 +564,7 @@ def relabel(packed: PackedACTBatch, permutation) -> PackedACTBatch:
         action_post1_class=permute_axis_channels(packed.action_post1_class, permutation),
         action_pre_status=permute_axis_channels(packed.action_pre_status, permutation),
     )
+    return replace(relabelled, plans=build_plans_from_cpu_batch(FULL, relabelled))
 
 
 @pytest.mark.parametrize("permutation", PERMUTATIONS)
@@ -735,7 +752,7 @@ def test_the_disabled_tactical_block_contributes_nothing(move_lists, batch, trun
     assert not any("tactical" in name for name, _ in module.named_parameters())
 
     graph = build(hexo_py.Position.replay(move_lists[21]), cfg)
-    packed = one(graph)
+    packed = one(graph, cfg)
     assert packed.action_tactical_numeric.shape[1] == 0
     out = module(packed, StateTrunk(cfg)(packed))
     assert torch.isfinite(out.actions.inv).all()
@@ -743,13 +760,16 @@ def test_the_disabled_tactical_block_contributes_nothing(move_lists, batch, trun
     # And the full model refuses that zero-width block rather than reading a
     # projection of nothing; the disabled model refuses a populated one.
     with pytest.raises(ValueError, match="action_tactical_numeric carries 0 columns"):
-        ActionEncoder(FULL)(packed, StateTrunk(FULL)(packed))
+        full_bound = replan(packed, FULL)
+        ActionEncoder(FULL)(full_bound, StateTrunk(FULL)(full_bound))
     with pytest.raises(ValueError, match="action_tactical_numeric carries 12 columns"):
-        module(batch, trunk(batch))
+        disabled_bound = replan(batch, cfg)
+        module(disabled_bound, StateTrunk(cfg)(disabled_bound))
 
 
-def test_the_no_action_latents_arm_holds_no_action_latent_parameters(batch, trunk):
+def test_the_no_action_latents_arm_holds_no_action_latent_parameters(graphs):
     cfg = PRESETS["full_no_action_latents"]
+    batch = collate([graphs[plies] for plies in PLIES], cfg)
     module = ActionEncoder(cfg).eval()
     assert not any(pass_.enabled for pass_ in module.latents.passes)
     assert not list(module.latents.parameters())
@@ -758,8 +778,9 @@ def test_the_no_action_latents_arm_holds_no_action_latent_parameters(batch, trun
     assert torch.isfinite(out.actions.inv).all()
 
 
-def test_the_no_latents_arm_reads_no_state_latent_context(batch):
+def test_the_no_latents_arm_reads_no_state_latent_context(graphs):
     cfg = PRESETS["full_no_latents"]
+    batch = collate([graphs[plies] for plies in PLIES], cfg)
     module = ActionEncoder(cfg).eval()
     assert all(block.state_context is None for block in module.blocks)
     out = module(batch, StateTrunk(cfg)(batch))
@@ -850,8 +871,9 @@ def test_the_state_context_read_is_the_gathered_attention_it_replaced(
     torch.testing.assert_close(got.axis, want_axis, atol=2e-6, rtol=2e-6)
 
 
-def test_the_no_axis_arm_holds_no_axis_parameters_anywhere(batch):
+def test_the_no_axis_arm_holds_no_axis_parameters_anywhere(graphs):
     cfg = PRESETS["full_no_axis"]
+    batch = collate([graphs[plies] for plies in PLIES], cfg)
     module = ActionEncoder(cfg).eval()
     assert module.base.no_cell_axis is None
     assert module.post.pre_empty_axis is None
@@ -861,12 +883,13 @@ def test_the_no_axis_arm_holds_no_axis_parameters_anywhere(batch):
     assert torch.isfinite(out.actions.inv).all()
 
 
-def test_the_counterfactual_encoder_can_be_removed_whole(batch, trunk):
+def test_the_counterfactual_encoder_can_be_removed_whole(graphs):
     cfg = replace(FULL, use_counterfactual_action_windows=False)
+    batch = collate([graphs[plies] for plies in PLIES], cfg)
     module = ActionEncoder(cfg).eval()
     assert module.post is None
     assert not any("post" in name for name, _ in module.named_parameters())
-    out = module(batch, trunk(batch))
+    out = module(batch, StateTrunk(cfg)(batch))
     assert torch.isfinite(out.actions.inv).all()
 
 

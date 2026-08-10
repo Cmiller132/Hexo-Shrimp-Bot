@@ -219,7 +219,7 @@ def build(position, cfg: MantisACTConfig) -> ACTGraph:
 
 def collate_positions(positions: Sequence, cfg: MantisACTConfig) -> PackedACTBatch:
     """Build a sequence of ``hexo_py.Position`` objects into one packed batch."""
-    return collate([build(position, cfg) for position in positions])
+    return collate([build(position, cfg) for position in positions], cfg)
 
 
 def collate_prefixes(
@@ -246,4 +246,4 @@ def collate_prefixes(
                 f"prefix {i} asks for {t} moves of a {len(moves)}-move game"
             )
         graphs.append(build(hexo_py.Position.replay(moves[:t]), cfg))
-    return collate(graphs)
+    return collate(graphs, cfg)

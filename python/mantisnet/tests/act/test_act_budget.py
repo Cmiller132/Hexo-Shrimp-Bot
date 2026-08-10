@@ -92,7 +92,7 @@ def test_a_graphs_cells_are_its_stones_plus_its_legal_moves(game, ply):
 def test_the_costs_unit_is_the_quantity_telemetry_reports():
     """The §26 counts the packer limits and the ones a batch reports agree."""
     plies = (21, 61, 121, 161)
-    batch = collate([build(position(0, ply), FULL) for ply in plies])
+    batch = collate([build(position(0, ply), FULL) for ply in plies], FULL)
     stats = telemetry(batch)
 
     cost = ACTChunkCost(
@@ -182,7 +182,8 @@ def test_the_model_supplies_its_own_law_and_its_own_collation():
         [
             build(hexo_py.Position.replay(game[:ply]), TINY)
             for game, ply in zip(games, (21, 31))
-        ]
+        ],
+        TINY,
     )
     assert int(packed.position_count) == 2
     assert torch.equal(packed.cell_offsets, expected.cell_offsets)

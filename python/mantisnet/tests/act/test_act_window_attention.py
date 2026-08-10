@@ -227,7 +227,7 @@ def graphs(move_lists):
 
 @pytest.fixture(scope="module")
 def batch(graphs):
-    return collate([graphs[plies] for plies in PLIES])
+    return collate([graphs[plies] for plies in PLIES], TYPED)
 
 
 # --------------------------------------------------------------------------
@@ -239,7 +239,7 @@ def test_the_pair_join_matches_the_ordered_pair_oracle(graphs, plies):
     """§16's two class families, against a quadratic statement of what they are."""
     graph = graphs[plies]
     assert graph.n_windows > 0
-    got = derived_pairs(collate([graph]))
+    got = derived_pairs(collate([graph], TYPED))
     want = naive_pairs(graph.window_id)
     assert got == want
     # Both families and the self loop are actually present, so a match is not a
@@ -296,9 +296,9 @@ def test_every_relation_class_survives_every_d6_transform(move_lists, transform_
     windows = window_correspondence(base, turned, transform_index)
     mapped = {
         (int(windows[dst]), int(windows[src]), cls)
-        for dst, src, cls in derived_pairs(collate([base]))
+        for dst, src, cls in derived_pairs(collate([base], TYPED))
     }
-    assert mapped == derived_pairs(collate([turned]))
+    assert mapped == derived_pairs(collate([turned], TYPED))
 
 
 def window_correspondence(base, image, transform_index) -> np.ndarray:
@@ -335,7 +335,7 @@ def state_of(n_windows: int, cfg, generator) -> EquivariantState:
 def test_both_streams_match_the_dense_oracle(graphs):
     """Parity, and the claim that a channel attends only within itself."""
     graph = graphs[21]
-    packed = collate([graph])
+    packed = collate([graph], TYPED)
     generator = torch.Generator().manual_seed(SEED)
     torch.manual_seed(SEED)
 
@@ -385,7 +385,7 @@ def test_both_streams_match_the_dense_oracle(graphs):
 def test_the_gradients_match_the_dense_oracles(graphs):
     """The custom backward, as this arm calls it, against plain autograd."""
     graph = graphs[7]
-    packed = collate([graph])
+    packed = collate([graph], TYPED)
     classes = class_matrix(graph.window_id)
     n, heads = graph.n_windows, 2
     head_dim = 5
@@ -420,7 +420,7 @@ def test_the_device_path_matches_the_host_path(graphs):
     are different code and only a cross-device comparison holds them together.
     """
     graph = graphs[21]
-    packed = collate([graph])
+    packed = collate([graph], TYPED)
     torch.manual_seed(SEED)
     module = TypedWindowAttention(TYPED).eval()
     with torch.no_grad():
@@ -450,7 +450,7 @@ def test_the_axis_bias_is_one_table_shared_by_the_three_channels():
 def test_permuting_the_channels_permutes_the_axis_output(graphs):
     """§12.1 on the stage alone, without the builder in the way."""
     graph = graphs[21]
-    edges = window_window_edges(collate([graph]))
+    edges = window_window_edges(collate([graph], TYPED))
     generator = torch.Generator().manual_seed(SEED)
     torch.manual_seed(SEED)
     module = TypedWindowAttention(TYPED).eval()
@@ -470,7 +470,7 @@ def test_permuting_the_channels_permutes_the_axis_output(graphs):
 
 def test_the_module_refuses_a_state_or_an_edge_set_that_is_not_its_own(graphs):
     module = TypedWindowAttention(TYPED)
-    edges = window_window_edges(collate([graphs[21]]))
+    edges = window_window_edges(collate([graphs[21]], TYPED))
     generator = torch.Generator().manual_seed(SEED)
     with pytest.raises(ValueError, match="windows against the edge family"):
         module(edges, state_of(edges.n_windows + 1, TYPED, generator))
@@ -509,8 +509,8 @@ def test_the_typed_trunk_maps_under_every_d6_transform(move_lists, transform_ind
                 parameter.normal_(0.5, 0.2)
     trunk.eval()
 
-    before = trunk(collate([base]))
-    after = trunk(collate([turned]))
+    before = trunk(collate([base], TYPED))
+    after = trunk(collate([turned], TYPED))
     windows = torch.from_numpy(window_correspondence(base, turned, transform_index))
     permutation = axis_permutation(transform_index)
 

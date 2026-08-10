@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import dataclass
 from typing import Sequence
 
 import torch
 from torch import Tensor
 
 from .equivariant import at_least_fp32
+from .plans import LatentSegments
 
 try:
     import triton
@@ -78,30 +78,6 @@ def row_positions(offsets: Tensor, n_rows: int) -> Tensor:
 
 # --------------------------------------------------------------------------
 # The multi-range view of a read's key rows
-
-
-@dataclass(frozen=True, eq=False)
-class LatentSegments:
-    """Which concatenated key rows belong to which position (§26).
-
-    ``ranges`` is ``(P, F, 2)``: the half-open row span each of the ``F``
-    concatenated node families contributes to each position. ``range_base`` is
-    where that span starts in the position's own row numbering, and ``counts``
-    is how many rows the position owns altogether, letting a split take an
-    even slice of a position whose rows are in several pieces.
-
-    ``row_pos`` is the same information inverted — one position per row —
-    used by the per-node gradient kernel and the torch reference. Both are
-    derived from the families' CSR offsets, so they cannot disagree.
-    """
-
-    ranges: Tensor
-    range_base: Tensor
-    counts: Tensor
-    row_pos: Tensor
-    n_rows: int
-    positions: int
-    families: int
 
 
 def latent_segments(
