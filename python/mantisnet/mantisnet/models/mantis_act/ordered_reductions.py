@@ -21,12 +21,13 @@ def _accumulate_dtype(tensor: Tensor) -> torch.dtype:
     return torch.promote_types(tensor.dtype, torch.float32)
 
 
-def _lengths(offsets: Tensor) -> Tensor:
-    return (offsets[1:] - offsets[:-1]).long()
-
-
 def ordered_segment_sum(values: Tensor, offsets: Tensor) -> Tensor:
-    """Sum contiguous rows according to ``offsets``, in at least fp32."""
+    """Sum contiguous rows according to ``offsets``, in at least fp32.
+
+    ``offsets`` comes from a collate-built plan whose constructor already
+    validated monotonicity and bounds; the ``lengths=`` form would rebuild
+    them with a scan and revalidate on every call.
+    """
     if values.ndim < 1:
         raise ValueError(f"values must have a row dimension, got {values.shape}")
     if offsets.ndim != 1:
@@ -34,7 +35,7 @@ def ordered_segment_sum(values: Tensor, offsets: Tensor) -> Tensor:
     reduced = torch.segment_reduce(
         values.to(_accumulate_dtype(values)),
         "sum",
-        lengths=_lengths(offsets),
+        offsets=offsets.long(),
         initial=0.0,
     )
     if reduced.shape[0] != offsets.shape[0] - 1:
@@ -73,10 +74,13 @@ def ordered_two_stage_segment_sum(
             dtype=_accumulate_dtype(values),
         )
 
+    block_row_offsets = torch.cat(
+        [block_lengths.new_zeros(1), block_lengths.cumsum(0)]
+    )
     partials = torch.segment_reduce(
         values.to(_accumulate_dtype(values)),
         "sum",
-        lengths=block_lengths.long(),
+        offsets=block_row_offsets.long(),
         initial=0.0,
     )
     return ordered_segment_sum(partials, block_offsets)
@@ -197,7 +201,7 @@ def ordered_segment_max(values: Tensor, offsets: Tensor) -> Tensor:
     return torch.segment_reduce(
         values,
         "max",
-        lengths=_lengths(offsets),
+        offsets=offsets.long(),
         initial=torch.finfo(values.dtype).min,
     )
 
