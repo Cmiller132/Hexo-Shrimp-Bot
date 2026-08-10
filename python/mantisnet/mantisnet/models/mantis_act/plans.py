@@ -10,6 +10,11 @@ The row-to-position and phase vectors remain ``int64`` because they are also
 ordinary torch gather indices.  Every sort is stable: rows tied on a source,
 destination, relation, embedding class, or source window retain the canonical
 packed row order, which fixes the order of deterministic reductions.
+
+The initial embedding tables and repeated action-to-cell gather also carry
+stable source-major views. Their forwards remain ordinary traceable gathers;
+the views replace only the duplicate-index backwards that Inductor would
+otherwise lower to atomic scatters.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from torch import Tensor
 from .config import MantisACTConfig
 from .pattern_classes import (
     ALL_CELL_WINDOW_REL_CLASSES,
+    ALL_WINDOW_PATTERN_CLASSES,
     MIXED,
     POST1_REL_CLASSES,
 )
@@ -35,6 +41,12 @@ from .symmetry import RELATION_PAD, coarse_relation, coarse_relation_count, orbi
 AXIS_CHANNELS = 3
 INCIDENCE_RELATIONS = ALL_CELL_WINDOW_REL_CLASSES
 WINDOW_STATUSES = MIXED + 1
+# The five initial embedding vocabularies. These heights are frozen by the
+# builder schema (state_trunk holds the matching module-side assertions).
+CELL_OCCUPANCY_CLASSES = 3
+CELL_LEGAL_CLASSES = 2
+CELL_NEAREST_CLASSES = 10
+WINDOW_PATTERN_CLASSES = ALL_WINDOW_PATTERN_CLASSES
 _INT32_MAX = np.iinfo(np.int32).max
 
 # Exactly the switches consumed while enumerating an ACTGraph or deriving the
@@ -540,6 +552,101 @@ class ClassRowPlan:
 
 
 @dataclass(frozen=True, eq=False)
+class EmbeddingRowPlans:
+    """Stable class-major rows for the five state-input embedding tables."""
+
+    cell_occupancy: ClassRowPlan
+    cell_legal: ClassRowPlan
+    cell_nearest: ClassRowPlan
+    window_pattern: ClassRowPlan
+    window_status: ClassRowPlan
+
+    def __post_init__(self) -> None:
+        plans = tuple(vars(self).values())
+        if len({plan.device for plan in plans}) != 1:
+            raise ValueError("state embedding row plans are on different devices")
+        if len({plan.n_rows for plan in plans[:3]}) != 1:
+            raise ValueError("cell embedding row plans describe different row counts")
+        if len({plan.n_rows for plan in plans[3:]}) != 1:
+            raise ValueError("window embedding row plans describe different row counts")
+
+    @property
+    def device(self) -> torch.device:
+        return self.cell_occupancy.device
+
+    def to(self, device, *, non_blocking: bool = True) -> "EmbeddingRowPlans":
+        return EmbeddingRowPlans(
+            **{
+                name: value.to(device, non_blocking=non_blocking)
+                for name, value in vars(self).items()
+            }
+        )
+
+    def pin_memory(self) -> "EmbeddingRowPlans":
+        return EmbeddingRowPlans(
+            **{name: value.pin_memory() for name, value in vars(self).items()}
+        )
+
+
+@dataclass(frozen=True, eq=False)
+class GatherRowPlan:
+    """Output rows stably grouped by a dynamic source-table row."""
+
+    n_rows: int
+    n_sources: int
+    ptr: Tensor
+    rows: Tensor
+    name: str
+
+    def __post_init__(self) -> None:
+        if self.n_rows < 0 or self.n_sources < 1:
+            raise ValueError(
+                f"{self.name} needs nonnegative rows and positive sources, got "
+                f"{self.n_rows}, {self.n_sources}"
+            )
+        device = _tensor(
+            f"{self.name}.ptr", self.ptr, dtype=torch.int32, rows=self.n_sources + 1
+        )
+        _tensor(
+            f"{self.name}.rows",
+            self.rows,
+            dtype=torch.int32,
+            rows=self.n_rows,
+            device=device,
+        )
+        if device.type == "cpu":
+            if int(self.ptr[0]) != 0 or int(self.ptr[-1]) != self.n_rows:
+                raise ValueError(f"{self.name}.ptr must span 0..{self.n_rows}")
+            if bool((self.ptr[1:] < self.ptr[:-1]).any()):
+                raise ValueError(f"{self.name}.ptr must be monotone")
+            expected = torch.arange(self.n_rows, dtype=torch.int32)
+            if not torch.equal(self.rows.sort().values, expected):
+                raise ValueError(f"{self.name}.rows must be a permutation")
+
+    @property
+    def device(self) -> torch.device:
+        return self.ptr.device
+
+    def to(self, device, *, non_blocking: bool = True) -> "GatherRowPlan":
+        return GatherRowPlan(
+            self.n_rows,
+            self.n_sources,
+            self.ptr.to(device, non_blocking=non_blocking),
+            self.rows.to(device, non_blocking=non_blocking),
+            self.name,
+        )
+
+    def pin_memory(self) -> "GatherRowPlan":
+        return GatherRowPlan(
+            self.n_rows,
+            self.n_sources,
+            self.ptr.pin_memory(),
+            self.rows.pin_memory(),
+            self.name,
+        )
+
+
+@dataclass(frozen=True, eq=False)
 class SourceWindowPlan:
     """Action rows grouped by persistent source window, plus sentinel rows."""
 
@@ -614,12 +721,20 @@ class ActionRowPlans:
     post1: ClassRowPlan
     pre_status: ClassRowPlan
     source_window: SourceWindowPlan
+    base_cell: GatherRowPlan
 
     def __post_init__(self) -> None:
         if len({self.post1.n_rows, self.pre_status.n_rows, self.source_window.n_rows}) != 1:
             raise ValueError("the three action row plans describe different row counts")
-        if len({self.post1.device, self.pre_status.device, self.source_window.device}) != 1:
-            raise ValueError("the three action row plans are on different devices")
+        if len(
+            {
+                self.post1.device,
+                self.pre_status.device,
+                self.source_window.device,
+                self.base_cell.device,
+            }
+        ) != 1:
+            raise ValueError("the action row plans are on different devices")
 
     @property
     def device(self) -> torch.device:
@@ -630,6 +745,7 @@ class ActionRowPlans:
             self.post1.to(device, non_blocking=non_blocking),
             self.pre_status.to(device, non_blocking=non_blocking),
             self.source_window.to(device, non_blocking=non_blocking),
+            self.base_cell.to(device, non_blocking=non_blocking),
         )
 
     def pin_memory(self) -> "ActionRowPlans":
@@ -637,6 +753,7 @@ class ActionRowPlans:
             self.post1.pin_memory(),
             self.pre_status.pin_memory(),
             self.source_window.pin_memory(),
+            self.base_cell.pin_memory(),
         )
 
 
@@ -645,6 +762,7 @@ class ACTPlans:
     """Every batch-only execution view moved with ``PackedACTBatch``."""
 
     state_edges: StatePlans
+    embedding_rows: EmbeddingRowPlans
     action_rows: ActionRowPlans
     cell_row_pos: Tensor
     window_row_pos: Tensor
@@ -666,7 +784,12 @@ class ACTPlans:
             "action_phase",
         ):
             _tensor(name, getattr(self, name), dtype=torch.int64, device=device)
-        for name in ("action_rows", "state_segments", "action_segments"):
+        for name in (
+            "embedding_rows",
+            "action_rows",
+            "state_segments",
+            "action_segments",
+        ):
             value = getattr(self, name)
             if value.device != device:
                 raise ValueError(f"{name} is on {value.device}, state plans on {device}")
@@ -679,6 +802,10 @@ class ACTPlans:
         n_cells = int(self.cell_row_pos.shape[0])
         n_windows = int(self.window_row_pos.shape[0])
         n_legal = int(self.legal_row_pos.shape[0])
+        if self.embedding_rows.cell_occupancy.n_rows != n_cells:
+            raise ValueError("cell embedding plans disagree with the cell row count")
+        if self.embedding_rows.window_pattern.n_rows != n_windows:
+            raise ValueError("window embedding plans disagree with the window row count")
         state = self.state_edges
         if (state.to_windows.n_src, state.to_windows.n_dst) != (n_cells, n_windows):
             raise ValueError("cells->windows plans disagree with row-position lengths")
@@ -690,6 +817,10 @@ class ACTPlans:
                 raise ValueError(f"{name} plans disagree with the cell row count")
         if self.action_rows.post1.n_rows != n_legal * AXIS_CHANNELS * 6:
             raise ValueError("action class plans do not cover the 3x6 row grid")
+        if self.action_rows.base_cell.n_rows != n_legal:
+            raise ValueError("action base-cell plan disagrees with the legal row count")
+        if self.action_rows.base_cell.n_sources != n_cells + 1:
+            raise ValueError("action base-cell plan lacks the sentinel source row")
         if (
             self.state_segments.n_rows != n_cells + n_windows
             or self.state_segments.families != 2
@@ -936,6 +1067,22 @@ def _class_rows(values: np.ndarray, n_classes: int, name: str) -> ClassRowPlan:
     )
 
 
+def _gather_rows(values: np.ndarray, n_sources: int, name: str) -> GatherRowPlan:
+    """Build a stable source-major backward plan for one ordinary gather."""
+    values = np.asarray(values, dtype=np.int64).reshape(-1)
+    if values.size and (values.min() < 0 or values.max() >= n_sources):
+        raise ValueError(f"{name} sources lie outside 0..{n_sources - 1}")
+    order = np.argsort(values, kind="stable")
+    ptr = _csr(values[order], n_sources, f"{name}.ptr")
+    return GatherRowPlan(
+        n_rows=int(values.size),
+        n_sources=int(n_sources),
+        ptr=_torch_int32(name, ptr),
+        rows=_torch_int32(name, order),
+        name=name,
+    )
+
+
 def _source_windows(values: np.ndarray, n_windows: int) -> SourceWindowPlan:
     values = np.asarray(values, dtype=np.int64).reshape(-1)
     if values.size and (values.min() < -1 or values.max() >= n_windows):
@@ -1089,6 +1236,28 @@ def build_plans(
             name="occupied radius",
         )
 
+    embedding_rows = EmbeddingRowPlans(
+        cell_occupancy=_class_rows(
+            arrays["cell_occupancy"], CELL_OCCUPANCY_CLASSES, "cell occupancy"
+        ),
+        cell_legal=_class_rows(
+            arrays["cell_is_legal"], CELL_LEGAL_CLASSES, "cell legal"
+        ),
+        cell_nearest=_class_rows(
+            arrays["cell_nearest_bucket"], CELL_NEAREST_CLASSES, "cell nearest"
+        ),
+        window_pattern=_class_rows(
+            arrays["window_pattern_class"],
+            WINDOW_PATTERN_CLASSES,
+            "window pattern",
+        ),
+        window_status=_class_rows(
+            arrays["window_status"], WINDOW_STATUSES, "window status"
+        ),
+    )
+
+    base_cell = np.asarray(arrays["legal_to_cell_index"], dtype=np.int64)
+    base_cell = np.where(base_cell >= 0, base_cell, n_cells)
     action_rows = ActionRowPlans(
         post1=_class_rows(
             arrays["action_post1_class"], POST1_REL_CLASSES, "action post1"
@@ -1097,6 +1266,7 @@ def build_plans(
             arrays["action_pre_status"], WINDOW_STATUSES, "action pre_status"
         ),
         source_window=_source_windows(arrays["action_window_index"], n_windows),
+        base_cell=_gather_rows(base_cell, n_cells + 1, "action base cell"),
     )
 
     cell_row_pos = _row_positions(cell_offsets, "cell")
@@ -1109,6 +1279,7 @@ def build_plans(
 
     return ACTPlans(
         state_edges=StatePlans(to_windows, to_cells, adjacency, radius),
+        embedding_rows=embedding_rows,
         action_rows=action_rows,
         cell_row_pos=_torch_int64(cell_row_pos),
         window_row_pos=_torch_int64(window_row_pos),
@@ -1136,6 +1307,11 @@ _BATCH_PLAN_ARRAYS = (
     "radius_orbit",
     "radius_axis_or_neg1",
     "cell_occupancy",
+    "cell_is_legal",
+    "cell_nearest_bucket",
+    "window_pattern_class",
+    "window_status",
+    "legal_to_cell_index",
     "action_post1_class",
     "action_pre_status",
     "action_window_index",
@@ -1182,6 +1358,8 @@ __all__ = [
     "ACTPlans",
     "ActionRowPlans",
     "ClassRowPlan",
+    "EmbeddingRowPlans",
+    "GatherRowPlan",
     "INCIDENCE_RELATIONS",
     "LatentSegments",
     "PlannedEdges",
