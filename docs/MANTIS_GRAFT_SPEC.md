@@ -217,17 +217,22 @@ by them, and this spec cites them nowhere as grounds. The only evidence that
 counts for any verdict is this campaign's own paired measurements.
 
 Steps keep their numbers as stable identities. Execution follows the
-owner-set favourites order (2026-08-10), dependencies respected:
+owner-set order (2026-08-10, revised same day to elevate mixed windows —
+an owner priority — out of the frontier), dependencies respected:
 
 ```text
-0 → 1 → 4 → 2 → 5 → 3 → 6 → 7 → 9 → 8 → 10 → frontier
+0 → 1 → 12 → 4 → 2 → 5 → 3 → 6 → 7 → 9 → 8 → 10 → frontier
 ```
 
-(Step 5 presumes Step 4's verdict; Steps 3 and 9 require Step 2 to have
-landed.) The owner may revise the order between steps. Steps 11–14
-(**structural frontier**) additionally require an explicit owner decision
-*before work starts*, because each is a large implementation whose hard speed
-gate is at serious risk from irreducible work.
+Step 12 precedes Step 4 so the counterfactual action tables are built
+ternary-native (729 classes) once, rather than binary (189) and then
+migrated; if Step 12's verdict is a revert, Step 4 proceeds with the
+binary-graft tables as specified. (Step 5 presumes Step 4's verdict; Steps 3
+and 9 require Step 2 to have landed.) The owner may revise the order between
+steps. Steps 11, 13, and 14 (**structural frontier**) additionally require
+an explicit owner decision *before work starts*, because each is a large
+implementation whose hard speed gate is at serious risk from irreducible
+work; Step 12's elevation on 2026-08-10 is exactly such a decision.
 
 ---
 
@@ -583,14 +588,14 @@ budget; measured.
 
 ---
 
-### Structural frontier — steps 11–14
+### Structural frontier — steps 11, 13, 14 (and 12's origin here)
 
 Each of these is a large build whose irreducible cost puts the hard speed
-gate at genuine risk, and whose prior evidence on ACT was neutral-to-negative.
-Per the campaign rules they remain fully specified candidates — prior ACT
-evidence is *not* a verdict on a production graft — but **starting one
-requires an explicit owner decision**, and each carries its honest cost
-projection in the request.
+gate at genuine risk. Per the campaign rules they remain fully specified
+candidates, but **starting one requires an explicit owner decision**, and
+each carries its honest cost projection in the request. Step 12 received
+that decision on 2026-08-10 (owner: all-nonempty windows are a priority
+idea) and moved into the main execution line; its speed gate is unchanged.
 
 ### Step 11 — `orbit48`
 
