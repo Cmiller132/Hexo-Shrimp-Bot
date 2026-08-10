@@ -13,6 +13,7 @@ from mantisnet.models.mantis_act.ordered_reductions import (
     ordered_index_select,
     ordered_row_broadcast,
     ordered_segment_max,
+    ordered_two_stage_segment_sum,
 )
 from mantisnet.models.mantis_act.actions import TACTICAL_FEATURES
 from mantisnet.models.mantis_act.builder import GLOBAL_NUMERIC_FEATURES
@@ -75,6 +76,34 @@ def test_ordered_row_broadcast_and_segment_max_match_segment_oracles():
     )
 
 
+def test_two_stage_segment_sum_matches_fixed_block_oracle_with_an_empty_owner():
+    values = (
+        torch.arange(14, dtype=torch.float64).reshape(7, 2).remainder(5) - 2
+    ) / 8
+    # Owner 0 has consecutive blocks of 2 and 1 rows; owner 1 is empty; owner
+    # 2 has two consecutive 2-row blocks.  This is the same compact block CSR
+    # emitted by plans.py, only with a deliberately tiny block size.
+    block_lengths = torch.tensor([2, 1, 2, 2], dtype=torch.int32)
+    block_offsets = torch.tensor([0, 2, 2, 4], dtype=torch.int32)
+
+    actual = ordered_two_stage_segment_sum(values, block_offsets, block_lengths)
+    expected = torch.stack(
+        (
+            values[:3].sum(0),
+            torch.zeros(2, dtype=torch.float64),
+            values[3:].sum(0),
+        )
+    )
+    assert torch.equal(actual, expected)
+
+    all_empty = ordered_two_stage_segment_sum(
+        torch.empty(0, 2, dtype=torch.float64),
+        torch.zeros(4, dtype=torch.int32),
+        torch.empty(0, dtype=torch.int32),
+    )
+    assert torch.equal(all_empty, torch.zeros(3, 2, dtype=torch.float64))
+
+
 def test_all_ordered_reductions_pass_float64_gradcheck():
     index = torch.tensor([2, 0, 2, 1, 0], dtype=torch.long)
     class_offsets, rows = _class_plan(index, 3)
@@ -99,6 +128,16 @@ def test_all_ordered_reductions_pass_float64_gradcheck():
     assert torch.autograd.gradcheck(
         lambda value: ordered_segment_max(value, segment_offsets),
         (values,),
+    )
+
+    blocked = torch.randn(7, 2, dtype=torch.float64, requires_grad=True)
+    block_lengths = torch.tensor([2, 1, 2, 2], dtype=torch.int32)
+    block_offsets = torch.tensor([0, 2, 2, 4], dtype=torch.int32)
+    assert torch.autograd.gradcheck(
+        lambda value: ordered_two_stage_segment_sum(
+            value, block_offsets, block_lengths
+        ),
+        (blocked,),
     )
 
 

@@ -15,7 +15,11 @@ from mantisnet.models.mantis_act.builder import GLOBAL_NUMERIC_FEATURES
 from mantisnet.models.mantis_act.config import MantisACTConfig, PRESETS
 from mantisnet.models.mantis_act.model import MantisACT
 from mantisnet.models.mantis_act.packed import collate
-from mantisnet.models.mantis_act.plans import ClassRowPlan, builder_fingerprint
+from mantisnet.models.mantis_act.plans import (
+    CLASS_REDUCTION_BLOCK_ROWS,
+    ClassRowPlan,
+    builder_fingerprint,
+)
 from mantisnet.models.mantis_act.state_trunk import StateTrunk
 from mantisnet.models.mantis_act.windows import WINDOW_NUMERIC_FEATURES
 
@@ -178,6 +182,20 @@ def _assert_class_csr(values: torch.Tensor, plan) -> None:
         want_ptr.append(len(want_rows))
     assert plan.ptr.tolist() == want_ptr
     assert plan.rows.tolist() == want_rows
+    if isinstance(plan, ClassRowPlan):
+        want_block_ptr = [0]
+        want_block_starts = []
+        want_block_lengths = []
+        for start, end in zip(want_ptr[:-1], want_ptr[1:], strict=True):
+            for block_start in range(start, end, CLASS_REDUCTION_BLOCK_ROWS):
+                want_block_starts.append(block_start)
+                want_block_lengths.append(
+                    min(CLASS_REDUCTION_BLOCK_ROWS, end - block_start)
+                )
+            want_block_ptr.append(len(want_block_starts))
+        assert plan.block_ptr.tolist() == want_block_ptr
+        assert plan.block_starts.tolist() == want_block_starts
+        assert plan.block_lengths.tolist() == want_block_lengths
 
 
 def test_action_class_and_source_window_csrs_are_stable_and_exact(batch):
@@ -251,6 +269,8 @@ def test_collate_and_transport_mark_chunk_rows_but_not_fixed_pointers_dynamic():
             state.inv_plan.dst_src,
             state.inv_plan.rel_src,
             action.post1.rows,
+            action.post1.block_starts,
+            action.post1.block_lengths,
             action.source_window.ptr,
             action.base_cell.ptr,
             candidate.plans.embedding_rows.cell_occupancy.rows,
@@ -265,10 +285,12 @@ def test_collate_and_transport_mark_chunk_rows_but_not_fixed_pointers_dynamic():
         assert state.inv_plan.rel_ptr.shape[0] > 2
         assert action.post1.ptr.shape[0] > 2
         assert action.pre_status.ptr.shape[0] > 2
+        assert action.post1.block_ptr.shape[0] > 2
         assert candidate.plans.embedding_rows.cell_nearest.ptr.shape[0] > 2
         assert not _is_dim0_dynamic(state.inv_plan.rel_ptr)
         assert not _is_dim0_dynamic(action.post1.ptr)
         assert not _is_dim0_dynamic(action.pre_status.ptr)
+        assert not _is_dim0_dynamic(action.post1.block_ptr)
         assert not _is_dim0_dynamic(
             candidate.plans.embedding_rows.cell_nearest.ptr
         )
@@ -299,6 +321,9 @@ def test_nested_plan_rows_share_one_fullgraph_dynamic_compile_across_chunks():
             + state.rel_ptr.float().sum()
             + action.post1.ptr.float().sum()
             + action.post1.rows.float().sum()
+            + action.post1.block_ptr.float().sum()
+            + action.post1.block_starts.float().sum()
+            + action.post1.block_lengths.float().sum()
             + action.base_cell.ptr.float().sum()
             + action.base_cell.rows.float().sum()
             + embeddings.window_pattern.ptr.float().sum()
@@ -376,6 +401,9 @@ def test_plan_pinning_is_recursive(batch):
     assert pinned.plans.state_edges.radius.inv_plan.dst_ptr.is_pinned()
     assert pinned.plans.state_edges.radius.routed_src.is_pinned()
     assert pinned.plans.action_rows.post1.rows.is_pinned()
+    assert pinned.plans.action_rows.post1.block_ptr.is_pinned()
+    assert pinned.plans.action_rows.post1.block_starts.is_pinned()
+    assert pinned.plans.action_rows.post1.block_lengths.is_pinned()
     assert pinned.plans.action_rows.base_cell.ptr.is_pinned()
     assert pinned.plans.embedding_rows.window_pattern.rows.is_pinned()
     assert pinned.plans.state_segments.ranges.is_pinned()
@@ -435,6 +463,19 @@ def test_class_csr_validation_rejects_a_nonpermutation(batch):
     broken_rows[0] = broken_rows[1]
     with pytest.raises(ValueError, match="permutation"):
         replace(plan, rows=broken_rows)
+
+
+def test_class_csr_validation_rejects_a_broken_block_partition(batch):
+    plan = batch.plans.action_rows.pre_status
+    broken_starts = plan.block_starts.clone()
+    broken_starts[0] += 1
+    with pytest.raises(ValueError, match="starts at"):
+        replace(plan, block_starts=broken_starts)
+
+    broken_lengths = plan.block_lengths.clone()
+    broken_lengths[0] = CLASS_REDUCTION_BLOCK_ROWS + 1
+    with pytest.raises(ValueError, match="block_lengths"):
+        replace(plan, block_lengths=broken_lengths)
 
 
 def test_collate_requires_the_builder_config():

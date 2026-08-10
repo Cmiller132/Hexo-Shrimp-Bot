@@ -16,9 +16,12 @@ from __future__ import annotations
 
 import pytest
 import torch
+from functorch.compile import make_boxed_func
+from torch._dynamo.backends.common import aot_autograd
 
 from mantisnet.models.mantis_act import class_embedding as kernel
 from mantisnet.models.mantis_act.class_embedding import class_pair_embedding
+from mantisnet.models.mantis_act.plans import CLASS_REDUCTION_BLOCK_ROWS
 
 
 SEED = 20260809
@@ -43,6 +46,27 @@ def stable_csr(index: torch.Tensor, classes: int) -> tuple[torch.Tensor, torch.T
         rows.extend(bucket)
         ptr.append(len(rows))
     return torch.tensor(ptr, dtype=torch.int32), torch.tensor(rows, dtype=torch.int32)
+
+
+def stable_blocks(
+    ptr: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Partition every class run into fixed, contiguous blocks in order."""
+    block_ptr = [0]
+    starts: list[int] = []
+    lengths: list[int] = []
+    for class_start, class_end in zip(ptr[:-1].tolist(), ptr[1:].tolist()):
+        class_start = int(class_start)
+        class_end = int(class_end)
+        for start in range(class_start, class_end, CLASS_REDUCTION_BLOCK_ROWS):
+            starts.append(start)
+            lengths.append(min(CLASS_REDUCTION_BLOCK_ROWS, class_end - start))
+        block_ptr.append(len(starts))
+    return (
+        torch.tensor(block_ptr, dtype=torch.int32),
+        torch.tensor(starts, dtype=torch.int32),
+        torch.tensor(lengths, dtype=torch.int32),
+    )
 
 
 def oracle_forward(
@@ -94,6 +118,8 @@ def fixed_case(width: int = 5):
     )
     post_ptr, post_rows = stable_csr(post_index, 7)
     status_ptr, status_rows = stable_csr(status_index, 4)
+    post_blocks = stable_blocks(post_ptr)
+    status_blocks = stable_blocks(status_ptr)
     post_weight = (
         torch.arange(7 * width, dtype=torch.float64).reshape(7, width) - 11
     ) / 8
@@ -109,6 +135,8 @@ def fixed_case(width: int = 5):
         post_rows,
         status_ptr,
         status_rows,
+        *post_blocks,
+        *status_blocks,
     )
 
 
@@ -123,6 +151,8 @@ def random_case(*, rows: int, width: int, post_classes: int = 29):
     status_index[:4] = torch.arange(4, dtype=torch.int32)
     post_ptr, post_rows = stable_csr(post_index, post_classes)
     status_ptr, status_rows = stable_csr(status_index, 4)
+    post_blocks = stable_blocks(post_ptr)
+    status_blocks = stable_blocks(status_ptr)
     return (
         torch.randn(post_classes, width, generator=generator),
         torch.randn(4, width, generator=generator),
@@ -132,6 +162,8 @@ def random_case(*, rows: int, width: int, post_classes: int = 29):
         post_rows,
         status_ptr,
         status_rows,
+        *post_blocks,
+        *status_blocks,
     )
 
 
@@ -156,19 +188,32 @@ def relative(got: torch.Tensor, want: torch.Tensor) -> float:
 
 def test_python_csr_is_stable_and_covers_each_row_once():
     case = fixed_case()
-    for index, ptr, rows, classes in (
-        (case[2], case[4], case[5], 7),
-        (case[3], case[6], case[7], 4),
+    for index, ptr, rows, block_ptr, block_starts, block_lengths, classes in (
+        (case[2], case[4], case[5], case[8], case[9], case[10], 7),
+        (case[3], case[6], case[7], case[11], case[12], case[13], 4),
     ):
         assert sorted(rows.tolist()) == list(range(index.numel()))
         assert ptr.tolist()[0] == 0
         assert ptr.tolist()[-1] == index.numel()
+        assert block_ptr.tolist()[0] == 0
+        assert block_ptr.tolist()[-1] == block_starts.numel()
+        assert block_starts.numel() == block_lengths.numel()
         for class_id in range(classes):
             got = rows[ptr[class_id] : ptr[class_id + 1]].tolist()
             want = [
                 row for row, value in enumerate(index.tolist()) if value == class_id
             ]
             assert got == want
+            first_block = int(block_ptr[class_id])
+            last_block = int(block_ptr[class_id + 1])
+            starts = block_starts[first_block:last_block].tolist()
+            lengths = block_lengths[first_block:last_block].tolist()
+            cursor = int(ptr[class_id])
+            for start, length in zip(starts, lengths):
+                assert start == cursor
+                assert 1 <= length <= CLASS_REDUCTION_BLOCK_ROWS
+                cursor += length
+            assert cursor == int(ptr[class_id + 1])
 
 
 def test_cpu_forward_and_table_gradients_are_exact_against_the_oracle():
@@ -248,7 +293,9 @@ def test_outer_compile_sees_the_plain_forward_across_dynamic_row_counts():
     compiled = torch.compile(
         class_pair_embedding, backend=backend, dynamic=True, fullgraph=True
     )
-    for rows in (263, 521):
+    # Begin above one reduction block per class so the first trace does not
+    # accidentally equate either table width with its block-grid size.
+    for rows in (4097, 5003):
         case = random_case(rows=rows, width=8)
         got = compiled(*case)
         want = oracle_forward(case[0], case[1], case[2], case[3])
@@ -261,10 +308,23 @@ def test_outer_compile_sees_the_plain_forward_across_dynamic_row_counts():
 
 
 def test_outer_aot_autograd_composes_with_the_ordered_backward():
-    """AOTAutograd may inline the lookup while retaining the backward op node."""
-    case = random_case(rows=263, width=8)
+    """One dynamic AOT pair retains the backward op across block-grid sizes."""
+    cases = [
+        random_case(rows=4097, width=8),
+        random_case(rows=5003, width=8),
+    ]
     generator = torch.Generator().manual_seed(SEED + 3)
-    grad_out = torch.randn(263, 8, generator=generator)
+    grad_outs = [
+        torch.randn(case[2].shape[0], 8, generator=generator) for case in cases
+    ]
+    graphs = []
+
+    def compiler(kind):
+        def capture_graph(graph, _inputs):
+            graphs.append((kind, graph))
+            return make_boxed_func(graph.forward)
+
+        return capture_graph
 
     def loss(
         post,
@@ -275,6 +335,12 @@ def test_outer_aot_autograd_composes_with_the_ordered_backward():
         post_rows,
         status_ptr,
         status_rows,
+        post_block_ptr,
+        post_block_starts,
+        post_block_lengths,
+        status_block_ptr,
+        status_block_starts,
+        status_block_lengths,
         gradient,
     ):
         return (
@@ -287,22 +353,40 @@ def test_outer_aot_autograd_composes_with_the_ordered_backward():
                 post_rows,
                 status_ptr,
                 status_rows,
+                post_block_ptr,
+                post_block_starts,
+                post_block_lengths,
+                status_block_ptr,
+                status_block_starts,
+                status_block_lengths,
             )
             * gradient
         ).sum()
 
-    def capture(call):
+    def capture(call, case, grad_out):
         post = case[0].clone().requires_grad_(True)
         status = case[1].clone().requires_grad_(True)
         value = call(post, status, *case[2:], grad_out)
         value.backward()
         return value.detach(), post.grad, status.grad
 
-    eager = capture(loss)
-    compiled = torch.compile(loss, backend="aot_eager", dynamic=True, fullgraph=True)
-    actual = capture(compiled)
-    for got, want in zip(actual, eager):
-        torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+    eager = [
+        capture(loss, case, grad_out)
+        for case, grad_out in zip(cases, grad_outs, strict=True)
+    ]
+    backend = aot_autograd(
+        fw_compiler=compiler("forward"), bw_compiler=compiler("backward")
+    )
+    compiled = torch.compile(loss, backend=backend, dynamic=True, fullgraph=True)
+    actual = [
+        capture(compiled, case, grad_out)
+        for case, grad_out in zip(cases, grad_outs, strict=True)
+    ]
+    for got_run, want_run in zip(actual, eager, strict=True):
+        for got, want in zip(got_run, want_run, strict=True):
+            torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+    assert [kind for kind, _graph in graphs].count("forward") == 1
+    assert [kind for kind, _graph in graphs].count("backward") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -375,16 +459,34 @@ def test_repeated_class_gradients_are_bitwise_deterministic_in_fp32():
 
 @_CUDA
 def test_supported_cuda_signature_really_launches_ordered_backward(monkeypatch):
-    """A cached/reference fallback cannot satisfy the device acceptance test."""
+    """Both tables genuinely launch a grid-parallel sum and ordered combine."""
     assert kernel._FAILED_BACKWARD_SHAPES == {}
-    host = random_case(rows=263, width=64)
+    host = random_case(rows=4097, width=64, post_classes=17)
     post, status, *plans = on_device(host, "cuda", torch.float32)
     post.requires_grad_(True)
     status.requires_grad_(True)
-    assert kernel._supported(post, 64, 263)
+    assert kernel._supported(post, 64, 4097)
 
     calls = {"backward": 0}
+    sum_grids = []
+    combine_grids = []
     original_backward = kernel._launch_backward
+    original_sum = kernel._class_block_sum_kernel
+    original_combine = kernel._class_block_combine_kernel
+
+    class CountedKernel:
+        def __init__(self, original, grids):
+            self.original = original
+            self.grids = grids
+
+        def __getitem__(self, grid):
+            launch = self.original[grid]
+
+            def counted_launch(*args, **kwargs):
+                self.grids.append(grid)
+                return launch(*args, **kwargs)
+
+            return counted_launch
 
     def counted_backward(*args, **kwargs):
         result = original_backward(*args, **kwargs)
@@ -392,8 +494,22 @@ def test_supported_cuda_signature_really_launches_ordered_backward(monkeypatch):
         return result
 
     monkeypatch.setattr(kernel, "_launch_backward", counted_backward)
+    monkeypatch.setattr(
+        kernel, "_class_block_sum_kernel", CountedKernel(original_sum, sum_grids)
+    )
+    monkeypatch.setattr(
+        kernel,
+        "_class_block_combine_kernel",
+        CountedKernel(original_combine, combine_grids),
+    )
     class_pair_embedding(post, status, *plans).square().sum().backward()
     torch.cuda.synchronize()
 
     assert calls == {"backward": 1}
+    post_blocks = int(host[9].numel())
+    status_blocks = int(host[12].numel())
+    assert post_blocks > int(post.shape[0])
+    assert status_blocks > int(status.shape[0])
+    assert sum_grids == [(post_blocks,), (status_blocks,)]
+    assert combine_grids == [(int(post.shape[0]),), (int(status.shape[0]),)]
     assert kernel._FAILED_BACKWARD_SHAPES == {}

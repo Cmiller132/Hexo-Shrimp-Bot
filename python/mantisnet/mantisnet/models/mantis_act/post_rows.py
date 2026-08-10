@@ -29,6 +29,14 @@ except ImportError:  # pragma: no cover - exercised only without triton
 # row tile itself.
 _BLOCK_M = 32
 
+# The shared sentinel base is read by most post rows.  Giving that reduction
+# one owner program made its backward deterministic, but also serialized tens
+# of thousands of vector additions on one CTA.  The first stage below gives
+# each fixed, contiguous slice of the already-sorted sentinel plan one owner;
+# the second stage combines those partials in ascending slice order.  The
+# association is therefore fixed without sacrificing grid parallelism.
+_GATHER_BASE_BLOCK_ROWS = 256
+
 # The table gradients are summed over a fixed number of programs rather than
 # over the row count, so the partial buffer does not grow with the batch and
 # the second stage is a reduction over a dimension the grid fixes.
@@ -136,23 +144,50 @@ if triton is not None:
         tl.store(d_source_ptr + slot * D + offs, acc, mask=live_d)
 
     @triton.jit
-    def _gather_base_backward_kernel(
+    def _gather_base_backward_partial_kernel(
         sentinel_rows,
         grad_ptr,
-        d_base_ptr,
+        partial_ptr,
         sentinel_count,
         D: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        BLOCK_ROWS: tl.constexpr,
     ):
-        # The sentinel list is ascending flattened-row order. A single program
-        # walks it once, so the shared base gradient is deterministic too.
+        # The sentinel list is ascending flattened-row order.  One program
+        # owns one contiguous slice and writes one fp32 partial; no two
+        # programs ever write the same address.
+        block = tl.program_id(0)
+        start = block * BLOCK_ROWS
+        end = tl.minimum(start + BLOCK_ROWS, sentinel_count)
         offs = tl.arange(0, BLOCK_D)
         live_d = offs < D
         acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-        for entry in tl.range(0, sentinel_count):
+        for entry in tl.range(start, end):
             row = tl.load(sentinel_rows + entry)
             acc += tl.load(
                 grad_ptr + row * D + offs, mask=live_d, other=0.0
+            ).to(tl.float32)
+        tl.store(partial_ptr + block * D + offs, acc, mask=live_d)
+
+    @triton.jit
+    def _gather_base_backward_combine_kernel(
+        partial_ptr,
+        d_base_ptr,
+        partial_count,
+        D: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+    ):
+        # A single owner visits the stage-one partials in their fixed ascending
+        # block order.  This is the only serialization left, and its trip count
+        # is reduced by GATHER_BASE_BLOCK_ROWS.
+        offs = tl.arange(0, BLOCK_D)
+        live_d = offs < D
+        acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+        for block in tl.range(0, partial_count):
+            acc += tl.load(
+                partial_ptr + block * D + offs,
+                mask=live_d,
+                other=0.0,
             ).to(tl.float32)
         tl.store(d_base_ptr + offs, acc, mask=live_d)
 
@@ -816,11 +851,27 @@ def _launch_gather_backward(
             AXES=axes,
         )
     d_base = torch.empty_like(base)
-    _gather_base_backward_kernel[(1,)](
+    sentinel_count = int(sentinel_rows.numel())
+    partial_count = max(1, triton.cdiv(sentinel_count, _GATHER_BASE_BLOCK_ROWS))
+    base_partials = torch.empty(
+        partial_count,
+        width,
+        dtype=torch.float32,
+        device=base.device,
+    )
+    _gather_base_backward_partial_kernel[(partial_count,)](
         sentinel_rows,
         grad_out,
+        base_partials,
+        sentinel_count,
+        D=width,
+        BLOCK_D=block_d,
+        BLOCK_ROWS=_GATHER_BASE_BLOCK_ROWS,
+    )
+    _gather_base_backward_combine_kernel[(1,)](
+        base_partials,
         d_base,
-        int(sentinel_rows.numel()),
+        partial_count,
         D=width,
         BLOCK_D=block_d,
     )

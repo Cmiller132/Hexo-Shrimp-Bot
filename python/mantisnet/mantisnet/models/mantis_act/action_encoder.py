@@ -301,6 +301,12 @@ class PostPlacementEncoder(nn.Module):
                 post_plan.rows,
                 status_plan.ptr,
                 status_plan.rows,
+                post_plan.block_ptr,
+                post_plan.block_starts,
+                post_plan.block_lengths,
+                status_plan.block_ptr,
+                status_plan.block_starts,
+                status_plan.block_lengths,
             )
 
         gated = row_gate(

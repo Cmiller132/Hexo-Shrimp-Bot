@@ -71,9 +71,12 @@ def _mark_chunk_dynamic(value, seen: set[int]) -> None:
         return
 
     if isinstance(value, ClassRowPlan):
-        # ``ptr`` has n_classes + 1 rows; only the class-sorted row order grows
-        # with a packed chunk.
-        _mark_chunk_dynamic(value.rows, seen)
+        # ``ptr`` and ``block_ptr`` have n_classes + 1 rows.  The class-sorted
+        # row order and its compact fixed-size block partition both grow with a
+        # packed chunk; marking those arrays keeps one outer graph across fit
+        # chunk shapes.
+        for child in (value.rows, value.block_starts, value.block_lengths):
+            _mark_chunk_dynamic(child, seen)
         return
 
     if is_dataclass(value):
