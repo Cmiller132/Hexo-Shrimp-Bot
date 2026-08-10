@@ -5,6 +5,9 @@
 - [`CONTAINER_SPEC.md`](CONTAINER_SPEC.md) defines how packages, evaluators,
   sessions, processes, checkpoints, and records compose. Read it before
   changing container execution or Rust/Python ownership boundaries.
+- [`MANTIS_GRAFT_SPEC.md`](MANTIS_GRAFT_SPEC.md) governs the stepwise graft
+  campaign: how MantisNet-ACT's components are ported into the production
+  MantisNet one measured, owner-gated step at a time.
 
 ## KLENT references and evidence
 
