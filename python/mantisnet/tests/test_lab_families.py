@@ -170,6 +170,33 @@ def test_slot_tables_expand_by_independently_derived_decoder_slot_class(tmp_path
         assert torch.equal(getattr(got, field), getattr(expected, field))
 
 
+@torch.no_grad()
+def test_historical_dead_key_biases_load_and_leave_outputs_identical(tmp_path):
+    torch.manual_seed(41)
+    direct = MantisNet(TINY).eval()
+    state = copy.deepcopy(direct.state_dict())
+    for index in range(TINY.blocks):
+        state[f"blocks.{index}.wk.bias"] = torch.linspace(0.25, 1.25, TINY.h)
+        state[f"blocks.{index}.wk_wa.bias"] = torch.linspace(-1.5, -0.5, TINY.h)
+
+    path = tmp_path / "historical-key-biases.pt"
+    torch.save(
+        {
+            "model": state,
+            "model_config": dataclasses.asdict(TINY),
+            "versions": _versions(),
+            "iteration": 23,
+        },
+        path,
+    )
+    loaded = load_checkpoint(path, device="cpu")
+    batch = collate_prefixes([[], [(0, 0), (-8, 8)]], [0, 2])
+    expected, actual = direct(batch, 0.2), loaded.model(batch, 0.2)
+
+    for field in vars(expected):
+        assert torch.equal(getattr(actual, field), getattr(expected, field)), field
+
+
 def test_bipolar_and_factored_compositions_match_their_formulas():
     torch.manual_seed(9)
     logits = torch.randn(31, 2)

@@ -24,6 +24,16 @@ from ..window_pairs import WA_CLASSES
 
 _SLOT_CLASSES = 3
 _BLOCK_KEY = re.compile(r"^blocks\.(\d+)\.")
+_DEAD_KEY_BIAS = re.compile(r"^blocks\.\d+\.(?:wk|wk_wa)\.bias$")
+
+
+def _drop_dead_key_biases(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    """Remove only the historical softmax-dead key projection biases."""
+    return {
+        key: value
+        for key, value in state_dict.items()
+        if _DEAD_KEY_BIAS.fullmatch(key) is None
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,7 +204,7 @@ _BLOCK_SUFFIXES = {
     "v.weight", "e_sw.weight", "mlp_s.lin_a.weight", "mlp_s.lin_a.bias",
     "mlp_s.lin_b.weight", "mlp_s.out.weight", "mlp_s.out.bias",
     "ln_attn.weight", "ln_attn.bias", "wq.weight", "wq.bias", "wk.weight",
-    "wk.bias", "wv.weight", "wv.bias", "wo.weight", "wo.bias", "dist_bias",
+    "wv.weight", "wv.bias", "wo.weight", "wo.bias", "dist_bias",
     "ln_ffn.weight", "ln_ffn.bias", "ffn.0.weight", "ffn.0.bias",
     "ffn.2.weight", "ffn.2.bias",
 }
@@ -221,7 +231,7 @@ _CP_SUFFIXES = {
 }
 _WA_SUFFIXES = {
     "ln_wa.weight", "ln_wa.bias", "wq_wa.weight", "wq_wa.bias",
-    "wk_wa.weight", "wk_wa.bias", "wv_wa.weight", "wv_wa.bias",
+    "wk_wa.weight", "wv_wa.weight", "wv_wa.bias",
     "wo_wa.weight", "wo_wa.bias", "wa_bias",
 }
 
@@ -386,9 +396,11 @@ def _expected_shapes(
             shapes[prefix + name + ".lin_b.weight"] = (h, h)
             shapes[prefix + name + ".out.weight"] = (h, h)
             shapes[prefix + name + ".out.bias"] = (h,)
-        for name in ("wq", "wk", "wv", "wo", "wq_wa", "wk_wa", "wv_wa", "wo_wa"):
+        for name in ("wq", "wv", "wo", "wq_wa", "wv_wa", "wo_wa"):
             shapes[prefix + name + ".weight"] = (h, h)
             shapes[prefix + name + ".bias"] = (h,)
+        for name in ("wk", "wk_wa"):
+            shapes[prefix + name + ".weight"] = (h, h)
         shapes[prefix + "wa_bias"] = (cfg.heads, WA_CLASSES)
         shapes[prefix + "dist_bias"] = (cfg.heads, cfg.d_max + 2)
         shapes[prefix + "axis_bias"] = (cfg.heads, cfg.d_max)
@@ -630,7 +642,10 @@ def load_checkpoint(
     raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(raw, Mapping) or not isinstance(raw.get("model"), Mapping):
         raise ValueError(f"{checkpoint_path} is not a production checkpoint with a model state dict")
-    state = raw["model"]
+    # Historical family checkpoints may carry these two exact per-block keys.
+    # They never affected a softmax output, so the lab can score the checkpoint
+    # exactly after dropping them. Ordinary KLENT loaders remain strict.
+    state = _drop_dead_key_biases(raw["model"])
     versions = raw.get("versions")
     if not isinstance(versions, Mapping):
         raise ValueError(f"checkpoint {checkpoint_path} has no versions mapping")

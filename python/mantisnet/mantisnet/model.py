@@ -8,7 +8,8 @@ and the scalar value decode is done in fp32).
 
 Linear maps written as bare matrices in the spec (``U``, ``V``, ``P``) are
 bias-free — the per-class embedding added alongside them is the additive term.
-Attention, FFN, and MLP linears keep the framework-default bias (§10).
+Attention key projections are bias-free; FFN, MLP, and the other attention
+linears keep the framework-default bias (§10).
 """
 
 from __future__ import annotations
@@ -219,7 +220,7 @@ class _Block(nn.Module):
         # §5.1c window <- windows through typed pair relations.
         self.ln_wa = nn.LayerNorm(h)
         self.wq_wa = nn.Linear(h, h)
-        self.wk_wa = nn.Linear(h, h)
+        self.wk_wa = nn.Linear(h, h, bias=False)
         self.wv_wa = nn.Linear(h, h)
         self.wo_wa = nn.Linear(h, h)
         self.wa_bias = nn.Parameter(
@@ -234,7 +235,7 @@ class _Block(nn.Module):
         # §5.3 stone self-attention + token
         self.ln_attn = nn.LayerNorm(h)
         self.wq = nn.Linear(h, h)
-        self.wk = nn.Linear(h, h)
+        self.wk = nn.Linear(h, h, bias=False)
         self.wv = nn.Linear(h, h)
         self.wo = nn.Linear(h, h)
         self.dist_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.d_max + 2))
