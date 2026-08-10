@@ -36,6 +36,7 @@ from .equivariant import (
 from .latent_attention import latent_broadcast
 from .latents import ActionLatents, LatentPass, LatentState, RaggedStream
 from .messages import make_relation_embedding
+from .ordered_reductions import ordered_index_select
 from .packed import POST_ACTION_ROWS, WINDOW_LEN, PackedACTBatch
 from .pattern_classes import POST1_REL_CLASSES
 from .post_rows import row_gate, sentinel_gather
@@ -129,14 +130,19 @@ class ActionBaseState(nn.Module):
             )
 
         rows = torch.where(index >= 0, index, torch.full_like(index, n_cells))
+        if batch.plans is None:
+            raise ValueError("action base state requires collate-built execution plans")
+        plan = batch.plans.action_rows.base_cell
         table = torch.cat([cells.inv, self.no_cell_inv.to(cells.inv.dtype)[None]])
-        inv = table.index_select(0, rows)
+        inv = ordered_index_select(table, rows, plan.ptr, plan.rows)
         if cells.axis is None:
             return EquivariantState(inv)
         pad = self.no_cell_axis.to(cells.axis.dtype).expand(
             1, AXIS_CHANNELS, self.cfg.d_axis
         )
-        axis = torch.cat([cells.axis, pad]).index_select(0, rows)
+        axis = ordered_index_select(
+            torch.cat([cells.axis, pad]), rows, plan.ptr, plan.rows
+        )
         return EquivariantState(inv, axis)
 
 

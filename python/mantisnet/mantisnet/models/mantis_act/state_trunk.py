@@ -56,6 +56,7 @@ from .messages import (
     relation_vocabulary_size,
     window_window_edges,
 )
+from .ordered_reductions import ordered_index_select
 from .packed import NEAREST_BUCKETS, PackedACTBatch
 from .plans import StatePlans, builder_fingerprint
 from .pattern_classes import ALL_WINDOW_PATTERN_CLASSES, EMPTY, MIXED
@@ -145,10 +146,28 @@ class CellEmbedding(nn.Module):
         )
 
     def forward(self, batch: PackedACTBatch) -> EquivariantState:
+        if batch.plans is None:
+            raise ValueError("cell embedding requires collate-built execution plans")
+        rows = batch.plans.embedding_rows
         inv = (
-            self.occupancy(batch.cell_occupancy)
-            + self.legal(batch.cell_is_legal)
-            + self.nearest(batch.cell_nearest_bucket)
+            ordered_index_select(
+                self.occupancy.weight,
+                batch.cell_occupancy,
+                rows.cell_occupancy.ptr,
+                rows.cell_occupancy.rows,
+            )
+            + ordered_index_select(
+                self.legal.weight,
+                batch.cell_is_legal,
+                rows.cell_legal.ptr,
+                rows.cell_legal.rows,
+            )
+            + ordered_index_select(
+                self.nearest.weight,
+                batch.cell_nearest_bucket,
+                rows.cell_nearest.ptr,
+                rows.cell_nearest.rows,
+            )
         )
         if self.axis_base is None:
             return EquivariantState(inv)
@@ -213,8 +232,21 @@ class WindowEmbedding(nn.Module):
 
     def forward(self, batch: PackedACTBatch) -> EquivariantState:
         _require_width("window_numeric", batch.window_numeric, self.numeric_width)
+        if batch.plans is None:
+            raise ValueError("window embedding requires collate-built execution plans")
+        rows = batch.plans.embedding_rows
 
-        inv = self.pattern(batch.window_pattern_class) + self.status(batch.window_status)
+        inv = ordered_index_select(
+            self.pattern.weight,
+            batch.window_pattern_class,
+            rows.window_pattern.ptr,
+            rows.window_pattern.rows,
+        ) + ordered_index_select(
+            self.status.weight,
+            batch.window_status,
+            rows.window_status.ptr,
+            rows.window_status.rows,
+        )
         if self.numeric is not None:
             inv = inv + self.numeric(batch.window_numeric.to(inv.dtype))
         if self.axis_base is None:

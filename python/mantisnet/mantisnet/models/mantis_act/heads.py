@@ -32,6 +32,7 @@ from .equivariant import (
     run_equivariant_stage,
 )
 from .latents import LatentState, row_positions
+from .ordered_reductions import ordered_row_broadcast, ordered_segment_max
 from .packed import PHASE_FIRST
 from .pattern_classes import OPP_LIVE, OWN_LIVE
 
@@ -179,16 +180,9 @@ def committed_mass(critic_logits: Tensor) -> Tensor:
     return p_pos + p_neg
 
 
-def _segment_max(values: Tensor, segment: Tensor, positions: int) -> Tensor:
-    """Per-position maximum of a flat ``(N,)`` fp32 tensor into ``(P,)``.
-
-    The identity fill is the dtype's minimum; it survives only for a position
-    with no legal action, which the builder refuses to produce. The caller's
-    floor clamps it either way. ``scatter_reduce_`` is the package's idiom for
-    a segment maximum (also `latent_attention.py:748`, `messages.py:211`).
-    """
-    out = values.new_full((positions,), torch.finfo(values.dtype).min)
-    return out.scatter_reduce_(0, segment, values, "amax", include_self=True)
+def _segment_max(values: Tensor, offsets: Tensor) -> Tensor:
+    """Per-position maximum over position-major legal-action runs."""
+    return ordered_segment_max(values, offsets)
 
 
 def compose_acting_q(
@@ -226,9 +220,8 @@ def compose_acting_q(
         if row_position is None
         else row_position
     )
-    positions = legal_offsets.shape[0] - 1
-    scale = _segment_max(p_pos + p_neg, segment, positions).clamp(min=mass_floor)
-    return (p_pos - p_neg) / scale.index_select(0, segment)
+    scale = _segment_max(p_pos + p_neg, legal_offsets).clamp(min=mass_floor)
+    return (p_pos - p_neg) / ordered_row_broadcast(scale, segment, legal_offsets)
 
 
 # --------------------------------------------------------------------------
@@ -313,7 +306,11 @@ class LatentContext(nn.Module):
         self.drop = nn.Dropout(cfg.dropout)
 
     def forward(
-        self, state: EquivariantState, latents: LatentState, row_position: Tensor
+        self,
+        state: EquivariantState,
+        latents: LatentState,
+        row_position: Tensor,
+        row_offsets: Tensor,
     ) -> EquivariantState:
         inv, axis = state.inv, state.axis
         # A LayerScale gain is fp32, so a residual under bf16 autocast promotes
@@ -327,7 +324,11 @@ class LatentContext(nn.Module):
                 )
             context = self.to_inv(self.norm_inv(latents.inv).mean(dim=1))
             inv = inv + self.scale_inv(
-                self.drop(context.index_select(0, row_position).to(inv.dtype))
+                self.drop(
+                    ordered_row_broadcast(context, row_position, row_offsets).to(
+                        inv.dtype
+                    )
+                )
             )
         if self.has_axis:
             if latents.axis is None:
@@ -341,7 +342,11 @@ class LatentContext(nn.Module):
                 )
             context = self.to_axis(self.norm_axis(latents.axis).mean(dim=1))
             axis = axis + self.scale_axis(
-                self.drop(context.index_select(0, row_position).to(axis.dtype))
+                self.drop(
+                    ordered_row_broadcast(context, row_position, row_offsets).to(
+                        axis.dtype
+                    )
+                )
             )
         if axis is not None and axis.dtype != inv.dtype:
             common = torch.promote_types(inv.dtype, axis.dtype)
@@ -375,13 +380,14 @@ class PrivateAdapterBlock(nn.Module):
         state: EquivariantState,
         latents: LatentState | None,
         row_position: Tensor,
+        row_offsets: Tensor,
     ) -> EquivariantState:
         if self.context is not None:
             if latents is None:
                 raise ValueError(
                     "this adapter block reads latents but none were given"
                 )
-            state = self.context(state, latents, row_position)
+            state = self.context(state, latents, row_position, row_offsets)
         return run_equivariant_stage(state, self.mix, self.ffn)
 
 
@@ -416,9 +422,10 @@ class PrivateAdapter(nn.Module):
         state: EquivariantState,
         latents: LatentState | None,
         row_position: Tensor,
+        row_offsets: Tensor,
     ) -> EquivariantState:
         for block in self.blocks:
-            state = block(state, latents, row_position)
+            state = block(state, latents, row_position, row_offsets)
         return state
 
 
@@ -889,20 +896,25 @@ class ActionHeads(nn.Module):
             )
         if row_position is None:
             row_position = row_positions(legal_offsets, actions.inv.shape[0])
-        return self._fork(actions, row_position, latents)
+        return self._fork(actions, row_position, legal_offsets, latents)
 
     def _fork(
         self,
         actions: EquivariantState,
         row_position: Tensor,
+        row_offsets: Tensor,
         latents: LatentState | None,
     ) -> tuple[Tensor, Tensor]:
         """The two logit families, off one already-validated action state."""
         policy_state = actions
         critic_state = actions
         if self.policy_adapter is not None:
-            policy_state = self.policy_adapter(actions, latents, row_position)
-            critic_state = self.critic_adapter(actions, latents, row_position)
+            policy_state = self.policy_adapter(
+                actions, latents, row_position, row_offsets
+            )
+            critic_state = self.critic_adapter(
+                actions, latents, row_position, row_offsets
+            )
         return self.policy(policy_state), self.critic(critic_state)
 
     def forward(
@@ -925,7 +937,9 @@ class ActionHeads(nn.Module):
             )
         if row_position is None:
             row_position = row_positions(legal_offsets, actions.inv.shape[0])
-        policy_logits, critic_logits = self._fork(actions, row_position, latents)
+        policy_logits, critic_logits = self._fork(
+            actions, row_position, legal_offsets, latents
+        )
         q_value, q_score, mass = self.critic.compose(
             critic_logits,
             legal_offsets=legal_offsets,

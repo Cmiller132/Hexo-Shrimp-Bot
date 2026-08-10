@@ -171,7 +171,9 @@ def _assert_class_csr(values: torch.Tensor, plan) -> None:
     flat = values.reshape(-1).tolist()
     want_rows = []
     want_ptr = [0]
-    for klass in range(plan.n_classes):
+    classes = getattr(plan, "n_classes", getattr(plan, "n_sources", None))
+    assert classes is not None
+    for klass in range(classes):
         want_rows.extend(row for row, value in enumerate(flat) if value == klass)
         want_ptr.append(len(want_rows))
     assert plan.ptr.tolist() == want_ptr
@@ -195,6 +197,44 @@ def test_action_class_and_source_window_csrs_are_stable_and_exact(batch):
         row for row, value in enumerate(flat) if value == -1
     ]
 
+    base = torch.where(
+        batch.legal_to_cell_index >= 0,
+        batch.legal_to_cell_index,
+        torch.full_like(batch.legal_to_cell_index, batch.cell_occupancy.shape[0]),
+    )
+    _assert_class_csr(base, rows.base_cell)
+
+
+def test_initial_embedding_csrs_are_stable_exact_and_match_table_heights(batch):
+    rows = batch.plans.embedding_rows
+    model = MantisACT(FULL)
+    cases = (
+        (
+            batch.cell_occupancy,
+            rows.cell_occupancy,
+            model.trunk.cell_embedding.occupancy,
+        ),
+        (batch.cell_is_legal, rows.cell_legal, model.trunk.cell_embedding.legal),
+        (
+            batch.cell_nearest_bucket,
+            rows.cell_nearest,
+            model.trunk.cell_embedding.nearest,
+        ),
+        (
+            batch.window_pattern_class,
+            rows.window_pattern,
+            model.trunk.window_embedding.pattern,
+        ),
+        (
+            batch.window_status,
+            rows.window_status,
+            model.trunk.window_embedding.status,
+        ),
+    )
+    for values, plan, table in cases:
+        assert plan.n_classes == table.num_embeddings
+        _assert_class_csr(values, plan)
+
 
 def test_collate_and_transport_mark_chunk_rows_but_not_fixed_pointers_dynamic():
     batch = _batch_with_positions(3)
@@ -212,6 +252,8 @@ def test_collate_and_transport_mark_chunk_rows_but_not_fixed_pointers_dynamic():
             state.inv_plan.rel_src,
             action.post1.rows,
             action.source_window.ptr,
+            action.base_cell.ptr,
+            candidate.plans.embedding_rows.cell_occupancy.rows,
             candidate.plans.state_segments.counts,
             candidate.plans.state_segments.row_pos,
         ):
@@ -219,13 +261,17 @@ def test_collate_and_transport_mark_chunk_rows_but_not_fixed_pointers_dynamic():
             assert _is_dim0_dynamic(tensor), tensor.shape
 
         # Vocabulary cardinalities are architecture constants, even though
-        # these pointer arrays happen to be longer than the >2 row cutoff.
+        # these pointer arrays are longer than the dynamic-row cutoff.
         assert state.inv_plan.rel_ptr.shape[0] > 2
         assert action.post1.ptr.shape[0] > 2
         assert action.pre_status.ptr.shape[0] > 2
+        assert candidate.plans.embedding_rows.cell_nearest.ptr.shape[0] > 2
         assert not _is_dim0_dynamic(state.inv_plan.rel_ptr)
         assert not _is_dim0_dynamic(action.post1.ptr)
         assert not _is_dim0_dynamic(action.pre_status.ptr)
+        assert not _is_dim0_dynamic(
+            candidate.plans.embedding_rows.cell_nearest.ptr
+        )
 
     assert_annotations(batch)
     assert_annotations(batch.to("cpu"))
@@ -244,6 +290,7 @@ def test_nested_plan_rows_share_one_fullgraph_dynamic_compile_across_chunks():
     def plan_probe(candidate):
         state = candidate.plans.state_edges.to_windows.inv_plan
         action = candidate.plans.action_rows
+        embeddings = candidate.plans.embedding_rows
         segments = candidate.plans.state_segments
         return (
             candidate.global_numeric.sum()
@@ -252,6 +299,10 @@ def test_nested_plan_rows_share_one_fullgraph_dynamic_compile_across_chunks():
             + state.rel_ptr.float().sum()
             + action.post1.ptr.float().sum()
             + action.post1.rows.float().sum()
+            + action.base_cell.ptr.float().sum()
+            + action.base_cell.rows.float().sum()
+            + embeddings.window_pattern.ptr.float().sum()
+            + embeddings.window_pattern.rows.float().sum()
             + segments.counts.float().sum()
             + segments.row_pos.float().sum()
         )
@@ -325,6 +376,8 @@ def test_plan_pinning_is_recursive(batch):
     assert pinned.plans.state_edges.radius.inv_plan.dst_ptr.is_pinned()
     assert pinned.plans.state_edges.radius.routed_src.is_pinned()
     assert pinned.plans.action_rows.post1.rows.is_pinned()
+    assert pinned.plans.action_rows.base_cell.ptr.is_pinned()
+    assert pinned.plans.embedding_rows.window_pattern.rows.is_pinned()
     assert pinned.plans.state_segments.ranges.is_pinned()
     assert _is_dim0_dynamic(pinned.plans.state_edges.radius.inv_plan.dst_ptr)
     assert _is_dim0_dynamic(pinned.plans.action_rows.post1.rows)
