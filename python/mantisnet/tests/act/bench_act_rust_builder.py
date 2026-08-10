@@ -182,7 +182,7 @@ def _lifetime_one(games, plies, cfg) -> tuple[float, float, float, float]:
         normalized_games, normalized_plies, _rust_config(cfg)
     )
     after_binding = time.perf_counter()
-    batch = packed_from_arrays(fields)
+    batch = packed_from_arrays(fields, cfg)
     after_wrap = time.perf_counter()
     del fields
     after_fields = time.perf_counter()

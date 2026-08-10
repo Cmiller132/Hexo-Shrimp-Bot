@@ -835,7 +835,7 @@ def profile(
         best["build"] = min(best["build"], time.perf_counter() - start)
 
         start = time.perf_counter()
-        batch = collate(graphs).to(target)
+        batch = collate(graphs, cfg).to(target)
         best["collate"] = min(best["collate"], _elapsed(target, start))
 
         start = time.perf_counter()

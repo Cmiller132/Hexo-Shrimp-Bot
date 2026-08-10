@@ -98,7 +98,8 @@ def playout(plies: int, seed: int) -> list[tuple[int, int]]:
 
 def _families(plies):
     batch = collate(
-        [build(hexo_py.Position.replay(playout(p, SEED)), FULL) for p in plies]
+        [build(hexo_py.Position.replay(playout(p, SEED)), FULL) for p in plies],
+        FULL,
     )
     to_windows, to_cells = incidence_edges(batch)
     return {

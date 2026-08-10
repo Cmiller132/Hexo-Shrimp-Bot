@@ -63,6 +63,7 @@ from mantisnet.models.mantis_act.packed import (
     collate,
 )
 from mantisnet.models.mantis_act.pattern_classes import ALL_WINDOW_PATTERN_CLASSES
+from mantisnet.models.mantis_act.plans import build_plans_from_cpu_batch
 from mantisnet.models.mantis_act.state_trunk import (
     CELL_LEGAL_CLASSES,
     CELL_OCCUPANCY_CLASSES,
@@ -134,7 +135,7 @@ def graphs(move_lists):
 @pytest.fixture(scope="module")
 def batch(graphs):
     """Every ply in one packed batch, in ply order."""
-    return collate([graphs[plies] for plies in PLIES])
+    return collate([graphs[plies] for plies in PLIES], FULL)
 
 
 @pytest.fixture(scope="module")
@@ -153,7 +154,7 @@ def trunk() -> StateTrunk:
 
 def one(graph) -> PackedACTBatch:
     """One position as a batch of one."""
-    return collate([graph])
+    return collate([graph], FULL)
 
 
 # --------------------------------------------------------------------------
@@ -317,12 +318,13 @@ def relabel(packed, permutation):
     """
     table = torch.tensor(permutation, dtype=torch.long)
     route = packed.radius_axis_or_neg1
-    return replace(
+    relabelled = replace(
         packed,
         window_axis=table[packed.window_axis],
         adjacency_axis=table[packed.adjacency_axis],
         radius_axis_or_neg1=torch.where(route >= 0, table[route.clamp(min=0)], route),
     )
+    return replace(relabelled, plans=build_plans_from_cpu_batch(FULL, relabelled))
 
 
 def assert_law(before: TrunkOutput, after: TrunkOutput, permutation, *, atol=1e-5):
@@ -547,8 +549,9 @@ def test_the_residual_streams_stay_fp32_under_autocast(batch):
 # The arms that remove a path (§29, §32)
 
 
-def test_the_no_axis_arm_holds_no_axis_parameters_anywhere(batch):
+def test_the_no_axis_arm_holds_no_axis_parameters_anywhere(graphs):
     cfg = PRESETS["full_no_axis"]
+    batch = collate([graphs[plies] for plies in PLIES], cfg)
     module = StateTrunk(cfg).eval()
     assert module.final_cell.axis is None and module.final_latent_axis is None
     assert module.cell_embedding.axis_base is None
@@ -560,8 +563,9 @@ def test_the_no_axis_arm_holds_no_axis_parameters_anywhere(batch):
     assert torch.isfinite(out.cells.inv).all()
 
 
-def test_the_no_latents_arm_holds_no_latent_parameters(batch):
+def test_the_no_latents_arm_holds_no_latent_parameters(graphs):
     cfg = PRESETS["full_no_latents"]
+    batch = collate([graphs[plies] for plies in PLIES], cfg)
     module = StateTrunk(cfg).eval()
     assert module.final_latent_inv is None and module.final_latent_axis is None
     assert not any(pass_.enabled for pass_ in module.latents.passes)
@@ -571,8 +575,9 @@ def test_the_no_latents_arm_holds_no_latent_parameters(batch):
     assert torch.isfinite(out.cells.inv).all()
 
 
-def test_a_disabled_geometry_path_is_absent_rather_than_zeroed(batch):
+def test_a_disabled_geometry_path_is_absent_rather_than_zeroed(graphs):
     cfg = replace(FULL, use_cell_adjacency=False, use_occupied_radius_edges=False)
+    batch = collate([graphs[plies] for plies in PLIES], cfg)
     module = StateTrunk(cfg).eval()
     assert module.blocks[0].adjacency is None and module.blocks[0].radius is None
     edges = state_edges(batch, cfg)
@@ -587,9 +592,11 @@ def zeros(rows: int, cfg: MantisACTConfig) -> EquivariantState:
     )
 
 
-def test_a_block_refuses_an_edge_set_its_config_disagrees_with(trunk, batch):
+def test_a_block_refuses_an_edge_set_its_config_disagrees_with(trunk, graphs):
     """A path the block runs and the edge set omits is a mismatch, not a skip."""
-    edges = state_edges(batch, replace(FULL, use_cell_adjacency=False))
+    cfg = replace(FULL, use_cell_adjacency=False)
+    batch = collate([graphs[plies] for plies in PLIES], cfg)
+    edges = state_edges(batch, cfg)
     n_cells, n_windows = int(batch.cell_offsets[-1]), int(batch.window_offsets[-1])
     with pytest.raises(ValueError, match="use_cell_adjacency"):
         trunk.blocks[0](
@@ -634,7 +641,7 @@ def test_the_window_numeric_block_is_absent_when_it_is_disabled(graphs):
     cfg = replace(FULL, use_window_numeric_features=False)
     embedding = WindowEmbedding(cfg)
     assert embedding.numeric is None
-    packed = collate([build(hexo_py.Position.replay(playout(21, SEED)), cfg)])
+    packed = collate([build(hexo_py.Position.replay(playout(21, SEED)), cfg)], cfg)
     assert packed.window_numeric.shape[1] == 0
     assert torch.isfinite(embedding(packed).inv).all()
     # And the full model's embedding refuses that zero-width block rather than
@@ -650,16 +657,14 @@ def test_the_window_numeric_block_is_absent_when_it_is_disabled(graphs):
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="a host stall needs a real device"
 )
-def test_the_forward_stalls_the_host_at_most_twice(batch):
-    """§26's forward reads nothing back off the device except two row counts.
+def test_the_forward_never_stalls_the_host(batch):
+    """§26's collate-time plans leave no data-dependent device read in forward.
 
     Every bound this trunk indexes with is fixed on the host before a tensor
     exists, every ragged row count it needs is a host-side tensor shape, and
     every structural property of an edge family travels with the family. What
-    is left is two ``nonzero`` calls, and neither is a check: each discovers a
-    count no host tensor carries — how many window slots the cell scope
-    represents, and how many radius displacements lie on an axis — and each
-    runs once per batch rather than once per block.
+    The represented incidence rows and routed radius subset are part of the CPU
+    plan and move with the batch, as are every row-position and latent segment.
 
     This is the property the whole shape of `messages.TypedEdges`,
     `latents.RaggedStream` and `latent_attention.row_positions` exists to hold,
@@ -695,7 +700,7 @@ def test_the_forward_stalls_the_host_at_most_twice(batch):
     stalls()
 
     first, second = stalls(), stalls()
-    assert len(first) == len(second) == 2, [str(w.message) for w in second]
+    assert len(first) == len(second) == 0, [str(w.message) for w in second]
 
 
 # --------------------------------------------------------------------------

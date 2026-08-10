@@ -69,6 +69,7 @@ from torch.overrides import TorchFunctionMode
 import hexo_py
 
 from mantisnet.models.mantis_act import messages as messages_module
+from mantisnet.models.mantis_act import segment_message as segment_message_module
 from mantisnet.models.mantis_act.builder import build
 from mantisnet.models.mantis_act.config import PRESETS, MantisACTConfig
 from mantisnet.models.mantis_act.equivariant import (
@@ -82,6 +83,7 @@ from mantisnet.models.mantis_act.equivariant import (
 from mantisnet.models.mantis_act.latents import ActionLatents, LatentPass
 from mantisnet.models.mantis_act.messages import RelationGatedMessage
 from mantisnet.models.mantis_act.packed import collate
+from mantisnet.models.mantis_act.plans import build_plans_from_cpu_batch
 from mantisnet.models.mantis_act.state_trunk import StateTrunk
 from mantisnet.models.mantis_act.summary import parameter_summary, subsystem_of
 
@@ -166,7 +168,7 @@ def position(game: int, plies: int):
 def real_batch(cfg: MantisACTConfig, plies=PLIES, games=(0, 1)):
     """A packed batch of real self-play positions at each of ``plies``."""
     graphs = [build(position(game, ply), cfg) for game in games for ply in plies]
-    return collate(graphs)
+    return collate(graphs, cfg)
 
 
 @pytest.fixture(scope="module")
@@ -243,7 +245,7 @@ def test_the_forward_is_finite_at_every_ply_separately(batch):
     module = StateTrunk(FULL).eval()
     for game in (0, 1):
         for ply in PLIES:
-            single = collate([build(position(game, ply), FULL)])
+            single = collate([build(position(game, ply), FULL)], FULL)
             with torch.autocast("cpu", dtype=torch.bfloat16):
                 out = module(single)
             assert torch.isfinite(out.cells.inv).all(), (game, ply)
@@ -312,11 +314,21 @@ class NumericsWatch(TorchFunctionMode):
         return func(*args, **(kwargs or {}))
 
 
-def test_every_softmax_gather_and_segment_reduction_runs_in_fp32(batch):
+def test_every_softmax_gather_and_segment_reduction_runs_in_fp32(
+    batch, monkeypatch
+):
     """§27, checked at the operation rather than read off a docstring."""
     torch.manual_seed(SEED)
     module = StateTrunk(FULL)
     watch = NumericsWatch()
+    fused_segments: list[tuple[torch.dtype, torch.dtype, torch.dtype]] = []
+    original_segment = segment_message_module._reference
+
+    def checked_segment(values, gate, bias, *args, **kwargs):
+        fused_segments.append((values.dtype, gate.dtype, bias.dtype))
+        return original_segment(values, gate, bias, *args, **kwargs)
+
+    monkeypatch.setattr(segment_message_module, "_reference", checked_segment)
     with watch, torch.autocast("cpu", dtype=torch.bfloat16):
         out = module(batch)
     trunk_loss(out).backward()
@@ -327,8 +339,20 @@ def test_every_softmax_gather_and_segment_reduction_runs_in_fp32(batch):
     )
     # A pass with nothing recorded would be vacuous: the trunk must have run
     # both kinds for the check to mean anything.
+    assert fused_segments
+    assert all(
+        dtype in _FP32_OR_BETTER
+        for segment in fused_segments
+        for dtype in segment
+    ), fused_segments
+    # The hand-written segment op is intentionally opaque to TorchFunctionMode.
+    # Each checked segment performs both its ordered gathers and its reduction;
+    # count that boundary alongside ordinary torch operations so this gate stays
+    # non-vacuous under the outer whole-model compile.
     reductions = sum(count for name, count in watch.seen.items() if name in _REDUCTIONS)
+    reductions += len(fused_segments)
     gathers = sum(count for name, count in watch.seen.items() if name in _GATHERS)
+    gathers += len(fused_segments)
     assert reductions > 0 and gathers > 0, watch.seen
 
 
@@ -622,6 +646,9 @@ def test_every_film_in_the_trunk_starts_at_identity(trunk, small_batch):
     with torch.no_grad():
         before = fresh(small_batch)
         rotated = replace(small_batch, phase_id=(small_batch.phase_id + 1) % 3)
+        rotated = replace(
+            rotated, plans=build_plans_from_cpu_batch(FULL, rotated)
+        )
         after = fresh(rotated)
     assert torch.equal(before.cells.inv, after.cells.inv)
     assert torch.equal(before.windows.axis, after.windows.axis)

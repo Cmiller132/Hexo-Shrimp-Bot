@@ -35,19 +35,14 @@ from .equivariant import (
 )
 from .latent_attention import row_positions
 from .packed import PackedACTBatch
-from .pattern_classes import ALL_CELL_WINDOW_REL_CLASSES
-from .segment_message import MessagePlan, message_plan, relation_gated_message
-from .symmetry import (
-    RELATION_PAD,
-    coarse_relation,
-    coarse_relation_count,
-    orbit_table,
+from .plans import (
+    INCIDENCE_RELATIONS,
+    PlannedEdges,
+    adjacency_relation_id,
+    radius_relation_count,
+    relation_vocabulary_size,
 )
-
-# §10.1's one joint (pattern, slot) relation table. The `nonempty` window scope
-# never emits the three all-empty classes; the table is still the 2187-row one,
-# so a scope change does not renumber a relation.
-INCIDENCE_RELATIONS = ALL_CELL_WINDOW_REL_CLASSES
+from .segment_message import MessagePlan, message_plan, relation_gated_message
 
 # §16's typed collinear/crossing vocabulary: 11 collinear offsets, 36 crossing
 # fold products, and the self loop. Read off `window_pairs`, which generates the
@@ -59,42 +54,6 @@ WINDOW_WINDOW_RELATIONS = WA_CLASSES
 EMBEDDING_INIT_STD = 0.02
 
 _REDUCTIONS = ("sum", "mean", "attention")
-
-
-def relation_vocabulary_size(cfg: MantisACTConfig) -> int:
-    """The geometry relation vocabulary of ``cfg``'s ``d6_relation_mode``.
-
-    Under ``orbit48`` that is the 48 exact orbits plus the four reserved ids of
-    §11.2, whatever ``d_max`` is: a smaller radius leaves the unused orbit ids
-    empty rather than shifting the reserved band down, so one embedding shape
-    serves every radius. Under ``coarse_distance_axis`` it is that scheme's own
-    space, which reserves nothing.
-    """
-    if cfg.d6_relation_mode == "orbit48":
-        return RELATION_PAD + 1
-    if cfg.d6_relation_mode == "coarse_distance_axis":
-        return coarse_relation_count(cfg.d_max)
-    raise ValueError(f"unknown d6_relation_mode {cfg.d6_relation_mode!r}")
-
-
-def radius_relation_count(cfg: MantisACTConfig) -> int:
-    """The joint ``(geometry class, source colour)`` vocabulary of §15.2."""
-    return 2 * relation_vocabulary_size(cfg)
-
-
-def adjacency_relation_id(cfg: MantisACTConfig) -> int:
-    """The one relation class a hex step belongs to, from the orbit table.
-
-    Every distance-one displacement is a single D6 orbit, so hex adjacency is
-    one relation and the id is read from the same table the radius edges use
-    rather than written down. Sharing the space means an adjacency edge and a
-    distance-one radius edge name the same class.
-    """
-    if cfg.d6_relation_mode == "orbit48":
-        return int(orbit_table(cfg.d_max).lookup(1, 0))
-    if cfg.d6_relation_mode == "coarse_distance_axis":
-        return int(coarse_relation(1, 0, cfg.d_max))
-    raise ValueError(f"unknown d6_relation_mode {cfg.d6_relation_mode!r}")
 
 
 def make_relation_embedding(num_relations: int, d_rel: int) -> nn.Embedding:
@@ -298,6 +257,17 @@ class TypedEdges:
             dst_sorted=self.dst_sorted,
         )
         return self._plans[channels]
+
+
+EdgeSet = TypedEdges | PlannedEdges
+
+
+def _edge_cardinalities(edges: EdgeSet) -> tuple[int, int]:
+    """Source/destination counts without specializing planned chunk metadata."""
+    if isinstance(edges, PlannedEdges):
+        plan = edges.inv_plan
+        return plan.src_ptr.shape[0] - 1, plan.dst_ptr.shape[0] - 1
+    return edges.n_src, edges.n_dst
 
 
 def incidence_edges(batch: PackedACTBatch) -> tuple[TypedEdges, TypedEdges]:
@@ -721,6 +691,7 @@ class RelationGatedMessage(nn.Module):
         self.num_relations = int(num_relations)
         self.d_inv = cfg.d_inv
         self.d_axis = cfg.d_axis
+        self.activation = cfg.activation
         self.reduce = cfg.incidence_reduce
         self.gated = cfg.incidence_message == "relation_gated"
         self.route_axis = bool(route_axis and cfg.use_axis_channels)
@@ -774,7 +745,7 @@ class RelationGatedMessage(nn.Module):
 
     def _check(
         self,
-        edges: TypedEdges,
+        edges: EdgeSet,
         source: EquivariantState,
         destination: EquivariantState,
     ) -> None:
@@ -784,9 +755,10 @@ class RelationGatedMessage(nn.Module):
                 f"edge family has {edges.num_relations} relation classes against "
                 f"this module's {self.num_relations}"
             )
+        n_src, n_dst = _edge_cardinalities(edges)
         for name, state, count in (
-            ("source", source, edges.n_src),
-            ("destination", destination, edges.n_dst),
+            ("source", source, n_src),
+            ("destination", destination, n_dst),
         ):
             if state.leading_shape != (count,):
                 raise ValueError(
@@ -816,7 +788,7 @@ class RelationGatedMessage(nn.Module):
     def _aggregate(
         self,
         values: Tensor,
-        edges: TypedEdges,
+        edges: EdgeSet,
         channels: int,
         *,
         gate_projection: nn.Linear | None,
@@ -858,7 +830,7 @@ class RelationGatedMessage(nn.Module):
     def _attend(
         self,
         values: Tensor,
-        edges: TypedEdges,
+        edges: EdgeSet,
         channels: int,
         gate: Tensor | None,
         bias: Tensor,
@@ -870,14 +842,15 @@ class RelationGatedMessage(nn.Module):
         weights are known, so this reduction keeps the ``(E, d)`` formulation
         the fused sum/mean path avoids.
         """
+        _n_src, n_dst = _edge_cardinalities(edges)
         if channels == 1:
             src_slots, dst_slots, relation = edges.src, edges.dst, edges.relation
-            n_segments = edges.n_dst
+            n_segments = n_dst
         else:
             edge_src, edge_dst, relation, edge_axis = edges.routed()
             src_slots = edge_src * channels + edge_axis
             dst_slots = edge_dst * channels + edge_axis
-            n_segments = edges.n_dst * channels
+            n_segments = n_dst * channels
         messages = values.index_select(0, src_slots)
         if gate is not None:
             messages = messages * gate.index_select(0, relation)
@@ -887,7 +860,7 @@ class RelationGatedMessage(nn.Module):
 
     def forward(
         self,
-        edges: TypedEdges,
+        edges: EdgeSet,
         source: EquivariantState,
         destination: EquivariantState,
     ) -> EquivariantState:
@@ -926,7 +899,7 @@ class RelationGatedMessage(nn.Module):
             gate_projection=self.wg_axis if self.gated else None,
             bias_projection=self.wb_axis,
             score_vector=self.score_axis if attending else None,
-        ).reshape(edges.n_dst, AXIS_CHANNELS, self.d_axis)
+        ).reshape(destination.inv.shape[0], AXIS_CHANNELS, self.d_axis)
         delta_axis = self.drop(
             self.update_axis(self.ln_dst_axis(destination.axis), aggregate)
         )

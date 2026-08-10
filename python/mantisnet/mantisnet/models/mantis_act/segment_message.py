@@ -88,6 +88,110 @@ class MessagePlan:
     rel_dst: Tensor
     rel_axis: Tensor | None
 
+    def __post_init__(self) -> None:
+        """Validate the transport shape without reading device values.
+
+        Plan contents are checked while they are built on the CPU.  This gate
+        deliberately limits itself to metadata, shapes, dtypes, contiguity and
+        device agreement so reconstructing a plan in :meth:`to` never stalls a
+        CUDA stream to inspect a value.
+        """
+        for name in ("n_src", "n_dst", "n_relations", "n_edges"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or value < 0:
+                raise ValueError(f"MessagePlan.{name} must be a nonnegative int, got {value!r}")
+        if self.channels not in (1, 3):
+            raise ValueError(f"MessagePlan.channels must be 1 or 3, got {self.channels}")
+
+        expected = {
+            "dst_ptr": self.n_dst + 1,
+            "dst_src": self.n_edges,
+            "dst_rel": self.n_edges,
+            "src_ptr": self.n_src + 1,
+            "src_dst": self.n_edges,
+            "src_rel": self.n_edges,
+            "rel_ptr": self.n_relations + 1,
+            "rel_src": self.n_edges,
+            "rel_dst": self.n_edges,
+        }
+        if self.channels == 3:
+            expected.update(
+                dst_axis=self.n_edges,
+                src_axis=self.n_edges,
+                rel_axis=self.n_edges,
+            )
+        elif any(axis is not None for axis in (self.dst_axis, self.src_axis, self.rel_axis)):
+            raise ValueError("a one-channel MessagePlan must not carry axis columns")
+
+        device = None
+        for name, rows in expected.items():
+            value = getattr(self, name)
+            if not isinstance(value, Tensor):
+                raise TypeError(f"MessagePlan.{name} must be a tensor, got {type(value).__name__}")
+            if value.dtype != torch.int32:
+                raise TypeError(f"MessagePlan.{name} must be int32, got {value.dtype}")
+            if value.ndim != 1 or int(value.shape[0]) != rows:
+                raise ValueError(
+                    f"MessagePlan.{name} must be ({rows},), got {tuple(value.shape)}"
+                )
+            if not value.is_contiguous():
+                raise ValueError(f"MessagePlan.{name} must be contiguous")
+            if device is None:
+                device = value.device
+            elif value.device != device:
+                raise ValueError(
+                    f"MessagePlan.{name} is on {value.device}, other columns on {device}"
+                )
+
+        if device is not None and device.type == "cpu":
+            for name in ("dst_ptr", "src_ptr", "rel_ptr"):
+                ptr = getattr(self, name)
+                if int(ptr[0]) != 0 or int(ptr[-1]) != self.n_edges:
+                    raise ValueError(
+                        f"MessagePlan.{name} must span 0..{self.n_edges}, got "
+                        f"{int(ptr[0])}..{int(ptr[-1])}"
+                    )
+                if bool((ptr[1:] < ptr[:-1]).any()):
+                    raise ValueError(f"MessagePlan.{name} must be monotone")
+            for name, bound in (
+                ("dst_src", self.n_src),
+                ("dst_rel", self.n_relations),
+                ("src_dst", self.n_dst),
+                ("src_rel", self.n_relations),
+                ("rel_src", self.n_src),
+                ("rel_dst", self.n_dst),
+            ):
+                values = getattr(self, name)
+                if values.numel() and bool(((values < 0) | (values >= bound)).any()):
+                    raise ValueError(
+                        f"MessagePlan.{name} contains an index outside 0..{bound - 1}"
+                    )
+            if self.channels == 3:
+                for name in ("dst_axis", "src_axis", "rel_axis"):
+                    values = getattr(self, name)
+                    if values.numel() and bool(((values < 0) | (values >= 3)).any()):
+                        raise ValueError(f"MessagePlan.{name} contains an axis outside 0..2")
+
+    def to(self, device, *, non_blocking: bool = True) -> "MessagePlan":
+        """The identical immutable plan with every tensor on ``device``."""
+        moved = {
+            name: (
+                value.to(device, non_blocking=non_blocking)
+                if isinstance(value, Tensor)
+                else value
+            )
+            for name, value in vars(self).items()
+        }
+        return MessagePlan(**moved)
+
+    def pin_memory(self) -> "MessagePlan":
+        """The identical plan in page-locked host memory."""
+        pinned = {
+            name: value.pin_memory() if isinstance(value, Tensor) else value
+            for name, value in vars(self).items()
+        }
+        return MessagePlan(**pinned)
+
     @property
     def device(self) -> torch.device:
         return self.dst_ptr.device
@@ -96,7 +200,7 @@ class MessagePlan:
         """The destination of each row of the destination-major view."""
         counts = (self.dst_ptr[1:] - self.dst_ptr[:-1]).long()
         return torch.repeat_interleave(
-            torch.arange(self.n_dst, device=self.device), counts
+            torch.arange(self.dst_ptr.shape[0] - 1, device=self.device), counts
         )
 
     def destination_counts(self) -> Tensor:
@@ -110,7 +214,9 @@ class MessagePlan:
             return (self.dst_ptr[1:] - self.dst_ptr[:-1]).float()
         slots = self.edge_destinations() * self.channels + self.dst_axis.long()
         return torch.zeros(
-            self.n_dst * self.channels, dtype=torch.float32, device=self.device
+            (self.dst_ptr.shape[0] - 1) * self.channels,
+            dtype=torch.float32,
+            device=self.device,
         ).index_add_(0, slots, torch.ones_like(slots, dtype=torch.float32))
 
 
@@ -861,15 +967,17 @@ def relation_gated_message(
     for §14's additive control. The result is ``(N_dst * channels, D)`` in fp32
     (§27).
     """
-    if plan.n_relations != bias.shape[0]:
+    relation_count = plan.rel_ptr.shape[0] - 1
+    source_count = plan.src_ptr.shape[0] - 1
+    if relation_count != bias.shape[0]:
         raise ValueError(
-            f"the plan has {plan.n_relations} relation classes against the "
+            f"the plan has {relation_count} relation classes against the "
             f"{bias.shape[0]}-row table"
         )
-    if values.shape[0] != plan.n_src * plan.channels:
+    if values.shape[0] != source_count * plan.channels:
         raise ValueError(
             f"values has {values.shape[0]} rows against the plan's "
-            f"{plan.n_src} sources over {plan.channels} channels"
+            f"{source_count} sources over {plan.channels} channels"
         )
     return _segment_message_op(
         values.contiguous(),

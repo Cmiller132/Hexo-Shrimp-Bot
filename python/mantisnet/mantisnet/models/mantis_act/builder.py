@@ -57,7 +57,7 @@ def collate_positions(positions: Sequence, cfg: MantisACTConfig) -> PackedACTBat
     import hexo_py
 
     fields = hexo_py.build_act_batch(list(positions), _rust_config(cfg))
-    return packed_from_arrays(fields)
+    return packed_from_arrays(fields, cfg)
 
 
 def collate_prefixes(
@@ -86,7 +86,7 @@ def collate_prefixes(
     fields = hexo_py.build_act_batch_prefixes(
         normalized_games, normalized_ts, _rust_config(cfg)
     )
-    return packed_from_arrays(fields)
+    return packed_from_arrays(fields, cfg)
 
 
 __all__ = [

@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
 from typing import Sequence
 
+import torch
 from torch import Tensor, nn
 
 from .action_encoder import ActionEncoder, ActionOutput
@@ -31,6 +32,7 @@ from .config import (
 )
 from .heads import ActionHeads
 from .packed import ACTChunkCost, PackedACTBatch
+from .plans import builder_fingerprint
 from .state_trunk import StateTrunk, TrunkOutput, refuse_unimplemented_paths
 
 # The on-disk shape of an ACT checkpoint. Formats here are not backward
@@ -209,6 +211,7 @@ class MantisACT(nn.Module):
         # refused with the missing input named rather than half-constructed.
         refuse_unimplemented_paths(cfg)
         self.cfg = cfg
+        self.builder_fingerprint = builder_fingerprint(cfg)
 
         self.aux_weights = {
             str(name): float(weight) for name, weight in dict(aux_weights or {}).items()
@@ -241,24 +244,48 @@ class MantisACT(nn.Module):
                 f"{type(batch).__name__}; `builder.collate_positions` and "
                 "`packed.collate` are what produce one"
             )
-        positions = int(batch.position_count)
-        if positions < 1:
-            raise ValueError(f"a batch must hold at least one position, got {positions}")
+        if batch.plans is None:
+            raise ValueError(
+                "PackedACTBatch.plans is missing; build batches with "
+                "collate(graphs, cfg)"
+            )
+        if batch.builder_fingerprint != self.builder_fingerprint:
+            raise ValueError(
+                f"the batch was planned for builder config "
+                f"{batch.builder_fingerprint!r}, but this model expects "
+                f"{self.builder_fingerprint!r}; rebuild it with "
+                "collate(graphs, model.cfg)"
+            )
+        # The tensor row count is symbolic under the outer dynamic compile;
+        # ``position_count`` is retained as transport metadata and checked only
+        # in eager mode so it cannot become a per-chunk constant guard.
+        compiling = torch.compiler.is_compiling()
+        positions = (
+            batch.global_numeric.shape[0] if compiling else batch.position_count
+        )
+        if not compiling:
+            if positions < 1:
+                raise ValueError(
+                    f"a batch must hold at least one position, got {positions}"
+                )
         for name in _OFFSET_FIELDS:
             offsets = getattr(batch, name)
-            if offsets.ndim != 1 or int(offsets.shape[0]) != positions + 1:
+            if offsets.ndim != 1 or offsets.shape[0] != positions + 1:
                 raise ValueError(
                     f"{name} must be ({positions + 1},) for a {positions}-position "
                     f"batch, got {tuple(offsets.shape)}"
                 )
         for name in ("phase_id", "moves_remaining"):
             values = getattr(batch, name)
-            if values.ndim != 1 or int(values.shape[0]) != positions:
+            if values.ndim != 1 or values.shape[0] != positions:
                 raise ValueError(
                     f"{name} must be ({positions},) for a {positions}-position "
                     f"batch, got {tuple(values.shape)}"
                 )
-        if batch.global_numeric.ndim != 2 or int(batch.global_numeric.shape[0]) != positions:
+        if (
+            batch.global_numeric.ndim != 2
+            or batch.global_numeric.shape[0] != positions
+        ):
             raise ValueError(
                 f"global_numeric must be ({positions}, G) for a {positions}-position "
                 f"batch, got {tuple(batch.global_numeric.shape)}"
@@ -288,6 +315,7 @@ class MantisACT(nn.Module):
             phase_id=batch.phase_id,
             windows=trunk.windows,
             window_status=batch.window_status,
+            row_position=batch.plans.legal_row_pos,
         )
         aux = dict(head.aux)
         if head.committed_mass is not None:
@@ -318,6 +346,7 @@ class MantisACT(nn.Module):
             actions.actions,
             legal_offsets=batch.legal_offsets,
             latents=trunk.latents,
+            row_position=batch.plans.legal_row_pos,
         )
 
     # §29 gives this architecture no binned state-value head (§23.3's optional

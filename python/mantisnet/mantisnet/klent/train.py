@@ -76,8 +76,6 @@ def _policy_q_fn(cfg: KlentConfig):
     if not cfg.compile:
         return _policy_q
     if _policy_q_compiled is None:
-        # Budget-packed chunks produce more size-range graphs than the default.
-        torch._dynamo.config.recompile_limit = 64
         _policy_q_compiled = torch.compile(_policy_q, dynamic=True)
     return _policy_q_compiled
 

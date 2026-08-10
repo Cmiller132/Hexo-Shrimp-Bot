@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 import torch
 
+from mantisnet.models.mantis_act.config import MantisACTConfig
 from mantisnet.models.mantis_act.packed import (
     _refuse_crossing,
     PHASE_FIRST,
@@ -27,6 +28,8 @@ from mantisnet.models.mantis_act.packed import (
     packed_from_arrays,
     telemetry,
 )
+
+FULL = MantisACTConfig()
 
 
 def _int(*values) -> np.ndarray:
@@ -345,7 +348,7 @@ def test_validate_rejects_a_second_phase_with_an_empty_board():
 
 
 def test_collate_offsets_are_the_cumulative_counts():
-    batch = collate([graph_a(), graph_b()])
+    batch = collate([graph_a(), graph_b()], FULL)
     assert batch.position_count == 2
     assert batch.cell_offsets.tolist() == [0, 4, 7]
     assert batch.window_offsets.tolist() == [0, 2, 3]
@@ -356,7 +359,7 @@ def test_collate_offsets_are_the_cumulative_counts():
 
 def test_collate_shifts_every_index_into_the_global_frame():
     a, b = graph_a(), graph_b()
-    batch = collate([a, b])
+    batch = collate([a, b], FULL)
     cell_offset, window_offset = 4, 2
 
     assert batch.legal_to_cell_index.tolist() == [3, 1, 1 + cell_offset, 2 + cell_offset]
@@ -369,14 +372,14 @@ def test_collate_shifts_every_index_into_the_global_frame():
 
     # A third position's indices shift by the running total, not by one
     # position's counts.
-    three = collate([b, a, a])
+    three = collate([b, a, a], FULL)
     assert three.legal_to_cell_index.tolist() == [1, 2, 6, 4, 10, 8]
 
 
 def test_collate_preserves_minus_one_sentinels():
     # B first, so A's sentinels sit behind a nonzero offset: an offset sentinel
     # would read as a real index into B's slice rather than as "no entity".
-    batch = collate([graph_b(), graph_a()])
+    batch = collate([graph_b(), graph_a()], FULL)
     a = graph_a()
 
     for name in ("window_cell_index", "action_window_index"):
@@ -397,7 +400,7 @@ def test_collate_preserves_minus_one_sentinels():
 
 def test_no_index_crosses_a_batch_position():
     """Spec §30.18, re-derived from the packed offsets alone."""
-    batch = collate([graph_a(), graph_b(), graph_a()])
+    batch = collate([graph_a(), graph_b(), graph_a()], FULL)
     families = {
         "cells": batch.cell_offsets.numpy(),
         "windows": batch.window_offsets.numpy(),
@@ -442,7 +445,7 @@ def test_the_cross_position_check_catches_a_shift_by_the_wrong_family():
     range for the batch, and only the row's own position says it is wrong.
     """
     a, b = graph_a(), graph_b()
-    batch = collate([a, b])
+    batch = collate([a, b], FULL)
     cells = batch.cell_offsets.numpy()
     windows = batch.window_offsets.numpy()
     assert cells[1] != windows[1], "the two families must offset differently"
@@ -484,17 +487,17 @@ def test_a_graph_cannot_reach_collate_unvalidated():
 
 def test_collate_refuses_an_empty_batch():
     with pytest.raises(ValueError, match=r"empty batch"):
-        collate([])
+        collate([], FULL)
 
 
 def test_collate_refuses_disagreeing_feature_widths():
     wide = graph_b(window_numeric=np.zeros((1, 4), dtype=np.float32))
     with pytest.raises(ValueError, match=r"window_numeric has inconsistent feature widths"):
-        collate([graph_a(), wide])
+        collate([graph_a(), wide], FULL)
 
 
 def test_collate_keeps_the_packed_dtypes():
-    batch = collate([graph_a(), graph_b()])
+    batch = collate([graph_a(), graph_b()], FULL)
     assert batch.cell_occupancy.dtype is torch.int64
     assert batch.window_incidence_mask.dtype is torch.bool
     assert batch.window_numeric.dtype is torch.float32
@@ -511,7 +514,7 @@ def test_packed_batch_carries_every_spec_field():
     edges are a join of the window identities, and joining them beside the model
     is what keeps the edges themselves off the bus.
     """
-    present = set(vars(collate([graph_a()])))
+    present = set(vars(collate([graph_a()], FULL)))
     assert {
         "window_id",
         "position_count",
@@ -546,6 +549,8 @@ def test_packed_batch_carries_every_spec_field():
         "moves_remaining",
         "global_numeric",
         "radius_orbit_bound",
+        "plans",
+        "builder_fingerprint",
     } == present
 
 
@@ -558,7 +563,7 @@ def test_collate_records_the_batch_s_own_orbit_ceiling():
     ceiling here, in numpy, is what lets that comparison be between two
     host-side integers instead of a read back off the device.
     """
-    batch = collate([graph_a(), graph_b()])
+    batch = collate([graph_a(), graph_b()], FULL)
     assert int(batch.radius_orbit.max()) == 5
     assert batch.radius_orbit_bound == 6
 
@@ -568,13 +573,13 @@ def test_collate_records_the_batch_s_own_orbit_ceiling():
         radius_dst=_int(), radius_src=_int(), radius_orbit=_int(),
         radius_axis_or_neg1=_int(),
     )
-    assert collate([empty]).radius_orbit_bound == 0
+    assert collate([empty], FULL).radius_orbit_bound == 0
 
 
 def test_packed_from_arrays_preserves_the_container_contract_without_copies():
-    expected = collate([graph_a(), graph_b()])
+    expected = collate([graph_a(), graph_b()], FULL)
     fields = packed_arrays(expected)
-    actual = packed_from_arrays(fields)
+    actual = packed_from_arrays(fields, FULL)
 
     assert actual.position_count == expected.position_count
     assert actual.radius_orbit_bound == expected.radius_orbit_bound
@@ -586,49 +591,49 @@ def test_packed_from_arrays_preserves_the_container_contract_without_copies():
 
 
 def test_packed_from_arrays_retains_batch_value_range_checks():
-    fields = packed_arrays(collate([graph_a(), graph_b()]))
+    fields = packed_arrays(collate([graph_a(), graph_b()], FULL))
     fields["window_status"] = fields["window_status"].copy()
     fields["window_status"][0] = 4
     with pytest.raises(ValueError, match=r"window_status must be <= 3"):
-        packed_from_arrays(fields)
+        packed_from_arrays(fields, FULL)
 
-    fields = packed_arrays(collate([graph_a(), graph_b()]))
+    fields = packed_arrays(collate([graph_a(), graph_b()], FULL))
     fields["cell_nearest_bucket"] = fields["cell_nearest_bucket"].copy()
     fields["cell_nearest_bucket"][0] = -1
     with pytest.raises(ValueError, match=r"cell_nearest_bucket must be >= 0"):
-        packed_from_arrays(fields)
+        packed_from_arrays(fields, FULL)
 
 
 def test_packed_from_arrays_retains_cross_position_checks():
-    fields = packed_arrays(collate([graph_a(), graph_b()]))
+    fields = packed_arrays(collate([graph_a(), graph_b()], FULL))
     fields["adjacency_dst"] = fields["adjacency_dst"].copy()
     first_b_edge = int(fields["adjacency_offsets"][1])
     fields["adjacency_dst"][first_b_edge] = 0
     with pytest.raises(ValueError, match=r"adjacency_dst crosses a batch position"):
-        packed_from_arrays(fields)
+        packed_from_arrays(fields, FULL)
 
 
 def test_packed_from_arrays_checks_crossing_around_a_sentinel():
-    fields = packed_arrays(collate([graph_a(), graph_b()]))
+    fields = packed_arrays(collate([graph_a(), graph_b()], FULL))
     fields["window_cell_index"] = fields["window_cell_index"].copy()
     first_b_window = int(fields["window_offsets"][1])
     fields["window_cell_index"][first_b_window, 0] = 0
     with pytest.raises(
         ValueError, match=r"window_cell_index crosses a batch position"
     ):
-        packed_from_arrays(fields)
+        packed_from_arrays(fields, FULL)
 
 
 def test_packed_from_arrays_rejects_a_foreign_negative_sentinel():
-    fields = packed_arrays(collate([graph_a(), graph_b()]))
+    fields = packed_arrays(collate([graph_a(), graph_b()], FULL))
     fields["action_window_index"] = fields["action_window_index"].copy()
     fields["action_window_index"][0, 0, 1] = -2
     with pytest.raises(ValueError, match=r"action_window_index must be >= -1"):
-        packed_from_arrays(fields)
+        packed_from_arrays(fields, FULL)
 
 
 def test_batch_moves_to_a_device():
-    batch = collate([graph_a(), graph_b()])
+    batch = collate([graph_a(), graph_b()], FULL)
     moved = batch.to("cpu")
     assert isinstance(moved, PackedACTBatch)
     assert moved.position_count == 2
@@ -637,7 +642,7 @@ def test_batch_moves_to_a_device():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="pinning needs a CUDA host")
 def test_batch_pins_every_tensor():
-    pinned = collate([graph_a(), graph_b()]).pin_memory()
+    pinned = collate([graph_a(), graph_b()], FULL).pin_memory()
     assert pinned.position_count == 2
     assert all(
         value.is_pinned()
@@ -647,7 +652,7 @@ def test_batch_pins_every_tensor():
 
 
 def test_telemetry_counts_every_budget_exactly():
-    stats = telemetry(collate([graph_a(), graph_b()]))
+    stats = telemetry(collate([graph_a(), graph_b()], FULL))
     assert stats == pytest.approx(
         {
             "positions": 2.0,

@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import math
 import warnings
-from dataclasses import dataclass
 from typing import Sequence
 
 import torch
 from torch import Tensor
 
 from .equivariant import at_least_fp32
+from .plans import LatentSegments
 
 try:
     import triton
@@ -78,30 +78,6 @@ def row_positions(offsets: Tensor, n_rows: int) -> Tensor:
 
 # --------------------------------------------------------------------------
 # The multi-range view of a read's key rows
-
-
-@dataclass(frozen=True, eq=False)
-class LatentSegments:
-    """Which concatenated key rows belong to which position (§26).
-
-    ``ranges`` is ``(P, F, 2)``: the half-open row span each of the ``F``
-    concatenated node families contributes to each position. ``range_base`` is
-    where that span starts in the position's own row numbering, and ``counts``
-    is how many rows the position owns altogether, letting a split take an
-    even slice of a position whose rows are in several pieces.
-
-    ``row_pos`` is the same information inverted — one position per row —
-    used by the per-node gradient kernel and the torch reference. Both are
-    derived from the families' CSR offsets, so they cannot disagree.
-    """
-
-    ranges: Tensor
-    range_base: Tensor
-    counts: Tensor
-    row_pos: Tensor
-    n_rows: int
-    positions: int
-    families: int
 
 
 def latent_segments(
@@ -1310,15 +1286,17 @@ def latent_read(
     ``k`` and ``v`` are the ``(N, C, heads, head_dim)`` rows of ``segments``'
     concatenated families, in the order those families were given.
     """
-    if int(q.shape[0]) != segments.positions:
+    segment_positions = segments.counts.shape[0]
+    segment_rows = segments.row_pos.shape[0]
+    if q.shape[0] != segment_positions:
         raise ValueError(
             f"q holds {q.shape[0]} positions but the segments describe "
-            f"{segments.positions}"
+            f"{segment_positions}"
         )
-    if int(k.shape[0]) != segments.n_rows:
+    if k.shape[0] != segment_rows:
         raise ValueError(
             f"k holds {k.shape[0]} rows but the segments describe "
-            f"{segments.n_rows}"
+            f"{segment_rows}"
         )
     out, _m, _total = _latent_read_op(
         q.contiguous(),
@@ -1342,10 +1320,10 @@ def latent_broadcast(
     ``(P + 1,)`` CSR offsets — the same information as ``node_pos``, in the
     ordering the gradient sweep reduces over.
     """
-    if int(offsets.shape[0]) - 1 != int(k.shape[0]):
+    if offsets.shape[0] - 1 != k.shape[0]:
         raise ValueError(
-            f"offsets describe {int(offsets.shape[0]) - 1} positions against "
-            f"the context's {int(k.shape[0])}"
+            f"offsets describe {offsets.shape[0] - 1} positions against "
+            f"the context's {k.shape[0]}"
         )
     return _latent_broadcast_op(
         q.contiguous(), k.contiguous(), v.contiguous(), node_pos, offsets

@@ -254,7 +254,7 @@ class Case:
         self.legacy = alias_report(self.legacy_sig, self.describe, samples=3)
         with torch.no_grad():
             self.act_policy, self.act_critic = act_model.policy_q(
-                collate([self.act_graph])
+                collate([self.act_graph], FULL)
             )
             self.old_policy, self.old_critic = old_model.policy_q(
                 legacy_collate([self.legacy_graph])
@@ -571,7 +571,7 @@ def test_37_1_every_named_preset_constructs_and_runs(cases):
         torch.manual_seed(SEED)
         model = MantisACT(cfg).eval()
         with torch.no_grad():
-            out = model(collate([graph_of[name]]), mass_floor=MASS_FLOOR)
+            out = model(collate([graph_of[name]], cfg), mass_floor=MASS_FLOOR)
         assert out.policy_logits.shape == (graph_of[name].n_legal,)
         assert torch.isfinite(out.policy_logits).all(), name
         assert torch.isfinite(out.q_value).all(), name
@@ -754,7 +754,7 @@ def test_37_5_the_model_carries_a_permuted_action_order(act_model, cases):
         action_tactical_numeric=graph.action_tactical_numeric[order],
     )
     with torch.no_grad():
-        got, _critic = act_model.policy_q(collate([permuted]))
+        got, _critic = act_model.policy_q(collate([permuted], FULL))
     assert deviation(got, case.act_policy[order]) <= budget(case.act_policy)
 
 
@@ -859,7 +859,7 @@ def test_37_10_the_evaluator_runs_over_both_architectures(cases):
     cfg = KlentConfig(device="cpu", autocast=False, compile=False)
     torch.manual_seed(SEED)
     for model, batch in (
-        (MantisACT(FULL).eval(), collate([case.act_graph for case in cases[:2]])),
+        (MantisACT(FULL).eval(), collate([case.act_graph for case in cases[:2]], FULL)),
         (
             MantisNet(MantisConfig()).eval(),
             legacy_collate([case.legacy_graph for case in cases[:2]]),
@@ -878,7 +878,7 @@ def test_37_11_a_bf16_smoke_training_step_is_finite(cases):
     torch.manual_seed(SEED)
     model = MantisACT(FULL).to(device).train()
     optimiser = torch.optim.AdamW(model.parameters(), lr=1e-3)
-    batch = collate([case.act_graph for case in cases[:3]]).to(torch.device(device))
+    batch = collate([case.act_graph for case in cases[:3]], FULL).to(torch.device(device))
 
     with torch.autocast(device, torch.bfloat16, enabled=True):
         out = model(batch, mass_floor=MASS_FLOOR)
@@ -902,7 +902,7 @@ def test_37_11_a_bf16_smoke_training_step_is_finite(cases):
 
 def test_37_12_node_edge_time_and_memory_telemetry_is_available(cases):
     """§34's figures, from the two calls that produce them."""
-    batch = collate([case.act_graph for case in cases])
+    batch = collate([case.act_graph for case in cases], FULL)
     counts = telemetry(batch)
     for name in (
         "cells",

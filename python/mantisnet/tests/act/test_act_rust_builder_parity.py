@@ -348,6 +348,6 @@ def test_rust_prefix_batch_matches_collated_python_reference(
         [case.ply for case in selected],
         cfg,
     )
-    singular = collate([build(case.position, cfg) for case in selected])
+    singular = collate([build(case.position, cfg) for case in selected], cfg)
     differences = _compare_batches(rust, singular, context=f"{config_name}[batch]")
     _report_float_differences(f"{config_name} batch", differences)

@@ -39,6 +39,8 @@ from mantisnet.models.mantis_act.messages import (
     segment_softmax,
     segment_sum,
 )
+from mantisnet.models.mantis_act.plans import PlannedEdges
+from mantisnet.models.mantis_act.segment_message import message_plan
 from mantisnet.models.mantis_act.packed import NUM_AXES, PackedACTBatch
 from mantisnet.models.mantis_act.symmetry import (
     D6_ORBITS_DMAX12,
@@ -145,6 +147,53 @@ def edge_set(name: str = "edges", **overrides) -> TypedEdges:
         "fully_routed", axis is None or bool((axis >= 0).all())
     )
     return TypedEdges(**fields)
+
+
+def planned_edge_set() -> PlannedEdges:
+    edges = edge_set()
+    axis_rows = (edges.axis >= 0).nonzero(as_tuple=True)[0]
+    routed = tuple(
+        column.index_select(0, axis_rows)
+        for column in (edges.src, edges.dst, edges.relation, edges.axis)
+    )
+    inv_plan = message_plan(
+        edges.src,
+        edges.dst,
+        edges.relation,
+        None,
+        edges.n_src,
+        edges.n_dst,
+        edges.num_relations,
+        1,
+        dst_sorted=edges.dst_sorted,
+    )
+    axis_plan = message_plan(
+        *routed,
+        edges.n_src,
+        edges.n_dst,
+        edges.num_relations,
+        NUM_AXES,
+        dst_sorted=edges.dst_sorted,
+    )
+    return PlannedEdges(
+        src=edges.src,
+        dst=edges.dst,
+        relation=edges.relation,
+        axis=edges.axis,
+        n_src=edges.n_src,
+        n_dst=edges.n_dst,
+        num_relations=edges.num_relations,
+        dst_sorted=edges.dst_sorted,
+        fully_routed=False,
+        name=edges.name,
+        axis_rows=axis_rows,
+        routed_src=routed[0],
+        routed_dst=routed[1],
+        routed_relation=routed[2],
+        routed_axis=routed[3],
+        inv_plan=inv_plan,
+        axis_plan=axis_plan,
+    )
 
 
 def state(rows: int, generator: torch.Generator, *, d_axis: int = D_AXIS):
@@ -757,7 +806,7 @@ def test_the_three_paths_run_on_a_position_the_builder_made():
     for _ in range(40):
         position.advance(*rng.choice(position.legal_moves()))
         assert not position.is_terminal
-    packed = collate([build(position, cfg)])
+    packed = collate([build(position, cfg)], cfg)
 
     to_windows, to_cells = incidence_edges(packed)
     adjacency = adjacency_edges(packed, cfg)

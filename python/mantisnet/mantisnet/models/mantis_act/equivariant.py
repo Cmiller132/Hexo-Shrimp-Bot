@@ -343,6 +343,7 @@ class EquivariantFFN(nn.Module):
 
     def __init__(self, cfg: MantisACTConfig) -> None:
         super().__init__()
+        self.activation = cfg.activation
         self.norm = EquivariantNorm(cfg)
         self.inv = nn.Sequential(
             nn.Linear(cfg.d_inv, cfg.ffn_mult * cfg.d_inv),
@@ -399,6 +400,7 @@ class AxisMix(nn.Module):
 
     def __init__(self, cfg: MantisACTConfig) -> None:
         super().__init__()
+        self.activation = cfg.activation
         self.d_axis = cfg.d_axis
         if not cfg.d_axis:
             return
@@ -645,6 +647,27 @@ class PhaseFiLM(nn.Module):
         return EquivariantState(inv, axis)
 
 
+def run_equivariant_stage(
+    state: EquivariantState,
+    mix: AxisMix,
+    ffn: EquivariantFFN,
+    *,
+    film: PhaseFiLM | None = None,
+    phase_id: Tensor | None = None,
+) -> EquivariantState:
+    """Run one traceable AxisMix/FFN/FiLM stage in the specified order.
+
+    The stage intentionally stays as ordinary torch code.  The production
+    compile boundary surrounds the whole model, allowing Inductor to fuse this
+    composition with its neighbours while preserving one shared ordering seam
+    for cells, windows, actions, and private heads.
+    """
+    if (film is None) != (phase_id is None):
+        raise ValueError("film and phase_id must be supplied together")
+    result = ffn(mix(state))
+    return result if film is None else film(result, phase_id)
+
+
 __all__ = [
     "AXIS_CHANNELS",
     "PHASE_IDS",
@@ -659,4 +682,5 @@ __all__ = [
     "activation_module",
     "at_least_fp32",
     "permute_axis_channels",
+    "run_equivariant_stage",
 ]

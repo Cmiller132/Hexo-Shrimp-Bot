@@ -12,11 +12,14 @@ leading zero.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields, is_dataclass
 
 import numpy as np
 import torch
 
+from .config import MantisACTConfig
+from .plans import ACTPlans, ClassRowPlan, build_plans, builder_fingerprint
+from .segment_message import MessagePlan
 from .pattern_classes import (
     ALL_CELL_WINDOW_REL_CLASSES,
     ALL_WINDOW_PATTERN_CLASSES,
@@ -32,6 +35,50 @@ WINDOW_LEN = 6
 NUM_AXES = 3
 # 3 axes x 6 candidate slots through every legal cell (§19.2).
 POST_ACTION_ROWS = NUM_AXES * WINDOW_LEN
+
+
+def _mark_chunk_dynamic(value, seen: set[int]) -> None:
+    """Mark one packed input tree's chunk-varying leading dimensions.
+
+    Dynamo does not recursively inherit a dynamic hint from a dataclass, and
+    both :meth:`Tensor.to` and the plan containers' ``to`` methods create new
+    tensors.  Walk the concrete transport tree after each construction so the
+    outer whole-model compile sees the same symbolic row dimensions on every
+    chunk.
+
+    Relation CSR pointers and class CSR pointers are the exceptions: their
+    lengths are vocabulary sizes fixed by the model architecture.  Marking
+    those dynamic would turn true architecture constants into unnecessary
+    symbolic inputs and can introduce false equality constraints.
+    """
+    if isinstance(value, torch.Tensor):
+        identity = id(value)
+        if identity in seen:
+            return
+        seen.add(identity)
+        # Dynamo necessarily specializes the degenerate 0/1 cases because
+        # those cardinalities change tensor semantics.  Size two is a normal
+        # dynamic row count now that the inner stage compilers (and their
+        # accidental equal-dimension constraints) are gone.
+        if value.ndim and value.shape[0] > 1:
+            torch._dynamo.mark_dynamic(value, 0)
+        return
+
+    if isinstance(value, MessagePlan):
+        for name, child in vars(value).items():
+            if name != "rel_ptr":
+                _mark_chunk_dynamic(child, seen)
+        return
+
+    if isinstance(value, ClassRowPlan):
+        # ``ptr`` has n_classes + 1 rows; only the class-sorted row order grows
+        # with a packed chunk.
+        _mark_chunk_dynamic(value.rows, seen)
+        return
+
+    if is_dataclass(value):
+        for field in fields(value):
+            _mark_chunk_dynamic(getattr(value, field.name), seen)
 
 # The rules' legality radius, and the §8.2 nearest-stone bucket vocabulary it
 # fixes: one bucket per hex distance 0..LEGAL_RADIUS, plus one for a cell no
@@ -625,13 +672,33 @@ class PackedACTBatch:
     # different ``d6_relation_mode``/``d_max`` settings.
     radius_orbit_bound: int
 
+    # CPU-built execution views. Hand-built batches used by module-level tests
+    # may omit them, but every model entry point refuses that omission before
+    # arithmetic; :func:`collate` always supplies both fields.
+    plans: ACTPlans | None = None
+    builder_fingerprint: str = ""
+
+    def mark_dynamic(self) -> "PackedACTBatch":
+        """Annotate every chunk-varying tensor row for the outer compiler.
+
+        The batch and its plans are immutable in shape for one step, so these
+        annotations alter no model value.  They only state that another packed
+        step may carry different position, node, edge, or action row counts.
+        """
+        _mark_chunk_dynamic(self, set())
+        return self
+
     def to(self, device) -> "PackedACTBatch":
         """The same batch with every tensor on ``device``."""
-        moved = {
-            name: (v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v)
-            for name, v in vars(self).items()
-        }
-        return PackedACTBatch(**moved)
+        moved = {}
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                moved[name] = value.to(device, non_blocking=True)
+            elif isinstance(value, ACTPlans):
+                moved[name] = value.to(device, non_blocking=True)
+            else:
+                moved[name] = value
+        return PackedACTBatch(**moved).mark_dynamic()
 
     def pin_memory(self) -> "PackedACTBatch":
         """The same batch in pinned host memory, so ``to`` is a true async DMA.
@@ -639,11 +706,15 @@ class PackedACTBatch:
         ``non_blocking`` silently degrades to a synchronous staged copy from
         pageable memory; a prefetch worker pins ahead of the transfer instead.
         """
-        pinned = {
-            name: (v.pin_memory() if isinstance(v, torch.Tensor) else v)
-            for name, v in vars(self).items()
-        }
-        return PackedACTBatch(**pinned)
+        pinned = {}
+        for name, value in vars(self).items():
+            if isinstance(value, torch.Tensor):
+                pinned[name] = value.pin_memory()
+            elif isinstance(value, ACTPlans):
+                pinned[name] = value.pin_memory()
+            else:
+                pinned[name] = value
+        return PackedACTBatch(**pinned).mark_dynamic()
 
 
 def _offsets(counts: np.ndarray) -> np.ndarray:
@@ -740,16 +811,21 @@ def _refuse_crossing(
     )
 
 
-def packed_from_arrays(fields: Mapping[str, object]) -> PackedACTBatch:
+def packed_from_arrays(
+    fields: Mapping[str, object], cfg: MantisACTConfig
+) -> PackedACTBatch:
     """Wrap one Rust-collated batch without rebuilding its position graphs.
 
     Rust owns concatenation and index shifting on the production batch path.
-    This boundary accepts exactly :class:`PackedACTBatch`'s fields, checks the
-    array wire format and the cheap batch-wide guards that protect model table
-    lookups, then shares the NumPy allocations with PyTorch.  In particular,
+    This boundary accepts exactly :class:`PackedACTBatch`'s array fields,
+    checks the wire format and the cheap batch-wide guards that protect model
+    table lookups, derives the CPU execution plans the trunk consumes, then
+    shares the NumPy allocations with PyTorch.  In particular,
     `_refuse_crossing` remains an independent check of the collation frame even
     though Rust constructs that frame, while no per-position ``ACTGraph`` or
-    NumPy concatenation is created here.
+    NumPy concatenation is created here.  ``cfg`` is the configuration the
+    batch was built under; the plans it produces carry its fingerprint, which
+    the model refuses to run against a disagreeing configuration.
     """
     if not isinstance(fields, Mapping):
         raise TypeError(
@@ -868,15 +944,25 @@ def packed_from_arrays(fields: Mapping[str, object]) -> PackedACTBatch:
             f"requires {expected_orbit_bound}"
         )
 
+    plans = build_plans(
+        cfg,
+        arrays=arrays,
+        cell_offsets=offsets[_CELLS],
+        window_offsets=offsets[_WINDOWS],
+        legal_offsets=offsets[_LEGAL],
+        phase_id=arrays["phase_id"],
+    )
     tensors = {name: torch.from_numpy(array) for name, array in arrays.items()}
     return PackedACTBatch(
         position_count=position_count,
         radius_orbit_bound=radius_orbit_bound,
+        plans=plans,
+        builder_fingerprint=builder_fingerprint(cfg),
         **tensors,
     )
 
 
-def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
+def collate(graphs: Sequence[ACTGraph], cfg: MantisACTConfig) -> PackedACTBatch:
     """Concatenate position graphs into one packed batch (§25, §26).
 
     Every index is shifted by its target family's offset, ``-1`` sentinels are
@@ -895,7 +981,13 @@ def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
     }
     offsets = {family: _offsets(count) for family, count in counts.items()}
 
-    packed: dict[str, torch.Tensor] = {}
+    if not isinstance(cfg, MantisACTConfig):
+        raise TypeError(
+            f"collate needs the MantisACTConfig that built its graphs, got "
+            f"{type(cfg).__name__}"
+        )
+
+    packed_numpy: dict[str, np.ndarray] = {}
     for name in _PACKED_ARRAYS:
         target = _INDEX_TARGETS.get(name)
         parts = []
@@ -910,32 +1002,44 @@ def collate(graphs: Sequence[ACTGraph]) -> PackedACTBatch:
             raise ValueError(
                 f"{name} has inconsistent feature widths across positions: {widths}"
             )
-        packed[name] = torch.from_numpy(np.ascontiguousarray(np.concatenate(parts)))
+        packed_numpy[name] = np.ascontiguousarray(np.concatenate(parts))
 
     for name, row_family, target_family, sentinel in _INDEX_FIELDS:
         _refuse_crossing(
             name,
-            packed[name].numpy(),
+            packed_numpy[name],
             offsets[row_family],
             offsets[target_family],
             sentinel=sentinel,
         )
 
     global_numeric = np.stack([g.global_numeric for g in graphs])
-    orbits = packed["radius_orbit"]
+    phase_id = np.asarray([g.phase_id for g in graphs], dtype=np.int64)
+    plans = build_plans(
+        cfg,
+        arrays=packed_numpy,
+        cell_offsets=offsets[_CELLS],
+        window_offsets=offsets[_WINDOWS],
+        legal_offsets=offsets[_LEGAL],
+        phase_id=phase_id,
+    )
+    packed = {name: torch.from_numpy(value) for name, value in packed_numpy.items()}
+    orbits = packed_numpy["radius_orbit"]
     return PackedACTBatch(
         position_count=len(graphs),
-        radius_orbit_bound=0 if orbits.numel() == 0 else int(orbits.max()) + 1,
+        radius_orbit_bound=0 if orbits.size == 0 else int(orbits.max()) + 1,
         cell_offsets=torch.from_numpy(offsets[_CELLS]),
         window_offsets=torch.from_numpy(offsets[_WINDOWS]),
         legal_offsets=torch.from_numpy(offsets[_LEGAL]),
         adjacency_offsets=torch.from_numpy(offsets[_ADJACENCY]),
         radius_offsets=torch.from_numpy(offsets[_RADIUS]),
-        phase_id=torch.tensor([g.phase_id for g in graphs], dtype=torch.long),
+        phase_id=torch.from_numpy(phase_id),
         moves_remaining=torch.tensor([g.moves_remaining for g in graphs], dtype=torch.long),
         global_numeric=torch.from_numpy(np.ascontiguousarray(global_numeric)),
+        plans=plans,
+        builder_fingerprint=builder_fingerprint(cfg),
         **packed,
-    )
+    ).mark_dynamic()
 
 
 # The graph-cell budget a fitting chunk is packed under (§26), in graph cells

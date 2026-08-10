@@ -221,7 +221,7 @@ def real_batch():
     graphs = [
         build(hexo_py.Position.replay(playout(plies, SEED)), FULL) for plies in PLIES
     ]
-    return collate(graphs)
+    return collate(graphs, FULL)
 
 
 # --------------------------------------------------------------------------

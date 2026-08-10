@@ -71,6 +71,7 @@ from mantisnet.models.mantis_act.packed import (
     PHASE_SECOND,
     collate,
 )
+from mantisnet.models.mantis_act.plans import build_plans_from_cpu_batch
 from mantisnet.models.mantis_act.summary import parameter_summary
 
 from .test_act_numerics import position
@@ -103,7 +104,9 @@ SHORT_PLIES = (21, 22)
 
 def act_batch(cfg: MantisACTConfig, plies=PLIES, games=(0, 1)):
     """A packed batch of real self-play positions at each of ``plies``."""
-    return collate([build(position(game, ply), cfg) for game in games for ply in plies])
+    return collate(
+        [build(position(game, ply), cfg) for game in games for ply in plies], cfg
+    )
 
 
 @pytest.fixture(scope="module")
@@ -186,10 +189,14 @@ def test_a_disabled_head_contributes_no_aux_key(model, batch):
     assert sorted(out.aux) == ["committed_mass"]
 
     torch.manual_seed(SEED)
-    with_value = MantisACT(replace(FULL, enable_state_value_head=True)).eval()
-    value_out = with_value(batch, MASS_FLOOR)
+    cfg = replace(FULL, enable_state_value_head=True)
+    with_value = MantisACT(cfg).eval()
+    value_batch = act_batch(cfg)
+    value_out = with_value(value_batch, MASS_FLOOR)
     assert sorted(value_out.aux) == ["committed_mass", "state_value"]
-    assert tuple(value_out.aux["state_value"].shape) == (batch.position_count,)
+    assert tuple(value_out.aux["state_value"].shape) == (
+        value_batch.position_count,
+    )
     assert value_out.aux["state_value"].dtype is torch.float32
 
 
@@ -254,7 +261,7 @@ def test_permuting_the_action_rows_permutes_the_output_the_same_way(trained):
     another, and a stage that sorted or regrouped actions would satisfy the
     first while failing this.
     """
-    single = collate([build(position(0, 61), FULL)])
+    single = collate([build(position(0, 61), FULL)], FULL)
     n_legal = int(single.legal_offsets[-1])
     generator = torch.Generator().manual_seed(SEED)
     order = torch.randperm(n_legal, generator=generator)
@@ -267,6 +274,7 @@ def test_permuting_the_action_rows_permutes_the_output_the_same_way(trained):
         action_pre_status=single.action_pre_status[order],
         action_tactical_numeric=single.action_tactical_numeric[order],
     )
+    shuffled = replace(shuffled, plans=build_plans_from_cpu_batch(FULL, shuffled))
     with torch.no_grad():
         base = trained(single, MASS_FLOOR)
         moved = trained(shuffled, MASS_FLOOR)
@@ -285,10 +293,10 @@ def test_permuting_the_action_rows_permutes_the_output_the_same_way(trained):
 def test_the_model_runs_at_every_ply_and_every_phase(model):
     """All three §13.1 phases, including the opening board with no window."""
     seen = set()
-    opening = collate([build(hexo_py.Position(), FULL)])
+    opening = collate([build(hexo_py.Position(), FULL)], FULL)
     assert int(opening.phase_id[0]) == PHASE_OPENING
     for one in [opening] + [
-        collate([build(position(game, ply), FULL)])
+        collate([build(position(game, ply), FULL)], FULL)
         for game in (0, 1)
         for ply in PLIES
     ]:
@@ -311,10 +319,10 @@ def test_a_batch_holds_both_placement_phases(batch):
 def test_batched_and_single_position_forwards_agree(trained):
     """§31.10: the only place a segment boundary can be wrong is a batch."""
     graphs = [build(position(game, ply), FULL) for game in (0, 1) for ply in PLIES]
-    packed = collate(graphs)
+    packed = collate(graphs, FULL)
     with torch.no_grad():
         together = trained(packed, MASS_FLOOR)
-        apart = [trained(collate([graph]), MASS_FLOOR) for graph in graphs]
+        apart = [trained(collate([graph], FULL), MASS_FLOOR) for graph in graphs]
 
     offsets = packed.legal_offsets.tolist()
     for index, one in enumerate(apart):

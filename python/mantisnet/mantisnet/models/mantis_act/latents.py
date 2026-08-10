@@ -80,7 +80,7 @@ class RaggedStream:
     row_pos: Tensor
 
     def __post_init__(self) -> None:
-        if self.row_pos.ndim != 1 or int(self.row_pos.shape[0]) != self.rows:
+        if self.row_pos.ndim != 1 or self.row_pos.shape[0] != self.rows:
             raise ValueError(
                 f"row_pos is {tuple(self.row_pos.shape)} against the family's "
                 f"({self.rows},) rows"
@@ -88,7 +88,7 @@ class RaggedStream:
 
     @property
     def rows(self) -> int:
-        return int(self.state.inv.shape[0])
+        return self.state.inv.shape[0]
 
 
 def _init_table(rows: int, width: int) -> nn.Parameter:
@@ -235,9 +235,11 @@ class LatentPass(nn.Module):
                 f"{list(self.entity_names)}"
             )
         streams = [entities[name] for name in self.entity_names]
-        counts = {int(s.offsets.shape[0]) - 1 for s in streams}
-        if len(counts) != 1:
-            raise ValueError(f"families disagree on position count: {sorted(counts)}")
+        positions = streams[0].offsets.shape[0] - 1
+        for stream in streams[1:]:
+            if stream.offsets.shape[0] - 1 != positions:
+                counts = [candidate.offsets.shape[0] - 1 for candidate in streams]
+                raise ValueError(f"families disagree on position count: {counts}")
         # A mismatched offset/row count is caught by `row_positions`'s own ATen
         # check and by `RaggedStream.__post_init__`, so it is not re-checked here.
         for name, stream in zip(self.entity_names, streams):
@@ -256,21 +258,51 @@ class LatentPass(nn.Module):
             raise ValueError("this pass has axis latents but got LatentState.axis=None")
         return latents.inv, latents.axis
 
+    def _segments(self, streams, inv: Tensor, segments):
+        """Build or validate the shared ragged view used by a latent read."""
+        positions = streams[0].offsets.shape[0] - 1
+        if segments is None:
+            return latent_segments(
+                [stream.offsets for stream in streams],
+                [stream.row_pos for stream in streams],
+            )
+        expected_rows = sum(stream.rows for stream in streams)
+        segment_positions = segments.counts.shape[0]
+        segment_rows = segments.row_pos.shape[0]
+        if (
+            segment_positions != positions
+            or segments.families != len(streams)
+            or segment_rows != expected_rows
+        ):
+            raise ValueError(
+                "the precomputed latent segments describe "
+                f"P={segment_positions}, F={segments.families}, "
+                f"N={segment_rows} against P={positions}, "
+                f"F={len(streams)}, N={expected_rows}"
+            )
+        if segments.device != inv.device:
+            raise ValueError(
+                f"latent segments are on {segments.device}, states on {inv.device}"
+            )
+        return segments
+
     def read(
-        self, latents: LatentState, entities: Mapping[str, RaggedStream]
+        self,
+        latents: LatentState,
+        entities: Mapping[str, RaggedStream],
+        *,
+        segments=None,
     ) -> LatentState:
         """Latents attend over every node of their own position (§17.2)."""
         if not self.enabled:
             return latents
         streams = self._ordered(entities)
         inv, axis = self._require(latents)
-        positions = int(streams[0].offsets.shape[0]) - 1
+        positions = streams[0].offsets.shape[0] - 1
         heads = self.cfg.num_heads
         # One multi-range view shared by both streams; the ranges depend only
         # on the offsets.
-        segments = latent_segments(
-            [s.offsets for s in streams], [s.row_pos for s in streams]
-        )
+        segments = self._segments(streams, inv, segments)
         normed = [self.norm_src[i](s.state) for i, s in enumerate(streams)]
 
         keys = []
@@ -440,12 +472,17 @@ class LatentPass(nn.Module):
         return updated
 
     def forward(
-        self, latents: LatentState, entities: Mapping[str, RaggedStream]
+        self,
+        latents: LatentState,
+        entities: Mapping[str, RaggedStream],
+        *,
+        segments=None,
     ) -> tuple[LatentState, dict[str, RaggedStream]]:
         """Read, mix, then broadcast — steps 6 to 8 of the §18 block."""
         if not self.enabled:
             return latents, dict(entities)
-        latents = self.mix(self.read(latents, entities))
+
+        latents = self.mix(self.read(latents, entities, segments=segments))
         return latents, self.broadcast(latents, entities)
 
 

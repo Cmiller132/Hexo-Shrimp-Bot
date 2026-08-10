@@ -36,8 +36,10 @@ from .equivariant import (
     EquivariantState,
     PhaseFiLM,
     activation_module,
+    run_equivariant_stage,
 )
-from .latents import LatentPass, LatentState, RaggedStream, StateLatents, row_positions
+from .latent_attention import LatentSegments
+from .latents import LatentPass, LatentState, RaggedStream, StateLatents
 from .messages import (
     INCIDENCE_RELATIONS,
     AdjacencyMessage,
@@ -55,6 +57,7 @@ from .messages import (
     window_window_edges,
 )
 from .packed import NEAREST_BUCKETS, PackedACTBatch
+from .plans import StatePlans, builder_fingerprint
 from .pattern_classes import ALL_WINDOW_PATTERN_CLASSES, EMPTY, MIXED
 from .windows import WINDOW_NUMERIC_FEATURES
 
@@ -247,8 +250,27 @@ class StateEdges:
     window_window: WindowWindowEdges | None
 
 
-def state_edges(batch: PackedACTBatch, cfg: MantisACTConfig) -> StateEdges:
+def state_edges(
+    batch: PackedACTBatch,
+    cfg: MantisACTConfig,
+    *,
+    expected_fingerprint: str | None = None,
+) -> StateEdges | StatePlans:
     """The §18 edge families of ``batch`` under ``cfg`` (§10, §15, §16)."""
+    expected = (
+        builder_fingerprint(cfg)
+        if expected_fingerprint is None
+        else expected_fingerprint
+    )
+    if batch.plans is not None:
+        if batch.builder_fingerprint != expected:
+            raise ValueError(
+                f"the batch was planned for builder config "
+                f"{batch.builder_fingerprint!r}, but this state trunk expects "
+                f"{expected!r}; rebuild it with collate(graphs, cfg)"
+            )
+        if cfg.window_window_mode != "typed_collinear_crossing":
+            return batch.plans.state_edges
     to_windows, to_cells = incidence_edges(batch)
     typed_windows = cfg.window_window_mode == "typed_collinear_crossing"
     return StateEdges(
@@ -342,8 +364,9 @@ class StateTrunkBlock(nn.Module):
         windows: EquivariantState,
         latents: LatentState,
         *,
-        edges: StateEdges,
+        edges: StateEdges | StatePlans,
         latent_pass: LatentPass,
+        latent_segments: LatentSegments | None = None,
         cell_offsets: Tensor,
         cell_row_pos: Tensor,
         window_offsets: Tensor,
@@ -389,14 +412,24 @@ class StateTrunkBlock(nn.Module):
                 "cell": RaggedStream(cells, cell_offsets, cell_row_pos),
                 "window": RaggedStream(windows, window_offsets, window_row_pos),
             },
+            segments=latent_segments,
         )
         cells, windows = entities["cell"].state, entities["window"].state
 
-        cells = self.cell_ffn(self.cell_mix(cells))
-        windows = self.window_ffn(self.window_mix(windows))
-
-        cells = self.cell_film(cells, cell_phase)
-        windows = self.window_film(windows, window_phase)
+        cells = run_equivariant_stage(
+            cells,
+            self.cell_mix,
+            self.cell_ffn,
+            film=self.cell_film,
+            phase_id=cell_phase,
+        )
+        windows = run_equivariant_stage(
+            windows,
+            self.window_mix,
+            self.window_ffn,
+            film=self.window_film,
+            phase_id=window_phase,
+        )
         return cells, windows, latents
 
 
@@ -467,6 +500,7 @@ class StateTrunk(nn.Module):
         super().__init__()
         refuse_unimplemented_paths(cfg)
         self.cfg = cfg
+        self.builder_fingerprint = builder_fingerprint(cfg)
 
         self.cell_embedding = CellEmbedding(cfg)
         self.window_embedding = WindowEmbedding(cfg)
@@ -538,27 +572,40 @@ class StateTrunk(nn.Module):
         return self._run(batch, trace), trace.tensors
 
     def _run(self, batch: PackedACTBatch, trace: _Trace | None) -> TrunkOutput:
+        if batch.plans is None:
+            raise ValueError(
+                "PackedACTBatch.plans is missing; build batches with "
+                "collate(graphs, cfg) so execution plans are made on the CPU"
+            )
+        if batch.builder_fingerprint != self.builder_fingerprint:
+            raise ValueError(
+                f"the batch was planned for builder config "
+                f"{batch.builder_fingerprint!r}, but this state trunk expects "
+                f"{self.builder_fingerprint!r}; rebuild it with "
+                "collate(graphs, model.cfg)"
+            )
+        plans = batch.plans
         cells = self.cell_embedding(batch)
         windows = self.window_embedding(batch)
         latents = self.latents.initial(batch.global_numeric)
-        edges = state_edges(batch, self.cfg)
+        edges = state_edges(
+            batch,
+            self.cfg,
+            expected_fingerprint=self.builder_fingerprint,
+        )
 
         # Which position owns each cell row and each window row, built once for
         # the whole forward: the latent read, the latent broadcast, and the
         # phase gather below all want the same two vectors, and they depend on
         # the batch alone. The row counts come off the families' own tables,
         # which is what makes `row_positions` sync-free (see its docstring).
-        cell_row_pos = row_positions(
-            batch.cell_offsets, int(batch.cell_occupancy.shape[0])
-        )
-        window_row_pos = row_positions(
-            batch.window_offsets, int(batch.window_pattern_class.shape[0])
-        )
+        cell_row_pos = plans.cell_row_pos
+        window_row_pos = plans.window_row_pos
 
         # §13.1's phase is a per-position scalar; every node of a position
         # carries its own position's, gathered once for the whole forward.
-        cell_phase = batch.phase_id.index_select(0, cell_row_pos)
-        window_phase = batch.phase_id.index_select(0, window_row_pos)
+        cell_phase = plans.cell_phase
+        window_phase = plans.window_phase
 
         if trace is not None:
             trace.state("input.cell", cells)
@@ -572,6 +619,7 @@ class StateTrunk(nn.Module):
                 latents,
                 edges=edges,
                 latent_pass=self.latents[index],
+                latent_segments=plans.state_segments,
                 cell_offsets=batch.cell_offsets,
                 cell_row_pos=cell_row_pos,
                 window_offsets=batch.window_offsets,
@@ -603,7 +651,7 @@ class StateTrunk(nn.Module):
             cells=cells,
             windows=windows,
             latents=latents,
-            position_count=int(batch.position_count),
+            position_count=batch.global_numeric.shape[0],
         )
 
 
