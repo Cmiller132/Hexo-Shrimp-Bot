@@ -166,20 +166,30 @@ def fit(
     model.train()
     policy_q = _policy_q_fn(cfg)
 
+    pin = torch.device(cfg.device).type == "cuda"
+
     def prep(indices: list[int]):
         chunk = [samples[i] for i in indices]
         batch = _rebuild(model, chunk)
         target = torch.from_numpy(np.concatenate([s.improved for s in chunk]))
         ranks = torch.tensor([s.rank for s in chunk])
         returns = torch.tensor([s.g for s in chunk], dtype=torch.float32)
+        if pin:
+            # Pinned here, on the prefetch worker, so the step's ``.to`` is a
+            # true async DMA; from pageable memory every transfer degrades to
+            # a staged synchronous copy on the training thread.
+            batch = batch.pin_memory()
+            target = target.pin_memory()
+            ranks = ranks.pin_memory()
+            returns = returns.pin_memory()
         return batch, target, ranks, returns
 
     def fit_step(payload):
         batch, target, ranks, returns = payload
         batch = batch.to(cfg.device)
-        target = target.to(cfg.device)
-        ranks = ranks.to(cfg.device)
-        returns = returns.to(cfg.device)
+        target = target.to(cfg.device, non_blocking=True)
+        ranks = ranks.to(cfg.device, non_blocking=True)
+        returns = returns.to(cfg.device, non_blocking=True)
 
         with torch.autocast(cfg.device, torch.bfloat16, enabled=cfg.autocast):
             policy_logits, critic_logits = policy_q(model, batch)
