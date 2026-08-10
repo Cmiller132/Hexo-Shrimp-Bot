@@ -15,6 +15,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from .actions import TACTICAL_FEATURES
 from .class_embedding import class_pair_embedding
@@ -322,7 +323,16 @@ class PostPlacementEncoder(nn.Module):
             self.wg_inv.bias,
             self.ln_inv.eps,
         )
-        row = self.row_inv(gated).view(*grid, self.cfg.d_inv)
+        # This MLP's hidden tensor is wider than all eighteen action rows.
+        # The enclosing post checkpoint removes it from the original forward;
+        # nesting here also keeps it out of the enclosing replay tape, so the
+        # two row streams do not coexist at the backward peak.
+        row = checkpoint(
+            self.row_inv,
+            gated,
+            use_reentrant=False,
+            preserve_rng_state=True,
+        ).view(*grid, self.cfg.d_inv)
         # §27: the reduction over the six candidate slots is fp32.
         summary_inv = at_least_fp32(row).sum(dim=2).to(row.dtype)
 
@@ -345,7 +355,12 @@ class PostPlacementEncoder(nn.Module):
                 self.wg_axis.bias,
                 self.ln_axis.eps,
             )
-            row = self.row_axis(gated).view(*grid, self.cfg.d_axis)
+            row = checkpoint(
+                self.row_axis,
+                gated,
+                use_reentrant=False,
+                preserve_rng_state=True,
+            ).view(*grid, self.cfg.d_axis)
             delta_axis = self.drop(at_least_fp32(row).sum(dim=2).to(row.dtype))
 
         pooled = at_least_fp32(self.phi(summary_inv)).mean(dim=1).to(summary_inv.dtype)
@@ -689,7 +704,18 @@ class ActionEncoder(nn.Module):
 
         actions = self.base(batch, trunk.cells)
         if self.post is not None:
-            actions = self.post(batch, actions, trunk.windows)
+            # The eighteen-row counterfactual block is the fit path's dominant
+            # saved-activation site. Non-reentrant checkpointing retains only
+            # its inputs and replays the same ordered custom kernels during
+            # backward; RNG preservation keeps configured dropout identical.
+            actions = checkpoint(
+                self.post,
+                batch,
+                actions,
+                trunk.windows,
+                use_reentrant=False,
+                preserve_rng_state=True,
+            )
         if self.tactical is not None:
             actions = self.tactical(actions, batch.action_tactical_numeric)
         elif batch.action_tactical_numeric.shape[1]:
