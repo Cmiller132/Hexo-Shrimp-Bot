@@ -13,6 +13,7 @@ from .. import message_passing
 from ..attention import fused_attention
 from ..builder import collate_positions
 from ..model import _class_term
+from ..optim import make_adam
 from ..klent.train import KlentConfig, _policy_q
 from .bench import _config, _family_fields, _load_or_fresh
 from .cohort import corpus_cohort, selfplay_cohort
@@ -273,6 +274,7 @@ def profile_fit(
     compile: bool = False,
     pair_budget: int | None = None,
     cell_budget: int | None = None,
+    adam_impl: str = "auto",
     model_kw: dict | None = None,
     family: str | None = None,
 ) -> dict:
@@ -287,7 +289,7 @@ def profile_fit(
             f"wait and warmup must be nonnegative and active positive, "
             f"got {wait}, {warmup}, {active}"
         )
-    cfg = _config(device, compile, pair_budget, cell_budget)
+    cfg = _config(device, compile, pair_budget, cell_budget, adam_impl)
     model, loaded = _load_or_fresh(
         checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
     )
@@ -300,7 +302,12 @@ def profile_fit(
     frozen = load_corpus(corpus) if isinstance(corpus, (str, Path)) else corpus
     samples = frozen.split_samples(split)
     sizes = sample_sizes(frozen, samples)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    optimizer, adam_resolved = make_adam(
+        model.parameters(),
+        lr=cfg.lr,
+        device=cfg.device,
+        implementation=cfg.adam_impl,
+    )
 
     def run_epoch(epoch_seed):
         return fit_supervised_epoch(
@@ -373,6 +380,7 @@ def profile_fit(
         **_family_fields(loaded),
         "device": device,
         "compile": compile,
+        "adam_impl": {"requested": adam_impl, "resolved": adam_resolved},
         "split": split,
         "samples": len(samples),
         "schedule": {"wait": wait, "warmup": warmup, "active": active},

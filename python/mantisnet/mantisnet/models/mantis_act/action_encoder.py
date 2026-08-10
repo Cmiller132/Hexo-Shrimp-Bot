@@ -34,6 +34,7 @@ from .equivariant import (
     run_equivariant_stage,
 )
 from .latent_attention import latent_broadcast
+from .linear_fusion import horizontal_linears
 from .latents import ActionLatents, LatentPass, LatentState, RaggedStream
 from .messages import make_relation_embedding
 from .ordered_reductions import ordered_index_select
@@ -493,8 +494,9 @@ class StateContextBroadcast(nn.Module):
         # reduces each position's contiguous action run, so no per-node context
         # tensor is materialised — §17.4's broadcast with a one-slot context.
         shape = (n_positions, n_rows, 1, heads, self.head_dim_inv)
-        key = at_least_fp32(self.k_inv(rows)).view(shape)
-        value = at_least_fp32(self.v_inv(rows)).view(shape)
+        key, value = horizontal_linears(rows, (self.k_inv, self.v_inv))
+        key = at_least_fp32(key).view(shape)
+        value = at_least_fp32(value).view(shape)
         query = at_least_fp32(self.q_inv(self.norm_q_inv(actions.inv))).view(
             n_legal, 1, heads, self.head_dim_inv
         )
@@ -516,8 +518,11 @@ class StateContextBroadcast(nn.Module):
                 heads,
                 self.head_dim_axis,
             )
-            key = at_least_fp32(self.k_axis(normed_axis)).view(shape)
-            value = at_least_fp32(self.v_axis(normed_axis)).view(shape)
+            key, value = horizontal_linears(
+                normed_axis, (self.k_axis, self.v_axis)
+            )
+            key = at_least_fp32(key).view(shape)
+            value = at_least_fp32(value).view(shape)
             query = at_least_fp32(self.q_axis(self.norm_q_axis(actions.axis))).view(
                 n_legal, AXIS_CHANNELS, heads, self.head_dim_axis
             )

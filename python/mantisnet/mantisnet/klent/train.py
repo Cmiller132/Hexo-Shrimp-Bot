@@ -21,6 +21,7 @@ from ..fitloop import FitBudgets, fit_epoch, pack_chunks
 from ..losses import policy_loss
 from ..model import compose_acting_q, compose_q
 from ..models.mantis_act import ACT_GRAPH_CELL_BUDGET
+from ..optim import resolve_adam_implementation
 from .selfplay import Collector, Sample, collection_stats
 
 
@@ -45,6 +46,10 @@ class KlentConfig:
     envs: int = 1024  # persistent self-play slots (the reference's env count)
     batch_size: int = 4096  # paper's *effective* batch: chunks accumulate to it
     lr: float = 1e-3  # paper's Adam rate
+    # Execution policy only: all choices implement the same Adam recipe. Auto
+    # resolves to fused on CUDA and scalar on CPU, and the resolved choice is
+    # recorded beside the run config.
+    adam_impl: str = "auto"
     device: str = "cpu"
     autocast: bool = False  # bf16 autocast for the network passes
     compile: bool = False  # torch.compile the policy/Q pass (one-time cost)
@@ -56,6 +61,9 @@ class KlentConfig:
     collect_pair_budget: int = 24_000_000  # collection (no_grad)
     collect_cell_budget: int = 2_400_000
     collect_graph_cell_budget: int = 3 * ACT_GRAPH_CELL_BUDGET
+
+    def __post_init__(self) -> None:
+        resolve_adam_implementation(self.adam_impl, self.device)
 
 
 def _policy_q(model, batch):

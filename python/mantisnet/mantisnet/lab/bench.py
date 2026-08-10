@@ -17,6 +17,7 @@ from ..klent import selfplay as selfplay_mod
 from ..klent.improve import improved_policy
 from ..klent.selfplay import Collector, episode_samples
 from ..klent.train import KlentConfig, fit, network_evaluate
+from ..optim import make_adam
 from .cohort import corpus_cohort, selfplay_cohort
 from .families import family_evaluate, load_checkpoint
 from .variants import build_variant
@@ -43,6 +44,7 @@ def _config(
     compile: bool,
     pair_budget: int | None = None,
     cell_budget: int | None = None,
+    adam_impl: str = "auto",
 ) -> KlentConfig:
     if pair_budget is not None and pair_budget <= 0:
         raise ValueError(f"pair_budget must be positive, got {pair_budget}")
@@ -52,6 +54,7 @@ def _config(
         device=device,
         autocast=device == "cuda",
         compile=compile,
+        adam_impl=adam_impl,
         pair_budget=(pair_budget if pair_budget is not None else KlentConfig.pair_budget),
         cell_budget=(cell_budget if cell_budget is not None else KlentConfig.cell_budget),
         collect_pair_budget=(
@@ -317,6 +320,7 @@ def _collect(
     compile: bool = False,
     pair_budget: int | None = None,
     cell_budget: int | None = None,
+    adam_impl: str = "auto",
     model_kw: dict | None = None,
     emit: bool = True,
     family: str | None = None,
@@ -325,7 +329,7 @@ def _collect(
         raise ValueError(
             f"games, envs, and cap must be positive, got {games}, {envs}, {cap}"
         )
-    cfg = _config(device, compile, pair_budget, cell_budget)
+    cfg = _config(device, compile, pair_budget, cell_budget, adam_impl)
     model, loaded = _load_or_fresh(
         checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
     )
@@ -400,11 +404,12 @@ def bench_fit(
     compile: bool = False,
     pair_budget: int | None = None,
     cell_budget: int | None = None,
+    adam_impl: str = "auto",
     model_kw: dict | None = None,
     family: str | None = None,
 ) -> dict:
     """Benchmark a production KLENT fit or one supervised corpus epoch."""
-    cfg = _config(device, compile, pair_budget, cell_budget)
+    cfg = _config(device, compile, pair_budget, cell_budget, adam_impl)
     model, loaded = _load_or_fresh(
         checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
     )
@@ -414,7 +419,12 @@ def bench_fit(
             f"checkpoint family {loaded.family.name!r} is scoreable but its "
             "historical fitting loss is outside the lab family contract"
         )
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    optimizer, adam_resolved = make_adam(
+        model.parameters(),
+        lr=cfg.lr,
+        device=cfg.device,
+        implementation=cfg.adam_impl,
+    )
     if corpus is None:
         model, cfg, episodes, _ = _collect(
             checkpoint=checkpoint,
@@ -426,11 +436,17 @@ def bench_fit(
             compile=compile,
             pair_budget=pair_budget,
             cell_budget=cell_budget,
+            adam_impl=adam_impl,
             model_kw=model_kw,
             emit=False,
             family=family,
         )
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+        optimizer, adam_resolved = make_adam(
+            model.parameters(),
+            lr=cfg.lr,
+            device=cfg.device,
+            implementation=cfg.adam_impl,
+        )
         samples = [
             sample
             for episode in episodes
@@ -486,6 +502,7 @@ def bench_fit(
         **_family_fields(loaded),
         "source": source,
         "device": device,
+        "adam_impl": {"requested": adam_impl, "resolved": adam_resolved},
         "samples": sample_count,
         "seconds": seconds,
         "samples_per_s": sample_count / seconds,

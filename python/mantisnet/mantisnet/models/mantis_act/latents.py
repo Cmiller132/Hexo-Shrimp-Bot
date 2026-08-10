@@ -37,6 +37,7 @@ from .latent_attention import (
     latent_segments,
     row_positions,
 )
+from .linear_fusion import horizontal_linears
 
 
 def _dense_softmax_attention(score: Tensor, value: Tensor, dim: int) -> Tensor:
@@ -315,12 +316,13 @@ class LatentPass(nn.Module):
             keys.append(feature)
         rows = torch.cat(keys)
         n_rows = rows.shape[0]
+        key, value = horizontal_linears(rows, (self.k_read_inv, self.v_read_inv))
         out = latent_read(
             self.q_read_inv(self.norm_read_q_inv(inv)).view(
                 positions, self.num_inv, 1, heads, self.head_dim_inv
             ),
-            self.k_read_inv(rows).view(n_rows, 1, heads, self.head_dim_inv),
-            self.v_read_inv(rows).view(n_rows, 1, heads, self.head_dim_inv),
+            key.view(n_rows, 1, heads, self.head_dim_inv),
+            value.view(n_rows, 1, heads, self.head_dim_inv),
             segments,
         )
         delta = self.o_read_inv(
@@ -336,16 +338,15 @@ class LatentPass(nn.Module):
                 ]
             )
             n_rows = rows.shape[0]
+            key, value = horizontal_linears(
+                rows, (self.k_read_axis, self.v_read_axis)
+            )
             out = latent_read(
                 self.q_read_axis(self.norm_read_q_axis(axis)).view(
                     positions, self.num_axis, AXIS_CHANNELS, heads, self.head_dim_axis
                 ),
-                self.k_read_axis(rows).view(
-                    n_rows, AXIS_CHANNELS, heads, self.head_dim_axis
-                ),
-                self.v_read_axis(rows).view(
-                    n_rows, AXIS_CHANNELS, heads, self.head_dim_axis
-                ),
+                key.view(n_rows, AXIS_CHANNELS, heads, self.head_dim_axis),
+                value.view(n_rows, AXIS_CHANNELS, heads, self.head_dim_axis),
                 segments,
             )
             delta = self.o_read_axis(
@@ -367,10 +368,13 @@ class LatentPass(nn.Module):
         positions, slots, _ = inv.shape
         z = self.norm_mix_inv(inv)
         shape = (positions, slots, heads, self.head_dim_inv)
+        query, key, value = horizontal_linears(
+            z, (self.q_mix_inv, self.k_mix_inv, self.v_mix_inv)
+        )
         score = torch.einsum(
-            "pqhd,pkhd->pqkh", self.q_mix_inv(z).view(shape), self.k_mix_inv(z).view(shape)
+            "pqhd,pkhd->pqkh", query.view(shape), key.view(shape)
         ) / math.sqrt(self.head_dim_inv)
-        out = _dense_softmax_attention(score, self.v_mix_inv(z).view(shape).unsqueeze(1), 2)
+        out = _dense_softmax_attention(score, value.view(shape).unsqueeze(1), 2)
         delta = self.o_mix_inv(out.reshape(positions, slots, self.cfg.d_inv).to(inv.dtype))
         inv = inv + self.scale_mix_inv(self.drop(delta))
 
@@ -380,14 +384,17 @@ class LatentPass(nn.Module):
         slots = axis.shape[1]
         z = self.norm_mix_axis(axis)
         shape = (positions, slots, AXIS_CHANNELS, heads, self.head_dim_axis)
+        query, key, value = horizontal_linears(
+            z, (self.q_mix_axis, self.k_mix_axis, self.v_mix_axis)
+        )
         # Attention runs inside each channel under one shared parameter set, so
         # the three channels permute with the board (§12.3).
         score = torch.einsum(
             "pqahd,pkahd->pqkah",
-            self.q_mix_axis(z).view(shape),
-            self.k_mix_axis(z).view(shape),
+            query.view(shape),
+            key.view(shape),
         ) / math.sqrt(self.head_dim_axis)
-        out = _dense_softmax_attention(score, self.v_mix_axis(z).view(shape).unsqueeze(1), 2)
+        out = _dense_softmax_attention(score, value.view(shape).unsqueeze(1), 2)
         delta = self.o_mix_axis(
             out.reshape(positions, slots, AXIS_CHANNELS, self.cfg.d_axis).to(axis.dtype)
         )
@@ -429,8 +436,11 @@ class LatentPass(nn.Module):
         # Context layout is (P, R, C, heads, head_dim); a node's channel `a`
         # meets latent channel `a` only, which carries §12.1 through the write.
         inv_shape = (positions, context_rows, 1, heads, self.head_dim_inv)
-        key_inv = self.k_bcast_inv(context).view(inv_shape)
-        value_inv = self.v_bcast_inv(context).view(inv_shape)
+        key_inv, value_inv = horizontal_linears(
+            context, (self.k_bcast_inv, self.v_bcast_inv)
+        )
+        key_inv = key_inv.view(inv_shape)
+        value_inv = value_inv.view(inv_shape)
         if self.has_axis:
             axis_shape = (
                 positions,
@@ -439,8 +449,11 @@ class LatentPass(nn.Module):
                 heads,
                 self.head_dim_axis,
             )
-            key_axis = self.k_bcast_axis(normed_axis).view(axis_shape)
-            value_axis = self.v_bcast_axis(normed_axis).view(axis_shape)
+            key_axis, value_axis = horizontal_linears(
+                normed_axis, (self.k_bcast_axis, self.v_bcast_axis)
+            )
+            key_axis = key_axis.view(axis_shape)
+            value_axis = value_axis.view(axis_shape)
 
         updated: dict[str, RaggedStream] = {}
         for index, (name, stream) in enumerate(zip(self.entity_names, streams)):
