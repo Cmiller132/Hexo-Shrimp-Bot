@@ -60,6 +60,7 @@ import numpy as np
 import pytest
 import torch
 
+from mantisnet.models.mantis_act import action_encoder as action_encoder_module
 from mantisnet.models.mantis_act.action_encoder import (
     ActionBaseState,
     ActionEncoder,
@@ -87,6 +88,7 @@ from mantisnet.models.mantis_act.plans import (
     builder_fingerprint,
 )
 from mantisnet.models.mantis_act.state_trunk import WINDOW_STATUSES, StateTrunk
+from mantisnet.models.mantis_act.model import MantisACT
 from mantisnet.models.mantis_act.summary import parameter_summary
 from mantisnet.models.mantis_act.symmetry import (
     D6_TRANSFORMS,
@@ -187,6 +189,80 @@ def replan(packed: PackedACTBatch, cfg) -> PackedACTBatch:
 
 def run(trunk, encoder, packed) -> ActionOutput:
     return encoder(packed, trunk(packed))
+
+
+def _model_outputs_and_gradients(model, packed):
+    policy, critic = model.policy_q(packed)
+    (policy.float().square().sum() + critic.float().square().sum()).backward()
+    gradients = {
+        name: parameter.grad.detach().clone()
+        for name, parameter in model.named_parameters()
+    }
+    return (policy.detach(), critic.detach()), gradients
+
+
+def test_action_post_recompute_is_exact_against_the_literal_backward(
+    graphs, monkeypatch
+):
+    """Selective recompute changes storage, not the §19.2 function or gradients."""
+    packed = one(graphs[21])
+    torch.manual_seed(SEED + 31)
+    literal = MantisACT(FULL).train()
+    recomputed = MantisACT(FULL).train()
+    recomputed.load_state_dict(literal.state_dict())
+
+    real_checkpoint = action_encoder_module.checkpoint
+    monkeypatch.setattr(
+        action_encoder_module,
+        "checkpoint",
+        lambda function, *args, **kwargs: function(*args),
+    )
+    expected_outputs, expected_gradients = _model_outputs_and_gradients(
+        literal, packed
+    )
+    monkeypatch.setattr(action_encoder_module, "checkpoint", real_checkpoint)
+    actual_outputs, actual_gradients = _model_outputs_and_gradients(
+        recomputed, packed
+    )
+
+    for actual, expected in zip(actual_outputs, expected_outputs, strict=True):
+        assert torch.equal(actual, expected)
+    assert actual_gradients.keys() == expected_gradients.keys()
+    for name in actual_gradients:
+        assert torch.equal(actual_gradients[name], expected_gradients[name]), name
+
+
+def test_action_post_is_replayed_once_by_backward(graphs, monkeypatch):
+    packed = one(graphs[21])
+    torch.manual_seed(SEED + 32)
+    model = MantisACT(FULL).train()
+    calls = 0
+    row_calls = {"inv": 0, "axis": 0}
+    post = model.actions.post
+    assert post is not None
+    forward = post.forward
+    row_inv_forward = post.row_inv.forward
+    row_axis_forward = post.row_axis.forward
+
+    def counted(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return forward(*args, **kwargs)
+
+    def counted_row_inv(*args, **kwargs):
+        row_calls["inv"] += 1
+        return row_inv_forward(*args, **kwargs)
+
+    def counted_row_axis(*args, **kwargs):
+        row_calls["axis"] += 1
+        return row_axis_forward(*args, **kwargs)
+
+    monkeypatch.setattr(post, "forward", counted)
+    monkeypatch.setattr(post.row_inv, "forward", counted_row_inv)
+    monkeypatch.setattr(post.row_axis, "forward", counted_row_axis)
+    _model_outputs_and_gradients(model, packed)
+    assert calls == 2
+    assert row_calls == {"inv": 3, "axis": 3}
 
 
 def windowless(graph) -> np.ndarray:
