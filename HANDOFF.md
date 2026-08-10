@@ -57,8 +57,16 @@ campaign's own paired measurements count.
   golden vectors regenerated (bump, never re-baseline).
 - **Measure the node bill first**: mixed-window fraction grows with board
   density; project node/edge growth on the campaign corpus before building.
-  The speed gate is unchanged and is the main risk.
-- Knob: `mixed_windows: bool = False`; screen live-only vs nonempty.
+- **Owner-amended gate (2026-08-10): Step 12 runs as a matrix, not one
+  arm** — A baseline, B mixed windows, C mixed + window-attention off (the
+  main cost offset; pair-attention cost grows with window count), D… further
+  speed-recovery arms from profiling. The hard 2% gate applies only to the
+  combination proposed for bake; the owner judges the speed/strength trade
+  from the whole matrix. Owner expects a slowdown and considers the idea
+  worth it if the strength shows. A bake with window-attention off subsumes
+  Step 3.
+- Knobs: `mixed_windows: bool = False` plus resurrected
+  `window_attention: bool = True` for the matrix.
 
 Then Step 4 (action rows — the strongest strength candidate; donors
 `act_encoder.rs` / `act_plans.rs` on branch `mantisnet-act` at `cc3edef`;

@@ -227,7 +227,9 @@ an owner priority — out of the frontier), dependencies respected:
 Step 12 precedes Step 4 so the counterfactual action tables are built
 ternary-native (729 classes) once, rather than binary (189) and then
 migrated; if Step 12's verdict is a revert, Step 4 proceeds with the
-binary-graft tables as specified. (Step 5 presumes Step 4's verdict; Steps 3
+binary-graft tables as specified. Step 12 runs as an owner-amended matrix
+(see its Gates) that folds a window-attention-off arm in as its principal
+cost offset; a bake with that arm subsumes Step 3. (Step 5 presumes Step 4's verdict; Steps 3
 and 9 require Step 2 to have landed.) The owner may revise the order between
 steps. Steps 11, 13, and 14 (**structural frontier**) additionally require
 an explicit owner decision *before work starts*, because each is a large
@@ -649,9 +651,26 @@ must include the projected node/edge growth). Kernels are count-agnostic; the
 speed line is held or lost on node economy, so this step's performance work
 is measurement-driven layout tuning plus packer re-budgeting.
 
-**Knob.** `mixed_windows: bool = False` (measured arm `True`).
+**Knob.** `mixed_windows: bool = False` (measured arm `True`), plus the
+resurrected `window_attention: bool = True` for the matrix below.
 
-**Gates & bake.** Full protocol.
+**Gates & bake — owner-amended protocol (2026-08-10).** The owner expects
+this step to cost speed and to be worth exploring anyway. It therefore runs
+as a small predeclared matrix rather than one arm:
+
+| Arm | mixed_windows | window_attention | Purpose |
+|---|---|---|---|
+| A (baseline) | off | on | the incumbent |
+| B | on | on | the idea, undiluted |
+| C | on | off | the main cost offset — pair-attention cost grows with the window count, so removal buys most exactly here |
+| D… | on | — | further speed-recovery arms as profiling suggests (kernel/layout work, incidence trimming), added to the packet as measured |
+
+All arms screen with the same paired seeds; speed is measured for every arm.
+The hard 2% gate applies only to the **combination finally proposed for
+bake**; exploratory arms may run slower during measurement without being
+auto-rejected. The owner judges the speed/strength trade from the full
+matrix. If the baked combination has `window_attention` off, Step 3's
+removal trial is subsumed and its deletion work happens here.
 
 ### Step 13 — `cell-nodes`
 
