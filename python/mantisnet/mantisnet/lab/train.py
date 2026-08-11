@@ -25,7 +25,7 @@ from .variants import (
     build_variant,
     count_parameters,
     refuse_param_budget,
-    variant_spec,
+    scoped_collate,
 )
 
 
@@ -46,6 +46,11 @@ class TrainConfig:
     device: str = "cpu"
     autocast: bool | None = None
     compile: bool = False
+    # Fitted-split cap: 0 fits the whole split; a positive count selects one
+    # deterministic subset (by ``train_subset_seed``, independent of the cell
+    # seed) so every arm and seed of a paired screen fits identical samples.
+    train_subset: int = 0
+    train_subset_seed: int = 0
 
     def __post_init__(self) -> None:
         resolve_adam_implementation(self.adam_impl, self.device)
@@ -78,6 +83,10 @@ class TrainConfig:
             raise ValueError(
                 f"ema_decay must be finite and in [0.0, 1.0), got {self.ema_decay}"
             )
+        if self.train_subset < 0:
+            raise ValueError(
+                f"train_subset must be 0 (whole split) or positive, got {self.train_subset}"
+            )
 
     def epoch_lr(self, epoch: int) -> float:
         """The learning rate for a 1-based epoch under this recipe."""
@@ -103,6 +112,39 @@ def current_versions() -> dict[str, object]:
 
 def _as_corpus(corpus: str | os.PathLike[str] | FrozenCorpus) -> FrozenCorpus:
     return corpus if isinstance(corpus, FrozenCorpus) else load_corpus(Path(corpus))
+
+
+def subset_samples(samples: SampleSplit, count: int, seed: int) -> SampleSplit:
+    """One deterministic ``count``-sample subset of a split, in corpus order.
+
+    The selection is a function of ``(len(samples), count, seed)`` alone, so
+    every arm and seed of a paired screen draws exactly the same samples.
+    """
+    if not 0 < count < len(samples):
+        raise ValueError(
+            f"subset count must be in 1..{len(samples) - 1}, got {count}"
+        )
+    picks = np.sort(
+        np.random.default_rng(seed).choice(len(samples), size=count, replace=False)
+    )
+    return SampleSplit(
+        game=samples.game[picks],
+        t=samples.t[picks],
+        rank=samples.rank[picks],
+        mover=samples.mover[picks],
+        z=samples.z[picks],
+        dist=samples.dist[picks],
+    )
+
+
+def _fit_samples(frozen: FrozenCorpus, split: str, cfg: TrainConfig) -> SampleSplit:
+    """The samples one fitting epoch runs over, after the recipe's cap."""
+    samples = frozen.split_samples(split)
+    if not len(samples):
+        raise ValueError(f"corpus split {split!r} is empty")
+    if cfg.train_subset:
+        samples = subset_samples(samples, cfg.train_subset, cfg.train_subset_seed)
+    return samples
 
 
 def sample_sizes(corpus: FrozenCorpus, samples: SampleSplit) -> tuple[np.ndarray, np.ndarray]:
@@ -256,11 +298,14 @@ def fit_supervised_epoch(
     """
 
     frozen = _as_corpus(corpus)
-    samples = frozen.split_samples(split)
-    if not len(samples):
-        raise ValueError(f"corpus split {split!r} is empty")
+    samples = _fit_samples(frozen, split, cfg)
     lengths, cells = sizes if sizes is not None else sample_sizes(frozen, samples)
-    collate = variant_spec(variant).collate
+    if len(lengths) != len(samples):
+        raise ValueError(
+            f"precomputed sizes cover {len(lengths)} samples but the fitted "
+            f"split has {len(samples)} after the recipe's train_subset cap"
+        )
+    collate = scoped_collate(variant, model)
     forward = _supervised_fn(cfg.compile)
     device_type = torch.device(cfg.device).type
 
@@ -349,7 +394,7 @@ def validate_supervised(
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
     )
-    collate = variant_spec(variant).collate
+    collate = scoped_collate(variant, model)
     forward = _supervised_fn(cfg.compile)
     device_type = torch.device(cfg.device).type
     correct = 0
@@ -431,6 +476,8 @@ def train_cell(
     device: str | None = None,
     compile: bool | None = None,
     cell_budget: int | None = None,
+    train_subset: int | None = None,
+    train_subset_seed: int | None = None,
     param_budget: int | None = None,
     param_tol: float = 0.02,
     progress=None,
@@ -460,6 +507,10 @@ def train_cell(
         updates["compile"] = compile
     if cell_budget is not None:
         updates["cell_budget"] = cell_budget
+    if train_subset is not None:
+        updates["train_subset"] = train_subset
+    if train_subset_seed is not None:
+        updates["train_subset_seed"] = train_subset_seed
     cfg = TrainConfig(**updates)
     frozen = _as_corpus(corpus)
 
@@ -509,7 +560,7 @@ def train_cell(
     }
     _write_json(destination / "config.json", cell_config)
 
-    train_samples = frozen.split_samples("train")
+    train_samples = _fit_samples(frozen, "train", cfg)
     val_samples = frozen.split_samples("val")
     train_sizes = sample_sizes(frozen, train_samples)
     val_sizes = sample_sizes(frozen, val_samples)

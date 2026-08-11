@@ -99,6 +99,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="cap accumulation micro-chunks (memory knob; optimizer batch unchanged)",
     )
+    train.add_argument(
+        "--train-subset",
+        type=int,
+        help="fit one deterministic N-sample train subset (identical across arms and seeds)",
+    )
+    train.add_argument(
+        "--train-subset-seed",
+        type=int,
+        help="selection seed of the train subset (default 0; recorded in the recipe)",
+    )
     train.add_argument("--param-budget", type=int)
     train.add_argument("--param-tol", type=float, default=0.02)
     _device(train)
@@ -302,6 +312,8 @@ def main(argv=None) -> None:
                 device=args.device,
                 compile=args.compile,
                 cell_budget=args.cell_budget,
+                train_subset=args.train_subset,
+                train_subset_seed=args.train_subset_seed,
                 param_budget=args.param_budget,
                 param_tol=args.param_tol,
             )

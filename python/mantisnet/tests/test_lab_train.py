@@ -258,3 +258,41 @@ def test_parameter_budget_refuses_before_creating_a_cell(tmp_path):
             param_tol=0.0,
         )
     assert not destination.exists()
+
+
+def test_train_subset_is_deterministic_and_recorded(tmp_path):
+    """The subset cap picks one deterministic sample set — identical across
+    arms and cell seeds — records it in the recipe, and refuses bad counts."""
+    from mantisnet.lab.train import subset_samples
+
+    corpus = tiny_corpus(tmp_path)
+    train = corpus.split_samples("train")
+
+    first = subset_samples(train, 5, 0)
+    again = subset_samples(train, 5, 0)
+    assert np.array_equal(first.t, again.t) and np.array_equal(first.rank, again.rank)
+    assert len(first) == 5
+    other_seed = subset_samples(train, 5, 1)
+    assert not np.array_equal(first.t, other_seed.t)
+    # Corpus order is preserved within the subset.
+    assert np.all(np.diff(first.t) > 0)
+
+    with pytest.raises(ValueError, match="subset count"):
+        subset_samples(train, 0, 0)
+    with pytest.raises(ValueError, match="subset count"):
+        subset_samples(train, len(train), 0)
+
+    cell_dir = tmp_path / "subset-cell"
+    result = train_cell(
+        corpus,
+        cell_dir,
+        model_kw=TINY_MODEL_KW,
+        seed=0,
+        epochs=1,
+        train_subset=5,
+    )
+    recipe = result["config"]["recipe"]
+    assert recipe["train_subset"] == 5 and recipe["train_subset_seed"] == 0
+    written = json.loads((cell_dir / "config.json").read_text(encoding="utf-8"))
+    assert written["recipe"]["train_subset"] == 5
+    assert result["metrics"][0]["fit_steps"] >= 1
