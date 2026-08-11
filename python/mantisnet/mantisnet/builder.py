@@ -172,6 +172,56 @@ TERN_OCC_CLASSES = int(_TERN_OCC_CLASS.max()) + 1
 assert TERN_DEC_CLASSES == 726 and TERN_OCC_CLASSES == 1458
 assert TERN_DEC_CLASSES + TERN_OCC_CLASSES == 2184
 
+
+# --- Step 4 action-row tables (MANTIS_GRAFT_SPEC §4, Step 4).
+#
+# Every legal action has 18 hypothetical post-placement windows (3 axes x 6
+# candidate slots with an own stone inserted at the action cell). The
+# post-placement class is joint in the post pattern and the inserted slot.
+#
+# Mixed scope (ACT §19, carried): orbits of ``(post, slot)`` pairs whose slot
+# digit is own, under the joint reversal — 1458 pairs, 729 orbits.
+#
+# Binary scope (the graft composite): inserting into an own live window keeps
+# it own — the joint (mask, slot) empty-slot orbit of the PRE occupancy, own
+# colour (93); into an opponent live window kills it — the same orbits,
+# opponent colour (93, offset); into an empty candidate only the slot
+# survives reversal (3, offset). A window already holding both colours is
+# dead — placing there cannot revive it — and carries class -1 (DEAD),
+# masked by every consumer. 2*93 + 3 = 189.
+
+def _tern_post1_classes() -> np.ndarray:
+    """(729, 6) orbit table of ``(post, slot)`` own-digit pairs; -1 elsewhere."""
+    table = np.full((729, WINDOW_LEN), -1, dtype=np.int64)
+    nxt = 0
+    for post in range(729):
+        rev = int(_TERN_REV[post])
+        for s in range(WINDOW_LEN):
+            if (post // 3**s) % 3 != 1:
+                continue
+            if (post, s) <= (rev, WINDOW_LEN - 1 - s):
+                table[post, s] = nxt
+                nxt += 1
+            else:
+                table[post, s] = table[rev, WINDOW_LEN - 1 - s]
+    assert nxt == 729
+    return table
+
+
+_TERN_POST1_CLASS = _tern_post1_classes()
+TERN_POST1_CLASSES = 729
+
+POST1_GRAFT_CLASSES = 2 * DEC_CLASSES + 3
+assert POST1_GRAFT_CLASSES == 189
+
+# fold3: the empty-candidate slot orbit under reversal, {0,5} {1,4} {2,3}.
+_SLOT_FOLD = np.minimum(np.arange(WINDOW_LEN), WINDOW_LEN - 1 - np.arange(WINDOW_LEN))
+
+# Pre-window statuses of an action row, uniform across scopes: the binary
+# consumer masks MIXED rows (a dead line is absent potential, not a fresh
+# one); the mixed consumer treats them as ordinary nodes.
+ACTION_OWN, ACTION_OPP, ACTION_EMPTY, ACTION_MIXED = 0, 1, 2, 3
+
 # Coordinate packing: q, r fit i16, so 21 bits of headroom per component is
 # collision-free. Window identity packs the axis into the low two bits.
 _QSHIFT = 1 << 21
@@ -208,6 +258,12 @@ class PositionGraph:
     # Window scope: False = live one-colour windows with binary classes,
     # True = all nonempty windows with ternary classes (Step 12 knob).
     mixed_windows: bool = False
+    # Step 4 action-row tables, built only under the action_rows knob. Dense
+    # (n_legal, 3, 6): kept-window index or -1; post-placement class in the
+    # scope's vocabulary (-1 exactly on binary MIXED rows); pre-window status.
+    action_window_index: np.ndarray | None = None
+    action_post1_class: np.ndarray | None = None
+    action_pre_status: np.ndarray | None = None
 
     @property
     def n_stones(self) -> int:
@@ -218,6 +274,114 @@ class PositionGraph:
         return len(self.window_feat)
 
 
+def _action_tables(
+    legal_qr: np.ndarray,
+    sorted_key: np.ndarray,
+    order: np.ndarray,
+    stone_own: np.ndarray,
+    live_key: np.ndarray,
+    mixed_windows: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The Step 4 row tables: 18 hypothetical post-placement windows per action.
+
+    Each legal cell's 11-cell line per axis is read once; candidate slot ``k``
+    is the window starting ``k`` steps before the cell. The emitted window
+    index refers to the kept-window list of the active scope, and the scope
+    agreement between status and index is asserted, mirroring the donor's
+    walk-consistency check.
+    """
+    n_legal = len(legal_qr)
+    offs = np.arange(-(WINDOW_LEN - 1), WINDOW_LEN, dtype=np.int64)  # (11,)
+    cells = (
+        legal_qr[:, None, None, :]
+        + AXES[None, :, None, :] * offs[None, None, :, None]
+    )  # (n_legal, 3, 11, 2)
+    key = _pack(cells.reshape(-1, 2))
+    pos = np.searchsorted(sorted_key, key)
+    pos_clip = np.minimum(pos, max(len(sorted_key) - 1, 0))
+    hit = (
+        (sorted_key[pos_clip] == key)
+        if len(sorted_key)
+        else np.zeros(len(key), dtype=bool)
+    )
+    occupant = np.where(hit, order[pos_clip] if len(order) else 0, -1)
+    digit = np.zeros(len(key), dtype=np.int64)
+    filled = occupant >= 0
+    digit[filled] = np.where(stone_own[occupant[filled]] == 0, 1, 2)
+    line = digit.reshape(n_legal, 3, 2 * WINDOW_LEN - 1)
+    if line[:, :, WINDOW_LEN - 1].any():
+        raise ValueError("a legal action cell is occupied")
+
+    # windows[a, x, k, j] = line[a, x, j + 5 - k]: slot j of the candidate
+    # window that starts k steps before the action cell.
+    j_idx = (
+        np.arange(WINDOW_LEN)[None, :]
+        + (WINDOW_LEN - 1)
+        - np.arange(WINDOW_LEN)[:, None]
+    )  # (k, j)
+    win_digits = line[:, :, j_idx]  # (n_legal, 3, 6, 6)
+    pre = (win_digits * _POW3[None, None, None, :]).sum(axis=-1)  # (n_legal, 3, 6)
+    own_mask = ((win_digits == 1) << np.arange(WINDOW_LEN)[None, None, None, :]).sum(
+        axis=-1
+    )
+    opp_mask = ((win_digits == 2) << np.arange(WINDOW_LEN)[None, None, None, :]).sum(
+        axis=-1
+    )
+    has_own, has_opp = own_mask > 0, opp_mask > 0
+    status = np.where(
+        has_own & ~has_opp,
+        ACTION_OWN,
+        np.where(
+            has_opp & ~has_own,
+            ACTION_OPP,
+            np.where(has_own & has_opp, ACTION_MIXED, ACTION_EMPTY),
+        ),
+    )
+
+    k_arr = np.arange(WINDOW_LEN)[None, None, :]
+    if mixed_windows:
+        post = pre + _POW3[None, None, :]
+        post1 = _TERN_POST1_CLASS[post, k_arr]
+        if post1.min() < 0:
+            raise ValueError("a post-placement row lost its own stone")
+    else:
+        post1 = np.full((n_legal, 3, WINDOW_LEN), -1, dtype=np.int64)
+        post1 = np.where(status == ACTION_OWN, _DEC_CLASS[own_mask, k_arr], post1)
+        post1 = np.where(
+            status == ACTION_OPP, DEC_CLASSES + _DEC_CLASS[opp_mask, k_arr], post1
+        )
+        post1 = np.where(
+            status == ACTION_EMPTY, 2 * DEC_CLASSES + _SLOT_FOLD[k_arr], post1
+        )
+        if ((post1 < 0) != (status == ACTION_MIXED)).any():
+            raise ValueError("binary action classes disagree with row statuses")
+
+    starts = legal_qr[:, None, None, :] - AXES[None, :, None, :] * np.arange(
+        WINDOW_LEN, dtype=np.int64
+    )[None, None, :, None]
+    axis_idx = np.broadcast_to(
+        np.arange(3, dtype=np.int64)[None, :, None], starts.shape[:3]
+    )
+    wkey = _pack(starts.reshape(-1, 2)) * 4 + axis_idx.reshape(-1)
+    wpos = np.searchsorted(live_key, wkey)
+    wpos_clip = np.minimum(wpos, max(len(live_key) - 1, 0))
+    whit = (
+        (live_key[wpos_clip] == wkey)
+        if len(live_key)
+        else np.zeros(len(wkey), dtype=bool)
+    )
+    window_index = np.where(whit, wpos_clip, -1).reshape(n_legal, 3, WINDOW_LEN)
+
+    kept = (
+        (status != ACTION_EMPTY)
+        if mixed_windows
+        else np.isin(status, (ACTION_OWN, ACTION_OPP))
+    )
+    if ((window_index >= 0) != kept).any():
+        raise ValueError("the kept-window set disagrees with the action-row walk")
+    return window_index, post1, status
+
+
 def build(
     stone_qr: np.ndarray,
     stone_owner: np.ndarray,
@@ -226,6 +390,7 @@ def build(
     moves_remaining: int,
     *,
     mixed_windows: bool = False,
+    action_rows: bool = False,
 ) -> PositionGraph:
     """Build one position's graph from the §11 input list.
 
@@ -236,7 +401,9 @@ def build(
 
     ``mixed_windows`` selects the window scope: the default keeps live
     one-colour windows under the binary tables; ``True`` keeps every nonempty
-    candidate under the ternary tables (Step 12 knob).
+    candidate under the ternary tables (Step 12 knob). ``action_rows``
+    additionally emits the Step 4 post-placement row tables in the active
+    scope's class vocabulary.
     """
     stone_qr = np.asarray(stone_qr, dtype=np.int64).reshape(-1, 2)
     stone_owner = np.asarray(stone_owner, dtype=np.int64).reshape(-1)
@@ -251,7 +418,15 @@ def build(
 
     if n_s == 0:
         # Ply 0: no stones, no windows, every legal cell on the background
-        # path with the clamp bucket.
+        # path with the clamp bucket. Action rows are all EMPTY inserts.
+        empty_key = np.empty(0, dtype=np.int64)
+        actions = (
+            _action_tables(
+                legal_qr, empty_key, empty_key, stone_own, empty_key, mixed_windows
+            )
+            if action_rows
+            else (None, None, None)
+        )
         return PositionGraph(
             stone_own=stone_own,
             stone_qr=stone_qr,
@@ -268,6 +443,9 @@ def build(
             bg_bucket=np.full(len(legal_qr), NEAREST_BUCKETS - 1, dtype=np.int64),
             moves_remaining=moves_remaining,
             mixed_windows=mixed_windows,
+            action_window_index=actions[0],
+            action_post1_class=actions[1],
+            action_pre_status=actions[2],
         )
 
     stone_key = _pack(stone_qr)
@@ -384,6 +562,11 @@ def build(
     else:
         bg_bucket = np.empty(0, dtype=np.int64)
 
+    actions = (
+        _action_tables(legal_qr, sorted_key, order, stone_own, live_key, mixed_windows)
+        if action_rows
+        else (None, None, None)
+    )
     return PositionGraph(
         stone_own=stone_own,
         stone_qr=stone_qr,
@@ -400,10 +583,15 @@ def build(
         bg_bucket=bg_bucket.astype(np.int64),
         moves_remaining=moves_remaining,
         mixed_windows=mixed_windows,
+        action_window_index=actions[0],
+        action_post1_class=actions[1],
+        action_pre_status=actions[2],
     )
 
 
-def from_position(pos, *, mixed_windows: bool = False) -> PositionGraph:
+def from_position(
+    pos, *, mixed_windows: bool = False, action_rows: bool = False
+) -> PositionGraph:
     """Build from a ``hexo_py.Position``. Terminal positions raise."""
     if pos.is_terminal:
         raise ValueError("terminal position: the builder refuses it")
@@ -422,6 +610,7 @@ def from_position(pos, *, mixed_windows: bool = False) -> PositionGraph:
         legal,
         pos.moves_remaining,
         mixed_windows=mixed_windows,
+        action_rows=action_rows,
     )
 
 
