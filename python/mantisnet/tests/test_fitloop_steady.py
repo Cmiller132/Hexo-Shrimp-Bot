@@ -64,12 +64,18 @@ def test_window_reports_rate_and_stops_the_epoch_early():
     assert measured["fit_steps"] < full["fit_steps"] == chunks_per_epoch
 
 
-def test_window_consumes_the_same_chunks_in_the_same_order():
+def test_window_consumes_the_same_chunks_in_the_same_order(monkeypatch):
+    # One prefetch worker makes the recorded prepare order the submission
+    # order; with several workers the appends race under machine load, which
+    # is not the property under test.
+    import mantisnet.fitloop as fitloop
+
+    monkeypatch.setattr(fitloop, "_PREFETCH_DEPTH", 1)
     full_order: list[tuple[int, ...]] = []
     _epoch(None, record=full_order)
     window_order: list[tuple[int, ...]] = []
     _epoch((1, 2), record=window_order)
-    # Prefetch prepares a few chunks past the stop, but everything prepared is
+    # Prefetch prepares a chunk past the stop, but everything prepared is
     # a prefix of the full epoch's identical packed order.
     assert window_order == full_order[: len(window_order)]
 
