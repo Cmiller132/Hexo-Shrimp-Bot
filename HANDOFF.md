@@ -46,6 +46,43 @@ action tables are built ternary-native (729 classes) once instead of binary
 ACT-era ablation results are void as evidence (owner ruling) — only this
 campaign's own paired measurements count.
 
+## Overnight rulings (2026-08-10, pre-overnight session)
+
+All committed in `de8c9aa`:
+
+- **Screen design for Step 12**: the full 2×2 factorial — A baseline, B
+  mixed windows, C mixed+wa-off, D baseline+wa-off — at **3 seeds**, with
+  larger cells (~400k train samples per cell, one identical deterministic
+  subset across every arm and seed, recorded in the recipe). 12 cells total.
+- **Horizon tables are mandatory in every packet**: full per-distance-from-
+  end-bucket paired tables for policy top-1 and critic sign accuracy / v̂
+  MAE; a bucket collapse blocks promotion even when overall primaries win.
+- **Failure policy overnight**: fix the issue and continue.
+- **Verdict lean**: benchmark-neutral but architecturally fundamental
+  candidates lean *keep* (owner still rules).
+- **Night surplus**: after the Step 12 matrix, start Step 4 implementation
+  (code + tests only, nothing baked overnight).
+
+## Node-bill projection — MEASURED (594 val positions, mnorm-late-v1)
+
+Growth factors moving window scope live-only → all-nonempty:
+
+| stones | n | live W | mixed W | windows × | incidence × | decoder ×|
+|---|---|---|---|---|---|---|
+| 0–30 | 201 | 113 | 53 | 1.47 | 2.05 | 1.33 |
+| 30–60 | 181 | 195 | 186 | 1.95 | 3.35 | 1.60 |
+| 60–100 | 124 | 249 | 342 | 2.37 | 4.63 | 1.78 |
+| 100–200 | 76 | 313 | 588 | 2.88 | 6.31 | 1.98 |
+| 200+ | 12 | 420 | 1070 | 3.55 | 8.64 | 2.19 |
+| **overall** | 594 | **198** | **243** | **2.22** | **4.31** | **1.69** |
+
+Interpretation: window nodes ~2.2× on average (3.5×+ late), stone-incidence
+edges ~4.3× (mixed windows hold more stones each — this is the expensive
+edge family), decoder/relay edges ~1.7×. The window-attention pair set grows
+super-linearly with window count, which is exactly why arm C (wa-off) is the
+matrix's principal cost offset. Script: scratchpad `node_bill.py` (session
+temp — rewrite from this table if needed, do not chase the file).
+
 ## Next step: Step 12 — `mixed-windows` (spec §4, Step 12)
 
 - Builder keeps every deduplicated nonempty candidate window (own-only,
@@ -128,6 +165,35 @@ tactical scalars, the window-attention removal trial, and the rest.
   shared object store).
 - ACT donor code: branch `mantisnet-act` (`cc3edef`); kernel-round history
   on `act-kernel-fusion`; the old spec text at `b735d27`.
+
+## Resume point (exact, for the post-compaction session)
+
+Done: rulings committed (`de8c9aa`), Step 12 task in progress, node-bill
+projection measured (table above). GPU idle. Tree clean at `de8c9aa`+handoff.
+
+Next actions, in order:
+1. **Implement Step 12** in the worktree: Rust builder (`crates/models/
+   mantisnet/src/encoder.rs` → `RawBatch` → `python/hexo-py` → `builder.py`)
+   gains the nonempty window scope behind a builder parameter — ternary
+   pattern classes (assert 378/377), joint ternary incidence/decoder classes
+   (assert 2187/2184), window status field; Python builder mirrors it as the
+   independent oracle; model builds binary (knob off, byte-identical
+   incumbent) or ternary (knob on) tables from `mixed_windows` in
+   `MantisConfig`; resurrect `window_attention: bool` from
+   `LEGACY_BAKED_KNOBS` as a live field (default True) for the matrix.
+   MODEL_REPR_VERSION bump. Tests first-class: class-count asserts, oracle
+   parity, D6 via lab check, golden-vector regeneration (bump, never
+   re-baseline). Read the engine-change skill before touching crates/.
+2. **Cell recipe tooling**: `lab train` needs a recorded train-subset cap
+   (~400k identical deterministic subset) — small `train_cell` extension.
+3. **Run the 12-cell matrix** in the WSL harness (sync clone first),
+   detached with inner timeouts (Bash cap is 600s — use nohup + artifact
+   files + periodic checks). Speed-bench each arm with the steady window.
+   Evaluate cells with `lab evaluate` (horizon buckets) and build the packet
+   per spec §2.3/§2.4 including the mandatory horizon tables.
+4. **Surplus hours**: Step 4 implementation (ternary-native if the matrix
+   looks good; donors on `mantisnet-act` at `cc3edef`).
+5. Morning: packet to owner; no bakes without verdicts.
 
 ## Memory
 
