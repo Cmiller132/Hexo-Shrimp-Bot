@@ -290,7 +290,7 @@ _EDGE_SLICE = 2_000_000
 # Kernel launch geometry: a 32-edge tile covers the colinear run (<= 22
 # partners plus SELF) in one pass and each claim run (<= 48 claimants:
 # sixteen spans on each of three axes) in two.
-_WA_BLOCK_E = 32
+_WA_BLOCK_E = 16  # candidate lanes per tile; mean run length is ~12
 _WA_BLOCK_CLS = 64  # next power of two over WA_CLASSES
 _WA_NUM_WARPS = 4
 
@@ -349,13 +349,13 @@ if triton is not None:
         l = tl.zeros([BLOCK_H], dtype=tl.float32)
         acc = tl.zeros([BLOCK_H, BLOCK_HD], dtype=tl.float32)
 
-        start = tl.load(colptr_ptr + w)
-        end = tl.load(colptr_ptr + w + 1)
+        start = tl.load(colptr_ptr + w).to(tl.int32)
+        end = tl.load(colptr_ptr + w + 1).to(tl.int32)
         for lo in tl.range(start, end, BLOCK_E):
             eids = lo + tl.arange(0, BLOCK_E)
             ok = eids < end
-            s_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0)
-            c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0)
+            s_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0).to(tl.int32)
+            c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0).to(tl.int32)
             k_tile = tl.load(
                 k_ptr
                 + (s_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
@@ -392,15 +392,15 @@ if triton is not None:
                 f_own = min(t, 5 - t)
             else:
                 f_own = 2 + min(-t if t < 0 else t - 5, 3)
-            lo = tl.load(clo_ptr + w * CLAIM_SPAN + k_slot)
-            hi = tl.load(chi_ptr + w * CLAIM_SPAN + k_slot)
+            lo = tl.load(clo_ptr + w * CLAIM_SPAN + k_slot).to(tl.int32)
+            hi = tl.load(chi_ptr + w * CLAIM_SPAN + k_slot).to(tl.int32)
             for base in tl.range(lo, hi, BLOCK_E):
                 eids = base + tl.arange(0, BLOCK_E)
                 inside = eids < hi
-                u = tl.load(clwin_ptr + eids, mask=inside, other=0)
+                u = tl.load(clwin_ptr + eids, mask=inside, other=0).to(tl.int32)
                 ax_u = tl.load(claxis_ptr + eids, mask=inside, other=0)
                 ok = inside & (ax_u != ax_w)
-                f_u = tl.load(clfold_ptr + eids, mask=ok, other=0)
+                f_u = tl.load(clfold_ptr + eids, mask=ok, other=0).to(tl.int32)
                 c_idx = 11 + f_own * 6 + f_u
                 k_tile = tl.load(
                     k_ptr
@@ -500,13 +500,13 @@ if triton is not None:
         acc = tl.zeros([BLOCK_H, BLOCK_HD], dtype=tl.float32)
         acc_bias = tl.zeros([BLOCK_H, BLOCK_CLS], dtype=tl.float32)
 
-        start = tl.load(colptr_ptr + w)
-        end = tl.load(colptr_ptr + w + 1)
+        start = tl.load(colptr_ptr + w).to(tl.int32)
+        end = tl.load(colptr_ptr + w + 1).to(tl.int32)
         for lo in tl.range(start, end, BLOCK_E):
             eids = lo + tl.arange(0, BLOCK_E)
             ok = eids < end
-            s_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0)
-            c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0)
+            s_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0).to(tl.int32)
+            c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0).to(tl.int32)
             k_tile = tl.load(
                 k_ptr
                 + (s_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
@@ -551,15 +551,15 @@ if triton is not None:
                 f_own = min(t, 5 - t)
             else:
                 f_own = 2 + min(-t if t < 0 else t - 5, 3)
-            lo = tl.load(clo_ptr + w * CLAIM_SPAN + k_slot)
-            hi = tl.load(chi_ptr + w * CLAIM_SPAN + k_slot)
+            lo = tl.load(clo_ptr + w * CLAIM_SPAN + k_slot).to(tl.int32)
+            hi = tl.load(chi_ptr + w * CLAIM_SPAN + k_slot).to(tl.int32)
             for base in tl.range(lo, hi, BLOCK_E):
                 eids = base + tl.arange(0, BLOCK_E)
                 inside = eids < hi
-                u = tl.load(clwin_ptr + eids, mask=inside, other=0)
+                u = tl.load(clwin_ptr + eids, mask=inside, other=0).to(tl.int32)
                 ax_u = tl.load(claxis_ptr + eids, mask=inside, other=0)
                 ok = inside & (ax_u != ax_w)
-                f_u = tl.load(clfold_ptr + eids, mask=ok, other=0)
+                f_u = tl.load(clfold_ptr + eids, mask=ok, other=0).to(tl.int32)
                 c_idx = 11 + f_own * 6 + f_u
                 k_tile = tl.load(
                     k_ptr
@@ -588,14 +588,16 @@ if triton is not None:
                     tl.sum(go_tile[None, :, :] * v_tile, axis=2) - delta[None, :]
                 )
                 acc += tl.sum(ds[:, :, None] * k_tile, axis=0)
-                acc_bias += tl.sum(
-                    tl.where(
-                        c_idx[:, None, None] == cls_range[None, None, :],
-                        ds[:, :, None],
-                        0.0,
-                    ),
-                    axis=0,
-                )
+                # Within one claim slot the class runs over just the six
+                # partner folds (f_own is a trace-time constant), so six
+                # masked reductions replace a BLOCK_CLS-wide one-hot
+                # broadcast; masked lanes carry ds = 0.
+                for f_c in tl.static_range(6):
+                    s_c = tl.sum(
+                        tl.where(f_u[:, None] == f_c, ds, 0.0), axis=0
+                    )
+                    onehot = cls_range == (11 + f_own * 6 + f_c)
+                    acc_bias += s_c[:, None] * onehot.to(tl.float32)[None, :]
 
         element = dq_ptr.dtype.element_ty
         tl.store(
@@ -666,13 +668,13 @@ if triton is not None:
         acc_k = tl.zeros([BLOCK_H, BLOCK_HD], dtype=tl.float32)
         acc_v = tl.zeros([BLOCK_H, BLOCK_HD], dtype=tl.float32)
 
-        start = tl.load(colptr_ptr + s)
-        end = tl.load(colptr_ptr + s + 1)
+        start = tl.load(colptr_ptr + s).to(tl.int32)
+        end = tl.load(colptr_ptr + s + 1).to(tl.int32)
         for lo in tl.range(start, end, BLOCK_E):
             eids = lo + tl.arange(0, BLOCK_E)
             ok = eids < end
-            d_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0)
-            c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0)
+            d_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0).to(tl.int32)
+            c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0).to(tl.int32)
             q_tile = tl.load(
                 q_ptr
                 + (d_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
@@ -724,15 +726,15 @@ if triton is not None:
                 f_own = min(t, 5 - t)
             else:
                 f_own = 2 + min(-t if t < 0 else t - 5, 3)
-            lo = tl.load(clo_ptr + s * CLAIM_SPAN + k_slot)
-            hi = tl.load(chi_ptr + s * CLAIM_SPAN + k_slot)
+            lo = tl.load(clo_ptr + s * CLAIM_SPAN + k_slot).to(tl.int32)
+            hi = tl.load(chi_ptr + s * CLAIM_SPAN + k_slot).to(tl.int32)
             for base in tl.range(lo, hi, BLOCK_E):
                 eids = base + tl.arange(0, BLOCK_E)
                 inside = eids < hi
-                d_idx = tl.load(clwin_ptr + eids, mask=inside, other=0)
+                d_idx = tl.load(clwin_ptr + eids, mask=inside, other=0).to(tl.int32)
                 ax_d = tl.load(claxis_ptr + eids, mask=inside, other=0)
                 ok = inside & (ax_d != ax_s)
-                f_d = tl.load(clfold_ptr + eids, mask=ok, other=0)
+                f_d = tl.load(clfold_ptr + eids, mask=ok, other=0).to(tl.int32)
                 c_idx = 11 + f_d * 6 + f_own
                 q_tile = tl.load(
                     q_ptr
