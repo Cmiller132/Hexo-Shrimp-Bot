@@ -82,15 +82,15 @@ uniform budgets pair 4M / cell 250k, collect 12M/1.2M; device cuda,
 compiled; val split scoring with horizon buckets via `step12_driver.py
 evaluate` (runs `evaluate_cell`, `include_state_value=True`).
 
-Done at handoff: all 5 benches; A s0-s2 trained+scored; B s0, B s1
-trained+scored. **B s2 was killed at 12:24 UTC (exit 143 after ~3 h of
-paging crawl; cause of the signal unknown — check dmesg/OOM-killer)**; the
-runner moved on to C s0. B s2's partial cell dir will be wiped and rebuilt
-automatically when the runner is relaunched after its current pass — or
-rebuild it directly: `uv run python step12_driver.py train B 2` then
-`evaluate B 2` from the clone. Pending: B s2 (rebuild), C×3, D×3 with
-evals. A 2-seed paired packet (A vs B on s0/s1) is already assemblable if
-the owner wants an early look. Runner: `~/step12_matrix.sh` (WSL), logs
+**Matrix pass COMPLETE 12:56 UTC — 11 of 12 cells trained + scored** (all
+5 benches; A×3, B s0/s1, C×3, D×3 with evals). The one gap: **B s2 was
+killed at 12:24 UTC (exit 143 after ~3 h of paging crawl; cause unknown —
+check dmesg/OOM-killer)**. One relaunch of `~/step12_matrix.sh` rebuilds
+exactly that cell (idempotent; ~1-2 h of paging crawl) and re-prints
+"matrix done" — or rebuild it directly: `uv run python step12_driver.py
+train B 2` then `evaluate B 2` from the clone. The packet is assemblable
+NOW: arms A/C/D fully paired at 3 seeds, B paired at s0/s1 (the aggregator
+handles the missing seed and reports per-metric n). Runner: `~/step12_matrix.sh` (WSL), logs
 `~/step12-artifacts/progress.log`, per-stage logs beside it. Cells:
 `~/graft-bench/python/mantisnet/runs/lab/step12-matrix/arm{A,B,C,D}/s{0,1,2}`.
 
