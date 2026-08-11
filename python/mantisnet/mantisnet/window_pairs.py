@@ -1,8 +1,4 @@
-"""Window-pair relation tables and attention for section 5.1c.
-
-``pair_tables`` derives the edge set on-device from window identities.
-The edge set is served in three CSR views: by destination (forward, ``dq``),
-by source (``dk``/``dv``), and by class (``dbias``).
+"""Window-pair relations and attention for section 5.1c, cell-mediated.
 
 Relation classes from window identity triples ``(axis, start_q, start_r)``:
 
@@ -14,8 +10,24 @@ Relation classes from window identity triples ``(axis, start_q, start_r)``:
   each side's fold is invariant under line reversal independently.
 - **SELF** (``47``): one loop per window.
 
-CUDA: flash-style kernels with online softmax in registers and deterministic
-segment sweeps.  CPU: eager slice composition as parity reference.
+The crossing set is never materialized as edges.  Two non-parallel lines
+meet at exactly one cell, so a window's crossing partners are exactly the
+other-axis claimants of its sixteen claimed cells (the six slots plus
+``_REACH`` on each end).  ``wa_tables`` therefore derives a cell-major
+claimant CSR — ``n_w * 16`` entries however dense the scope — plus a small
+explicit colinear/self edge list, and the kernels walk claims instead of
+edges: per (window, head), the colinear run (degree <= 23) and sixteen
+claim runs (claimants per cell <= 48: sixteen spans on each of three
+axes), one online softmax across all of them.  Under the mixed-window
+scope this replaces tens of millions of
+materialized edges with a few hundred MB of claims, and the per-edge
+``dscore`` array of the old backward disappears: the bias gradient
+accumulates per-program partial rows summed by a fixed torch reduction, so
+every output stays run-to-run deterministic.
+
+CUDA: flash-style kernels with online softmax in registers.  CPU and the
+failure fallback: expand the claims to an explicit edge list and run the
+sliced eager composition as the parity reference.
 """
 
 from __future__ import annotations
@@ -39,6 +51,7 @@ WA_CLASSES = 48
 _SELF = 47
 _REACH = 5  # cells beyond a span end, matching the colinear gap of <= 5
 _MAX_OFFSET = 11
+_CLAIM_SPAN = 6 + 2 * _REACH  # claimed cells per window
 
 # fold(t) for t in -_REACH..5+_REACH, indexed by t + _REACH: in-span slots to
 # min(t, 5 - t), out-of-span to 2 + min(distance, 3).
@@ -49,18 +62,9 @@ _FOLD = torch.tensor(
     dtype=torch.long,
 )
 
+
 # Unit steps of the engine's axes, canonical order Q, R, QR (builder.AXES).
 _AXES = torch.tensor([[1, 0], [0, 1], [1, -1]], dtype=torch.long)
-
-# Class of the reversed edge: colinear and SELF are symmetric, a crossing
-# swaps its two sides' folds. The edge set is closed under reversal, so the
-# source-major view is the destination view through this table — no sort.
-_MIRROR = torch.tensor(
-    list(range(11))
-    + [11 + b * 6 + a for a in range(6) for b in range(6)]
-    + [_SELF],
-    dtype=torch.long,
-)
 
 # Key packing: coordinates are i16-bounded, so 17 bits per component after an
 # offset is collision-free, and the position index rides above them.
@@ -77,21 +81,22 @@ def _segment_pairs(counts: Tensor, slot: Tensor) -> tuple[Tensor, Tensor]:
     return first, first + 1 + rank
 
 
-class PairTables(NamedTuple):
-    """The three CSR views of one batch's directed §5.1c edges."""
+class WaTables(NamedTuple):
+    """One batch's §5.1c structure: colinear edges and cell claims."""
 
-    ptr: Tensor  # (N_w + 1,) destination-major run starts
-    src: Tensor  # (E,) source window per edge, destination order
-    cls: Tensor  # (E,) relation class per edge, destination order
-    sptr: Tensor  # (N_w + 1,) source-major run starts
-    sdst: Tensor  # (E,) destination window per edge, source order
-    scls: Tensor  # (E,) relation class per edge, source order
-    cptr: Tensor  # (WA_CLASSES + 1,) class-major run starts
-    cedge: Tensor  # (E,) destination-order edge ids, class order
+    col_ptr: Tensor  # (N_w + 1,) destination-major colinear/self run starts
+    col_src: Tensor  # (E_col,) source window per colinear edge
+    col_cls: Tensor  # (E_col,) class per colinear edge (0..10, SELF)
+    claim_lo: Tensor  # (N_w * 16,) claimant-run start of window w's k-th cell
+    claim_hi: Tensor  # (N_w * 16,) claimant-run end
+    cl_win: Tensor  # (N_w * 16,) claimant window, cell-major order
+    cl_fold: Tensor  # (N_w * 16,) claimant's fold at that cell
+    cl_axis: Tensor  # (N_w * 16,) claimant's axis
+    waxis: Tensor  # (N_w,) each window's axis
 
 
-def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
-    """Derive every §5.1c edge view from the batch's window identities.
+def wa_tables(window_id: Tensor, window_pos: Tensor) -> WaTables:
+    """Derive the §5.1c structure from the batch's window identities.
 
     ``window_id`` is the batch's ``(N_w, 3)`` identity table and
     ``window_pos`` the ``(N_w,)`` position of each window.
@@ -104,14 +109,13 @@ def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
     device = window_id.device
     axis, sq, sr = window_id.unbind(1)
 
-    dsts, srcs, classes = [], [], []
-
     # Colinear: sort by (position, axis, line, position-on-line); starts on a
     # line are distinct, so within a sorted group every pair at most 11 slots
     # apart is an edge. searchsorted bounds each start's partner run — the
     # offset cannot escape its group because the position-on-line rides the
     # low key bits with margin — and the runs enumerate without per-shift
     # rescans or compaction syncs.
+    dsts, srcs, classes = [], [], []
     line = torch.where(axis == 0, sr, torch.where(axis == 1, sq, sq + sr))
     pos_on = torch.where(axis == 1, sr, sq)
     key = ((window_pos * 4 + axis) * _KSPAN + (line + _KOFF)) * _KSPAN + (
@@ -130,133 +134,164 @@ def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
         srcs.append(torch.cat([far, near]))
         classes.append(torch.cat([cls, cls]))
 
-    # Crossing: join the claimed line cells. Windows claiming one
-    # (position, cell) key form a sorted run; every intra-run pair with
-    # different axes is a crossing within reach, and a crossing pair shares
-    # exactly one cell, so segmented pair enumeration yields each directed
-    # edge once — O(cells + pairs), no per-shift rescan of the runs.
+    # SELF keeps every destination's softmax segment nonempty.
+    loop = torch.arange(n_w, device=device)
+    dsts.append(loop)
+    srcs.append(loop)
+    classes.append(torch.full((n_w,), _SELF, dtype=torch.long, device=device))
+
+    dst = torch.cat(dsts)
+    col_src = torch.cat(srcs)
+    col_cls = torch.cat(classes)
+    # Window ids fit int32, and radix passes scale with key width.
+    corder = torch.argsort(dst.to(torch.int32), stable=True)
+    dst = dst[corder]
+    col_src = col_src[corder].contiguous()
+    col_cls = col_cls[corder].contiguous()
+    steps = torch.arange(n_w + 1, device=device)
+    col_ptr = torch.searchsorted(dst, steps)
+
+    # Claims: each window claims its six slots plus _REACH beyond each end.
+    # Windows claiming one (position, cell) key form a sorted run; a crossing
+    # pair shares exactly one cell, so the other-axis members of a claim's
+    # run are exactly that claim's crossing partners — no edge enumeration.
     t_ext = torch.arange(-_REACH, 6 + _REACH, device=device)
     vec = _AXES.to(device)[axis]  # (N_w, 2)
     cq = sq[:, None] + t_ext[None, :] * vec[:, 0:1]
     cr = sr[:, None] + t_ext[None, :] * vec[:, 1:2]
-    span = t_ext.shape[0]
     ckey = (
         (window_pos[:, None] * _KSPAN + (cq + _KOFF)) * _KSPAN + (cr + _KOFF)
     ).reshape(-1)
-    cwin = torch.arange(n_w, device=device)[:, None].expand(-1, span).reshape(-1)
+    n_claims = ckey.shape[0]
+    cwin = loop[:, None].expand(-1, _CLAIM_SPAN).reshape(-1)
     ct = t_ext[None, :].expand(n_w, -1).reshape(-1)
-    corder = torch.argsort(ckey)
-    rkey = ckey[corder]
-    rwin = cwin[corder]
-    rt = ct[corder]
-    raxis = axis[rwin]
-    fold = _FOLD.to(device)
-    n_cells = rkey.shape[0]
-    if n_cells:
-        slot = torch.arange(n_cells, device=device)
-        starts = torch.ones(n_cells, dtype=torch.bool, device=device)
+    sorted_order = torch.argsort(ckey)
+    rkey = ckey[sorted_order]
+    cl_win = cwin[sorted_order].contiguous()
+    cl_fold = _FOLD.to(device)[ct[sorted_order] + _REACH].contiguous()
+    cl_axis = axis.index_select(0, cl_win).contiguous()
+
+    claim_lo = torch.empty(n_claims, dtype=torch.long, device=device)
+    claim_hi = torch.empty(n_claims, dtype=torch.long, device=device)
+    if n_claims:
+        starts = torch.ones(n_claims, dtype=torch.bool, device=device)
         starts[1:] = rkey[1:] != rkey[:-1]
-        # Segment bookkeeping per element: my run and its end slot.
         run = starts.cumsum(0) - 1
-        run_end = run.new_empty(n_cells).scatter_reduce_(
-            0, run, slot + 1, "amax", include_self=False
-        )[run]
-        # first pairs with every later element of its run.
-        first, second = _segment_pairs(run_end - slot - 1, slot)
-        hit = (
-            raxis.index_select(0, first) != raxis.index_select(0, second)
-        ).nonzero().squeeze(1)
-        first = first.index_select(0, hit)
-        second = second.index_select(0, hit)
-        wi = rwin.index_select(0, first)
-        wj = rwin.index_select(0, second)
-        fi = fold[rt.index_select(0, first) + _REACH]
-        fj = fold[rt.index_select(0, second) + _REACH]
-        dsts.append(torch.cat([wi, wj]))
-        srcs.append(torch.cat([wj, wi]))
-        classes.append(torch.cat([11 + fi * 6 + fj, 11 + fj * 6 + fi]))
+        bounds = torch.cat(
+            [
+                starts.nonzero().squeeze(1),
+                torch.tensor([n_claims], device=device),
+            ]
+        )
+        claim_lo[sorted_order] = bounds.index_select(0, run)
+        claim_hi[sorted_order] = bounds.index_select(0, run + 1)
 
-    # SELF.
-    loop = torch.arange(n_w, device=window_id.device)
-    dsts.append(loop)
-    srcs.append(loop)
-    classes.append(torch.full((n_w,), _SELF, dtype=torch.long, device=window_id.device))
-
-    dst = torch.cat(dsts)
-    src = torch.cat(srcs)
-    cls = torch.cat(classes)
-    # Window ids fit int32, and radix passes scale with key width.
-    order = torch.argsort(dst.to(torch.int32), stable=True)
-    dst, src, cls = dst[order], src[order], cls[order]
-    steps = torch.arange(n_w + 1, device=window_id.device)
-    ptr = torch.searchsorted(dst, steps)
-
-    # Reversal closure: window w's outgoing edges are its incoming edges with
-    # the class mirrored, so the source view shares the destination view's
-    # runs and arrays instead of paying a second edge-set sort.
-    sptr = ptr
-    sdst = src
-    scls = _MIRROR.to(device)[cls]
-
-    corder = torch.argsort(cls.to(torch.int32), stable=True)
-    cptr = torch.searchsorted(
-        cls[corder], torch.arange(WA_CLASSES + 1, device=window_id.device)
+    return WaTables(
+        col_ptr,
+        col_src,
+        col_cls,
+        claim_lo,
+        claim_hi,
+        cl_win,
+        cl_fold,
+        cl_axis,
+        # clone, not contiguous: a 0/1-window unbind view is already
+        # contiguous and custom ops may not return input aliases.
+        axis.clone(),
     )
-    return PairTables(ptr, src, cls, sptr, sdst, scls, cptr, corder)
 
 
-@torch.library.custom_op("mantisnet::pair_tables", mutates_args=())
-def derive_pair_tables(
+@torch.library.custom_op("mantisnet::wa_tables", mutates_args=())
+def derive_wa_tables(
     window_id: Tensor, window_pos: Tensor
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """``pair_tables``' distinct tensors as an opaque op for the trunk.
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    """``wa_tables``' tensors as an opaque op for the trunk.
 
     The joins are data-dependent and cannot trace; as a graph break they
     would spill the surrounding message passing out of the compiled graph
-    to eager. As a custom op with unbacked edge sizes the derivation sits
-    inside the graph like the attention op it feeds. Custom ops may not
-    return aliases, so the source view's shared ``ptr``/``src`` arrays are
-    reassembled into ``PairTables`` by the caller.
+    to eager. As a custom op with an unbacked colinear edge size the
+    derivation sits inside the graph like the attention op it feeds.
     """
-    tables = pair_tables(window_id, window_pos)
-    return (
-        tables.ptr,
-        tables.src,
-        tables.cls,
-        tables.scls,
-        tables.cptr,
-        tables.cedge,
-    )
+    return tuple(wa_tables(window_id, window_pos))
 
 
-@derive_pair_tables.register_fake
+@derive_wa_tables.register_fake
 def _(window_id, window_pos):
     n_w = window_id.shape[0]
     e = torch.library.get_ctx().new_dynamic_size()
 
-    def edges():
+    def col():
         return window_id.new_empty((e,), dtype=torch.long)
+
+    def claims():
+        return window_id.new_empty((n_w * _CLAIM_SPAN,), dtype=torch.long)
 
     return (
         window_id.new_empty((n_w + 1,), dtype=torch.long),
-        edges(),
-        edges(),
-        edges(),
-        window_id.new_empty((WA_CLASSES + 1,), dtype=torch.long),
-        edges(),
+        col(),
+        col(),
+        claims(),
+        claims(),
+        claims(),
+        claims(),
+        claims(),
+        window_id.new_empty((n_w,), dtype=torch.long),
     )
+
+
+def _expanded_edges(tables: WaTables) -> tuple[Tensor, Tensor, Tensor]:
+    """The explicit destination-major edge list the claims encode.
+
+    The reference path and the CUDA failure fallback compose attention over
+    these expanded views; the kernels never build them.
+    """
+    (
+        col_ptr,
+        col_src,
+        col_cls,
+        claim_lo,
+        claim_hi,
+        cl_win,
+        cl_fold,
+        cl_axis,
+        waxis,
+    ) = tables
+    n_w = waxis.shape[0]
+    device = waxis.device
+    lens = claim_hi - claim_lo
+    total = int(lens.sum())
+    claim = torch.repeat_interleave(
+        torch.arange(lens.shape[0], device=device), lens
+    )
+    within = torch.arange(total, device=device) - (
+        lens.cumsum(0) - lens
+    ).index_select(0, claim)
+    entry = claim_lo.index_select(0, claim) + within
+    owner = claim // _CLAIM_SPAN
+    partner = cl_win.index_select(0, entry)
+    keep = cl_axis.index_select(0, entry) != waxis.index_select(0, owner)
+    fold_own = _FOLD.to(device)[claim % _CLAIM_SPAN]
+    cross_cls = 11 + fold_own * 6 + cl_fold.index_select(0, entry)
+
+    dst = torch.cat([owner[keep], _edge_dst(col_ptr)])
+    src = torch.cat([partner[keep], col_src])
+    cls = torch.cat([cross_cls[keep], col_cls])
+    order = torch.argsort(dst.to(torch.int32), stable=True)
+    dst, src, cls = dst[order], src[order], cls[order]
+    ptr = torch.searchsorted(dst, torch.arange(n_w + 1, device=device))
+    return ptr, src, cls
 
 
 # The eager fallback walks the destination view in fixed slices so nothing of
 # size (E, head_dim) is ever materialized whole.
 _EDGE_SLICE = 2_000_000
 
-# Kernel launch geometry: segments average a few dozen edges, so one 32-edge
-# tile per iteration; the class gradient is the relay's split-partial shape.
+# Kernel launch geometry: a 32-edge tile covers the colinear run (<= 22
+# partners plus SELF) in one pass and each claim run (<= 48 claimants:
+# sixteen spans on each of three axes) in two.
 _WA_BLOCK_E = 32
+_WA_BLOCK_CLS = 64  # next power of two over WA_CLASSES
 _WA_NUM_WARPS = 1
-_BIAS_SPLITS = 64
-_BIAS_BLOCK_E = 128
 
 _FAILED_SHAPES: dict[tuple[object, ...], str] = {}
 _FAILED_BACKWARD_SHAPES: dict[tuple[object, ...], str] = {}
@@ -270,9 +305,15 @@ if triton is not None:
         k_ptr,
         v_ptr,
         bias_ptr,
-        ptr_ptr,
-        src_ptr,
-        cls_ptr,
+        colptr_ptr,
+        colsrc_ptr,
+        colcls_ptr,
+        clo_ptr,
+        chi_ptr,
+        clwin_ptr,
+        clfold_ptr,
+        claxis_ptr,
+        waxis_ptr,
         out_ptr,
         m_ptr,
         l_ptr,
@@ -282,11 +323,12 @@ if triton is not None:
         HD: tl.constexpr,
         BLOCK_HD: tl.constexpr,
         BLOCK_E: tl.constexpr,
+        CLAIM_SPAN: tl.constexpr,
     ):
-        # One (destination window, head) per program: an online softmax over
-        # the destination's edge run, saving only the max and denominator.
-        # A window's head programs are consecutive, so their gathers of the
-        # same source rows reuse cache lines instead of refetching them.
+        # One (destination window, head) per program: one online softmax over
+        # the colinear run and the sixteen claim runs, saving only the max
+        # and denominator. A window's head programs are consecutive, so
+        # their gathers of the same source rows reuse cache lines.
         pid = tl.program_id(0)
         w = pid // HEADS
         a = pid % HEADS
@@ -294,16 +336,18 @@ if triton is not None:
         live = offs < HD
         row = (w * HEADS + a) * HD
         q_row = tl.load(q_ptr + row + offs, mask=live, other=0.0).to(tl.float32)
-        start = tl.load(ptr_ptr + w)
-        end = tl.load(ptr_ptr + w + 1)
+        ax_w = tl.load(waxis_ptr + w)
         m = -float("inf")
         l = 0.0
         acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+
+        start = tl.load(colptr_ptr + w)
+        end = tl.load(colptr_ptr + w + 1)
         for lo in tl.range(start, end, BLOCK_E):
             eids = lo + tl.arange(0, BLOCK_E)
             ok = eids < end
-            s_idx = tl.load(src_ptr + eids, mask=ok, other=0)
-            c_idx = tl.load(cls_ptr + eids, mask=ok, other=0)
+            s_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0)
+            c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0)
             k_tile = tl.load(
                 k_ptr + (s_idx[:, None] * HEADS + a) * HD + offs[None, :],
                 mask=ok[:, None] & live[None, :],
@@ -325,6 +369,47 @@ if triton is not None:
             ).to(tl.float32)
             acc = acc * rescale + tl.sum(p[:, None] * v_tile, axis=0)
             m = m_new
+
+        for k_slot in tl.static_range(CLAIM_SPAN):
+            # fold(t) of this claim slot, folded at trace time: static_range
+            # makes k_slot a compile-time constant per unrolled iteration.
+            t = k_slot - 5
+            if t >= 0 and t <= 5:
+                f_own = min(t, 5 - t)
+            else:
+                f_own = 2 + min(-t if t < 0 else t - 5, 3)
+            lo = tl.load(clo_ptr + w * CLAIM_SPAN + k_slot)
+            hi = tl.load(chi_ptr + w * CLAIM_SPAN + k_slot)
+            for base in tl.range(lo, hi, BLOCK_E):
+                eids = base + tl.arange(0, BLOCK_E)
+                inside = eids < hi
+                u = tl.load(clwin_ptr + eids, mask=inside, other=0)
+                ax_u = tl.load(claxis_ptr + eids, mask=inside, other=0)
+                ok = inside & (ax_u != ax_w)
+                f_u = tl.load(clfold_ptr + eids, mask=ok, other=0)
+                c_idx = 11 + f_own * 6 + f_u
+                k_tile = tl.load(
+                    k_ptr + (u[:, None] * HEADS + a) * HD + offs[None, :],
+                    mask=ok[:, None] & live[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                score = tl.sum(q_row[None, :] * k_tile, axis=1) * scale
+                score += tl.load(
+                    bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
+                ).to(tl.float32)
+                score = tl.where(ok, score, -float("inf"))
+                m_new = tl.maximum(m, tl.max(score, axis=0))
+                rescale = tl.exp(m - m_new)
+                p = tl.exp(score - m_new)
+                l = l * rescale + tl.sum(p, axis=0)
+                v_tile = tl.load(
+                    v_ptr + (u[:, None] * HEADS + a) * HD + offs[None, :],
+                    mask=ok[:, None] & live[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                acc = acc * rescale + tl.sum(p[:, None] * v_tile, axis=0)
+                m = m_new
+
         tl.store(out_ptr + row + offs, acc / l, mask=live)
         tl.store(m_ptr + w * HEADS + a, m)
         tl.store(l_ptr + w * HEADS + a, l)
@@ -336,44 +421,56 @@ if triton is not None:
         v_ptr,
         bias_ptr,
         go_ptr,
-        ptr_ptr,
-        src_ptr,
-        cls_ptr,
+        colptr_ptr,
+        colsrc_ptr,
+        colcls_ptr,
+        clo_ptr,
+        chi_ptr,
+        clwin_ptr,
+        clfold_ptr,
+        claxis_ptr,
+        waxis_ptr,
         m_ptr,
         l_ptr,
         delta_ptr,
         dq_ptr,
-        dscore_ptr,
+        partial_ptr,
         scale,
         stride_bias,
         HEADS: tl.constexpr,
         HD: tl.constexpr,
         BLOCK_HD: tl.constexpr,
         BLOCK_E: tl.constexpr,
+        BLOCK_CLS: tl.constexpr,
+        CLAIM_SPAN: tl.constexpr,
     ):
-        # Destination sweep: recompute alpha from the saved stats, emit the
-        # per-edge dscore for the bias gradient, and accumulate dq in
-        # registers — one deterministic pass, no atomics. Head programs of
-        # one window are consecutive for cache-line reuse of their gathers.
+        # Destination sweep: recompute alpha from the saved stats, accumulate
+        # dq and this program's per-class dscore sums in registers — one
+        # deterministic pass, no atomics. The per-program bias partials are
+        # summed by a fixed torch reduction afterwards.
         pid = tl.program_id(0)
         w = pid // HEADS
         a = pid % HEADS
         offs = tl.arange(0, BLOCK_HD)
         live = offs < HD
+        cls_range = tl.arange(0, BLOCK_CLS)
         row = (w * HEADS + a) * HD
         q_row = tl.load(q_ptr + row + offs, mask=live, other=0.0).to(tl.float32)
         go_row = tl.load(go_ptr + row + offs, mask=live, other=0.0).to(tl.float32)
+        ax_w = tl.load(waxis_ptr + w)
         m = tl.load(m_ptr + w * HEADS + a)
         l = tl.load(l_ptr + w * HEADS + a)
         delta = tl.load(delta_ptr + w * HEADS + a)
-        start = tl.load(ptr_ptr + w)
-        end = tl.load(ptr_ptr + w + 1)
         acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+        acc_bias = tl.zeros([BLOCK_CLS], dtype=tl.float32)
+
+        start = tl.load(colptr_ptr + w)
+        end = tl.load(colptr_ptr + w + 1)
         for lo in tl.range(start, end, BLOCK_E):
             eids = lo + tl.arange(0, BLOCK_E)
             ok = eids < end
-            s_idx = tl.load(src_ptr + eids, mask=ok, other=0)
-            c_idx = tl.load(cls_ptr + eids, mask=ok, other=0)
+            s_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0)
+            c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0)
             k_tile = tl.load(
                 k_ptr + (s_idx[:, None] * HEADS + a) * HD + offs[None, :],
                 mask=ok[:, None] & live[None, :],
@@ -383,18 +480,67 @@ if triton is not None:
             score += tl.load(
                 bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
             ).to(tl.float32)
-            alpha = tl.exp(score - m) / l
+            alpha = tl.where(ok, tl.exp(score - m) / l, 0.0)
             v_tile = tl.load(
                 v_ptr + (s_idx[:, None] * HEADS + a) * HD + offs[None, :],
                 mask=ok[:, None] & live[None, :],
                 other=0.0,
             ).to(tl.float32)
-            dalpha = tl.sum(go_row[None, :] * v_tile, axis=1)
-            ds = tl.where(ok, alpha * (dalpha - delta), 0.0)
-            tl.store(dscore_ptr + eids * HEADS + a, ds, mask=ok)
+            ds = alpha * (tl.sum(go_row[None, :] * v_tile, axis=1) - delta)
             acc += tl.sum(ds[:, None] * k_tile, axis=0)
+            acc_bias += tl.sum(
+                tl.where(c_idx[:, None] == cls_range[None, :], ds[:, None], 0.0),
+                axis=0,
+            )
+
+        for k_slot in tl.static_range(CLAIM_SPAN):
+            # fold(t) of this claim slot, folded at trace time: static_range
+            # makes k_slot a compile-time constant per unrolled iteration.
+            t = k_slot - 5
+            if t >= 0 and t <= 5:
+                f_own = min(t, 5 - t)
+            else:
+                f_own = 2 + min(-t if t < 0 else t - 5, 3)
+            lo = tl.load(clo_ptr + w * CLAIM_SPAN + k_slot)
+            hi = tl.load(chi_ptr + w * CLAIM_SPAN + k_slot)
+            for base in tl.range(lo, hi, BLOCK_E):
+                eids = base + tl.arange(0, BLOCK_E)
+                inside = eids < hi
+                u = tl.load(clwin_ptr + eids, mask=inside, other=0)
+                ax_u = tl.load(claxis_ptr + eids, mask=inside, other=0)
+                ok = inside & (ax_u != ax_w)
+                f_u = tl.load(clfold_ptr + eids, mask=ok, other=0)
+                c_idx = 11 + f_own * 6 + f_u
+                k_tile = tl.load(
+                    k_ptr + (u[:, None] * HEADS + a) * HD + offs[None, :],
+                    mask=ok[:, None] & live[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                score = tl.sum(q_row[None, :] * k_tile, axis=1) * scale
+                score += tl.load(
+                    bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
+                ).to(tl.float32)
+                alpha = tl.where(ok, tl.exp(score - m) / l, 0.0)
+                v_tile = tl.load(
+                    v_ptr + (u[:, None] * HEADS + a) * HD + offs[None, :],
+                    mask=ok[:, None] & live[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                ds = alpha * (tl.sum(go_row[None, :] * v_tile, axis=1) - delta)
+                acc += tl.sum(ds[:, None] * k_tile, axis=0)
+                acc_bias += tl.sum(
+                    tl.where(
+                        c_idx[:, None] == cls_range[None, :], ds[:, None], 0.0
+                    ),
+                    axis=0,
+                )
+
         element = dq_ptr.dtype.element_ty
         tl.store(dq_ptr + row + offs, (acc * scale).to(element), mask=live)
+        tl.store(
+            partial_ptr + pid * BLOCK_CLS + cls_range,
+            acc_bias,
+        )
 
     @triton.jit
     def _wa_dkdv_kernel(
@@ -403,9 +549,15 @@ if triton is not None:
         v_ptr,
         bias_ptr,
         go_ptr,
-        sptr_ptr,
-        sdst_ptr,
-        scls_ptr,
+        colptr_ptr,
+        colsrc_ptr,
+        colcls_ptr,
+        clo_ptr,
+        chi_ptr,
+        clwin_ptr,
+        clfold_ptr,
+        claxis_ptr,
+        waxis_ptr,
         m_ptr,
         l_ptr,
         delta_ptr,
@@ -417,10 +569,13 @@ if triton is not None:
         HD: tl.constexpr,
         BLOCK_HD: tl.constexpr,
         BLOCK_E: tl.constexpr,
+        CLAIM_SPAN: tl.constexpr,
     ):
-        # Source sweep over the same edges: this program's k and v rows are
-        # fixed, the destinations' rows and stats are gathered per edge. Head
-        # programs of one source are consecutive for cache-line reuse.
+        # Source sweep over the same relation set: this program's k and v
+        # rows are fixed, the destinations' rows and stats are gathered per
+        # partner. Colinear and SELF are reversal-symmetric so the
+        # destination-major run doubles as the source view; a claim's
+        # crossing partners see this window with the folds' roles swapped.
         pid = tl.program_id(0)
         s = pid // HEADS
         a = pid % HEADS
@@ -429,15 +584,17 @@ if triton is not None:
         row = (s * HEADS + a) * HD
         k_row = tl.load(k_ptr + row + offs, mask=live, other=0.0).to(tl.float32)
         v_row = tl.load(v_ptr + row + offs, mask=live, other=0.0).to(tl.float32)
-        start = tl.load(sptr_ptr + s)
-        end = tl.load(sptr_ptr + s + 1)
+        ax_s = tl.load(waxis_ptr + s)
         acc_k = tl.zeros([BLOCK_HD], dtype=tl.float32)
         acc_v = tl.zeros([BLOCK_HD], dtype=tl.float32)
+
+        start = tl.load(colptr_ptr + s)
+        end = tl.load(colptr_ptr + s + 1)
         for lo in tl.range(start, end, BLOCK_E):
             eids = lo + tl.arange(0, BLOCK_E)
             ok = eids < end
-            d_idx = tl.load(sdst_ptr + eids, mask=ok, other=0)
-            c_idx = tl.load(scls_ptr + eids, mask=ok, other=0)
+            d_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0)
+            c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0)
             q_tile = tl.load(
                 q_ptr + (d_idx[:, None] * HEADS + a) * HD + offs[None, :],
                 mask=ok[:, None] & live[None, :],
@@ -456,50 +613,55 @@ if triton is not None:
                 bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
             ).to(tl.float32)
             alpha = tl.where(ok, tl.exp(score - m_e) / l_e, 0.0)
-            dalpha = tl.sum(go_tile * v_row[None, :], axis=1)
-            ds = alpha * (dalpha - delta_e)
+            ds = alpha * (tl.sum(go_tile * v_row[None, :], axis=1) - delta_e)
             acc_k += tl.sum(ds[:, None] * q_tile, axis=0)
             acc_v += tl.sum(alpha[:, None] * go_tile, axis=0)
+
+        for k_slot in tl.static_range(CLAIM_SPAN):
+            # fold(t) of this claim slot, folded at trace time: static_range
+            # makes k_slot a compile-time constant per unrolled iteration.
+            t = k_slot - 5
+            if t >= 0 and t <= 5:
+                f_own = min(t, 5 - t)
+            else:
+                f_own = 2 + min(-t if t < 0 else t - 5, 3)
+            lo = tl.load(clo_ptr + s * CLAIM_SPAN + k_slot)
+            hi = tl.load(chi_ptr + s * CLAIM_SPAN + k_slot)
+            for base in tl.range(lo, hi, BLOCK_E):
+                eids = base + tl.arange(0, BLOCK_E)
+                inside = eids < hi
+                d_idx = tl.load(clwin_ptr + eids, mask=inside, other=0)
+                ax_d = tl.load(claxis_ptr + eids, mask=inside, other=0)
+                ok = inside & (ax_d != ax_s)
+                f_d = tl.load(clfold_ptr + eids, mask=ok, other=0)
+                c_idx = 11 + f_d * 6 + f_own
+                q_tile = tl.load(
+                    q_ptr + (d_idx[:, None] * HEADS + a) * HD + offs[None, :],
+                    mask=ok[:, None] & live[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                go_tile = tl.load(
+                    go_ptr + (d_idx[:, None] * HEADS + a) * HD + offs[None, :],
+                    mask=ok[:, None] & live[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                m_e = tl.load(m_ptr + d_idx * HEADS + a, mask=ok, other=0.0)
+                l_e = tl.load(l_ptr + d_idx * HEADS + a, mask=ok, other=1.0)
+                delta_e = tl.load(
+                    delta_ptr + d_idx * HEADS + a, mask=ok, other=0.0
+                )
+                score = tl.sum(q_tile * k_row[None, :], axis=1) * scale
+                score += tl.load(
+                    bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
+                ).to(tl.float32)
+                alpha = tl.where(ok, tl.exp(score - m_e) / l_e, 0.0)
+                ds = alpha * (tl.sum(go_tile * v_row[None, :], axis=1) - delta_e)
+                acc_k += tl.sum(ds[:, None] * q_tile, axis=0)
+                acc_v += tl.sum(alpha[:, None] * go_tile, axis=0)
+
         element = dk_ptr.dtype.element_ty
         tl.store(dk_ptr + row + offs, (acc_k * scale).to(element), mask=live)
         tl.store(dv_ptr + row + offs, acc_v.to(element), mask=live)
-
-    @triton.jit
-    def _wa_bias_partial_kernel(
-        dscore_ptr,
-        cptr_ptr,
-        cedge_ptr,
-        partial_ptr,
-        SPLITS: tl.constexpr,
-        HEADS: tl.constexpr,
-        BLOCK_H: tl.constexpr,
-        BLOCK_E: tl.constexpr,
-    ):
-        # The relay's split-partial shape: a class run can own most of the
-        # edge set, so each program sums one fixed slice of one run.
-        cls = tl.program_id(0)
-        part = tl.program_id(1)
-        offs = tl.arange(0, BLOCK_H)
-        live = offs < HEADS
-        start = tl.load(cptr_ptr + cls)
-        end = tl.load(cptr_ptr + cls + 1)
-        per = (end - start + SPLITS - 1) // SPLITS
-        lo = start + part * per
-        hi = tl.minimum(lo + per, end)
-        acc = tl.zeros([BLOCK_H], dtype=tl.float32)
-        for base in tl.range(lo, hi, BLOCK_E):
-            entries = base + tl.arange(0, BLOCK_E)
-            inside = entries < hi
-            rows = tl.load(cedge_ptr + entries, mask=inside, other=0)
-            acc += tl.sum(
-                tl.load(
-                    dscore_ptr + rows[:, None] * HEADS + offs[None, :],
-                    mask=inside[:, None] & live[None, :],
-                    other=0.0,
-                ),
-                axis=0,
-            )
-        tl.store(partial_ptr + (cls * SPLITS + part) * HEADS + offs, acc, mask=live)
 
 
 def _edge_dst(ptr: Tensor) -> Tensor:
@@ -509,23 +671,30 @@ def _edge_dst(ptr: Tensor) -> Tensor:
     )
 
 
-def _validate_attention(q, k, v, bias, tables) -> None:
-    ptr, src, cls, sptr, sdst, scls, cptr, cedge = tables
+def _validate_attention(q, k, v, bias, tables: WaTables) -> None:
     if q.ndim != 3 or q.shape != k.shape or q.shape != v.shape:
         raise ValueError("q, k, v must share shape (N_w, heads, head_dim)")
     if bias.ndim != 2 or bias.shape[0] != q.shape[1]:
         raise ValueError("bias must have shape (heads, classes)")
-    if ptr.shape[0] != q.shape[0] + 1 or sptr.shape[0] != q.shape[0] + 1:
-        raise ValueError("ptr and sptr must have one row per window plus one")
-    if cptr.shape[0] != bias.shape[1] + 1:
-        raise ValueError("cptr must have one row per class plus one")
-    edges = src.shape
-    if any(t.shape != edges for t in (cls, sdst, scls, cedge)) or src.ndim != 1:
-        raise ValueError("the three edge views must have one length")
+    n_w = q.shape[0]
+    if tables.col_ptr.shape[0] != n_w + 1 or tables.waxis.shape[0] != n_w:
+        raise ValueError("col_ptr and waxis must have one row per window")
+    claims = (n_w * _CLAIM_SPAN,)
+    claim_views = (
+        tables.claim_lo,
+        tables.claim_hi,
+        tables.cl_win,
+        tables.cl_fold,
+        tables.cl_axis,
+    )
+    if any(view.shape != claims for view in claim_views):
+        raise ValueError("the claim views must have sixteen entries per window")
+    if tables.col_src.shape != tables.col_cls.shape or tables.col_src.ndim != 1:
+        raise ValueError("the colinear views must be one length")
 
 
 def _reference_forward(q, k, v, bias, ptr, src, cls):
-    """Sliced eager composition: the parity reference and the CPU path."""
+    """Sliced eager composition over expanded edges: parity and CPU path."""
     n_w, heads, hd = q.shape
     scale = 1.0 / math.sqrt(hd)
     dst = _edge_dst(ptr)
@@ -627,17 +796,30 @@ def _shape_key(x: Tensor) -> tuple[object, ...]:
     return (x.device.type, x.device.index, x.dtype, x.shape[1], x.shape[2])
 
 
-def _supported(q: Tensor, src: Tensor) -> bool:
+def _supported(q: Tensor) -> bool:
     return (
         triton is not None
         and q.is_cuda
         and q.dtype in (torch.float16, torch.bfloat16, torch.float32)
         and q.shape[0] > 0
-        and src.numel() > 0
     )
 
 
-def _launch_forward(q, k, v, bias, ptr, src, cls):
+def _table_args(tables: WaTables) -> tuple[Tensor, ...]:
+    return (
+        tables.col_ptr,
+        tables.col_src,
+        tables.col_cls,
+        tables.claim_lo,
+        tables.claim_hi,
+        tables.cl_win,
+        tables.cl_fold,
+        tables.cl_axis,
+        tables.waxis,
+    )
+
+
+def _launch_forward(q, k, v, bias, tables: WaTables):
     n_w, heads, hd = q.shape
     out = torch.empty((n_w, heads, hd), dtype=torch.float32, device=q.device)
     m = torch.empty((n_w, heads), dtype=torch.float32, device=q.device)
@@ -647,9 +829,7 @@ def _launch_forward(q, k, v, bias, ptr, src, cls):
         k,
         v,
         bias,
-        ptr,
-        src,
-        cls,
+        *_table_args(tables),
         out,
         m,
         l,
@@ -659,40 +839,51 @@ def _launch_forward(q, k, v, bias, ptr, src, cls):
         HD=hd,
         BLOCK_HD=triton.next_power_of_2(hd),
         BLOCK_E=_WA_BLOCK_E,
+        CLAIM_SPAN=_CLAIM_SPAN,
         num_warps=_WA_NUM_WARPS,
     )
     return out, m, l
 
 
-def _launch_backward(q, k, v, bias, tables, m, l, delta, go):
-    ptr, src, cls, sptr, sdst, scls, cptr, cedge = tables
+def _launch_backward(q, k, v, bias, tables: WaTables, m, l, delta, go):
     n_w, heads, hd = q.shape
     scale = 1.0 / math.sqrt(hd)
     block_hd = triton.next_power_of_2(hd)
     dq = torch.empty_like(q)
-    dscore = torch.empty((src.shape[0], heads), dtype=torch.float32, device=q.device)
+    # One partial row per (window, head) program keeps the bias gradient
+    # atomics-free and run-to-run deterministic; the fixed-tree torch sum
+    # finishes it. The buffer is (N_w * heads, 64) fp32 — far below the
+    # per-edge dscore array this design retires.
+    partial = torch.empty(
+        (n_w * heads, _WA_BLOCK_CLS), dtype=torch.float32, device=q.device
+    )
     _wa_dq_kernel[(n_w * heads,)](
         q,
         k,
         v,
         bias,
         go,
-        ptr,
-        src,
-        cls,
+        *_table_args(tables),
         m,
         l,
         delta,
         dq,
-        dscore,
+        partial,
         scale,
         bias.stride(0),
         HEADS=heads,
         HD=hd,
         BLOCK_HD=block_hd,
         BLOCK_E=_WA_BLOCK_E,
+        BLOCK_CLS=_WA_BLOCK_CLS,
+        CLAIM_SPAN=_CLAIM_SPAN,
         num_warps=_WA_NUM_WARPS,
     )
+    dbias = (
+        partial.view(n_w, heads, _WA_BLOCK_CLS)
+        .sum(dim=0)[:, : bias.shape[1]]
+        .contiguous()
+    ).to(bias.dtype)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
     _wa_dkdv_kernel[(n_w * heads,)](
@@ -701,9 +892,7 @@ def _launch_backward(q, k, v, bias, tables, m, l, delta, go):
         v,
         bias,
         go,
-        sptr,
-        sdst,
-        scls,
+        *_table_args(tables),
         m,
         l,
         delta,
@@ -715,26 +904,9 @@ def _launch_backward(q, k, v, bias, tables, m, l, delta, go):
         HD=hd,
         BLOCK_HD=block_hd,
         BLOCK_E=_WA_BLOCK_E,
+        CLAIM_SPAN=_CLAIM_SPAN,
         num_warps=_WA_NUM_WARPS,
     )
-    classes = bias.shape[1]
-    partial = torch.empty(
-        (classes * _BIAS_SPLITS, heads), dtype=torch.float32, device=q.device
-    )
-    _wa_bias_partial_kernel[(classes, _BIAS_SPLITS)](
-        dscore,
-        cptr,
-        cedge,
-        partial,
-        SPLITS=_BIAS_SPLITS,
-        HEADS=heads,
-        BLOCK_H=triton.next_power_of_2(heads),
-        BLOCK_E=_BIAS_BLOCK_E,
-        num_warps=_WA_NUM_WARPS,
-    )
-    dbias = (
-        partial.view(classes, _BIAS_SPLITS, heads).sum(dim=1).t().contiguous()
-    ).to(bias.dtype)
     return dq, dk, dv, dbias
 
 
@@ -744,25 +916,28 @@ def _wa_op(
     k: Tensor,
     v: Tensor,
     bias: Tensor,
-    ptr: Tensor,
-    src: Tensor,
-    cls: Tensor,
-    sptr: Tensor,
-    sdst: Tensor,
-    scls: Tensor,
-    cptr: Tensor,
-    cedge: Tensor,
+    col_ptr: Tensor,
+    col_src: Tensor,
+    col_cls: Tensor,
+    claim_lo: Tensor,
+    claim_hi: Tensor,
+    cl_win: Tensor,
+    cl_fold: Tensor,
+    cl_axis: Tensor,
+    waxis: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
-    tables = (ptr, src, cls, sptr, sdst, scls, cptr, cedge)
+    tables = WaTables(
+        col_ptr, col_src, col_cls, claim_lo, claim_hi, cl_win, cl_fold, cl_axis, waxis
+    )
     _validate_attention(q, k, v, bias, tables)
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
-    if not _supported(q, src):
-        return _reference_forward(q, k, v, bias, ptr, src, cls)
+    if not _supported(q):
+        return _reference_forward(q, k, v, bias, *_expanded_edges(tables))
     key = _shape_key(q)
     if key in _FAILED_SHAPES:
-        return _reference_forward(q, k, v, bias, ptr, src, cls)
+        return _reference_forward(q, k, v, bias, *_expanded_edges(tables))
     try:
-        return _launch_forward(q, k, v, bias, ptr, src, cls)
+        return _launch_forward(q, k, v, bias, tables)
     except Exception as exc:
         _FAILED_SHAPES[key] = f"{type(exc).__name__}: {exc}"
         warnings.warn(
@@ -772,11 +947,11 @@ def _wa_op(
             RuntimeWarning,
             stacklevel=2,
         )
-        return _reference_forward(q, k, v, bias, ptr, src, cls)
+        return _reference_forward(q, k, v, bias, *_expanded_edges(tables))
 
 
 @_wa_op.register_fake
-def _(q, k, v, bias, ptr, src, cls, sptr, sdst, scls, cptr, cedge):
+def _(q, k, v, bias, col_ptr, col_src, col_cls, claim_lo, claim_hi, cl_win, cl_fold, cl_axis, waxis):
     n_w, heads, hd = q.shape
     out = q.new_empty((n_w, heads, hd), dtype=torch.float32)
     m = q.new_empty((n_w, heads), dtype=torch.float32)
@@ -790,30 +965,37 @@ def _wa_backward_op(
     k: Tensor,
     v: Tensor,
     bias: Tensor,
-    ptr: Tensor,
-    src: Tensor,
-    cls: Tensor,
-    sptr: Tensor,
-    sdst: Tensor,
-    scls: Tensor,
-    cptr: Tensor,
-    cedge: Tensor,
+    col_ptr: Tensor,
+    col_src: Tensor,
+    col_cls: Tensor,
+    claim_lo: Tensor,
+    claim_hi: Tensor,
+    cl_win: Tensor,
+    cl_fold: Tensor,
+    cl_axis: Tensor,
+    waxis: Tensor,
     out: Tensor,
     m: Tensor,
     l: Tensor,
     grad_out: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    tables = WaTables(
+        col_ptr, col_src, col_cls, claim_lo, claim_hi, cl_win, cl_fold, cl_axis, waxis
+    )
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     go = grad_out.contiguous().float()
     # delta = Σ_hd go · out per (window, head) — algebraically the segment's
     # Σ alpha dalpha, so the softmax backward needs no first edge sweep.
     delta = (go * out).sum(-1)
-    if not _supported(q, src):
-        return _reference_backward(q, k, v, bias, ptr, src, cls, m, l, delta, go)
+    if not _supported(q):
+        return _reference_backward(
+            q, k, v, bias, *_expanded_edges(tables), m, l, delta, go
+        )
     key = _shape_key(q) + (grad_out.dtype,)
     if key in _FAILED_BACKWARD_SHAPES:
-        return _reference_backward(q, k, v, bias, ptr, src, cls, m, l, delta, go)
-    tables = (ptr, src, cls, sptr, sdst, scls, cptr, cedge)
+        return _reference_backward(
+            q, k, v, bias, *_expanded_edges(tables), m, l, delta, go
+        )
     try:
         return _launch_backward(q, k, v, bias, tables, m, l, delta, go)
     except Exception as exc:
@@ -825,11 +1007,13 @@ def _wa_backward_op(
             RuntimeWarning,
             stacklevel=2,
         )
-        return _reference_backward(q, k, v, bias, ptr, src, cls, m, l, delta, go)
+        return _reference_backward(
+            q, k, v, bias, *_expanded_edges(tables), m, l, delta, go
+        )
 
 
 @_wa_backward_op.register_fake
-def _(q, k, v, bias, ptr, src, cls, sptr, sdst, scls, cptr, cedge, out, m, l, grad_out):
+def _(q, k, v, bias, col_ptr, col_src, col_cls, claim_lo, claim_hi, cl_win, cl_fold, cl_axis, waxis, out, m, l, grad_out):
     return (
         torch.empty_like(q),
         torch.empty_like(k),
@@ -839,16 +1023,45 @@ def _(q, k, v, bias, ptr, src, cls, sptr, sdst, scls, cptr, cedge, out, m, l, gr
 
 
 def _wa_setup_context(ctx, inputs, output) -> None:
-    q, k, v, bias, ptr, src, cls, sptr, sdst, scls, cptr, cedge = inputs
+    (
+        q,
+        k,
+        v,
+        bias,
+        col_ptr,
+        col_src,
+        col_cls,
+        claim_lo,
+        claim_hi,
+        cl_win,
+        cl_fold,
+        cl_axis,
+        waxis,
+    ) = inputs
     out, m, l = output
     ctx.save_for_backward(
-        q, k, v, bias, ptr, src, cls, sptr, sdst, scls, cptr, cedge, out, m, l
+        q,
+        k,
+        v,
+        bias,
+        col_ptr,
+        col_src,
+        col_cls,
+        claim_lo,
+        claim_hi,
+        cl_win,
+        cl_fold,
+        cl_axis,
+        waxis,
+        out,
+        m,
+        l,
     )
 
 
 def _wa_dispatch_backward(ctx, grad_out, _grad_m, _grad_l):
     dq, dk, dv, dbias = _wa_backward_op(*ctx.saved_tensors, grad_out)
-    return (dq, dk, dv, dbias) + (None,) * 8
+    return (dq, dk, dv, dbias) + (None,) * 9
 
 
 _wa_op.register_autograd(_wa_dispatch_backward, setup_context=_wa_setup_context)
@@ -859,15 +1072,30 @@ def edge_attention(
     k: Tensor,
     v: Tensor,
     bias: Tensor,
-    ptr: Tensor,
-    src: Tensor,
-    cls: Tensor,
-    sptr: Tensor,
-    sdst: Tensor,
-    scls: Tensor,
-    cptr: Tensor,
-    cedge: Tensor,
+    col_ptr: Tensor,
+    col_src: Tensor,
+    col_cls: Tensor,
+    claim_lo: Tensor,
+    claim_hi: Tensor,
+    cl_win: Tensor,
+    cl_fold: Tensor,
+    cl_axis: Tensor,
+    waxis: Tensor,
 ) -> Tensor:
-    """§5.1c attention over the edge views: fp32 ``(N_w, heads, head_dim)``."""
-    out, _m, _l = _wa_op(q, k, v, bias, ptr, src, cls, sptr, sdst, scls, cptr, cedge)
+    """§5.1c attention over the claim views: fp32 ``(N_w, heads, head_dim)``."""
+    out, _m, _l = _wa_op(
+        q,
+        k,
+        v,
+        bias,
+        col_ptr,
+        col_src,
+        col_cls,
+        claim_lo,
+        claim_hi,
+        cl_win,
+        cl_fold,
+        cl_axis,
+        waxis,
+    )
     return out

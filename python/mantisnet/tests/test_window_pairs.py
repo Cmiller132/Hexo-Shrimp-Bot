@@ -16,7 +16,7 @@ import torch
 import mantisnet.window_pairs as window_pairs
 from mantisnet import MantisConfig, MantisNet, collate, from_position
 from mantisnet.builder import AXES
-from mantisnet.window_pairs import WA_CLASSES, edge_attention, pair_tables
+from mantisnet.window_pairs import WA_CLASSES, edge_attention, wa_tables
 
 
 def _fold(t: int) -> int:
@@ -77,8 +77,8 @@ def test_pair_tables_match_the_brute_force(positions):
         ids = [tuple(map(int, row)) for row in g.window_id]
         n_w = len(ids)
         window_id = torch.from_numpy(g.window_id)
-        tables = pair_tables(window_id, torch.zeros(n_w, dtype=torch.long))
-        ptr, src, cls = tables.ptr, tables.src, tables.cls
+        tables = wa_tables(window_id, torch.zeros(n_w, dtype=torch.long))
+        ptr, src, cls = window_pairs._expanded_edges(tables)
 
         got = set()
         for dst in range(n_w):
@@ -96,33 +96,33 @@ def test_pair_tables_match_the_brute_force(positions):
         assert got == expected
 
 
-def test_the_three_views_hold_the_same_edges(positions):
+def test_the_claim_views_bound_and_cover_the_relations(positions):
     g = from_position(positions[8])
     n_w = g.n_windows
-    tables = pair_tables(
+    tables = wa_tables(
         torch.from_numpy(g.window_id), torch.zeros(n_w, dtype=torch.long)
     )
-    e = tables.src.shape[0]
-    dst = torch.repeat_interleave(torch.arange(n_w), tables.ptr[1:] - tables.ptr[:-1])
-    forward = set(zip(dst.tolist(), tables.src.tolist(), tables.cls.tolist()))
+    # Structure: sixteen claims per window, run bounds inside the claimant
+    # list, and the hard degree bounds the kernel tiles rely on — at most
+    # 48 claimants per cell (sixteen spans on each of three axes), at most
+    # 22 colinear partners plus SELF.
+    assert tables.claim_lo.shape == tables.claim_hi.shape == (n_w * 16,)
+    assert tables.cl_win.shape == tables.cl_fold.shape == (n_w * 16,)
+    assert torch.all(tables.claim_lo >= 0)
+    assert torch.all(tables.claim_hi <= n_w * 16)
+    assert torch.all(tables.claim_hi - tables.claim_lo >= 1)
+    assert torch.all(tables.claim_hi - tables.claim_lo <= 48)
+    col_degree = tables.col_ptr[1:] - tables.col_ptr[:-1]
+    assert torch.all(col_degree >= 1) and torch.all(col_degree <= 23)
+    assert torch.all((tables.col_cls <= 10) | (tables.col_cls == 47))
+    assert torch.all((tables.cl_fold >= 0) & (tables.cl_fold <= 5))
 
-    source = torch.repeat_interleave(
-        torch.arange(n_w), tables.sptr[1:] - tables.sptr[:-1]
-    )
-    by_source = set(
-        zip(tables.sdst.tolist(), source.tolist(), tables.scls.tolist())
-    )
-    assert by_source == forward
-
-    # The class view is a permutation of destination-order edge ids whose
-    # classes run nondecreasing, with cptr at the class boundaries.
-    assert torch.equal(tables.cedge.sort().values, torch.arange(e))
-    ordered = tables.cls[tables.cedge]
-    assert torch.all(ordered[1:] >= ordered[:-1])
-    counts = torch.bincount(tables.cls, minlength=WA_CLASSES)
-    assert torch.equal(
-        tables.cptr, torch.cat([counts.new_zeros(1), counts.cumsum(0)])
-    )
+    # Every claim's own window sits in its run (same axis, so the kernels
+    # filter it), pinning each run to the right cell.
+    owner = torch.arange(n_w).repeat_interleave(16)
+    for c in range(n_w * 16):
+        run = tables.cl_win[int(tables.claim_lo[c]) : int(tables.claim_hi[c])]
+        assert bool((run == owner[c]).any())
 
 
 def _batched_tables(graphs):
@@ -130,47 +130,45 @@ def _batched_tables(graphs):
     window_pos = torch.repeat_interleave(
         torch.arange(len(graphs)), torch.tensor([g.n_windows for g in graphs])
     )
-    return pair_tables(window_id, window_pos)
+    return wa_tables(window_id, window_pos)
 
 
 def test_pairs_never_cross_positions(positions):
     graphs = [from_position(pos) for pos in positions if from_position(pos).n_windows]
-    tables = _batched_tables(graphs)
+    ptr, src, cls = window_pairs._expanded_edges(_batched_tables(graphs))
     # Stack the same graphs as one batch; every edge must stay inside its
     # position's window range.
     offsets = [0]
     for g in graphs:
         offsets.append(offsets[-1] + g.n_windows)
-    dst = torch.repeat_interleave(
-        torch.arange(offsets[-1]), tables.ptr[1:] - tables.ptr[:-1]
-    )
+    dst = torch.repeat_interleave(torch.arange(offsets[-1]), ptr[1:] - ptr[:-1])
     lo = torch.tensor(offsets[:-1])
     hi = torch.tensor(offsets[1:])
     position = torch.searchsorted(hi, dst, right=True)
-    assert torch.all(tables.src >= lo[position])
-    assert torch.all(tables.src < hi[position])
+    assert torch.all(src >= lo[position])
+    assert torch.all(src < hi[position])
 
     # Single-position tables agree with the batched ones for the first graph,
     # per destination as sets: the join visits edges in a different order when
     # other positions interleave the sort.
-    single = _batched_tables(graphs[:1])
+    sptr, ssrc, scls = window_pairs._expanded_edges(_batched_tables(graphs[:1]))
     n0 = graphs[0].n_windows
-    assert torch.equal(single.ptr, tables.ptr[: n0 + 1])
+    assert torch.equal(sptr, ptr[: n0 + 1])
     for w in range(n0):
-        a, b = int(tables.ptr[w]), int(tables.ptr[w + 1])
-        got = set(zip(tables.src[a:b].tolist(), tables.cls[a:b].tolist()))
-        want = set(zip(single.src[a:b].tolist(), single.cls[a:b].tolist()))
+        a, b = int(ptr[w]), int(ptr[w + 1])
+        got = set(zip(src[a:b].tolist(), cls[a:b].tolist()))
+        want = set(zip(ssrc[a:b].tolist(), scls[a:b].tolist()))
         assert got == want
 
 
 def test_every_window_carries_exactly_one_self_loop():
     g = from_position(__import__("hexo_py").Position.replay([(0, 0), (1, 0), (0, 1)]))
-    tables = _batched_tables([g])
-    counts = tables.ptr[1:] - tables.ptr[:-1]
+    ptr, src, cls = window_pairs._expanded_edges(_batched_tables([g]))
+    counts = ptr[1:] - ptr[:-1]
     assert torch.all(counts >= 1)
     self_edges = (
-        tables.src == torch.repeat_interleave(torch.arange(g.n_windows), counts)
-    ) & (tables.cls == 47)
+        src == torch.repeat_interleave(torch.arange(g.n_windows), counts)
+    ) & (cls == 47)
     assert int(self_edges.sum()) == g.n_windows
 
 
@@ -206,7 +204,7 @@ def _attention_case(positions, seed: int):
 def test_edge_attention_matches_the_naive_oracle(positions):
     q, k, v, bias, tables = _attention_case(positions, seed=21)
     got = edge_attention(q, k, v, bias, *tables)
-    want = _naive_attention(q, k, v, bias, *tables[:3])
+    want = _naive_attention(q, k, v, bias, *window_pairs._expanded_edges(tables))
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
 
 
@@ -220,7 +218,7 @@ def test_edge_attention_slices_and_gradients_match_the_oracle(positions, monkeyp
 
     got = edge_attention(q, k, v, bias, *tables)
     got_grads = torch.autograd.grad((got * upstream).sum(), (q, k, v, bias))
-    want = _naive_attention(q, k, v, bias, *tables[:3])
+    want = _naive_attention(q, k, v, bias, *window_pairs._expanded_edges(tables))
     want_grads = torch.autograd.grad((want * upstream).sum(), (q, k, v, bias))
 
     torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
@@ -255,7 +253,7 @@ def test_fused_kernels_match_the_oracle(positions, dtype):
     kr = kd.detach().float().cpu().requires_grad_()
     vr = vd.detach().float().cpu().requires_grad_()
     br = bd.detach().cpu().requires_grad_()
-    want = _naive_attention(qr, kr, vr, br, *tables[:3])
+    want = _naive_attention(qr, kr, vr, br, *window_pairs._expanded_edges(tables))
     want_grads = torch.autograd.grad((want * upstream).sum(), (qr, kr, vr, br))
 
     # dq/dk/dv are stored in the input dtype, so bf16 compares at bf16 grain.
