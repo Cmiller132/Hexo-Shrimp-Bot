@@ -218,6 +218,7 @@ durable record.
 | 12 | `mixed-windows` | ternary all-nonempty window nodes — **ACCEPTED** | full |
 | 13 | `cell-nodes` | explicit relevant-cell nodes + geometry edges | full |
 | 14 | `axis-channels` | three axis-equivariant channels | full |
+| 15 | `cell-latents` | legal-cell latents and a per-line pass | full |
 
 **Owner ruling (2026-08-10): ACT-era ablation results are disregarded as
 evidence.** The old ablations were coarse; no step is favoured or disfavoured
@@ -229,7 +230,7 @@ owner-set order (2026-08-10, revised same day to elevate mixed windows —
 an owner priority — out of the frontier), dependencies respected:
 
 ```text
-0 → 1 → 12 → 4 → 2 → 5 → 3 → 6 → 7 → 9 → 8 → 10 → frontier
+0 → 1 → 12 → 4 → 2 → 5 → 3 → 15 → 6 → 7 → 9 → 8 → 10 → frontier
 ```
 
 Step 12 precedes Step 4 so the counterfactual action tables are built
@@ -238,7 +239,9 @@ migrated; if Step 12's verdict is a revert, Step 4 proceeds with the
 binary-graft tables as specified. Step 12 runs as an owner-amended matrix
 (see its Gates) that folds a window-attention-off arm in as its principal
 cost offset; a bake with that arm subsumes Step 3. (Step 5 presumes Step 4's verdict; Steps 3
-and 9 require Step 2 to have landed.) The owner may revise the order between
+and 9 require Step 2 to have landed. Step 15 requires Step 3's verdict —
+its arms are replacements or additions depending on what §5.1c state that
+verdict leaves.) The owner may revise the order between
 steps. Steps 11, 13, and 14 (**structural frontier**) additionally require
 an explicit owner decision *before work starts*, because each is a large
 implementation whose hard speed gate is at serious risk from irreducible
@@ -596,6 +599,67 @@ budget; measured.
 
 **Gates & bake.** Full protocol.
 
+### Step 15 — `cell-latents`
+
+**Donor.** None — fork-native (owner-adopted 2026-08-11), out of Step 12's
+measured cost profile. §5.1c is the trunk's dominant stage; its edge set is
+quadratic in the windows claiming a shared cell, and the kernel campaign
+around the Step 12 screen established that the cost belongs to the pair
+function itself, not to its kernels (docs/ABLATIONS.md). The structural
+observation: every window↔window interaction the game defines — fork,
+block, shared line — is mediated by a cell, so pair interaction can factor
+through cells at O(incidence) instead of O(pairs).
+
+**Adaptation.** Two separable mechanisms:
+
+- *Cell latents.* Every legal cell — the decoder set; no new node
+  enumeration — carries a persistent state vector. Per block, a cell
+  updates by attention over the windows containing it (at most 18, through
+  the existing decoder incidence, typed by its 726 joint classes), and each
+  window reads back from its at most 5 empty cells, typed the same way.
+  This absorbs the §5.1b relay: `cell_pass` is the same graph with
+  transient state, one ReLU, and an untyped return. The policy and
+  action-value decoders read the refined cell latent in place of the
+  one-shot window aggregate (Step 4's action rows, where landed, join it
+  at the readout).
+- *Line pass.* Windows grouped per (axis, line), ordered by span start,
+  run a short per-line sequence op with a relative-offset bias — the
+  colinear vocabulary of §5.1c exactly, with unbounded offset and
+  whole-line context that pairwise offsets cannot express.
+
+Known coverage loss against §5.1c: out-of-span crossing pairs (the claim
+reach) have no mediating cell; arm E prices that signal before it is
+dropped.
+
+**Performance work.** The builder emits the per-line window CSR
+(re-deriving window identities if Step 3's removal deleted `window_id`);
+`MODEL_REPR_VERSION` bump at bake. Cell attention is relay-shaped —
+bounded fan-in, contiguous segment reductions — so its kernels follow the
+relay kernels' geometry, not the pair kernels'. The packet reports
+reclaimed time and VRAM against the post-Step-3 baseline.
+
+**Knob.** `cell_latents: bool = False`, `line_pass: bool = False`
+(measured arms per matrix).
+
+**Gates & bake.** Full protocol as a small predeclared matrix on paired
+seeds, Step-12-style. If Step 3 accepted removal, the arms are additions
+to the latents-only baseline under the standard speed gate; if Step 3
+rejected, arm B is a replacement trial and inherits Step 3's inverted
+expectation — a speed gain at owner-judged strength non-inferiority.
+
+| Arm | cell_latents | line_pass | §5.1c | Purpose |
+|---|---|---|---|---|
+| A | off | off | per Step 3 | baseline |
+| B | on | on | off | the full replacement/addition |
+| C | on | off | off | cell mediation alone |
+| D | off | on | off | line structure alone |
+| E | off | off | on, claim reach 0 | prices the out-of-span crossing signal (only if Step 3 rejected) |
+
+On accept: `relay.py` — and `window_pairs.py`, where still present — is
+deleted with its kernels and parameters, the knobs bake, and the golden
+vectors regenerate under the repr bump. On reject: knobs deleted, stages
+unchanged.
+
 ---
 
 ### Structural frontier — steps 11, 13, 14 (and 12's origin here)
@@ -717,8 +781,12 @@ campaign's rules say measurement, not memory, closes questions; but the
 request packet must project node/edge growth on the campaign corpus and
 identify which existing structures (relay, background path, action rows) it
 subsumes, and the expected outcome is that the hard speed gate fails without
-extraordinary kernel offsets. Detailed sub-specification is deferred to that
-packet (donor: ACT §8, §10, §15 in `b735d27`).
+extraordinary kernel offsets. A landed Step 15 covers the legal-cell
+portion of this node economy at O(incidence); a Step 13 packet must
+project its remaining delta — occupied-cell nodes and the geometric edge
+vocabularies — against a baseline that includes Step 15. Detailed
+sub-specification is deferred to that packet (donor: ACT §8, §10, §15 in
+`b735d27`).
 
 **Knob.** `cell_nodes: bool = False` (measured arm `True`).
 
