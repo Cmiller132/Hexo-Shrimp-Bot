@@ -490,8 +490,8 @@ class MantisNet(nn.Module):
 
     def _pair_tables(self, batch: Batch):
         # §5.1c structure is born on the batch's device from the window
-        # identities: the line blocks and claim views cost more to ship over
-        # PCIe than to derive beside the model, and every trunk block shares one
+        # identities: the claim views cost several times more to ship over
+        # PCIe than to derive beside the model, and every block shares one
         # derivation. The op is opaque to the compiler — a graph break here
         # would spill the surrounding message passing to eager.
         return window_pairs.WaTables(

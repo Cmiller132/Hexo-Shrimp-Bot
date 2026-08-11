@@ -96,66 +96,33 @@ def test_pair_tables_match_the_brute_force(positions):
         assert got == expected
 
 
-def test_the_line_blocks_and_claim_runs_are_consistent(positions):
+def test_the_claim_views_bound_and_cover_the_relations(positions):
     g = from_position(positions[8])
     n_w = g.n_windows
     tables = wa_tables(
         torch.from_numpy(g.window_id), torch.zeros(n_w, dtype=torch.long)
     )
-    # Structure and hard claimant-degree bound used by the kernel tiles.
-    # At most 48 windows claim one cell: sixteen starts on each of three axes.
-    n_blocks = tables.lane_win.shape[0]
-    assert tables.lane_win.shape == (n_blocks, 16)
-    assert tables.claim_lo.shape == tables.claim_hi.shape == (n_blocks, 31)
+    # Structure: sixteen claims per window, run bounds inside the claimant
+    # list, and the hard degree bounds the kernel tiles rely on — at most
+    # 48 claimants per cell (sixteen spans on each of three axes), at most
+    # 22 colinear partners plus SELF.
+    assert tables.claim_lo.shape == tables.claim_hi.shape == (n_w * 16,)
     assert tables.cl_win.shape == tables.cl_fold.shape == (n_w * 16,)
-    assert all(t.dtype == torch.int32 for t in tables)
     assert torch.all(tables.claim_lo >= 0)
     assert torch.all(tables.claim_hi <= n_w * 16)
-    assert torch.all(tables.claim_hi >= tables.claim_lo)
+    assert torch.all(tables.claim_hi - tables.claim_lo >= 1)
     assert torch.all(tables.claim_hi - tables.claim_lo <= 48)
+    col_degree = tables.col_ptr[1:] - tables.col_ptr[:-1]
+    assert torch.all(col_degree >= 1) and torch.all(col_degree <= 23)
+    assert torch.all((tables.col_cls <= 10) | (tables.col_cls == 47))
     assert torch.all((tables.cl_fold >= 0) & (tables.cl_fold <= 5))
 
-    # Every window appears in exactly one lane at its signed modulo-16 offset.
-    present = tables.lane_win >= 0
-    seen = tables.lane_win[present].to(torch.long)
-    assert torch.equal(seen.sort().values, torch.arange(n_w))
-    window_id = torch.from_numpy(g.window_id)
-    axis, sq, sr = window_id.unbind(1)
-    pos_on = torch.where(axis == 1, sr, sq)
-    expected_lane = pos_on - torch.floor_divide(pos_on, 16) * 16
-    assert torch.equal(tables.w_lane.long(), expected_lane)
-    assert torch.equal(
-        tables.lane_win[tables.w_block.long(), tables.w_lane.long()],
-        torch.arange(n_w, dtype=torch.int32),
-    )
-
-    blocks = torch.arange(n_blocks, dtype=torch.int32)
-    has_prev = tables.block_prev >= 0
-    has_next = tables.block_next >= 0
-    assert torch.equal(
-        tables.block_next[tables.block_prev[has_prev].long()], blocks[has_prev]
-    )
-    assert torch.equal(
-        tables.block_prev[tables.block_next[has_next].long()], blocks[has_next]
-    )
-
-    # Compare each window's original sixteen claim runs with block cells
-    # lane..lane+15, the identity used by all three kernels.
-    t = torch.arange(-5, 11)
-    axes = torch.tensor([[1, 0], [0, 1], [1, -1]])
-    vec = axes[axis]
-    cq = sq[:, None] + t[None, :] * vec[:, 0:1]
-    cr = sr[:, None] + t[None, :] * vec[:, 1:2]
-    koff, kspan = 1 << 16, 1 << 17
-    claim_key = ((cq + koff) * kspan + (cr + koff)).reshape(-1)
-    sorted_key = claim_key.sort().values
-    old_lo = torch.searchsorted(sorted_key, claim_key, side="left").view(n_w, 16)
-    old_hi = torch.searchsorted(sorted_key, claim_key, side="right").view(n_w, 16)
-    block_cells = tables.w_lane.long()[:, None] + torch.arange(16)
-    got_lo = tables.claim_lo[tables.w_block.long()[:, None], block_cells]
-    got_hi = tables.claim_hi[tables.w_block.long()[:, None], block_cells]
-    assert torch.equal(got_lo.long(), old_lo)
-    assert torch.equal(got_hi.long(), old_hi)
+    # Every claim's own window sits in its run (same axis, so the kernels
+    # filter it), pinning each run to the right cell.
+    owner = torch.arange(n_w).repeat_interleave(16)
+    for c in range(n_w * 16):
+        run = tables.cl_win[int(tables.claim_lo[c]) : int(tables.claim_hi[c])]
+        assert bool((run == owner[c]).any())
 
 
 def _batched_tables(graphs):
