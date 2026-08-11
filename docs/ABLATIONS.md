@@ -950,6 +950,26 @@ peak 10.06 GiB.
 | Verification | full pytest (376) and `cargo xtask verify` green |
 | Disposition | **Baked** (owner, 2026-08-10). |
 
+### Step 12 — `mixed-windows`
+
+| Field | Record |
+| --- | --- |
+| Commits | `9168639` (knob, both builders), `f92f500` (run-reduced mixed class/decoder sums), `ddcd2e5` (bake: ternary-only scope, `MODEL_REPR_VERSION` 4) |
+| Screen | owner-amended 2×2 factorial × 3 seeds (A baseline / B mixed / C mixed+waOff / D waOff), 400k-sample cells on `mnorm-late-v1`, uniform matrix budgets (fit pair 4M / cell 250k, collect 12M / 1.2M). B s2 ran on `f92f500` at halved budgets (2M/125k, 6M/600k) after WDDM paging under the dwm leak — budgets are chunking-only and recipe-recorded, gradients identical. |
+| Primaries (paired vs A) | B top-1 +0.553 ±1.438 pp [2+/1−], critic sign +1.334 ±8.355 pp; top-3 +0.941 ±1.210 pp [3+/0−]. Horizon top-1 (intervals excluding zero, all [3+/0−]): moves 33–48 +0.482 ±0.465 pp, 49–64 +2.019 ±1.939 pp, 65+ +1.294 ±0.772 pp — the late-horizon gains carried the verdict. C top-1 −0.120; D −0.760 [0+/3−]. |
+| Speed | matrix-budget steady window: A 3186.0 samples/s / 3.32 GiB; B 1068.1 / 9.17; C 390.3 / 2.42 (CPU-collate prefetch starvation, not attention cost); D 2388.5 / 2.42. Lean-budget B on `f92f500`: 1045.8 / 4.63 — ~2% under uniform-budget B with the §5.1c pair-density cliff gone. Node bill (`edbf760`): windows 2.22×, incidence 4.31×, decoder 1.69×. |
+| Verification | full pytest (397, 3 skipped) and `cargo xtask verify` green at `ddcd2e5`; the arm-B matrix checkpoints are the reference state-dict shape and load unchanged |
+| Disposition | **ACCEPTED and baked** (owner, 2026-08-11). Binary path deleted across Rust and Python; `mixed_windows: True` recorded in `LEGACY_BAKED_KNOBS`; binary-scope families are cleanly rejected by the registry; `window_attention` stays a live knob for Step 3. |
+
+### §5.1c cell-mediated attention — measured negative (Step 12 in-step work)
+
+| Field | Record |
+| --- | --- |
+| Commits | `b482346..2b5aec4` (claims-CSR derivation, three fused kernels, tunings), reverted at `ab3c3ae` |
+| Content | §5.1c without the materialized pair edge list: crossing pairs enumerated through claimed cells at attention time. VRAM dramatically better — B lean 3.43 vs 4.63 GiB, A 3.17 vs 3.32, and the pair-density scaling cliff gone entirely. |
+| Speed | 2.4–2.5× slower on both scopes (B lean 415.8 vs 1045.8 samples/s; A uniform 1355.4 vs 3186.0): the kernels sit at the random-gather bandwidth floor, so the cost belongs to the pair function, not the kernels. A line-blocked variant (claimant tiles serving 16 lanes) lost a further 1.8× to 41% lane occupancy, the fp32-parity ban on tf32/bf16 dots, and register pressure. |
+| Disposition | **Reverted** (owner, 2026-08-11): the edge-list §5.1c is restored; lean budgets are the sanctioned VRAM lever (chunking-only, ~2% cost). The result motivates spec Step 15 (`cell-latents`), which changes the function instead of the kernels. |
+
 ## Provenance
 
 | Source | Use in this record |
