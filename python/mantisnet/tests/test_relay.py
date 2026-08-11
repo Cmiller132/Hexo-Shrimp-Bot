@@ -14,7 +14,7 @@ import torch
 
 import mantisnet.relay as relay_impl
 from mantisnet import collate, from_position
-from mantisnet.builder import DEC_CLASSES
+from mantisnet.builder import TERN_DEC_CLASSES
 from mantisnet.relay import (
     _FAILED_BACKWARD_SHAPES,
     _FAILED_SHAPES,
@@ -51,7 +51,7 @@ def _tables(batch, device="cpu"):
         batch.dec_window,
         batch.dec_class,
         batch.window_feat.shape[0],
-        DEC_CLASSES,
+        TERN_DEC_CLASSES,
     )
     return tuple(t.to(device) for t in tables)
 
@@ -59,7 +59,7 @@ def _tables(batch, device="cpu"):
 def _inputs(batch, h=32, seed=0, device="cpu", dtype=torch.float32):
     generator = torch.Generator().manual_seed(seed)
     x = torch.randn(batch.window_feat.shape[0], h, generator=generator)
-    emb = torch.randn(DEC_CLASSES, h, generator=generator)
+    emb = torch.randn(TERN_DEC_CLASSES, h, generator=generator)
     return x.to(device, dtype), emb.to(device)
 
 

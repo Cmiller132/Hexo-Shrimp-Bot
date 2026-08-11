@@ -28,10 +28,10 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..builder import (
-    DEC_CLASSES,
+    TERN_DEC_CLASSES,
     WINDOW_LEN,
     Batch,
-    _DEC_CLASS,
+    _TERN_DEC_CLASS,
     collate,
     collate_prefixes,
     from_position,
@@ -42,13 +42,14 @@ from .improve import improved_policy
 from .run import _versions
 
 ARM = "joint-trinomial"
+DEC_CLASSES = TERN_DEC_CLASSES
 
 _EXPANDED_KEYS = ("e_pw.weight", "e_qw.weight")
 _READOUT_KEYS = ("mlp_q.out.weight", "mlp_q.out.bias")
 _TRANSFORMED_KEYS = frozenset((*_EXPANDED_KEYS, *_READOUT_KEYS))
 ZERO_LOGIT = -20.0
 TRANSFORM = (
-    "expand e_pw and e_qw from 3 slot-class rows to 93 joint-class rows by "
+    "expand e_pw and e_qw from 3 slot-class rows to 726 ternary joint-class rows by "
     "parent-row replication; set the scalar critic readout to W_pos = W_s, "
     "b_pos = b_s, W_neg = -W_s, b_neg = -b_s, W_zero = 0, b_zero = -20; "
     "copy every other parent "
@@ -75,7 +76,7 @@ PROBE_PLIES = (20, 60)
 PROBE_TOP_K = 16
 _PROBE_ATTEMPTS = 100
 
-# Tolerances for the GEMM reassociation (93-wide class sum vs per-entry).
+# Tolerances for the GEMM reassociation (ternary class sum vs per-entry).
 # Preservation itself is exact; these cover the folded-arithmetic delta.
 Q_TOLERANCE = 1e-5
 POLICY_TOLERANCE = 1e-4  # raw logits, which are not squashed into [-1, 1]
@@ -110,9 +111,9 @@ _ADAM_FIELDS = ("step", "exp_avg", "exp_avg_sq")
 def parent_row_of_class() -> np.ndarray:
     """The parent slot-class row each joint class replicates, derived and checked."""
     rows = np.full(DEC_CLASSES, -1, dtype=np.int64)
-    for mask in range(1, 63):
+    for pattern in range(1, 729):
         for slot in range(WINDOW_LEN):
-            cls = int(_DEC_CLASS[mask, slot])
+            cls = int(_TERN_DEC_CLASS[pattern, slot])
             if cls < 0:
                 continue
             slot_class = min(slot, WINDOW_LEN - 1 - slot)

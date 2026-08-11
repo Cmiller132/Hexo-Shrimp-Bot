@@ -12,7 +12,6 @@ import torch
 from .. import message_passing
 from ..attention import fused_attention
 from ..builder import collate_positions
-from ..model import _class_term
 from ..optim import make_adam
 from ..klent.train import KlentConfig, _policy_q
 from .bench import _config, _family_fields, _load_or_fresh
@@ -55,36 +54,78 @@ def _positions(model, loaded, *, corpus, split, envs, steps, seed, device, compi
     )
 
 
-def _replicated_block(block, s, w, g, batch, seq_lens, plan, device, timings):
+# One timing bucket per §5 trunk stage, in block execution order.
+_TRUNK_STAGES = (
+    "window_from_stones",
+    "cell_pass",
+    "window_attention",
+    "stone_from_windows",
+    "attention",
+    "ffn",
+)
+
+
+def _replicated_block(block, s, w, g, batch, seq_lens, plan, pairs, device, timings):
     """Transcribe one ``_Block`` without hooks or model instrumentation."""
     cfg = block.cfg
-    stone_counts, window_counts = plan.stone_counts, plan.window_counts
 
     def window_from_stones():
         nonlocal w
         x = block.u(block.ln_ws_s(s))
-        msg = x.index_select(0, batch.inc_stone).float()
-        agg = (
-            msg.new_zeros(w.shape[0], cfg.h)
-            .index_add_(0, batch.inc_window, msg)
-            .to(x.dtype)
+        agg = message_passing.aggregate_to_windows(
+            x,
+            batch.inc_stone,
+            batch.inc_window,
+            plan.run_stone,
+            plan.run_window,
+            w.shape[0],
         )
-        agg = agg + _class_term(window_counts, block.e_ws.weight, agg.dtype)
+        agg = agg + message_passing.class_row_sum(
+            block.e_ws.weight,
+            batch.inc_class,
+            batch.inc_window,
+            w.shape[0],
+            message_passing.WINDOW_RUN,
+        ).to(agg.dtype)
         w = w + block.drop(block.mlp_w(block.ln_ws_w(w), agg))
 
-    _, dt = _elapsed(device, window_from_stones)
-    timings["window_from_stones"] += dt
+    def cell_pass():
+        nonlocal w
+        w = block._cell_pass(
+            w,
+            batch.relay_cell_ptr,
+            batch.relay_window,
+            batch.relay_class,
+            batch.relay_win_ptr,
+            batch.relay_wcell,
+            batch.relay_cls_ptr,
+            batch.relay_ccell,
+        )
+
+    def window_attention():
+        nonlocal w
+        if cfg.window_attention:
+            w = block._window_attention(w, pairs)
 
     def stone_from_windows():
         nonlocal s
         y = block.v(block.ln_sw_w(w))
-        msg = y.index_select(0, batch.inc_window).float()
-        agg = msg.new_zeros(s.shape[0], cfg.h).index_add_(0, batch.inc_stone, msg)
-        agg = agg + _class_term(stone_counts, block.e_sw.weight, agg.dtype)
+        agg = message_passing.aggregate_to_stones(
+            y,
+            batch.inc_stone,
+            batch.inc_window,
+            plan.run_stone,
+            plan.run_window,
+            s.shape[0],
+        )
+        agg = agg + message_passing.class_row_sum(
+            block.e_sw.weight,
+            plan.run_class,
+            plan.run_stone,
+            s.shape[0],
+            message_passing.STONE_RUN,
+        ).to(agg.dtype)
         s = s + block.drop(block.mlp_s(block.ln_sw_s(s), agg))
-
-    _, dt = _elapsed(device, stone_from_windows)
-    timings["stone_from_windows"] += dt
 
     def attention():
         nonlocal s, g
@@ -98,15 +139,14 @@ def _replicated_block(block, s, w, g, batch, seq_lens, plan, device, timings):
         q = block.wq(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         k = block.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         v = block.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
-        out = fused_attention(q, k, v, batch.coords, seq_lens, block.dist_bias)
+        out = fused_attention(
+            q, k, v, batch.coords, seq_lens, block.dist_bias, block.axis_bias
+        )
         out = block.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(
             p * max_t, cfg.h
         )
         s = s + block.drop(out.index_select(0, batch.stone_slot))
         g = g + block.drop(out.index_select(0, token_slot))
-
-    _, dt = _elapsed(device, attention)
-    timings["attention"] += dt
 
     def ffn():
         nonlocal s, g
@@ -115,8 +155,10 @@ def _replicated_block(block, s, w, g, batch, seq_lens, plan, device, timings):
         s = s + rows[: s.shape[0]]
         g = g + rows[s.shape[0] :]
 
-    _, dt = _elapsed(device, ffn)
-    timings["ffn"] += dt
+    stages = (window_from_stones, cell_pass, window_attention, stone_from_windows, attention, ffn)
+    for name, stage in zip(_TRUNK_STAGES, stages):
+        _, dt = _elapsed(device, stage)
+        timings[name] += dt
     return s, w, g
 
 
@@ -128,21 +170,14 @@ def _replicated_trunk(model, batch, device: str):
         batch.inc_stone,
         batch.inc_window,
         batch.inc_class,
-        s.shape[0],
-        w.shape[0],
-        model.blocks[0].e_ws.num_embeddings,
     )
+    pairs = model._pair_tables(batch) if model.cfg.window_attention else None
     seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
     per_block = []
     for block in model.blocks:
-        timings = {
-            "window_from_stones": 0.0,
-            "stone_from_windows": 0.0,
-            "attention": 0.0,
-            "ffn": 0.0,
-        }
+        timings = {name: 0.0 for name in _TRUNK_STAGES}
         s, w, g = _replicated_block(
-            block, s, w, g, batch, seq_lens, plan, device, timings
+            block, s, w, g, batch, seq_lens, plan, pairs, device, timings
         )
         per_block.append(timings)
     return (model.ln_out(s), model.ln_out(w), model.ln_out(g)), per_block
@@ -192,15 +227,7 @@ def profile_trunk(
         expected = model.trunk(batch)
         actual, _ = _replicated_trunk(model, batch, device)
         _assert_trunk_match(expected, actual)
-        totals = [
-            {
-                "window_from_stones": 0.0,
-                "stone_from_windows": 0.0,
-                "attention": 0.0,
-                "ffn": 0.0,
-            }
-            for _ in model.blocks
-        ]
+        totals = [{name: 0.0 for name in _TRUNK_STAGES} for _ in model.blocks]
         total_seconds = 0.0
         for _ in range(iters):
             start = time.perf_counter()
@@ -240,6 +267,7 @@ def _profile_activities(device: str):
 # claims a row, so the in-repo Triton kernels come before the generic families
 # ("triton_" alone would also claim them).
 _FIT_BUCKETS = {
+    "window_pairs": ("_wa_",),
     "relay": (
         "_cell_values_kernel",
         "_cell_grad_kernel",

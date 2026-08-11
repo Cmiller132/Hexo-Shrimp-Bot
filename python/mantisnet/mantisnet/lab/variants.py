@@ -7,7 +7,6 @@ ablations are typed ``MantisConfig`` overrides, not separate variants.
 
 from __future__ import annotations
 
-import functools
 import math
 from dataclasses import dataclass, fields
 from typing import Callable, Mapping, Sequence, get_type_hints
@@ -133,15 +132,9 @@ def variant_spec(name: str) -> VariantSpec:
 
 
 def scoped_collate(name: str, model: nn.Module) -> Collate:
-    """The variant's collate bound to the model's window scope.
-
-    The Step 12 knob lives on ``MantisConfig``; every batch built for a model
-    must share its scope, so the binding happens once here instead of at each
-    call site.
-    """
-    return functools.partial(
-        variant_spec(name).collate, mixed_windows=model.cfg.mixed_windows
-    )
+    """The variant's collate function."""
+    del model
+    return variant_spec(name).collate
 
 
 def build_variant(

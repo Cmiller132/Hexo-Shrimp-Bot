@@ -17,10 +17,13 @@ import pytest
 import torch
 
 import mantisnet.message_passing as message_impl
-from mantisnet import OCC_CLASSES, collate, from_position
+from mantisnet import TERN_OCC_CLASSES, collate, from_position
 from mantisnet.message_passing import (
+    STONE_RUN,
+    WINDOW_RUN,
     aggregate_to_stones,
     aggregate_to_windows,
+    class_row_sum,
     incidence_plan,
 )
 
@@ -68,13 +71,22 @@ def _composed(
     values: torch.Tensor,
     class_weight: torch.Tensor,
     views: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-    counts: torch.Tensor,
+    class_view: tuple[torch.Tensor, torch.Tensor, int],
     n_dest: int,
 ) -> torch.Tensor:
-    """The production composition: values aggregation plus the counts matmul."""
+    """The production composition: values aggregation plus the class term."""
     fn = aggregate_to_windows if direction == "windows" else aggregate_to_stones
     rows = fn(values, *views, n_dest)
-    return rows + (counts @ class_weight).to(rows.dtype)
+    gather, runs, run_len = class_view
+    term = class_row_sum(class_weight, gather, runs, n_dest, run_len)
+    return rows + term.to(rows.dtype)
+
+
+def _class_view(batch, plan, direction: str) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """The production class-term views: window-major native, stone-major reordered."""
+    if direction == "windows":
+        return (batch.inc_class, batch.inc_window, WINDOW_RUN)
+    return (plan.run_class, plan.run_stone, STONE_RUN)
 
 
 def _batch_for_case(positions, case: str):
@@ -83,7 +95,7 @@ def _batch_for_case(positions, case: str):
     single = [graph for graph in graphs if graph.n_stones == 1]
     assert len(empty) == len(single) == 1
 
-    # Ply zero is simultaneously the no-live-window trunk case and the
+    # Ply zero is simultaneously the no-window trunk case and the
     # background-only legal-cell case.  Pin both facts so fixture drift cannot
     # quietly delete either edge case from the CUDA tests.
     zero = empty[0]
@@ -113,14 +125,7 @@ def _batch_for_case(positions, case: str):
 
 
 def _plan_for(batch):
-    return incidence_plan(
-        batch.inc_stone,
-        batch.inc_window,
-        batch.inc_class,
-        int(batch.stone_own.shape[0]),
-        int(batch.window_feat.shape[0]),
-        OCC_CLASSES,
-    )
+    return incidence_plan(batch.inc_stone, batch.inc_window, batch.inc_class)
 
 
 def _views_for(batch, plan) -> tuple[torch.Tensor, ...]:
@@ -156,10 +161,9 @@ def _inputs(n_source: int, source_dtype: torch.dtype, seed: int):
     # This is the production autocast signature: linear projections may be
     # bf16, while nn.Embedding keeps its fp32 weight and lookup result.  The old
     # add therefore promotes the messages and accumulator to fp32.  The table
-    # spans every joint class a batch can carry; a stock model folds before
-    # reaching the trunk's histograms.
+    # spans every joint class a batch can carry.
     class_weight = torch.randn(
-        (OCC_CLASSES, _H), device=_DEVICE, dtype=torch.float32, generator=generator
+        (TERN_OCC_CLASSES, _H), device=_DEVICE, dtype=torch.float32, generator=generator
     )
     return values, class_weight
 
@@ -196,24 +200,6 @@ def test_cuda_values_term_matches_the_old_scatter(
 
     assert actual.shape == (n_dest, _H)
     assert actual.dtype == expected.dtype
-    torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=2.0e-5)
-
-
-@pytest.mark.parametrize("direction", ["windows", "stones"])
-def test_class_histograms_match_the_per_entry_gather(positions, direction: str):
-    """``counts @ table`` is exactly the old per-entry class-row scatter."""
-    batch = _batch_for_case(positions, "ragged")
-    assert batch.inc_class.unique().numel() > 3
-    assert int(batch.inc_class.max()) < OCC_CLASSES
-    _n_source, _source, destination, n_dest = _direction(batch, direction)
-    _values, class_weight = _inputs(1, torch.float32, seed=71)
-    plan = _plan_for(batch)
-    counts = plan.window_counts if direction == "windows" else plan.stone_counts
-
-    actual = counts @ class_weight
-    expected = torch.zeros((n_dest, _H), device=_DEVICE).index_add_(
-        0, destination, class_weight.index_select(0, batch.inc_class)
-    )
     torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=2.0e-5)
 
 
@@ -263,7 +249,7 @@ def test_source_and_class_gradients_match_the_old_scatter(positions, direction: 
         fast_values,
         fast_class,
         views,
-        plan.window_counts if direction == "windows" else plan.stone_counts,
+        _class_view(batch, plan, direction),
         n_dest,
     )
     fast_grads = torch.autograd.grad(
@@ -300,14 +286,7 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
     model = model.to(_DEVICE)
     block = model.blocks[0]
     pairs = model._pair_tables(batch)
-    plan = incidence_plan(
-        batch.inc_stone,
-        batch.inc_window,
-        batch.inc_class,
-        int(batch.stone_own.shape[0]),
-        int(batch.window_feat.shape[0]),
-        block.e_ws.num_embeddings,
-    )
+    plan = incidence_plan(batch.inc_stone, batch.inc_window, batch.inc_class)
     seen: set[str] = set()
 
     def windows(values, inc_stone, inc_window, run_stone, run_window, n_dest):
@@ -354,13 +333,13 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
 @pytest.mark.parametrize("direction", ["windows", "stones"])
 @torch.no_grad()
 def test_dynamic_fullgraph_compile_matches_the_old_scatter(positions, direction: str):
-    def run(values, class_weight, inc_stone, inc_window, run_stone, run_window, counts, n_dest):
+    def run(values, class_weight, inc_stone, inc_window, run_stone, run_window, gather, runs, run_len, n_dest):
         return _composed(
             direction,
             values,
             class_weight,
             (inc_stone, inc_window, run_stone, run_window),
-            counts,
+            (gather, runs, run_len),
             n_dest,
         )
 
@@ -377,7 +356,7 @@ def test_dynamic_fullgraph_compile_matches_the_old_scatter(positions, direction:
             values,
             class_weight,
             *_views_for(batch, plan),
-            plan.window_counts if direction == "windows" else plan.stone_counts,
+            *_class_view(batch, plan, direction),
             n_dest,
         )
         expected = _old_scatter(
@@ -388,11 +367,13 @@ def test_dynamic_fullgraph_compile_matches_the_old_scatter(positions, direction:
 
 
 def test_dynamic_compiled_window_backward_matches_the_old_scatter(positions):
-    def loss(values, class_weight, inc_stone, inc_window, run_stone, run_window, window_counts, upstream, n_dest):
+    def loss(values, class_weight, inc_stone, inc_window, run_stone, run_window, inc_class, upstream, n_dest):
         rows = aggregate_to_windows(
             values, inc_stone, inc_window, run_stone, run_window, n_dest
         )
-        rows = rows + (window_counts @ class_weight).to(rows.dtype)
+        rows = rows + class_row_sum(
+            class_weight, inc_class, inc_window, n_dest, WINDOW_RUN
+        ).to(rows.dtype)
         return (rows.float() * upstream).sum()
 
     compiled = torch.compile(loss, dynamic=True, fullgraph=True)
@@ -419,7 +400,7 @@ def test_dynamic_compiled_window_backward_matches_the_old_scatter(positions):
                 fast_values,
                 fast_class,
                 *_views_for(batch, plan),
-                plan.window_counts,
+                batch.inc_class,
                 upstream,
                 n_dest,
             ),

@@ -91,6 +91,8 @@ def test_variant_registry_is_exact_and_overrides_are_typed():
 
     with pytest.raises(ValueError, match="unknown MantisConfig field"):
         parse_model_kw(["width=16"])
+    with pytest.raises(ValueError, match="unknown MantisConfig field"):
+        parse_model_kw(["mixed_windows=true"])
     with pytest.raises(ValueError, match="must be an int"):
         parse_model_kw(["h=wide"])
     with pytest.raises(ValueError, match="duplicate"):

@@ -1,9 +1,9 @@
 """Fused incidence aggregation for the two trunk message-passing passes.
 
 Both directions consume the builder's window-major incidence table and
-aggregate projected entity rows.  The class term is a separate dense matmul
-(``counts @ weight``); ``incidence_plan`` builds the histograms outside
-autograd.  The stone direction accumulates in fp32.
+aggregate projected entity rows.  The class terms run-reduce class-table
+rows per destination (``class_row_sum``); ``incidence_plan`` derives the
+stone-major view outside autograd.  The stone direction accumulates in fp32.
 
 CUDA: one segment-reduction kernel serving all four directions over
 window-major and stone-major orderings.  CPU: gather + ``index_add_`` parity
@@ -320,7 +320,7 @@ def aggregate_to_stones(
     )
 
 
-# The mixed-window scope's ternary class vocabularies (726/1458) are too wide
+# The ternary class vocabularies (726/1458) are too wide
 # for the histogram matmul, so its class terms and its decoder aggregation
 # reduce rows per run with the same kernel as the trunk aggregations — never
 # materializing the (E, H) gather of the literal formulation.
@@ -485,68 +485,33 @@ def incidence_row_sum(
 
 
 class IncidencePlan(NamedTuple):
-    """Per-batch derivations both passes share: histograms and orderings."""
+    """Per-batch derivations both passes share: the stone-major incidence view."""
 
-    stone_counts: Tensor | None  # (N_s, classes) fp32; None without histograms
-    window_counts: Tensor | None  # (N_w, classes) fp32; None without histograms
     run_stone: Tensor  # (E,) int64: inc_stone, stone-major stable order
     run_window: Tensor  # (E,) int64: inc_window in the same order
-    run_class: Tensor | None  # (E,) int64: inc_class in the same order; mixed only
+    run_class: Tensor  # (E,) int64: inc_class in the same order
 
 
 def incidence_plan(
     inc_stone: Tensor,
     inc_window: Tensor,
     inc_class: Tensor,
-    n_stones: int,
-    n_windows: int,
-    classes: int,
-    histograms: bool = True,
 ) -> IncidencePlan:
-    """Both passes' class histograms and the stone-major incidence view.
+    """The stone-major incidence view both passes share.
 
-    ``counts @ class_weight`` is each destination's summed class rows, so the
-    trunk adds the class term as a dense matmul instead of routing it through
-    the aggregation.  The plan is data, not activations: it carries no
+    The class terms run-reduce their table rows per destination
+    (``class_row_sum``), so the plan carries the class ids alongside the
+    reordered incidence.  The plan is data, not activations: it carries no
     gradient, and one derivation per batch serves every block's two passes.
-
-    ``histograms=False`` skips the dense count matrices for scopes whose class
-    vocabulary makes them prohibitively wide (the ternary mixed-window tables);
-    such callers run-reduce the class rows instead (``class_row_sum``), so the
-    plan carries the stone-major class view and the count fields are ``None``.
     """
     if inc_class.shape != inc_stone.shape or inc_class.dtype != torch.int64:
         raise ValueError("inc_class must be int64 and one length with inc_stone")
-    if classes <= 0:
-        raise ValueError(f"classes must be positive, got {classes}")
     with torch.no_grad():
-        if histograms:
-            ones = torch.ones(
-                inc_class.shape[0], dtype=torch.float32, device=inc_class.device
-            )
-            stone_counts = torch.zeros(
-                n_stones * classes, dtype=torch.float32, device=inc_class.device
-            ).index_add_(0, inc_stone * classes + inc_class, ones).view(
-                n_stones, classes
-            )
-            window_counts = torch.zeros(
-                n_windows * classes, dtype=torch.float32, device=inc_class.device
-            ).index_add_(0, inc_window * classes + inc_class, ones).view(
-                n_windows, classes
-            )
-        else:
-            stone_counts = None
-            window_counts = None
         # Stone ids fit int32, and radix passes scale with key width; the
         # stable sort keeps each run in the builder's window-major order.
         order = torch.argsort(inc_stone.to(torch.int32), stable=True)
-        run_stone = inc_stone.index_select(0, order)
-        run_window = inc_window.index_select(0, order)
-        run_class = None if histograms else inc_class.index_select(0, order)
-    return IncidencePlan(
-        stone_counts,
-        window_counts,
-        run_stone,
-        run_window,
-        run_class,
-    )
+        return IncidencePlan(
+            inc_stone.index_select(0, order),
+            inc_window.index_select(0, order),
+            inc_class.index_select(0, order),
+        )

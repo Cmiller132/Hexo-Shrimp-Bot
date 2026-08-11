@@ -8,19 +8,15 @@ supervised laboratory harness, and the Shrimp Control Deck telemetry dashboard. 
 
 ## The model: MantisNet
 
-MantisNet is a graph network whose nodes are stones, live win windows, and one
+MantisNet is a graph network whose nodes are stones, nonempty win windows, and one
 global token. It has no cell grid, no coordinate inputs, and no empty-cell
 nodes.
 
-A **window** is six consecutive cells along one hex axis. A window is **live**
-when it contains at least one stone and stones of only one colour; by default
-mixed windows are excluded. The transient `mixed_windows` config knob
-(MANTIS_GRAFT_SPEC Step 12) widens the scope to every nonempty candidate
-window under ternary slot patterns (empty/own/opponent, 377 canonical
-classes) with correspondingly wider joint slot-class tables (726 decoder,
-1458 incidence); batches must be built with the model's scope, and the trunk
-refuses a mismatch. The input representation is D6-invariant by construction
-under either scope: every input -- stone colour (own/opponent relative to the
+A **window** is six consecutive cells along one hex axis. Every nonempty
+candidate window is represented under ternary slot patterns
+(empty/own/opponent, 377 canonical classes), with 726 decoder classes and
+1458 incidence classes. The input representation is D6-invariant by
+construction: every input -- stone colour (own/opponent relative to the
 side to move), window pattern, joint slot classes, hex-distance buckets, and
 `moves_remaining` -- is invariant under the twelve board symmetries.
 
@@ -32,7 +28,7 @@ types window pairs by colinear/crossing relations.
 
 Three heads read the trunk output:
 
-- **Policy decoder**: one raw logit per legal cell, routed through live windows
+- **Policy decoder**: one raw logit per legal cell, routed through nonempty windows
   or a background nearest-stone path.
 - **Action-value decoder**: three categorical logits per legal cell (positive,
   negative, zero return), composed into Q in (-1, 1) and committed mass M.
@@ -69,7 +65,7 @@ discovery.
 
 ### Versioning
 
-`MODEL_REPR_VERSION` (model-owned, currently 3) covers the builder and every
+`MODEL_REPR_VERSION` (model-owned, currently 4) covers the builder and every
 feature encoding. `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing. Either bump invalidates checkpoints.
 
@@ -213,13 +209,10 @@ against a named baseline arm.
 
 The family registry identifies a checkpoint structurally from its model key
 set, native critic-readout width, and decoder-table row count. Configuration
-is inferred from state-dict tensor shapes, including the live Step 12 knobs
-(`mixed_windows` from the window-table rows, `window_attention` from the
-presence of §5.1c tensors). Shipped scoreable families: `trinomial-joint`,
-`bipolar-joint`, `scalar-joint`, `scalar-slot`, `bipolar-slot`, and
-`factored-slot`. Slot-class decoder tables are expanded to 93 joint classes
-at load time; mixed-scope checkpoints carry the ternary joint tables
-natively.
+is inferred from state-dict tensor shapes, including the live
+`window_attention` knob from the presence of §5.1c tensors. Shipped scoreable
+families for the ternary scope are `trinomial-joint`, `bipolar-joint`, and
+`scalar-joint`. Historic binary-scope families are rejected as unsupported.
 
 ### Measurement commands
 
@@ -305,7 +298,7 @@ The top-level `mantisnet` package exports:
 | `collate_positions`, `collate_prefixes` | Shared Rust encoder path |
 | `policy_loss`, `value_loss`, `value_target` | Training losses and targets |
 | `param_groups` | Decay/no-decay optimizer groups |
-| `MODEL_REPR_VERSION`, `NUM_PATTERNS`, `DEC_CLASSES`, `TERN_PATTERNS`, `TERN_DEC_CLASSES`, `TERN_OCC_CLASSES` | Representation constants |
+| `MODEL_REPR_VERSION`, `TERN_PATTERNS`, `TERN_DEC_CLASSES`, `TERN_OCC_CLASSES` | Representation constants |
 
 ## Run / test
 
@@ -414,7 +407,7 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `evaluate.py` | Packed imitation and outcome-horizon evaluation for lab and KLENT checkpoints |
 | `report.py` | Cross-seed score aggregation with optional paired-difference baselines |
 | `variants.py` | Variant registry: MantisNet presets with typed config overrides |
-| `families.py` | Structural checkpoint-family registry, config inference, slot-table expansion |
+| `families.py` | Structural checkpoint-family registry and config inference |
 | `bench.py` | Benchmarks for building, collection, and fitting |
 | `check.py` | D6 invariance, batch parity, decoder coverage, and builder contract checks |
 | `cohort.py` | Production-shaped position cohorts from real collection or corpus replay |

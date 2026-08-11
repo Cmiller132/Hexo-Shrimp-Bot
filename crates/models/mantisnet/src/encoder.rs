@@ -15,98 +15,9 @@ const NEAREST_BUCKETS: i64 = 8;
 const WIRE_MAGIC: &[u8; 8] = b"MANTIS\x00\x01";
 const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 4 + 4 + 6 * 4;
 
-/// Number of reversal-canonical nonempty, nonfull six-cell occupancy patterns.
-pub const NUM_PATTERNS: i64 = 34;
-
-/// Rank of each canonical 6-bit occupancy mask (1–5 bits, mod reversal);
-/// `-1` for masks that are empty, full, or non-canonical.
-const PATTERN_RANK: [i8; 64] = {
-    let mut canon = [0u8; 64];
-    let mut m = 0usize;
-    while m < 64 {
-        let mut rev = 0usize;
-        let mut k = 0;
-        while k < 6 {
-            rev |= ((m >> k) & 1) << (5 - k);
-            k += 1;
-        }
-        canon[m] = if rev < m { rev as u8 } else { m as u8 };
-        m += 1;
-    }
-    let mut rank = [-1i8; 64];
-    let mut next = 0i8;
-    let mut m = 1usize;
-    while m < 63 {
-        if canon[m] as usize == m {
-            rank[m] = next;
-            next += 1;
-        }
-        m += 1;
-    }
-    let mut m = 1usize;
-    while m < 63 {
-        rank[m] = rank[canon[m] as usize];
-        m += 1;
-    }
-    rank
-};
-
-/// Number of joint window-occupancy/candidate-slot classes the decoder reads.
-///
-/// Orbits of the `(mask, slot) -> (reverse6(mask), 5 - slot)` involution
-/// over nonempty, nonfull masks with an empty slot: 186 pairs, 93 orbits.
-pub const DEC_CLASSES: i64 = 93;
-
-/// Number of joint window-occupancy/occupied-slot classes for stone incidence.
-///
-/// Same involution as [`DEC_CLASSES`], over pairs whose slot holds a stone:
-/// 186 pairs, 93 orbits.
-pub const OCC_CLASSES: i64 = 93;
-
-/// Orbit table of `(mask, slot)` pairs under the joint reversal, indexed
-/// `mask * 6 + slot`.
-///
-/// Entries are orbit ranks in ascending `(mask, slot)` order for nonempty,
-/// nonfull masks where the slot bit matches `occupied`; `-1` elsewhere.
-/// `occupied = false` gives the decoder table, `true` the stone-incidence table.
-const fn orbit_table(occupied: bool) -> [i8; 64 * 6] {
-    let want = occupied as usize;
-    let mut table = [-1i8; 64 * 6];
-    let mut next = 0i8;
-    let mut m = 1usize;
-    while m < 63 {
-        let mut rev = 0usize;
-        let mut k = 0;
-        while k < 6 {
-            rev |= ((m >> k) & 1) << (5 - k);
-            k += 1;
-        }
-        let mut s = 0usize;
-        while s < 6 {
-            if (m >> s) & 1 == want {
-                if m < rev || (m == rev && s <= 5 - s) {
-                    table[m * 6 + s] = next;
-                    next += 1;
-                } else {
-                    table[m * 6 + s] = table[rev * 6 + (5 - s)];
-                }
-            }
-            s += 1;
-        }
-        m += 1;
-    }
-    table
-}
-
-/// Decoder class of each `(mask, empty candidate slot)` pair.
-const DEC_CLASS: [i8; 64 * 6] = orbit_table(false);
-
-/// Stone-incidence class of each `(mask, occupied slot)` pair.
-const OCC_CLASS: [i8; 64 * 6] = orbit_table(true);
-
 /// Number of reversal-canonical nonempty ternary window patterns.
 ///
-/// Under the mixed-window scope a slot is empty (0), own (1), or opponent
+/// A slot is empty (0), own (1), or opponent
 /// (2): a window is a base-3 pattern over its six slots, digit at `3^k` for
 /// slot `k`, mover-relative. 729 patterns fold to 378 orbits under digit
 /// reversal (27 palindromes); the empty pattern is unreachable, leaving 377.
@@ -256,7 +167,7 @@ const TERN_OCC_CLASS: [i16; 729 * 6] = tern_orbit_table(true);
 const POW3: [u16; 6] = [1, 3, 9, 27, 81, 243];
 
 /// Number of reversal orbits of ternary `(post-placement pattern, own slot)`
-/// pairs used by mixed-scope action rows.
+/// pairs used by action rows.
 pub const TERN_POST1_CLASSES: i64 = 729;
 
 /// Ternary post-placement class of each `(pattern, own slot)` pair.
@@ -287,11 +198,6 @@ const TERN_POST1_CLASS: [i16; 729 * 6] = {
     table
 };
 
-/// Number of binary graft post-placement classes: 93 own-live, 93
-/// opponent-live, and three empty-window slot-fold classes.
-pub const POST1_GRAFT_CLASSES: i64 = 2 * DEC_CLASSES + 3;
-
-const SLOT_FOLD: [i64; 6] = [0, 1, 2, 2, 1, 0];
 const ACTION_OWN: i64 = 0;
 const ACTION_OPP: i64 = 1;
 const ACTION_EMPTY: i64 = 2;
@@ -493,10 +399,7 @@ fn append_i64s(out: &mut Vec<u8>, values: &[i64]) {
 /// Every integer is little-endian. A terminal position is a caller protocol
 /// violation: the engine, not the network, owns terminal outcomes.
 pub fn encode_position(position: &engine::Position, out: &mut Vec<u8>) {
-    // The wire format speaks the binary scope: the container never runs a
-    // mixed-windows model while the Step 12 knob exists, and a bake replaces
-    // this scope wholesale under a MODEL_REPR_VERSION bump.
-    let graph = build(position, false, false)
+    let graph = build(position, false)
         .unwrap_or_else(|why| panic!("MantisNet encoder refuses position: {why}"));
     let counts = WireCounts::from_graph(&graph);
     let encoded_counts = [
@@ -662,7 +565,7 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
 
     let window_feat = read_i64_vec(&mut reader, counts.windows, "window_feat")?;
     for (index, &value) in window_feat.iter().enumerate() {
-        if !(0..2 * NUM_PATTERNS).contains(&value) {
+        if !(0..TERN_PATTERNS).contains(&value) {
             return Err(invalid_feature("window_feat", index, value));
         }
     }
@@ -687,7 +590,7 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
     validate_indices(&inc_stone, counts.stones, "inc_stone")?;
     validate_indices(&inc_window, counts.windows, "inc_window")?;
     for (index, &value) in inc_class.iter().enumerate() {
-        if !(0..OCC_CLASSES).contains(&value) {
+        if !(0..TERN_OCC_CLASSES).contains(&value) {
             return Err(invalid_feature("inc_class", index, value));
         }
     }
@@ -698,7 +601,7 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
     validate_indices(&dec_cell, counts.legal, "dec_cell")?;
     validate_indices(&dec_window, counts.windows, "dec_window")?;
     for (index, &value) in dec_class.iter().enumerate() {
-        if !(0..DEC_CLASSES).contains(&value) {
+        if !(0..TERN_DEC_CLASSES).contains(&value) {
             return Err(invalid_feature("dec_class", index, value));
         }
     }
@@ -758,7 +661,6 @@ fn action_tables(
     mover: engine::Player,
     legal: &[engine::HexCoord],
     live_keys: &[i64],
-    mixed: bool,
 ) -> Result<ActionTables, String> {
     let rows = legal
         .len()
@@ -804,42 +706,22 @@ fn action_tables(
                 (false, false) => ACTION_EMPTY,
                 (true, true) => ACTION_MIXED,
             };
-            let class = if mixed {
-                let mut pre = 0usize;
-                for (k, &power) in POW3.iter().enumerate() {
-                    let digit = ((own >> k) & 1) as usize + 2 * ((opp >> k) & 1) as usize;
-                    pre += digit * power as usize;
-                }
-                let post = pre + POW3[slot] as usize;
-                let class = TERN_POST1_CLASS[post * engine::WINDOW_LEN + slot] as i64;
-                if class < 0 {
-                    return Err("a post-placement row lost its own stone".to_owned());
-                }
-                class
-            } else {
-                match status {
-                    ACTION_OWN => DEC_CLASS[own as usize * engine::WINDOW_LEN + slot] as i64,
-                    ACTION_OPP => {
-                        DEC_CLASSES + DEC_CLASS[opp as usize * engine::WINDOW_LEN + slot] as i64
-                    }
-                    ACTION_EMPTY => 2 * DEC_CLASSES + SLOT_FOLD[slot],
-                    ACTION_MIXED => -1,
-                    _ => unreachable!("the status match above is exhaustive"),
-                }
-            };
-            if !mixed && ((class < 0) != (status == ACTION_MIXED)) {
-                return Err("binary action classes disagree with row statuses".to_owned());
+            let mut pre = 0usize;
+            for (k, &power) in POW3.iter().enumerate() {
+                let digit = ((own >> k) & 1) as usize + 2 * ((opp >> k) & 1) as usize;
+                pre += digit * power as usize;
+            }
+            let post = pre + POW3[slot] as usize;
+            let class = TERN_POST1_CLASS[post * engine::WINDOW_LEN + slot] as i64;
+            if class < 0 {
+                return Err("a post-placement row lost its own stone".to_owned());
             }
 
             let key = pack(wr.window.start) * 4 + axis as i64;
             let found = live_keys
                 .binary_search(&key)
                 .map_or(-1, |index| index as i64);
-            let kept = if mixed {
-                status != ACTION_EMPTY
-            } else {
-                status == ACTION_OWN || status == ACTION_OPP
-            };
+            let kept = status != ACTION_EMPTY;
             if (found >= 0) != kept {
                 return Err("the kept-window set disagrees with the action-row walk".to_owned());
             }
@@ -860,11 +742,9 @@ fn action_tables(
 ///
 /// Returns an error for terminal positions.
 ///
-/// `mixed` selects the window scope: `false` keeps live one-colour windows
-/// under the binary tables, `true` every nonempty candidate under the
-/// ternary tables (Step 12 knob). `action_rows` emits the dense Step 4 row
-/// tables in that scope's class vocabulary.
-pub fn build(pos: &engine::Position, mixed: bool, action_rows: bool) -> Result<Graph, String> {
+/// Every nonempty candidate is represented under the ternary tables.
+/// `action_rows` emits the dense Step 4 row tables.
+pub fn build(pos: &engine::Position, action_rows: bool) -> Result<Graph, String> {
     if pos.is_terminal() {
         return Err("terminal position: the builder refuses it".into());
     }
@@ -892,7 +772,7 @@ pub fn build(pos: &engine::Position, mixed: bool, action_rows: bool) -> Result<G
     if stones.is_empty() {
         // Ply 0: one legal cell, background path, the clamp bucket.
         let actions = if action_rows {
-            action_tables(pos, mover, &legal, &[], mixed)?
+            action_tables(pos, mover, &legal, &[])?
         } else {
             ActionTables::default()
         };
@@ -940,34 +820,24 @@ pub fn build(pos: &engine::Position, mixed: bool, action_rows: bool) -> Result<G
     let mut window_feat = Vec::new();
     let mut window_id = Vec::new();
     let mut live_occ = Vec::new();
-    // Ternary slot patterns of the kept windows; unused under the binary scope.
     let mut patterns: Vec<u16> = Vec::new();
     let mut live_ref = Vec::new();
     // Sorted for binary-search lookup by the decoder.
     let mut live_keys: Vec<i64> = Vec::new();
     for &(key, wr, m0, m1) in &candidates {
-        if !mixed && (m0 > 0) == (m1 > 0) {
-            continue; // dead; never empty, since it came through a stone
-        }
         let (own, opp) = if mover == engine::Player::P0 {
             (m0, m1)
         } else {
             (m1, m0)
         };
         let occ = m0 | m1;
-        if mixed {
-            let mut pattern = 0u16;
-            for (k, &place) in POW3.iter().enumerate() {
-                let digit = (own >> k & 1) as u16 + 2 * (opp >> k & 1) as u16;
-                pattern += digit * place;
-            }
-            window_feat.push(TERN_RANK[pattern as usize] as i64);
-            patterns.push(pattern);
-        } else {
-            let colour = (own == 0) as i64;
-            let rank = PATTERN_RANK[occ as usize] as i64;
-            window_feat.push(colour * NUM_PATTERNS + rank);
+        let mut pattern = 0u16;
+        for (k, &place) in POW3.iter().enumerate() {
+            let digit = (own >> k & 1) as u16 + 2 * (opp >> k & 1) as u16;
+            pattern += digit * place;
         }
+        window_feat.push(TERN_RANK[pattern as usize] as i64);
+        patterns.push(pattern);
         live_keys.push(key);
         window_id.push(wr.window.axis.index() as i64);
         window_id.push(wr.window.start.q as i64);
@@ -986,11 +856,7 @@ pub fn build(pos: &engine::Position, mixed: bool, action_rows: bool) -> Result<G
                 let cell = wr.window.cell(k);
                 inc_stone.push(stone_index[&pack(cell)]);
                 inc_window.push(w as i64);
-                inc_class.push(if mixed {
-                    TERN_OCC_CLASS[patterns[w] as usize * 6 + k] as i64
-                } else {
-                    OCC_CLASS[occ as usize * 6 + k] as i64
-                });
+                inc_class.push(TERN_OCC_CLASS[patterns[w] as usize * 6 + k] as i64);
             }
         }
     }
@@ -1010,11 +876,7 @@ pub fn build(pos: &engine::Position, mixed: bool, action_rows: bool) -> Result<G
             let key = pack(wr.window.start) * 4 + wr.window.axis.index() as i64;
             if let Ok(w) = live_keys.binary_search(&key) {
                 let slot = i % 6;
-                let class = if mixed {
-                    TERN_DEC_CLASS[patterns[w] as usize * 6 + slot] as i64
-                } else {
-                    DEC_CLASS[live_occ[w] as usize * 6 + slot] as i64
-                };
+                let class = TERN_DEC_CLASS[patterns[w] as usize * 6 + slot] as i64;
                 assert!(
                     class >= 0,
                     "legal cell {cell:?} sits at slot {slot} of a window whose \
@@ -1039,7 +901,7 @@ pub fn build(pos: &engine::Position, mixed: bool, action_rows: bool) -> Result<G
     }
 
     let actions = if action_rows {
-        action_tables(pos, mover, &legal, &live_keys, mixed)?
+        action_tables(pos, mover, &legal, &live_keys)?
     } else {
         ActionTables::default()
     };
@@ -1213,20 +1075,16 @@ pub fn decode_batch<'a>(items: impl IntoIterator<Item = &'a [u8]>) -> Result<Raw
 }
 
 /// Build every position in parallel, then collate.
-pub fn build_batch(positions: &[engine::Position], mixed: bool) -> Result<RawBatch, String> {
+pub fn build_batch(positions: &[engine::Position]) -> Result<RawBatch, String> {
     let graphs: Vec<Graph> = positions
         .par_iter()
-        .map(|pos| build(pos, mixed, false))
+        .map(|pos| build(pos, false))
         .collect::<Result<_, _>>()?;
     Ok(collate(&graphs))
 }
 
 /// Replay each game's first `t` placements, then build, in parallel.
-pub fn build_batch_prefixes(
-    games: &[Vec<(i16, i16)>],
-    ts: &[usize],
-    mixed: bool,
-) -> Result<RawBatch, String> {
+pub fn build_batch_prefixes(games: &[Vec<(i16, i16)>], ts: &[usize]) -> Result<RawBatch, String> {
     if games.len() != ts.len() {
         return Err("games and ts must have equal length".into());
     }
@@ -1245,7 +1103,7 @@ pub fn build_batch_prefixes(
                 .map(|&(q, r)| engine::Action::new(engine::HexCoord::new(q, r)))
                 .collect();
             let pos = engine::Position::replay(&actions).map_err(|e| e.to_string())?;
-            build(&pos, mixed, false)
+            build(&pos, false)
         })
         .collect::<Result<_, _>>()?;
     Ok(collate(&graphs))
@@ -1269,40 +1127,20 @@ mod tests {
         bytes
     }
 
-    fn reverse6(mask: usize) -> usize {
-        let mut reversed = 0;
-        for slot in 0..engine::WINDOW_LEN {
-            reversed |= (mask >> slot & 1) << (engine::WINDOW_LEN - 1 - slot);
-        }
-        reversed
-    }
-
-    fn expected_action_row(own: u8, opp: u8, slot: usize, mixed: bool) -> (i64, i64) {
+    fn expected_action_row(own: u8, opp: u8, slot: usize) -> (i64, i64) {
         let status = match (own != 0, opp != 0) {
             (true, false) => ACTION_OWN,
             (false, true) => ACTION_OPP,
             (false, false) => ACTION_EMPTY,
             (true, true) => ACTION_MIXED,
         };
-        let class = if mixed {
-            let mut pre = 0usize;
-            for (k, &power) in POW3.iter().enumerate() {
-                let digit = ((own >> k) & 1) as usize + 2 * ((opp >> k) & 1) as usize;
-                pre += digit * power as usize;
-            }
-            let post = pre + POW3[slot] as usize;
-            TERN_POST1_CLASS[post * engine::WINDOW_LEN + slot] as i64
-        } else {
-            match status {
-                ACTION_OWN => DEC_CLASS[own as usize * engine::WINDOW_LEN + slot] as i64,
-                ACTION_OPP => {
-                    DEC_CLASSES + DEC_CLASS[opp as usize * engine::WINDOW_LEN + slot] as i64
-                }
-                ACTION_EMPTY => 2 * DEC_CLASSES + SLOT_FOLD[slot],
-                ACTION_MIXED => -1,
-                _ => unreachable!("the status match above is exhaustive"),
-            }
-        };
+        let mut pre = 0usize;
+        for (k, &power) in POW3.iter().enumerate() {
+            let digit = ((own >> k) & 1) as usize + 2 * ((opp >> k) & 1) as usize;
+            pre += digit * power as usize;
+        }
+        let post = pre + POW3[slot] as usize;
+        let class = TERN_POST1_CLASS[post * engine::WINDOW_LEN + slot] as i64;
         (class, status)
     }
 
@@ -1330,34 +1168,10 @@ mod tests {
             }
         }
         assert!(tern_seen.into_iter().all(|seen| seen));
-
-        assert_eq!(POST1_GRAFT_CLASSES, 2 * DEC_CLASSES + 3);
-        assert_eq!(POST1_GRAFT_CLASSES, 189);
-        let mut graft_seen = [false; POST1_GRAFT_CLASSES as usize];
-        for mask in 1..63 {
-            for slot in 0..engine::WINDOW_LEN {
-                if mask >> slot & 1 != 0 {
-                    continue;
-                }
-                let class = DEC_CLASS[mask * engine::WINDOW_LEN + slot] as i64;
-                let mirror = DEC_CLASS
-                    [reverse6(mask) * engine::WINDOW_LEN + engine::WINDOW_LEN - 1 - slot]
-                    as i64;
-                assert!((0..DEC_CLASSES).contains(&class));
-                assert_eq!(class, mirror);
-                graft_seen[class as usize] = true;
-                graft_seen[(DEC_CLASSES + class) as usize] = true;
-            }
-        }
-        for slot in 0..engine::WINDOW_LEN {
-            assert_eq!(SLOT_FOLD[slot], SLOT_FOLD[engine::WINDOW_LEN - 1 - slot]);
-            graft_seen[(2 * DEC_CLASSES + SLOT_FOLD[slot]) as usize] = true;
-        }
-        assert!(graft_seen.into_iter().all(|seen| seen));
     }
 
     #[test]
-    fn action_rows_match_successor_windows_in_both_scopes() {
+    fn action_rows_match_successor_windows() {
         let games: &[&[(i16, i16)]] = &[
             &[],
             &[(0, 0)],
@@ -1387,62 +1201,55 @@ mod tests {
             ],
         ];
         let mut rows_checked = 0;
-        for &mixed in &[false, true] {
-            for &moves in games {
-                let position = replay(moves);
-                let mover = position.current_player();
-                let graph = build(&position, mixed, true).expect("fixture graph builds");
-                let legal: Vec<_> = position
-                    .legal_actions()
-                    .map(|action| action.coord())
-                    .collect();
-                let picks: Vec<_> = if legal.len() <= 40 {
-                    (0..legal.len()).collect()
-                } else {
-                    (0..legal.len()).step_by(7).collect()
-                };
+        for &moves in games {
+            let position = replay(moves);
+            let mover = position.current_player();
+            let graph = build(&position, true).expect("fixture graph builds");
+            let legal: Vec<_> = position
+                .legal_actions()
+                .map(|action| action.coord())
+                .collect();
+            let picks: Vec<_> = if legal.len() <= 40 {
+                (0..legal.len()).collect()
+            } else {
+                (0..legal.len()).step_by(7).collect()
+            };
 
-                for action in picks {
-                    let cell = legal[action];
-                    let mut successor = position.clone();
-                    successor
-                        .advance(engine::Action::new(cell))
-                        .expect("selected legal action advances");
-                    for (row, wr) in successor.windows_through(cell).into_iter().enumerate() {
-                        if !wr.window.start.is_valid() {
-                            continue;
-                        }
-                        let slot = row % engine::WINDOW_LEN;
-                        let m0 = wr.mask.mask(engine::Player::P0);
-                        let m1 = wr.mask.mask(engine::Player::P1);
-                        let (own_post, opp_post) = if mover == engine::Player::P0 {
-                            (m0, m1)
-                        } else {
-                            (m1, m0)
-                        };
-                        assert_eq!(own_post >> slot & 1, 1, "the played stone is missing");
-                        let own_pre = own_post & !(1 << slot);
-                        let (want_class, want_status) =
-                            expected_action_row(own_pre, opp_post, slot, mixed);
-                        let index = action * engine::WINDOWS_PER_PLACEMENT + row;
-                        assert_eq!(graph.action_post1_class[index], want_class);
-                        assert_eq!(graph.action_pre_status[index], want_status);
-
-                        let got_window = graph.action_window_index[index];
-                        let kept = if mixed {
-                            want_status != ACTION_EMPTY
-                        } else {
-                            want_status == ACTION_OWN || want_status == ACTION_OPP
-                        };
-                        assert_eq!(got_window >= 0, kept);
-                        if got_window >= 0 {
-                            let id = got_window as usize * 3;
-                            assert_eq!(graph.window_id[id], wr.window.axis.index() as i64);
-                            assert_eq!(graph.window_id[id + 1], wr.window.start.q as i64);
-                            assert_eq!(graph.window_id[id + 2], wr.window.start.r as i64);
-                        }
-                        rows_checked += 1;
+            for action in picks {
+                let cell = legal[action];
+                let mut successor = position.clone();
+                successor
+                    .advance(engine::Action::new(cell))
+                    .expect("selected legal action advances");
+                for (row, wr) in successor.windows_through(cell).into_iter().enumerate() {
+                    if !wr.window.start.is_valid() {
+                        continue;
                     }
+                    let slot = row % engine::WINDOW_LEN;
+                    let m0 = wr.mask.mask(engine::Player::P0);
+                    let m1 = wr.mask.mask(engine::Player::P1);
+                    let (own_post, opp_post) = if mover == engine::Player::P0 {
+                        (m0, m1)
+                    } else {
+                        (m1, m0)
+                    };
+                    assert_eq!(own_post >> slot & 1, 1, "the played stone is missing");
+                    let own_pre = own_post & !(1 << slot);
+                    let (want_class, want_status) = expected_action_row(own_pre, opp_post, slot);
+                    let index = action * engine::WINDOWS_PER_PLACEMENT + row;
+                    assert_eq!(graph.action_post1_class[index], want_class);
+                    assert_eq!(graph.action_pre_status[index], want_status);
+
+                    let got_window = graph.action_window_index[index];
+                    let kept = want_status != ACTION_EMPTY;
+                    assert_eq!(got_window >= 0, kept);
+                    if got_window >= 0 {
+                        let id = got_window as usize * 3;
+                        assert_eq!(graph.window_id[id], wr.window.axis.index() as i64);
+                        assert_eq!(graph.window_id[id + 1], wr.window.start.q as i64);
+                        assert_eq!(graph.window_id[id + 2], wr.window.start.r as i64);
+                    }
+                    rows_checked += 1;
                 }
             }
         }
@@ -1451,7 +1258,7 @@ mod tests {
 
     #[test]
     fn ply_zero_action_rows_are_empty_inserts() {
-        let graph = build(&engine::Position::new(), false, true).expect("the opening is live");
+        let graph = build(&engine::Position::new(), true).expect("the opening is live");
         assert_eq!(graph.action_window_index.len(), 3 * engine::WINDOW_LEN);
         assert!(graph.action_window_index.iter().all(|&index| index == -1));
         assert!(
@@ -1461,9 +1268,12 @@ mod tests {
                 .all(|&status| status == ACTION_EMPTY)
         );
         for axis in 0..3 {
-            for (slot, &fold) in SLOT_FOLD.iter().enumerate() {
+            for slot in 0..engine::WINDOW_LEN {
                 let row = axis * engine::WINDOW_LEN + slot;
-                assert_eq!(graph.action_post1_class[row], 2 * DEC_CLASSES + fold);
+                assert_eq!(
+                    graph.action_post1_class[row],
+                    expected_action_row(0, 0, slot).0
+                );
             }
         }
     }
@@ -1471,23 +1281,21 @@ mod tests {
     #[test]
     fn disabling_action_rows_leaves_the_graph_core_unchanged() {
         let position = replay(&[(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]);
-        for &mixed in &[false, true] {
-            let off = build(&position, mixed, false).expect("fixture graph builds");
-            assert!(off.action_window_index.is_empty());
-            assert!(off.action_post1_class.is_empty());
-            assert!(off.action_pre_status.is_empty());
+        let off = build(&position, false).expect("fixture graph builds");
+        assert!(off.action_window_index.is_empty());
+        assert!(off.action_post1_class.is_empty());
+        assert!(off.action_pre_status.is_empty());
 
-            let mut enabled = build(&position, mixed, true).expect("fixture graph builds");
-            enabled.action_window_index.clear();
-            enabled.action_post1_class.clear();
-            enabled.action_pre_status.clear();
-            assert_eq!(off, enabled);
-        }
+        let mut enabled = build(&position, true).expect("fixture graph builds");
+        enabled.action_window_index.clear();
+        enabled.action_post1_class.clear();
+        enabled.action_pre_status.clear();
+        assert_eq!(off, enabled);
     }
 
     #[test]
     fn the_opening_batch_has_only_the_token_and_background_cell() {
-        let raw = build_batch(&[engine::Position::new()], false).expect("the opening is live");
+        let raw = build_batch(&[engine::Position::new()]).expect("the opening is live");
 
         assert_eq!(raw.n_pos, 1);
         assert_eq!(raw.max_t, 1);
@@ -1513,10 +1321,9 @@ mod tests {
     }
 
     #[test]
-    fn the_mixed_scope_keeps_every_nonempty_candidate_with_ternary_classes() {
+    fn every_nonempty_candidate_uses_ternary_classes() {
         let position = replay(&[(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]);
-        let binary = build(&position, false, false).expect("live position");
-        let mixed = build(&position, true, false).expect("live position");
+        let graph = build(&position, false).expect("live position");
 
         // Every nonempty candidate window through a stone, deduplicated.
         let mut keys = std::collections::HashSet::new();
@@ -1529,25 +1336,17 @@ mod tests {
                 }
             }
         }
-        assert_eq!(mixed.window_feat.len(), keys.len());
-        assert!(mixed.window_feat.len() > binary.window_feat.len());
+        assert_eq!(graph.window_feat.len(), keys.len());
 
-        for &feat in &mixed.window_feat {
+        for &feat in &graph.window_feat {
             assert!((0..TERN_PATTERNS).contains(&feat));
         }
-        for &class in &mixed.inc_class {
+        for &class in &graph.inc_class {
             assert!((0..TERN_OCC_CLASSES).contains(&class));
         }
-        for &class in &mixed.dec_class {
+        for &class in &graph.dec_class {
             assert!((0..TERN_DEC_CLASSES).contains(&class));
         }
-
-        // Same stones, same legal cells; each stone appears in exactly the
-        // windows that cover it, so the incidence count is the summed slot
-        // occupancy of the kept windows.
-        assert_eq!(mixed.stone_own, binary.stone_own);
-        assert_eq!(mixed.n_legal, binary.n_legal);
-        assert!(mixed.inc_stone.len() > binary.inc_stone.len());
     }
 
     #[test]
@@ -1559,20 +1358,18 @@ mod tests {
             .collect();
         let position = engine::Position::replay(&actions).expect("legal fixture");
 
-        let direct = build_batch(&[position], false).expect("live position");
+        let direct = build_batch(&[position]).expect("live position");
         let replayed =
-            build_batch_prefixes(&[moves], &[actions.len()], false).expect("legal prefix fixture");
+            build_batch_prefixes(&[moves], &[actions.len()]).expect("legal prefix fixture");
         assert_eq!(direct, replayed);
     }
 
     #[test]
     fn malformed_prefix_requests_are_refused() {
-        let unequal =
-            build_batch_prefixes(&[vec![(0, 0)]], &[], false).expect_err("lengths must agree");
+        let unequal = build_batch_prefixes(&[vec![(0, 0)]], &[]).expect_err("lengths must agree");
         assert_eq!(unequal, "games and ts must have equal length");
 
-        let too_long =
-            build_batch_prefixes(&[vec![(0, 0)]], &[2], false).expect_err("prefix is too long");
+        let too_long = build_batch_prefixes(&[vec![(0, 0)]], &[2]).expect_err("prefix is too long");
         assert_eq!(too_long, "prefix length 2 exceeds game length 1");
     }
 
@@ -1588,7 +1385,7 @@ mod tests {
 
         let decoded =
             decode_batch(items.iter().map(Vec::as_slice)).expect("encoder output is valid");
-        let direct = build_batch(&positions, false).expect("all positions are live");
+        let direct = build_batch(&positions).expect("all positions are live");
         assert_eq!(decoded, direct);
     }
 
@@ -1672,7 +1469,7 @@ mod tests {
     #[test]
     fn wire_decoder_bounds_the_joint_decoder_class() {
         let position = replay(&[(0, 0)]);
-        let graph = build(&position, false, false).expect("a one-stone position builds");
+        let graph = build(&position, false).expect("a one-stone position builds");
         let counts = WireCounts::from_graph(&graph);
         // dec_class follows stone_own, stone_qr, window_feat, window_id, the
         // three incidence arrays, dec_cell, and dec_window.
@@ -1690,13 +1487,13 @@ mod tests {
             .copied()
             .max()
             .expect("entries exist");
-        assert!((0..DEC_CLASSES).contains(&build_max));
-        for out_of_range in [DEC_CLASSES, -1] {
+        assert!((0..TERN_DEC_CLASSES).contains(&build_max));
+        for out_of_range in [TERN_DEC_CLASSES, -1] {
             let mut bytes = encoded(&position);
             bytes[offset..offset + 8].copy_from_slice(&out_of_range.to_le_bytes());
             assert!(
                 decode_batch(std::iter::once(bytes.as_slice()))
-                    .expect_err("the class table has 93 rows and no more")
+                    .expect_err("the class table has 726 rows and no more")
                     .to_string()
                     .contains(&format!("dec_class[0] has invalid feature {out_of_range}"))
             );

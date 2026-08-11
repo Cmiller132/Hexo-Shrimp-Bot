@@ -244,7 +244,7 @@ def test_default_model_runs_and_has_expected_parameter_count(positions):
     batch = collate([from_position(positions[3])])
     out = net(batch, 0.2)
 
-    assert count_parameters(net) == 1_943_141
+    assert count_parameters(net) == 3_866_597
     for tensor in vars(out).values():
         assert torch.isfinite(tensor).all()
 

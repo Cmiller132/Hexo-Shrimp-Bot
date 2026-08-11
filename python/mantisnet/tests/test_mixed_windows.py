@@ -1,10 +1,8 @@
-"""Step 12 mixed-windows: ternary class laws, scope parity, and knobbed arms.
+"""The baked all-nonempty scope: ternary laws, builder parity, and structure.
 
 The ternary tables are the MANTIS_GRAFT_SPEC §4 (Step 12) class laws; the
-builder's mixed scope is checked against the engine's window walk as the
-independent oracle, against the Rust builder field for field, and the knobbed
-model arms (mixed windows, window-attention off) run the same D6 and
-batch-parity contracts as the incumbent.
+builder is checked against the engine's window walk as the independent oracle,
+against the Rust builder field for field, and with window attention on and off.
 """
 
 from __future__ import annotations
@@ -82,11 +80,11 @@ def test_ternary_class_laws():
                 assert _TERN_OCC_CLASS[p, s] == _TERN_OCC_CLASS[mirror] >= 0
 
 
-def test_mixed_scope_matches_the_engine_window_oracle():
+def test_scope_matches_the_engine_window_oracle():
     """The kept window set is exactly the engine's nonempty candidates, and
     each window's ternary pattern matches the engine masks slot for slot."""
     for pos in _positions():
-        graph = from_position(pos, mixed_windows=True)
+        graph = from_position(pos)
         mover = pos.current_player
         oracle: dict[tuple[int, int, int], int] = {}
         for q, r, _player in pos.stones():
@@ -106,57 +104,30 @@ def test_mixed_scope_matches_the_engine_window_oracle():
             assert int(feat) == int(_TERN_RANK[oracle[tuple(map(int, row))]])
 
 
-def test_mixed_scope_rust_python_parity():
-    """Rust and Python builders agree field for field under both scopes."""
-    for mixed in (False, True):
-        rust = builder.collate_prefixes(
-            _GAMES, [len(g) for g in _GAMES], mixed_windows=mixed
-        )
-        python = collate(
-            [from_position(pos, mixed_windows=mixed) for pos in _positions()]
-        )
-        assert rust.mixed_windows == python.mixed_windows == mixed
-        for name, value in vars(python).items():
-            if isinstance(value, torch.Tensor):
-                assert torch.equal(getattr(rust, name), value), name
-            else:
-                assert getattr(rust, name) == value, name
+def test_rust_python_parity():
+    """Rust and Python builders agree field for field."""
+    rust = builder.collate_prefixes(_GAMES, [len(g) for g in _GAMES])
+    python = collate([from_position(pos) for pos in _positions()])
+    for name, value in vars(python).items():
+        if isinstance(value, torch.Tensor):
+            assert torch.equal(getattr(rust, name), value), name
+        else:
+            assert getattr(rust, name) == value, name
 
 
-def test_mixed_decoder_routes_partition_legal_cells():
-    """Decoder and background routes still partition every legal cell, and
-    background shrinks (never grows) when dead windows join the scope."""
+def test_decoder_routes_partition_legal_cells():
+    """Decoder and background routes partition every legal cell."""
     for pos in _positions():
-        binary = from_position(pos)
-        mixed = from_position(pos, mixed_windows=True)
-        for graph in (binary, mixed):
-            covered = set(map(int, graph.dec_cell))
-            background = set(map(int, graph.bg_cell))
-            assert not covered & background
-            assert covered | background == set(range(graph.n_legal))
-        assert set(map(int, mixed.bg_cell)) <= set(map(int, binary.bg_cell))
-
-
-def test_scope_mismatch_is_refused():
-    pos = hexo_py.Position.replay(_GAMES[2])
-    batch = collate([from_position(pos, mixed_windows=True)])
-    model = MantisNet(MantisConfig(h=32, heads=2, blocks=1, policy_hidden=32,
-                                   value_hidden=32))
-    with pytest.raises(ValueError, match="scope"):
-        model.trunk(batch)
-
-    mixed_model = MantisNet(
-        MantisConfig(h=32, heads=2, blocks=1, policy_hidden=32, value_hidden=32,
-                     mixed_windows=True)
-    )
-    with pytest.raises(ValueError, match="scope"):
-        mixed_model.trunk(collate([from_position(pos)]))
+        graph = from_position(pos)
+        covered = set(map(int, graph.dec_cell))
+        background = set(map(int, graph.bg_cell))
+        assert not covered & background
+        assert covered | background == set(range(graph.n_legal))
 
 
 _ARM_CONFIGS = {
-    "B-mixed": {"mixed_windows": True},
-    "C-mixed-waoff": {"mixed_windows": True, "window_attention": False},
-    "D-waoff": {"window_attention": False},
+    "attention-on": {},
+    "attention-off": {"window_attention": False},
 }
 
 
@@ -176,9 +147,7 @@ def test_knobbed_arms_forward_and_shapes(arm):
     has_wa = any("wa" in name for name, _ in model.named_parameters())
     assert has_wa == cfg.window_attention
 
-    batch = collate(
-        [from_position(pos, mixed_windows=cfg.mixed_windows) for pos in _positions()]
-    )
+    batch = collate([from_position(pos) for pos in _positions()])
     with torch.no_grad():
         out = model(batch, 0.2)
     assert out.policy_logits.shape[0] == batch.n_cells
@@ -219,12 +188,10 @@ def test_knobbed_arms_are_d6_invariant(arm):
 
     for moves in _GAMES[2:]:
         pos = hexo_py.Position.replay(moves)
-        base = collate([from_position(pos, mixed_windows=cfg.mixed_windows)])
+        base = collate([from_position(pos)])
         turned_moves = [_transform(m) for m in moves]
         turned_pos = hexo_py.Position.replay(turned_moves)
-        turned = collate(
-            [from_position(turned_pos, mixed_windows=cfg.mixed_windows)]
-        )
+        turned = collate([from_position(turned_pos)])
         with torch.no_grad():
             got = model(base, 0.2)
             got_turned = model(turned, 0.2)
@@ -239,16 +206,15 @@ def test_knobbed_arms_are_d6_invariant(arm):
             assert turned_map[_transform(move)] == pytest.approx(logit, abs=1e-5)
 
 
-def test_mixed_checkpoint_round_trips_through_the_family_registry(tmp_path):
-    """A mixed / wa-off checkpoint is identified, config-inferred, and loaded
-    by the lab family registry with its live knobs intact."""
+def test_checkpoint_round_trips_through_the_family_registry(tmp_path):
+    """A wa-off checkpoint is identified, config-inferred, and loaded."""
     from mantisnet.lab.families import infer_config, load_checkpoint
 
-    cfg = MantisConfig(mixed_windows=True, window_attention=False)
+    cfg = MantisConfig(window_attention=False)
     torch.manual_seed(2)
     model = MantisNet(cfg)
     inferred = infer_config(model.state_dict())
-    assert inferred.mixed_windows and not inferred.window_attention
+    assert not inferred.window_attention
 
     path = tmp_path / "mixed.pt"
     torch.save(
@@ -268,10 +234,9 @@ def test_mixed_checkpoint_round_trips_through_the_family_registry(tmp_path):
     )
     loaded = load_checkpoint(path)
     assert loaded.family.name == "trinomial-joint"
-    assert loaded.config.mixed_windows and not loaded.config.window_attention
+    assert not loaded.config.window_attention
 
-    batch = collate_prefixes(_GAMES[2:], [len(g) for g in _GAMES[2:]],
-                             mixed_windows=True)
+    batch = collate_prefixes(_GAMES[2:], [len(g) for g in _GAMES[2:]])
     with torch.no_grad():
         reference = MantisNet(cfg).eval()
         reference.load_state_dict(model.state_dict())
@@ -281,3 +246,10 @@ def test_mixed_checkpoint_round_trips_through_the_family_registry(tmp_path):
         )
     assert torch.allclose(got_policy, expected.policy_logits, atol=1e-6)
     assert torch.allclose(got_q, expected.q_values, atol=1e-6)
+
+
+def test_recorded_binary_scope_is_refused():
+    from mantisnet.model import strip_legacy_knobs
+
+    with pytest.raises(ValueError, match="no longer implements"):
+        strip_legacy_knobs({"mixed_windows": False})

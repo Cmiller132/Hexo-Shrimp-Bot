@@ -8,20 +8,14 @@ board copy and reads the successor's windows from the engine walk.
 from __future__ import annotations
 
 import numpy as np
-import pytest
-
 import hexo_py
 from mantisnet.builder import (
     ACTION_EMPTY,
     ACTION_MIXED,
     ACTION_OPP,
     ACTION_OWN,
-    DEC_CLASSES,
-    POST1_GRAFT_CLASSES,
     TERN_POST1_CLASSES,
     WINDOW_LEN,
-    _DEC_CLASS,
-    _SLOT_FOLD,
     _TERN_POST1_CLASS,
     _TERN_REV,
     from_position,
@@ -54,31 +48,6 @@ def test_ternary_post1_law():
                 assert _TERN_POST1_CLASS[post, s] == -1
 
 
-def test_binary_post1_composite_law():
-    """189 = 93 own + 93 opp + 3 empty-slot orbits; each branch is
-    reversal-invariant and the branches are disjoint."""
-    assert POST1_GRAFT_CLASSES == 2 * DEC_CLASSES + 3 == 189
-
-    def reverse6(m: int) -> int:
-        return sum(((m >> k) & 1) << (WINDOW_LEN - 1 - k) for k in range(WINDOW_LEN))
-
-    seen = set()
-    for mask in range(1, 63):
-        for slot in range(WINDOW_LEN):
-            if (mask >> slot) & 1:
-                continue
-            own = int(_DEC_CLASS[mask, slot])
-            assert 0 <= own < DEC_CLASSES
-            assert own == _DEC_CLASS[reverse6(mask), WINDOW_LEN - 1 - slot]
-            seen.add(own)
-            seen.add(DEC_CLASSES + own)
-    for slot in range(WINDOW_LEN):
-        fold = int(_SLOT_FOLD[slot])
-        assert fold == _SLOT_FOLD[WINDOW_LEN - 1 - slot]
-        seen.add(2 * DEC_CLASSES + fold)
-    assert seen == set(range(POST1_GRAFT_CLASSES))
-
-
 def _successor_windows(pos, move):
     """Engine oracle: play the move on a copy, return the successor's window
     masks keyed by (axis, start_q, start_r)."""
@@ -90,7 +59,7 @@ def _successor_windows(pos, move):
     }
 
 
-def _expected_row(pre_own: int, pre_opp: int, slot: int, mixed: bool):
+def _expected_row(pre_own: int, pre_opp: int, slot: int):
     """The class and status an action row must carry, from PRE-insert masks."""
     has_own, has_opp = pre_own > 0, pre_opp > 0
     if has_own and not has_opp:
@@ -101,23 +70,14 @@ def _expected_row(pre_own: int, pre_opp: int, slot: int, mixed: bool):
         status = ACTION_MIXED
     else:
         status = ACTION_EMPTY
-    if mixed:
-        post = sum(
-            (1 if (pre_own >> j) & 1 else 2 if (pre_opp >> j) & 1 else 0) * 3**j
-            for j in range(WINDOW_LEN)
-        ) + 3**slot
-        return int(_TERN_POST1_CLASS[post, slot]), status
-    if status == ACTION_OWN:
-        return int(_DEC_CLASS[pre_own, slot]), status
-    if status == ACTION_OPP:
-        return DEC_CLASSES + int(_DEC_CLASS[pre_opp, slot]), status
-    if status == ACTION_EMPTY:
-        return 2 * DEC_CLASSES + int(_SLOT_FOLD[slot]), status
-    return -1, status
+    post = sum(
+        (1 if (pre_own >> j) & 1 else 2 if (pre_opp >> j) & 1 else 0) * 3**j
+        for j in range(WINDOW_LEN)
+    ) + 3**slot
+    return int(_TERN_POST1_CLASS[post, slot]), status
 
 
-@pytest.mark.parametrize("mixed", (False, True))
-def test_action_rows_match_the_successor_board_oracle(mixed):
+def test_action_rows_match_the_successor_board_oracle():
     """Every emitted row agrees with actually playing the action: the class
     recomputed from the successor's engine windows, the status from the pre
     masks, and the window index from the graph's own kept-window identity."""
@@ -125,7 +85,7 @@ def test_action_rows_match_the_successor_board_oracle(mixed):
     for moves in _GAMES:
         pos = hexo_py.Position.replay(moves)
         mover = pos.current_player
-        graph = from_position(pos, mixed_windows=mixed, action_rows=True)
+        graph = from_position(pos, action_rows=True)
         window_ids = [tuple(map(int, row)) for row in graph.window_id]
         legal = pos.legal_moves()
         picks = range(len(legal)) if len(legal) <= 40 else range(0, len(legal), 7)
@@ -148,15 +108,11 @@ def test_action_rows_match_the_successor_board_oracle(mixed):
                     own_post, opp_post = (m0, m1) if mover == 0 else (m1, m0)
                     assert (own_post >> k) & 1, "the played stone is missing"
                     pre_own = own_post & ~(1 << k)
-                    want_class, want_status = _expected_row(pre_own, opp_post, k, mixed)
+                    want_class, want_status = _expected_row(pre_own, opp_post, k)
                     assert got_class == want_class, (moves, move, axis, k)
                     assert got_status == want_status, (moves, move, axis, k)
 
-                    kept = (
-                        want_status != ACTION_EMPTY
-                        if mixed
-                        else want_status in (ACTION_OWN, ACTION_OPP)
-                    )
+                    kept = want_status != ACTION_EMPTY
                     assert (got_index >= 0) == kept
                     if got_index >= 0:
                         assert window_ids[got_index] == key
@@ -164,8 +120,7 @@ def test_action_rows_match_the_successor_board_oracle(mixed):
     assert rows_checked > 500
 
 
-@pytest.mark.parametrize("mixed", (False, True))
-def test_action_row_tables_are_d6_invariant_as_multisets(mixed):
+def test_action_row_tables_are_d6_invariant_as_multisets():
     """A transformed board's rows are the same multiset of (class, status)
     per action — the classes are reversal orbits, so the multiset survives
     any axis permutation or line reversal the transform induces."""
@@ -173,7 +128,7 @@ def test_action_row_tables_are_d6_invariant_as_multisets(mixed):
 
     for moves in _GAMES[2:]:
         pos = hexo_py.Position.replay(moves)
-        graph = from_position(pos, mixed_windows=mixed, action_rows=True)
+        graph = from_position(pos, action_rows=True)
         base = {
             move: sorted(
                 zip(
@@ -185,7 +140,7 @@ def test_action_row_tables_are_d6_invariant_as_multisets(mixed):
         }
         for transform in telemetry.D6_TRANSFORMS[1:3]:
             turned_pos = hexo_py.Position.replay([transform(m) for m in moves])
-            turned = from_position(turned_pos, mixed_windows=mixed, action_rows=True)
+            turned = from_position(turned_pos, action_rows=True)
             turned_rows = {
                 move: sorted(
                     zip(
@@ -204,8 +159,8 @@ def test_ply0_rows_are_empty_inserts():
     assert graph.action_window_index.shape == (1, 3, 6)
     assert (graph.action_window_index == -1).all()
     assert (graph.action_pre_status == ACTION_EMPTY).all()
-    fold = 2 * DEC_CLASSES + _SLOT_FOLD[np.arange(WINDOW_LEN)]
-    assert (graph.action_post1_class == fold[None, None, :]).all()
+    classes = np.array([_expected_row(0, 0, slot)[0] for slot in range(WINDOW_LEN)])
+    assert (graph.action_post1_class == classes[None, None, :]).all()
 
 
 def test_action_rows_default_off():

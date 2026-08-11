@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from mantisnet import MantisConfig, MantisNet, collate, from_position
-from mantisnet.builder import DEC_CLASSES
+from mantisnet.builder import TERN_DEC_CLASSES as DEC_CLASSES, _TERN_DEC_CLASS
 from mantisnet.klent import graft as graft_module
 from mantisnet.klent.graft import (
     MAX_ABS_DQ,
@@ -40,8 +40,6 @@ from mantisnet.klent.graft import (
     main,
 )
 from mantisnet.klent.run import _versions, load_checkpoint
-
-from .conftest import joint_class
 
 TAU, LAM = 0.1, 0.01
 _ITERATION = 151
@@ -125,14 +123,14 @@ def _write_parent(tmp_path, checkpoint=None):
 
 def test_every_joint_class_replicates_its_slot_class_row():
     # The map the conversion rests on, against conftest's own orbit derivation:
-    # every (mask, slot) pair's class takes the parent row of that slot's class,
+    # every (pattern, slot) pair's class takes the parent row of that slot's class,
     # and mirrored slots — which share an orbit — agree on it.
     assert _PARENT_ROW.shape == (DEC_CLASSES,)
-    for mask in range(1, 63):
+    for pattern in range(1, 729):
         for slot in range(6):
-            if (mask >> slot) & 1:
+            if (pattern // 3**slot) % 3:
                 continue
-            assert _PARENT_ROW[joint_class(mask, slot)] == min(slot, 5 - slot)
+            assert _PARENT_ROW[_TERN_DEC_CLASS[pattern, slot]] == min(slot, 5 - slot)
     assert set(_PARENT_ROW.tolist()) == {0, 1, 2}
 
 
@@ -154,6 +152,7 @@ def test_graft_preserves_the_parent_decode(tmp_path, positions):
     # place: the parent's is refused by every loader, the child's is this build's.
     assert manifest["parent_versions"]["MODEL_REPR_VERSION"] == PARENT_REPR_VERSION
     assert manifest["versions"] == _versions()
+    assert manifest["versions"]["MODEL_REPR_VERSION"] == 4
     assert manifest["probe_positions"] == PROBE_POSITIONS
     assert manifest["probe_legal_cells"] > PROBE_POSITIONS * PROBE_TOP_K
     assert (min(manifest["probe_plies"]), max(manifest["probe_plies"])) == PROBE_PLIES
@@ -263,14 +262,14 @@ def test_the_cli_writes_the_same_manifest(tmp_path):
     main([str(old), str(new), "--tau", str(TAU), "--lam", str(LAM)])
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest["arm"] == "joint-trinomial"
-    assert manifest["classes"] == DEC_CLASSES == 93
+    assert manifest["classes"] == DEC_CLASSES == 726
     assert manifest["class_to_parent_row"] == _PARENT_ROW.tolist()
     assert manifest["preservation"]["holds"]
 
 
 def test_a_parent_of_this_representation_is_refused(tmp_path):
     # A checkpoint already at this build's version is not a parent to convert:
-    # its class tables are 93 rows wide and the transform has nothing to do.
+    # its class tables are 726 rows wide and the transform has nothing to do.
     checkpoint = _parent_checkpoint()
     checkpoint["versions"] = _versions()
     old, new, manifest_path = _write_parent(tmp_path, checkpoint)
@@ -309,7 +308,7 @@ def test_a_malformed_optimizer_entry_is_refused(tmp_path):
 
 
 def test_a_moment_of_the_wrong_width_is_refused(tmp_path):
-    # A moment that is already 93 rows wide would sail through a shape check
+    # A moment that is already 726 rows wide would sail through a shape check
     # written against the new parameter instead of the parent's.
     checkpoint = _parent_checkpoint()
     model = MantisNet(MantisConfig())

@@ -43,7 +43,7 @@ def _literal(
 
 
 def _mixed_batch(positions, case: str):
-    graphs = [from_position(pos, mixed_windows=True) for pos in positions]
+    graphs = [from_position(pos) for pos in positions]
     if case == "empty":
         selected = [graph for graph in graphs if graph.n_stones == 0]
         assert len(selected) == 1 and selected[0].n_windows == 0
@@ -68,17 +68,7 @@ def _sites(batch) -> dict[str, tuple[torch.Tensor, torch.Tensor, int, int]]:
     n_windows = int(batch.window_feat.shape[0])
     n_stones = int(batch.stone_own.shape[0])
     n_cells = int(batch.cell_pos.shape[0])
-    plan = incidence_plan(
-        batch.inc_stone,
-        batch.inc_window,
-        batch.inc_class,
-        n_stones,
-        n_windows,
-        TERN_OCC_CLASSES,
-        histograms=False,
-    )
-    assert plan.stone_counts is None and plan.window_counts is None
-    assert plan.run_class is not None
+    plan = incidence_plan(batch.inc_stone, batch.inc_window, batch.inc_class)
     return {
         "windows": (batch.inc_class, batch.inc_window, n_windows, WINDOW_RUN),
         "stones": (plan.run_class, plan.run_stone, n_stones, STONE_RUN),
@@ -215,7 +205,7 @@ def test_mixed_model_call_sites_match_the_literal_forms(positions, monkeypatch):
     same model does.
     """
     torch.manual_seed(3)
-    model = MantisNet(MantisConfig(mixed_windows=True)).to(_DEVICE).eval()
+    model = MantisNet(MantisConfig()).to(_DEVICE).eval()
     batch = _mixed_batch(positions, "ragged")
 
     def run():

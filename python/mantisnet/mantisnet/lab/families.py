@@ -15,21 +15,18 @@ import torch
 from torch import Tensor, nn
 
 from ..builder import (
-    DEC_CLASSES,
     NEAREST_BUCKETS,
-    OCC_CLASSES,
     TERN_DEC_CLASSES,
     TERN_OCC_CLASSES,
     TERN_PATTERNS,
 )
-from ..klent.graft import _PARENT_ROW
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
 from ..model import MantisConfig, MantisNet, ModelOutput, strip_legacy_knobs
 from ..segments import segment_ids, segment_max
 from ..window_pairs import WA_CLASSES
 
 
-_SLOT_CLASSES = 3
+_HISTORIC_OCC_CLASSES = 93
 _BLOCK_KEY = re.compile(r"^blocks\.(\d+)\.")
 _DEAD_KEY_BIAS = re.compile(r"^blocks\.\d+\.(?:wk|wk_wa)\.bias$")
 
@@ -105,12 +102,6 @@ def _scalar(logits: Tensor) -> tuple[Tensor, Tensor]:
     return q, q.abs()
 
 
-def _factored(logits: Tensor) -> tuple[Tensor, Tensor]:
-    mover_win, magnitude = logits.unbind(dim=-1)
-    mass = magnitude.sigmoid()
-    return (2.0 * mover_win.sigmoid() - 1.0) * mass, mass
-
-
 TRINOMIAL = Composition(
     "trinomial", 3, "softmax(z)[+] - softmax(z)[-]", "1 - softmax(z)[0]", _trinomial
 )
@@ -118,13 +109,6 @@ BIPOLAR = Composition(
     "bipolar", 2, "sigmoid(z[+]) - sigmoid(z[-])", "sigmoid(z[+]) + sigmoid(z[-])", _bipolar
 )
 SCALAR = Composition("scalar", 1, "tanh(z)", "abs(tanh(z))", _scalar)
-FACTORED = Composition(
-    "factored",
-    2,
-    "(2*sigmoid(z_p)-1) * sigmoid(z_m)",
-    "sigmoid(z_m)",
-    _factored,
-)
 
 
 class FamilyMantisNet(MantisNet):
@@ -216,15 +200,6 @@ _BLOCK_SUFFIXES = {
     "ffn.2.weight", "ffn.2.bias",
 }
 
-_TAIL_KEYS = {
-    "q_tail_ln.weight", "q_tail_ln.bias", "q_tail.0.weight", "q_tail.0.bias",
-    "q_tail.2.weight", "q_tail.2.bias",
-}
-_DUEL_KEYS = {
-    "mlp_qbase.0.weight", "mlp_qbase.0.bias",
-    "mlp_qbase.2.weight", "mlp_qbase.2.bias",
-}
-
 # Trunk-stage parameter groups: the relay (§5.1b), typed window attention
 # (§5.1c), the axis-aware §5.3 bias, and joint incidence classes are baked
 # into this build. The profile is still read off the state dict so an
@@ -250,7 +225,6 @@ class _Knobs:
     cell_pass: bool
     cell_pass_from: int
     joint_incidence: bool
-    # Live Step 12 knobs: any combination is instantiable in this build.
     window_attention: bool
     mixed_windows: bool
 
@@ -282,15 +256,16 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         joint_incidence=(
             isinstance(e_ws, Tensor)
             and e_ws.ndim == 2
-            and e_ws.shape[0] == (TERN_OCC_CLASSES if mixed else OCC_CLASSES)
+            and e_ws.shape[0]
+            == (TERN_OCC_CLASSES if mixed else _HISTORIC_OCC_CLASSES)
         ),
         window_attention="blocks.0.wa_bias" in state_dict,
         mixed_windows=mixed,
     )
 
 
-# The profile this build instantiates, at the live knobs' default values;
-# a deviation in a live knob is a config, not a refusal.
+# The profile this build instantiates. Window attention remains live, so its
+# value is normalized during profile comparison.
 _BAKED = _Knobs(
     axis_bias=True,
     off_axis_bias=False,
@@ -298,7 +273,7 @@ _BAKED = _Knobs(
     cell_pass_from=0,
     joint_incidence=True,
     window_attention=True,
-    mixed_windows=False,
+    mixed_windows=True,
 )
 
 
@@ -330,7 +305,6 @@ def _claims(
     state_dict: Mapping[str, Tensor],
     *,
     width: int,
-    table_rows: int,
     extras: set[str] | None = None,
 ) -> bool:
     blocks = _block_count(state_dict)
@@ -339,20 +313,16 @@ def _claims(
     knobs = _knob_profile(state_dict, blocks)
     if set(state_dict) != _base_keys(blocks, knobs) | (extras or set()):
         return False
-    if knobs.mixed_windows:
-        # The ternary scope widens the joint decoder tables; slot-class
-        # families predate it and never carry the mixed vocabulary.
-        if table_rows != DEC_CLASSES:
-            return False
-        table_rows = TERN_DEC_CLASSES
+    if not knobs.mixed_windows:
+        return False
     stone = _shape(state_dict, "stone_table.weight")
     readout = _shape(state_dict, "mlp_q.out.weight")
     return bool(
         stone is not None
         and len(stone) == 2
         and stone[0] == 2
-        and _shape(state_dict, "e_pw.weight") == (table_rows, stone[1])
-        and _shape(state_dict, "e_qw.weight") == (table_rows, stone[1])
+        and _shape(state_dict, "e_pw.weight") == (TERN_DEC_CLASSES, stone[1])
+        and _shape(state_dict, "e_qw.weight") == (TERN_DEC_CLASSES, stone[1])
         and readout is not None
         and len(readout) == 2
         and readout[0] == width
@@ -517,7 +487,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         )
 
     knobs = _knob_profile(state_dict, blocks)
-    if replace(knobs, window_attention=True, mixed_windows=False) != _BAKED:
+    if replace(knobs, window_attention=True) != _BAKED:
         raise ValueError(
             f"state dict trunk profile {knobs} is not the baked architecture "
             f"{_BAKED}; checkpoints predating a baked stage are not "
@@ -535,19 +505,16 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         policy_hidden=policy_hidden,
         value_hidden=value_hidden,
         dropout=0.0,
-        mixed_windows=knobs.mixed_windows,
         window_attention=knobs.window_attention,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")
     critic = _require_tensor(state_dict, "mlp_q.out.weight")
-    allowed_rows = (
-        {TERN_DEC_CLASSES} if knobs.mixed_windows else {_SLOT_CLASSES, DEC_CLASSES}
-    )
+    allowed_rows = {TERN_DEC_CLASSES}
     if table.ndim != 2 or table.shape[0] not in allowed_rows:
         raise ValueError(
             f"tensor 'e_pw.weight' has shape {tuple(table.shape)}, expected rows "
-            f"in {sorted(allowed_rows)} for this window scope"
+            f"in {sorted(allowed_rows)} for this build"
         )
     if critic.ndim != 2 or critic.shape[0] not in {1, 2, 3}:
         raise ValueError(
@@ -566,7 +533,6 @@ class FamilyEntry:
     claims: Callable[[Mapping[str, Tensor]], bool]
     scoreable: bool
     composition: Composition | None
-    table_rows: int
     reason: str | None = None
 
     def load(
@@ -577,20 +543,14 @@ class FamilyEntry:
     ) -> nn.Module:
         if not self.scoreable or self.composition is None:
             raise ValueError(_unscoreable_message(self))
-        state = dict(checkpoint_model_dict)
-        if self.table_rows == _SLOT_CLASSES:
-            rows = torch.from_numpy(_PARENT_ROW).to(dtype=torch.long)
-            for key in ("e_pw.weight", "e_qw.weight"):
-                state[key] = state[key].index_select(0, rows)
         model = FamilyMantisNet(cfg, self.composition)
-        model.load_state_dict(state, strict=True)
+        model.load_state_dict(checkpoint_model_dict, strict=True)
         return model.to(device).eval()
 
 
 def _entry(
     name: str,
     width: int,
-    rows: int,
     composition: Composition | None,
     *,
     extras: set[str] | None = None,
@@ -598,12 +558,9 @@ def _entry(
 ) -> FamilyEntry:
     return FamilyEntry(
         name=name,
-        claims=lambda state, w=width, r=rows, e=extras: _claims(
-            state, width=w, table_rows=r, extras=e
-        ),
+        claims=lambda state, w=width, e=extras: _claims(state, width=w, extras=e),
         scoreable=composition is not None,
         composition=composition,
-        table_rows=rows,
         reason=reason,
     )
 
@@ -614,28 +571,9 @@ _COMPAT_REQUIREMENT = (
 )
 
 FAMILIES: tuple[FamilyEntry, ...] = (
-    _entry("trinomial-joint", 3, DEC_CLASSES, TRINOMIAL),
-    _entry("bipolar-joint", 2, DEC_CLASSES, BIPOLAR),
-    _entry("scalar-joint", 1, DEC_CLASSES, SCALAR),
-    _entry("scalar-slot", 1, _SLOT_CLASSES, SCALAR),
-    _entry("bipolar-slot", 2, _SLOT_CLASSES, BIPOLAR),
-    _entry("factored-slot", 2, _SLOT_CLASSES, FACTORED),
-    _entry(
-        "tail-slot", 1, _SLOT_CLASSES, None, extras=_TAIL_KEYS,
-        reason=(
-            "its private q_tail.* and q_tail_ln.* forward semantics live only "
-            "on retired branch 83e5f13, and a composition-parity test against "
-            "runnable historical code is not possible in this tree"
-        ),
-    ),
-    _entry(
-        "duel-slot", 1, _SLOT_CLASSES, None, extras=_DUEL_KEYS,
-        reason=(
-            "its private mlp_qbase.* forward semantics live only on retired "
-            "branch 4c8bed8, and a composition-parity test against runnable "
-            "historical code is not possible in this tree"
-        ),
-    ),
+    _entry("trinomial-joint", 3, TRINOMIAL),
+    _entry("bipolar-joint", 2, BIPOLAR),
+    _entry("scalar-joint", 1, SCALAR),
 )
 
 

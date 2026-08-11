@@ -215,7 +215,7 @@ durable record.
 | 9 | `global-numeric` | global scalar conditioning of the latents | full |
 | 10 | `head-adapters` | private per-head residual depth | full |
 | 11 | `orbit48` | exact 48-orbit D6 attention geometry | full |
-| 12 | `mixed-windows` | ternary all-nonempty window nodes | full |
+| 12 | `mixed-windows` | ternary all-nonempty window nodes — **ACCEPTED** | full |
 | 13 | `cell-nodes` | explicit relevant-cell nodes + geometry edges | full |
 | 14 | `axis-channels` | three axis-equivariant channels | full |
 
@@ -672,8 +672,9 @@ per batch at 726/1458 classes, so the mixed scope computes the identical
 sums as per-edge class-row gathers with fp32 scatter-add; fusing those
 gathers into the Triton kernels is D-arm work if profiling shows them hot.
 
-**Knob.** `mixed_windows: bool = False` (measured arm `True`), plus the
-resurrected `window_attention: bool = True` for the matrix below.
+**Knob.** Baked as `mixed_windows: True`; the field and binary path are
+deleted, and `LEGACY_BAKED_KNOBS` records the accepted value. The resurrected
+`window_attention: bool = True` remains live for Step 3.
 
 **Gates & bake — owner-amended protocol (2026-08-10).** The owner expects
 this step to cost speed and to be worth exploring anyway. It therefore runs
@@ -697,6 +698,10 @@ Owner-set screen design (2026-08-10, overnight run): the full 2×2 factorial
 (A baseline, B mixed, C mixed+wa-off, D baseline+wa-off), **3 seeds**,
 larger per-cell training budgets (~400k train samples per cell, identical
 deterministic subset across arms and seeds, recorded in the recipe).
+
+**Owner verdict (2026-08-11): ACCEPTED.** The all-nonempty ternary scope is
+baked; the binary builder/model path and `mixed_windows` live knob are deleted.
+`window_attention` is not part of this verdict and remains a live knob.
 
 ### Step 13 — `cell-nodes`
 

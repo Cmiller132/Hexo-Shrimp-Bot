@@ -12,16 +12,21 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from mantisnet.builder import NUM_PATTERNS, PATTERN_STONES, collate_positions
+from mantisnet.builder import TERN_PATTERNS, _TERN_DIGITS, _TERN_RANK, collate_positions
 
-_STONES = torch.from_numpy(PATTERN_STONES)
+_PATTERN_SCORE = np.zeros(TERN_PATTERNS, dtype=np.int64)
+for _pattern in range(1, 729):
+    _digits = _TERN_DIGITS[_pattern]
+    _PATTERN_SCORE[_TERN_RANK[_pattern]] = (
+        int((_digits == 1).sum()) if not (_digits == 2).any() else 0
+    )
+_STONES = torch.from_numpy(_PATTERN_SCORE)
 
 
 def heuristic_scores(batch) -> torch.Tensor:
     """Per legal cell: the stone count of its best own live window, with a
     six-completing cell assigned the maximum score."""
-    own = batch.window_feat < NUM_PATTERNS
-    wscore = torch.where(own, _STONES[batch.window_feat % NUM_PATTERNS], 0)
+    wscore = _STONES[batch.window_feat]
     per_cell = torch.zeros(batch.n_cells)
     per_cell.index_reduce_(
         0, batch.dec_cell, wscore.index_select(0, batch.dec_window).float(), "amax"

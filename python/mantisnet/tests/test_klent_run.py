@@ -391,7 +391,7 @@ def test_checkpoints_carry_and_enforce_their_model_config(tmp_path):
 
     # The live Step 12 knobs are real config: a knobbed model round-trips.
     knobbed_cfg = MantisConfig(
-        h=64, policy_hidden=64, mixed_windows=True, window_attention=False
+        h=64, policy_hidden=64, window_attention=False
     )
     knobbed = MantisNet(knobbed_cfg)
     knobbed_path = tmp_path / "knobbed.pt"
