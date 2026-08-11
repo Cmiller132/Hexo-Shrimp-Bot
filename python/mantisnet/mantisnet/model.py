@@ -489,16 +489,17 @@ class MantisNet(nn.Module):
             nn.init.zeros_(head.out.bias)
 
     def _pair_tables(self, batch: Batch):
-        # §5.1c structure is born on the batch's device from the window
-        # identities: the claim views cost several times more to ship over
-        # PCIe than to derive beside the model, and every block shares one
-        # derivation. The op is opaque to the compiler — a graph break here
-        # would spill the surrounding message passing to eager.
-        return window_pairs.WaTables(
-            *window_pairs.derive_wa_tables(
-                batch.window_id, batch.window_slot // batch.max_w
-            )
+        # §5.1c tables are born on the batch's device from the window
+        # identities: the int64 edge views cost several times more to ship
+        # over PCIe than to derive beside the model, and every block shares
+        # one derivation. The op is opaque to the compiler — a graph break
+        # here would spill the surrounding message passing to eager. The
+        # source view shares the destination view's arrays (reversal
+        # closure), reassembled here because ops may not return aliases.
+        ptr, src, cls, scls, cptr, cedge = window_pairs.derive_pair_tables(
+            batch.window_id, batch.window_slot // batch.max_w
         )
+        return window_pairs.PairTables(ptr, src, cls, ptr, src, scls, cptr, cedge)
 
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""

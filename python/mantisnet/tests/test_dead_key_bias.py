@@ -6,7 +6,7 @@ import torch
 
 from mantisnet import MantisConfig, MantisNet, collate, from_position
 from mantisnet.attention import fused_attention
-from mantisnet.window_pairs import edge_attention, wa_tables
+from mantisnet.window_pairs import edge_attention, pair_tables
 
 
 def test_softmax_key_projection_parameter_census():
@@ -75,7 +75,7 @@ def test_constant_post_projection_key_bias_cancels_in_both_cpu_attention_paths(
     wq = block.wq_wa(wz).view(n_windows, heads, head_dim)
     wk = block.wk_wa(wz).view(n_windows, heads, head_dim)
     wv = block.wv_wa(wz).view(n_windows, heads, head_dim)
-    pairs = wa_tables(batch.window_id, batch.window_slot // batch.max_w)
+    pairs = pair_tables(batch.window_id, batch.window_slot // batch.max_w)
     window_bias = torch.linspace(-0.75, -0.125, cfg.h).view(heads, head_dim)
     window_expected = edge_attention(wq, wk, wv, block.wa_bias, *pairs)
     window_actual = edge_attention(
