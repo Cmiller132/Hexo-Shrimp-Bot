@@ -481,7 +481,7 @@ def bench_fit(
             )
     else:
         from .corpus import load_corpus
-        from .train import fit_supervised_epoch, sample_sizes
+        from .train import TrainConfig, fit_supervised_epoch, sample_sizes
 
         frozen = load_corpus(corpus) if isinstance(corpus, (str, Path)) else corpus
         samples = frozen.split_samples(split)
@@ -490,6 +490,21 @@ def bench_fit(
         # Sizing replays the corpus once per split; production fitting reads
         # sizes from its buffer, so the replay stays outside the timed epoch.
         sizes = sample_sizes(frozen, samples)
+        # The supervised entry point takes the supervised recipe type; mirror
+        # the production budgets exactly. No train_subset cap: the bench fits
+        # the whole split it was pointed at.
+        fit_cfg = TrainConfig(
+            batch_size=cfg.batch_size,
+            pair_budget=cfg.pair_budget,
+            cell_budget=cfg.cell_budget,
+            collect_pair_budget=cfg.collect_pair_budget,
+            collect_cell_budget=cfg.collect_cell_budget,
+            lr=cfg.lr,
+            adam_impl=cfg.adam_impl,
+            device=cfg.device,
+            autocast=cfg.autocast,
+            compile=cfg.compile,
+        )
 
         def run_epoch(epoch_seed, steady=None):
             return fit_supervised_epoch(
@@ -497,7 +512,7 @@ def bench_fit(
                 optimizer,
                 frozen,
                 split=split,
-                cfg=cfg,
+                cfg=fit_cfg,
                 rng=np.random.default_rng(epoch_seed),
                 sizes=sizes,
                 steady=steady,
