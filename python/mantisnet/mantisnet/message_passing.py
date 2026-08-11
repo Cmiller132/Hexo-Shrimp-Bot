@@ -26,12 +26,13 @@ except ImportError:
     tl = None
 
 
-# Run bounds for the two orderings.  A live window has at most six occupied
-# slots (five in non-terminal inputs; six covers the structural boundary).  A
-# stone occupies at most eighteen live windows: six span offsets on each of
-# the three axes.
-_WINDOW_RUN = 6
-_STONE_RUN = 18
+# Run bounds for the orderings.  A window has at most six slots of either
+# kind (occupied slots for the trunk incidence, empty cells for the decoder
+# incidence), and a stone or cell sits in at most eighteen windows: six span
+# offsets on each of the three axes.  The same two bounds therefore serve the
+# trunk views, the mixed-scope class sums, and the decoder incidence.
+WINDOW_RUN = 6
+STONE_RUN = 18
 _RUN_WARPS = 1
 
 if triton is not None:
@@ -201,7 +202,7 @@ if triton is not None:
             inc_stone,
             inc_window,
             n_windows,
-            _WINDOW_RUN,
+            WINDOW_RUN,
             values.dtype,
             fill_zero=False,
         )
@@ -220,7 +221,7 @@ if triton is not None:
             run_window,
             run_stone,
             n_stones,
-            _STONE_RUN,
+            STONE_RUN,
             torch.float32,
             fill_zero=True,
         )
@@ -247,7 +248,7 @@ def _backward_to_windows(ctx, grad_out: Tensor):
         run_window,
         run_stone,
         ctx.n_source,
-        _STONE_RUN,
+        STONE_RUN,
         ctx.values_dtype,
         fill_zero=True,
     )
@@ -263,7 +264,7 @@ def _backward_to_stones(ctx, grad_out: Tensor):
         inc_stone,
         inc_window,
         ctx.n_source,
-        _WINDOW_RUN,
+        WINDOW_RUN,
         ctx.values_dtype,
         fill_zero=False,
     )
@@ -319,6 +320,170 @@ def aggregate_to_stones(
     )
 
 
+# The mixed-window scope's ternary class vocabularies (726/1458) are too wide
+# for the histogram matmul, so its class terms and its decoder aggregation
+# reduce rows per run with the same kernel as the trunk aggregations — never
+# materializing the (E, H) gather of the literal formulation.
+
+_CLASS_GRAD_SLICES = 8
+
+
+def _row_sum_reference(
+    table: Tensor, gather: Tensor, runs: Tensor, n_dest: int
+) -> Tensor:
+    """Literal gather/scatter row sum: the pre-kernel formulation."""
+    rows = table.index_select(0, gather).float()
+    out = torch.zeros(
+        n_dest, table.shape[1], dtype=torch.float32, device=table.device
+    )
+    return out.index_add_(0, runs, rows)
+
+
+if triton is not None:
+
+    @triton_op("mantisnet::class_row_sum", mutates_args={})
+    def _class_row_sum_op(
+        weight: Tensor, gather: Tensor, runs: Tensor, n_dest: int, run_len: int
+    ) -> Tensor:
+        return _launch_runs(
+            weight, gather, runs, n_dest, run_len, torch.float32, fill_zero=True
+        )
+
+    @triton_op("mantisnet::incidence_row_sum", mutates_args={})
+    def _incidence_row_sum_op(
+        values: Tensor,
+        gather: Tensor,
+        runs: Tensor,
+        rev_gather: Tensor,
+        rev_runs: Tensor,
+        n_dest: int,
+        run_len: int,
+        rev_run_len: int,
+    ) -> Tensor:
+        return _launch_runs(
+            values, gather, runs, n_dest, run_len, torch.float32, fill_zero=True
+        )
+
+else:  # pragma: no cover - exercised only by installations without Triton
+    _class_row_sum_op = None
+    _incidence_row_sum_op = None
+
+
+def _class_setup_context(ctx, inputs, output) -> None:
+    del output
+    weight, gather, runs, _n_dest, _run_len = inputs
+    ctx.save_for_backward(gather, runs)
+    ctx.n_classes = weight.shape[0]
+    ctx.weight_dtype = weight.dtype
+
+
+def _class_row_sum_backward(ctx, grad_out: Tensor):
+    # The table gradient reduces by class, and class runs are unbounded — one
+    # class can own most of a chunk's entries.  Fixed slices keep the gathered
+    # upstream rows a small fraction of the (E, H) table the forward avoids.
+    gather, runs = ctx.saved_tensors
+    grad_out = grad_out.contiguous()
+    grad = torch.zeros(
+        ctx.n_classes, grad_out.shape[1], dtype=torch.float32, device=grad_out.device
+    )
+    n = gather.shape[0]
+    for k in range(_CLASS_GRAD_SLICES):
+        piece = slice(k * n // _CLASS_GRAD_SLICES, (k + 1) * n // _CLASS_GRAD_SLICES)
+        grad.index_add_(
+            0, gather[piece], grad_out.index_select(0, runs[piece]).float()
+        )
+    return grad.to(ctx.weight_dtype), None, None, None, None
+
+
+def _incidence_setup_context(ctx, inputs, output) -> None:
+    del output
+    values, _gather, _runs, rev_gather, rev_runs, _n_dest, _run_len, rev_run_len = (
+        inputs
+    )
+    ctx.save_for_backward(rev_gather, rev_runs)
+    ctx.n_source = values.shape[0]
+    ctx.values_dtype = values.dtype
+    ctx.rev_run_len = rev_run_len
+
+
+def _incidence_row_sum_backward(ctx, grad_out: Tensor):
+    # A source row's gradient sums its entries' upstream rows — the reverse
+    # ordering's run reduction.
+    rev_gather, rev_runs = ctx.saved_tensors
+    grad = _launch_runs(
+        grad_out.contiguous(),
+        rev_gather,
+        rev_runs,
+        ctx.n_source,
+        ctx.rev_run_len,
+        ctx.values_dtype,
+        fill_zero=True,
+    )
+    return grad, None, None, None, None, None, None, None
+
+
+if _class_row_sum_op is not None:
+    _class_row_sum_op.register_autograd(
+        _class_row_sum_backward, setup_context=_class_setup_context
+    )
+    _incidence_row_sum_op.register_autograd(
+        _incidence_row_sum_backward, setup_context=_incidence_setup_context
+    )
+
+
+def _validate_views(entries: tuple[Tensor, ...], n_dest: int) -> None:
+    first = entries[0]
+    if first.ndim != 1 or any(view.shape != first.shape for view in entries):
+        raise ValueError("the incidence views must be one-dimensional and one length")
+    if any(view.dtype != torch.int64 for view in entries):
+        raise ValueError("incidence tensors must have dtype int64")
+    if n_dest < 0:
+        raise ValueError(f"destination count must be nonnegative, got {n_dest}")
+
+
+def class_row_sum(
+    weight: Tensor, gather: Tensor, runs: Tensor, n_dest: int, run_len: int
+) -> Tensor:
+    """Sum class-table rows into destination rows, accumulating in fp32.
+
+    ``gather`` holds each entry's class row and ``runs`` its destination,
+    sorted so equal destinations are adjacent in runs of at most ``run_len``.
+    Destinations without entries are zero and the output is fp32 for the
+    caller to cast — both exactly the literal zeros/``index_add_`` form.
+    """
+    _validate_views((gather, runs), n_dest)
+    if not _supported(weight, n_dest) or gather.numel() == 0:
+        return _row_sum_reference(weight, gather, runs, n_dest)
+    return _class_row_sum_op(weight, gather, runs, n_dest, run_len)
+
+
+def incidence_row_sum(
+    values: Tensor,
+    gather: Tensor,
+    runs: Tensor,
+    rev_gather: Tensor,
+    rev_runs: Tensor,
+    n_dest: int,
+    run_len: int,
+    rev_run_len: int,
+) -> Tensor:
+    """Sum gathered ``values`` rows into destination rows, fp32 accumulated.
+
+    ``(gather, runs)`` order the incidence by destination; ``(rev_gather,
+    rev_runs)`` hold the same entries ordered by source, which the backward
+    run-reduces to build the ``values`` gradient without an (E, H)
+    intermediate.  Both orderings bound their runs (``run_len``,
+    ``rev_run_len``).  Destinations without entries are zero and the output
+    is fp32, exactly the literal zeros/``index_add_`` form.
+    """
+    _validate_views((gather, runs, rev_gather, rev_runs), n_dest)
+    if not _supported(values, n_dest) or gather.numel() == 0:
+        return _row_sum_reference(values, gather, runs, n_dest)
+    return _incidence_row_sum_op(
+        values, gather, runs, rev_gather, rev_runs, n_dest, run_len, rev_run_len
+    )
+
+
 class IncidencePlan(NamedTuple):
     """Per-batch derivations both passes share: histograms and orderings."""
 
@@ -326,6 +491,7 @@ class IncidencePlan(NamedTuple):
     window_counts: Tensor | None  # (N_w, classes) fp32; None without histograms
     run_stone: Tensor  # (E,) int64: inc_stone, stone-major stable order
     run_window: Tensor  # (E,) int64: inc_window in the same order
+    run_class: Tensor | None  # (E,) int64: inc_class in the same order; mixed only
 
 
 def incidence_plan(
@@ -346,8 +512,8 @@ def incidence_plan(
 
     ``histograms=False`` skips the dense count matrices for scopes whose class
     vocabulary makes them prohibitively wide (the ternary mixed-window tables);
-    such callers sum gathered class rows per edge instead, and the count
-    fields are ``None``.
+    such callers run-reduce the class rows instead (``class_row_sum``), so the
+    plan carries the stone-major class view and the count fields are ``None``.
     """
     if inc_class.shape != inc_stone.shape or inc_class.dtype != torch.int64:
         raise ValueError("inc_class must be int64 and one length with inc_stone")
@@ -376,9 +542,11 @@ def incidence_plan(
         order = torch.argsort(inc_stone.to(torch.int32), stable=True)
         run_stone = inc_stone.index_select(0, order)
         run_window = inc_window.index_select(0, order)
+        run_class = None if histograms else inc_class.index_select(0, order)
     return IncidencePlan(
         stone_counts,
         window_counts,
         run_stone,
         run_window,
+        run_class,
     )

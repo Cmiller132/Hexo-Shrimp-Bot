@@ -200,23 +200,6 @@ def _class_term(counts: Tensor, weight: Tensor, dtype: torch.dtype) -> Tensor:
     return (counts @ weight).to(dtype)
 
 
-def _edge_class_sum(
-    weight: Tensor, edge_class: Tensor, edge_dest: Tensor, n_dest: int, dtype: torch.dtype
-) -> Tensor:
-    """A destination's summed slot-class rows, gathered per edge.
-
-    The mixed-window scope's class vocabularies (726/1458) make the histogram
-    form of :func:`_class_term` prohibitively wide, so the same sum runs as an
-    embedding gather plus scatter-add, accumulated fp32 like the histogram
-    matmul.
-    """
-    rows = weight.index_select(0, edge_class).float()
-    out = torch.zeros(n_dest, weight.shape[1], dtype=torch.float32, device=weight.device)
-    return out.index_add_(0, edge_dest, rows).to(dtype)
-
-
-
-
 class _PairMlp(nn.Module):
     """``MLP([a; b])`` with the concatenation folded away.
 
@@ -351,7 +334,8 @@ class _Block(nn.Module):
         # signal. The class term of each pass is a dense ``counts @ table``
         # whose gradient is another matmul, not a per-entry gather whose
         # backward scatters into a few rows; the mixed scope's wide ternary
-        # vocabularies take the gathered form instead.
+        # vocabularies run-reduce the same table rows (``class_row_sum``)
+        # without materializing the per-edge gather.
         x = self.u(self.ln_ws_s(s))
         agg = message_passing.aggregate_to_windows(
             x,
@@ -362,9 +346,13 @@ class _Block(nn.Module):
             w.shape[0],
         )
         if cfg.mixed_windows:
-            agg = agg + _edge_class_sum(
-                self.e_ws.weight, batch.inc_class, batch.inc_window, w.shape[0], agg.dtype
-            )
+            agg = agg + message_passing.class_row_sum(
+                self.e_ws.weight,
+                batch.inc_class,
+                batch.inc_window,
+                w.shape[0],
+                message_passing.WINDOW_RUN,
+            ).to(agg.dtype)
         else:
             agg = agg + _class_term(plan.window_counts, self.e_ws.weight, agg.dtype)
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
@@ -393,9 +381,13 @@ class _Block(nn.Module):
             s.shape[0],
         )
         if cfg.mixed_windows:
-            agg = agg + _edge_class_sum(
-                self.e_sw.weight, batch.inc_class, batch.inc_stone, s.shape[0], agg.dtype
-            )
+            agg = agg + message_passing.class_row_sum(
+                self.e_sw.weight,
+                plan.run_class,
+                plan.run_stone,
+                s.shape[0],
+                message_passing.STONE_RUN,
+            ).to(agg.dtype)
         else:
             agg = agg + _class_term(plan.stone_counts, self.e_sw.weight, agg.dtype)
         s = s + self.drop(self.mlp_s(self.ln_sw_s(s), agg))
@@ -545,14 +537,26 @@ class MantisNet(nn.Module):
 
         Binary scope: the parameter-free coefficient rows (window sum, class
         histogram, background one-hot). Mixed scope: the histogram is too wide
-        at 726 classes, so the shared part is only the summed window rows and
-        each head adds its own gathered class rows in ``_cell_scores``."""
+        at 726 classes, so the shared part is only the run-reduced window rows
+        and each head adds its own class-row sum in ``_cell_scores``."""
         if self.cfg.mixed_windows:
-            gathered = w.index_select(0, batch.dec_window).float()
-            rows = torch.zeros(
-                batch.cell_pos.shape[0], w.shape[1], dtype=torch.float32, device=w.device
-            )
-            return rows.index_add_(0, batch.dec_cell, gathered).to(dtype)
+            # The batch's decoder order is already cell-major; the reverse
+            # (window-major) view the backward reduces is derived beside the
+            # model like the §5.1c pair tables, not shipped over PCIe.
+            with torch.no_grad():
+                order = torch.argsort(batch.dec_window.to(torch.int32), stable=True)
+                rev_gather = batch.dec_cell.index_select(0, order)
+                rev_runs = batch.dec_window.index_select(0, order)
+            return message_passing.incidence_row_sum(
+                w,
+                batch.dec_window,
+                batch.dec_cell,
+                rev_gather,
+                rev_runs,
+                batch.cell_pos.shape[0],
+                message_passing.STONE_RUN,
+                message_passing.WINDOW_RUN,
+            ).to(dtype)
         return decoder.aggregate(
             w.to(dtype),
             batch.dec_window,
@@ -579,17 +583,18 @@ class MantisNet(nn.Module):
         runs per position.
 
         The mixed scope composes the same quantity without the histogram:
-        ``lin_a(proj @ Σw + Σ e_class rows + e_bg row) + bias``, with the two
-        embedding sums gathered per edge and accumulated fp32."""
+        ``lin_a(proj @ Σw + Σ e_class rows + e_bg row) + bias``, the class sum
+        run-reduced fp32 and the background rows gathered — background cells
+        are unique destinations, so that gather is already output-sized."""
         if self.cfg.mixed_windows:
-            n_cells, h = rows.shape[0], e_w.weight.shape[1]
-            extra = torch.zeros(
-                n_cells, h, dtype=torch.float32, device=rows.device
+            extra = message_passing.class_row_sum(
+                e_w.weight,
+                batch.dec_class,
+                batch.dec_cell,
+                rows.shape[0],
+                message_passing.STONE_RUN,
             )
-            extra.index_add_(
-                0, batch.dec_cell, e_w.weight.index_select(0, batch.dec_class).float()
-            )
-            extra.index_add_(
+            extra = extra.index_add(
                 0, batch.bg_cell, e_bg.weight.index_select(0, batch.bg_bucket).float()
             )
             base = F.linear(rows, lin.weight) + extra.to(rows.dtype)
