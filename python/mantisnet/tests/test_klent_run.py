@@ -384,10 +384,27 @@ def test_checkpoints_carry_and_enforce_their_model_config(tmp_path):
     assert dataclasses.asdict(load_model(path).cfg) == dataclasses.asdict(cfg)
 
     # Any other knob value names a model this build does not implement.
-    ckpt["model_config"] = {**ckpt["model_config"], "window_attention": False}
+    ckpt["model_config"] = {**ckpt["model_config"], "cell_pass": False}
     torch.save(ckpt, path)
     with pytest.raises(ValueError, match="no longer implements"):
         load_model(path)
+
+    # The live Step 12 knobs are real config: a knobbed model round-trips.
+    knobbed_cfg = MantisConfig(
+        h=64, policy_hidden=64, mixed_windows=True, window_attention=False
+    )
+    knobbed = MantisNet(knobbed_cfg)
+    knobbed_path = tmp_path / "knobbed.pt"
+    save_checkpoint(
+        knobbed_path,
+        knobbed,
+        torch.optim.Adam(knobbed.parameters()),
+        1,
+        np.random.default_rng(0),
+    )
+    reloaded = load_model(knobbed_path)
+    assert dataclasses.asdict(reloaded.cfg) == dataclasses.asdict(knobbed_cfg)
+    assert not hasattr(reloaded.blocks[0], "wa_bias")
 
 
 def test_lab_cell_init_validates_format_build_and_model_kw(tmp_path):
@@ -417,7 +434,8 @@ def test_lab_cell_init_validates_format_build_and_model_kw(tmp_path):
     with pytest.raises(ValueError, match="model_kw"):
         load_lab_cell(path, target, {"h": 64, "policy_hidden": 64, "heads": 8})
 
-    # Legacy knob keys naming the baked architecture are stripped, not compared.
+    # Legacy knob keys naming the baked architecture are stripped; the live
+    # window_attention knob at its default compares equal through the config.
     load_lab_cell(path, target, {**model_kw, "axis_bias": True, "cell_pass": True,
                                  "joint_incidence": True, "window_attention": True})
 

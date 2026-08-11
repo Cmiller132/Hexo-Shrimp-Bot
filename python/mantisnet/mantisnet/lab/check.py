@@ -14,7 +14,7 @@ from ..builder import AXES, collate, from_position
 from ..klent import telemetry
 from .cohort import CohortCase, corpus_cohort, selfplay_cohort
 from .families import load_checkpoint
-from .variants import VARIANTS, build_variant, variant_spec
+from .variants import VARIANTS, build_variant, scoped_collate, variant_spec
 
 
 _BATCH_TENSORS = (
@@ -151,7 +151,7 @@ def _check_decoder_coverage(model, cases, device: str, collate_fn) -> int:
     checked = 0
     for case in cases:
         pos = case.position
-        graph = from_position(pos)
+        graph = from_position(pos, mixed_windows=model.cfg.mixed_windows)
         batch = _collate_cases([case], collate_fn)
         expected_bg = {
             i
@@ -177,6 +177,8 @@ def _check_decoder_coverage(model, cases, device: str, collate_fn) -> int:
 
 
 def _assert_batches_equal(rust, python) -> None:
+    if rust.mixed_windows != python.mixed_windows:
+        raise ValueError("Rust/Python builder disagreement in window scope")
     shape = (rust.n_pos, rust.max_t, rust.max_w, rust.n_cells)
     expected_shape = (python.n_pos, python.max_t, python.max_w, python.n_cells)
     if shape != expected_shape:
@@ -187,16 +189,18 @@ def _assert_batches_equal(rust, python) -> None:
             raise ValueError(f"Rust/Python builder disagreement in {name}")
 
 
-def _check_builder_agreement(cases, collate_fn) -> int:
+def _check_builder_agreement(cases, collate_fn, mixed_windows: bool) -> int:
     batch = _collate_cases(cases, collate_fn)
     _assert_batches_equal(
         batch,
-        collate([from_position(case.position) for case in cases]),
+        collate(
+            [from_position(case.position, mixed_windows=mixed_windows) for case in cases]
+        ),
     )
     for case in cases:
         _assert_batches_equal(
             _collate_cases([case], collate_fn),
-            collate([from_position(case.position)]),
+            collate([from_position(case.position, mixed_windows=mixed_windows)]),
         )
     return len(cases)
 
@@ -221,7 +225,11 @@ def contract_battery(
             model, cases, device, collate_fn
         ),
         "python_rust_positions": (
-            _check_builder_agreement(cases, collate_fn) if rust_collate else None
+            _check_builder_agreement(
+                cases, collate_fn, model.cfg.mixed_windows
+            )
+            if rust_collate
+            else None
         ),
         "atol": 1e-5,
         "logit_rtol": _LOGIT_RTOL,
@@ -257,6 +265,7 @@ def run_check(
         model = loaded.model
         spec = variant_spec("mantis")
         identity = {"checkpoint": str(Path(checkpoint)), **loaded.metadata}
+        variant = "mantis"
     else:
         if variant not in VARIANTS:
             raise ValueError(f"unknown variant {variant!r}; choose from {sorted(VARIANTS)}")
@@ -287,7 +296,7 @@ def run_check(
         **contract_battery(
             model,
             cases,
-            collate_fn=spec.collate,
+            collate_fn=scoped_collate(variant, model),
             device=device,
             rust_collate=spec.rust_collate,
         ),

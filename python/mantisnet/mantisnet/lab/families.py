@@ -14,7 +14,14 @@ from typing import Callable, Mapping
 import torch
 from torch import Tensor, nn
 
-from ..builder import DEC_CLASSES, NEAREST_BUCKETS, NUM_PATTERNS, OCC_CLASSES
+from ..builder import (
+    DEC_CLASSES,
+    NEAREST_BUCKETS,
+    OCC_CLASSES,
+    TERN_DEC_CLASSES,
+    TERN_OCC_CLASSES,
+    TERN_PATTERNS,
+)
 from ..klent.graft import _PARENT_ROW
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
 from ..model import MantisConfig, MantisNet, ModelOutput, strip_legacy_knobs
@@ -243,7 +250,9 @@ class _Knobs:
     cell_pass: bool
     cell_pass_from: int
     joint_incidence: bool
+    # Live Step 12 knobs: any combination is instantiable in this build.
     window_attention: bool
+    mixed_windows: bool
 
 
 def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
@@ -258,6 +267,12 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         for index in range(blocks)
         if f"blocks.{index}.u_cp.weight" in state_dict
     ]
+    window_table = state_dict.get("window_table.weight")
+    mixed = (
+        isinstance(window_table, Tensor)
+        and window_table.ndim == 2
+        and window_table.shape[0] == TERN_PATTERNS
+    )
     e_ws = state_dict.get("blocks.0.e_ws.weight")
     return _Knobs(
         axis_bias="blocks.0.axis_bias" in state_dict,
@@ -267,13 +282,15 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         joint_incidence=(
             isinstance(e_ws, Tensor)
             and e_ws.ndim == 2
-            and e_ws.shape[0] == OCC_CLASSES
+            and e_ws.shape[0] == (TERN_OCC_CLASSES if mixed else OCC_CLASSES)
         ),
         window_attention="blocks.0.wa_bias" in state_dict,
+        mixed_windows=mixed,
     )
 
 
-# The one profile this build instantiates.
+# The profile this build instantiates, at the live knobs' default values;
+# a deviation in a live knob is a config, not a refusal.
 _BAKED = _Knobs(
     axis_bias=True,
     off_axis_bias=False,
@@ -281,6 +298,7 @@ _BAKED = _Knobs(
     cell_pass_from=0,
     joint_incidence=True,
     window_attention=True,
+    mixed_windows=False,
 )
 
 
@@ -321,6 +339,12 @@ def _claims(
     knobs = _knob_profile(state_dict, blocks)
     if set(state_dict) != _base_keys(blocks, knobs) | (extras or set()):
         return False
+    if knobs.mixed_windows:
+        # The ternary scope widens the joint decoder tables; slot-class
+        # families predate it and never carry the mixed vocabulary.
+        if table_rows != DEC_CLASSES:
+            return False
+        table_rows = TERN_DEC_CLASSES
     stone = _shape(state_dict, "stone_table.weight")
     readout = _shape(state_dict, "mlp_q.out.weight")
     return bool(
@@ -357,7 +381,7 @@ def _expected_shapes(
     )
     shapes = {
         "stone_table.weight": (2, h),
-        "window_table.weight": (2 * NUM_PATTERNS, h),
+        "window_table.weight": (cfg.window_vocab, h),
         "token_base": (h,),
         "token_moves.weight": (2, h),
         "ln_out.weight": (h,), "ln_out.bias": (h,),
@@ -377,31 +401,37 @@ def _expected_shapes(
         "mlp_v.2.weight": (k, vh), "mlp_v.2.bias": (k,),
     }
     fh = cfg.ffn_factor * h
+    ln_names = ["ln_ws_s", "ln_ws_w", "ln_cp_in", "ln_cp_w", "ln_sw_w",
+                "ln_sw_s", "ln_attn", "ln_ffn"]
+    biased = ["wq", "wv", "wo"]
+    bias_free = ["wk"]
+    if cfg.window_attention:
+        ln_names.append("ln_wa")
+        biased += ["wq_wa", "wv_wa", "wo_wa"]
+        bias_free.append("wk_wa")
     for index in range(cfg.blocks):
         prefix = f"blocks.{index}."
-        for name in (
-            "ln_ws_s", "ln_ws_w", "ln_cp_in", "ln_cp_w", "ln_wa",
-            "ln_sw_w", "ln_sw_s", "ln_attn", "ln_ffn"
-        ):
+        for name in ln_names:
             shapes[prefix + name + ".weight"] = (h,)
             shapes[prefix + name + ".bias"] = (h,)
         for name in ("u", "v", "u_cp"):
             shapes[prefix + name + ".weight"] = (h, h)
         for name in ("e_ws", "e_sw"):
-            shapes[prefix + name + ".weight"] = (OCC_CLASSES, h)
-        shapes[prefix + "e_cp.weight"] = (DEC_CLASSES, h)
+            shapes[prefix + name + ".weight"] = (cfg.occ_classes, h)
+        shapes[prefix + "e_cp.weight"] = (cfg.dec_classes, h)
         for name in ("mlp_w", "mlp_s", "mlp_cp"):
             shapes[prefix + name + ".lin_a.weight"] = (h, h)
             shapes[prefix + name + ".lin_a.bias"] = (h,)
             shapes[prefix + name + ".lin_b.weight"] = (h, h)
             shapes[prefix + name + ".out.weight"] = (h, h)
             shapes[prefix + name + ".out.bias"] = (h,)
-        for name in ("wq", "wv", "wo", "wq_wa", "wv_wa", "wo_wa"):
+        for name in biased:
             shapes[prefix + name + ".weight"] = (h, h)
             shapes[prefix + name + ".bias"] = (h,)
-        for name in ("wk", "wk_wa"):
+        for name in bias_free:
             shapes[prefix + name + ".weight"] = (h, h)
-        shapes[prefix + "wa_bias"] = (cfg.heads, WA_CLASSES)
+        if cfg.window_attention:
+            shapes[prefix + "wa_bias"] = (cfg.heads, WA_CLASSES)
         shapes[prefix + "dist_bias"] = (cfg.heads, cfg.d_max + 2)
         shapes[prefix + "axis_bias"] = (cfg.heads, cfg.d_max)
         shapes[prefix + "ffn.0.weight"] = (fh, h)
@@ -487,7 +517,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         )
 
     knobs = _knob_profile(state_dict, blocks)
-    if knobs != _BAKED:
+    if replace(knobs, window_attention=True, mixed_windows=False) != _BAKED:
         raise ValueError(
             f"state dict trunk profile {knobs} is not the baked architecture "
             f"{_BAKED}; checkpoints predating a baked stage are not "
@@ -505,13 +535,19 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         policy_hidden=policy_hidden,
         value_hidden=value_hidden,
         dropout=0.0,
+        mixed_windows=knobs.mixed_windows,
+        window_attention=knobs.window_attention,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")
     critic = _require_tensor(state_dict, "mlp_q.out.weight")
-    if table.ndim != 2 or table.shape[0] not in {_SLOT_CLASSES, DEC_CLASSES}:
+    allowed_rows = (
+        {TERN_DEC_CLASSES} if knobs.mixed_windows else {_SLOT_CLASSES, DEC_CLASSES}
+    )
+    if table.ndim != 2 or table.shape[0] not in allowed_rows:
         raise ValueError(
-            f"tensor 'e_pw.weight' has shape {tuple(table.shape)}, expected (3, H) or ({DEC_CLASSES}, H)"
+            f"tensor 'e_pw.weight' has shape {tuple(table.shape)}, expected rows "
+            f"in {sorted(allowed_rows)} for this window scope"
         )
     if critic.ndim != 2 or critic.shape[0] not in {1, 2, 3}:
         raise ValueError(

@@ -13,16 +13,22 @@ global token. It has no cell grid, no coordinate inputs, and no empty-cell
 nodes.
 
 A **window** is six consecutive cells along one hex axis. A window is **live**
-when it contains at least one stone and stones of only one colour; mixed
-windows are excluded. The input representation is D6-invariant by
-construction: every input -- stone colour (own/opponent relative to the side to
-move), window occupancy pattern, joint slot classes, hex-distance buckets, and
+when it contains at least one stone and stones of only one colour; by default
+mixed windows are excluded. The transient `mixed_windows` config knob
+(MANTIS_GRAFT_SPEC Step 12) widens the scope to every nonempty candidate
+window under ternary slot patterns (empty/own/opponent, 377 canonical
+classes) with correspondingly wider joint slot-class tables (726 decoder,
+1458 incidence); batches must be built with the model's scope, and the trunk
+refuses a mismatch. The input representation is D6-invariant by construction
+under either scope: every input -- stone colour (own/opponent relative to the
+side to move), window pattern, joint slot classes, hex-distance buckets, and
 `moves_remaining` -- is invariant under the twelve board symmetries.
 
 The **trunk** interleaves bipartite message passing (stones to/from windows)
 with self-attention over the stone set biased by hex distance. A cell-pass
-relay lets windows exchange state through shared empty cells, and an optional
-window-attention layer types window pairs by colinear/crossing relations.
+relay lets windows exchange state through shared empty cells, and a
+window-attention layer (the live `window_attention` knob, on by default)
+types window pairs by colinear/crossing relations.
 
 Three heads read the trunk output:
 
@@ -207,10 +213,13 @@ against a named baseline arm.
 
 The family registry identifies a checkpoint structurally from its model key
 set, native critic-readout width, and decoder-table row count. Configuration
-is inferred from state-dict tensor shapes. Shipped scoreable families:
-`trinomial-joint`, `bipolar-joint`, `scalar-joint`, `scalar-slot`,
-`bipolar-slot`, and `factored-slot`. Slot-class decoder tables are expanded to
-93 joint classes at load time.
+is inferred from state-dict tensor shapes, including the live Step 12 knobs
+(`mixed_windows` from the window-table rows, `window_attention` from the
+presence of §5.1c tensors). Shipped scoreable families: `trinomial-joint`,
+`bipolar-joint`, `scalar-joint`, `scalar-slot`, `bipolar-slot`, and
+`factored-slot`. Slot-class decoder tables are expanded to 93 joint classes
+at load time; mixed-scope checkpoints carry the ternary joint tables
+natively.
 
 ### Measurement commands
 
@@ -296,7 +305,7 @@ The top-level `mantisnet` package exports:
 | `collate_positions`, `collate_prefixes` | Shared Rust encoder path |
 | `policy_loss`, `value_loss`, `value_target` | Training losses and targets |
 | `param_groups` | Decay/no-decay optimizer groups |
-| `MODEL_REPR_VERSION`, `NUM_PATTERNS`, `DEC_CLASSES` | Representation constants |
+| `MODEL_REPR_VERSION`, `NUM_PATTERNS`, `DEC_CLASSES`, `TERN_PATTERNS`, `TERN_DEC_CLASSES`, `TERN_OCC_CLASSES` | Representation constants |
 
 ## Run / test
 

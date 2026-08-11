@@ -23,7 +23,7 @@ from .train import (
     pack_inference_indices,
     sample_sizes,
 )
-from .variants import build_variant, count_parameters, variant_spec
+from .variants import build_variant, count_parameters, scoped_collate
 
 
 # (label, inclusive lower bound, inclusive upper bound or None).
@@ -149,7 +149,7 @@ def evaluate_model(
         pair_budget=pair_budget,
         cell_budget=cell_budget,
     )
-    collate = variant_spec(variant).collate
+    collate = scoped_collate(variant, model)
     device_type = torch.device(device).type
     expected_autocast = device_type == "cuda"
     if autocast is not None and autocast is not expected_autocast:

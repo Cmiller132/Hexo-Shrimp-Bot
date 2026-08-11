@@ -28,6 +28,9 @@ from .builder import (
     NEAREST_BUCKETS,
     NUM_PATTERNS,
     OCC_CLASSES,
+    TERN_DEC_CLASSES,
+    TERN_OCC_CLASSES,
+    TERN_PATTERNS,
     Batch,
 )
 from .segments import segment_ids, segment_max
@@ -47,12 +50,31 @@ class MantisConfig:
     policy_hidden: int = 128  # P_H
     value_hidden: int = 128  # V_H
     dropout: float = 0.0
+    # Step 12 knob: all-nonempty window scope under the ternary tables. The
+    # batch must be built with the same scope; the trunk refuses a mismatch.
+    mixed_windows: bool = False
+    # Step 12 matrix arm: the §5.1c typed window-pair attention stage.
+    window_attention: bool = True
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
             raise ValueError(f"H={self.h} must divide into A={self.heads} heads")
         if self.value_bins % 2 == 0:
             raise ValueError(f"K={self.value_bins} must be odd so an exact-zero bin exists")
+
+    # Class-table sizes follow the window scope: binary live-window tables or
+    # the ternary all-nonempty tables (MANTIS_GRAFT_SPEC §4, Step 12).
+    @property
+    def window_vocab(self) -> int:
+        return TERN_PATTERNS if self.mixed_windows else 2 * NUM_PATTERNS
+
+    @property
+    def dec_classes(self) -> int:
+        return TERN_DEC_CLASSES if self.mixed_windows else DEC_CLASSES
+
+    @property
+    def occ_classes(self) -> int:
+        return TERN_OCC_CLASSES if self.mixed_windows else OCC_CLASSES
 
     # Bucket indices of the attention bias table (§4.1): distances 1..D_MAX
     # occupy 0..D_MAX-1, then SELF, then TOKEN. TOKEN wins on the token-token
@@ -99,7 +121,6 @@ LEGACY_BAKED_KNOBS: dict[str, object] = {
     "cell_pass_from": 0,
     "cell_pass_rounds": 1,
     "joint_incidence": True,
-    "window_attention": True,
 }
 
 
@@ -179,6 +200,21 @@ def _class_term(counts: Tensor, weight: Tensor, dtype: torch.dtype) -> Tensor:
     return (counts @ weight).to(dtype)
 
 
+def _edge_class_sum(
+    weight: Tensor, edge_class: Tensor, edge_dest: Tensor, n_dest: int, dtype: torch.dtype
+) -> Tensor:
+    """A destination's summed slot-class rows, gathered per edge.
+
+    The mixed-window scope's class vocabularies (726/1458) make the histogram
+    form of :func:`_class_term` prohibitively wide, so the same sum runs as an
+    embedding gather plus scatter-add, accumulated fp32 like the histogram
+    matmul.
+    """
+    rows = weight.index_select(0, edge_class).float()
+    out = torch.zeros(n_dest, weight.shape[1], dtype=torch.float32, device=weight.device)
+    return out.index_add_(0, edge_dest, rows).to(dtype)
+
+
 
 
 class _PairMlp(nn.Module):
@@ -209,28 +245,29 @@ class _Block(nn.Module):
         self.ln_ws_s = nn.LayerNorm(h)
         self.ln_ws_w = nn.LayerNorm(h)
         self.u = nn.Linear(h, h, bias=False)
-        self.e_ws = nn.Embedding(OCC_CLASSES, h)
+        self.e_ws = nn.Embedding(cfg.occ_classes, h)
         self.mlp_w = _PairMlp(h, h, h)
         # §5.1b window <- windows through their shared empty cells.
         self.ln_cp_in = nn.LayerNorm(h)
         self.u_cp = nn.Linear(h, h, bias=False)
-        self.e_cp = nn.Embedding(DEC_CLASSES, h)
+        self.e_cp = nn.Embedding(cfg.dec_classes, h)
         self.ln_cp_w = nn.LayerNorm(h)
         self.mlp_cp = _PairMlp(h, h, h)
         # §5.1c window <- windows through typed pair relations.
-        self.ln_wa = nn.LayerNorm(h)
-        self.wq_wa = nn.Linear(h, h)
-        self.wk_wa = nn.Linear(h, h, bias=False)
-        self.wv_wa = nn.Linear(h, h)
-        self.wo_wa = nn.Linear(h, h)
-        self.wa_bias = nn.Parameter(
-            torch.zeros(cfg.heads, window_pairs.WA_CLASSES)
-        )
+        if cfg.window_attention:
+            self.ln_wa = nn.LayerNorm(h)
+            self.wq_wa = nn.Linear(h, h)
+            self.wk_wa = nn.Linear(h, h, bias=False)
+            self.wv_wa = nn.Linear(h, h)
+            self.wo_wa = nn.Linear(h, h)
+            self.wa_bias = nn.Parameter(
+                torch.zeros(cfg.heads, window_pairs.WA_CLASSES)
+            )
         # §5.2 stone <- windows
         self.ln_sw_w = nn.LayerNorm(h)
         self.ln_sw_s = nn.LayerNorm(h)
         self.v = nn.Linear(h, h, bias=False)
-        self.e_sw = nn.Embedding(OCC_CLASSES, h)
+        self.e_sw = nn.Embedding(cfg.occ_classes, h)
         self.mlp_s = _PairMlp(h, h, h)
         # §5.3 stone self-attention + token
         self.ln_attn = nn.LayerNorm(h)
@@ -313,7 +350,8 @@ class _Block(nn.Module):
         # §5.1: windows aggregate their stones. Sum, not mean — the count is
         # signal. The class term of each pass is a dense ``counts @ table``
         # whose gradient is another matmul, not a per-entry gather whose
-        # backward scatters into a few rows.
+        # backward scatters into a few rows; the mixed scope's wide ternary
+        # vocabularies take the gathered form instead.
         x = self.u(self.ln_ws_s(s))
         agg = message_passing.aggregate_to_windows(
             x,
@@ -323,7 +361,12 @@ class _Block(nn.Module):
             plan.run_window,
             w.shape[0],
         )
-        agg = agg + _class_term(plan.window_counts, self.e_ws.weight, agg.dtype)
+        if cfg.mixed_windows:
+            agg = agg + _edge_class_sum(
+                self.e_ws.weight, batch.inc_class, batch.inc_window, w.shape[0], agg.dtype
+            )
+        else:
+            agg = agg + _class_term(plan.window_counts, self.e_ws.weight, agg.dtype)
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
         w = self._cell_pass(
@@ -336,7 +379,8 @@ class _Block(nn.Module):
             batch.relay_cls_ptr,
             batch.relay_ccell,
         )
-        w = self._window_attention(w, pairs)
+        if cfg.window_attention:
+            w = self._window_attention(w, pairs)
 
         # §5.2: stones aggregate their windows.
         y = self.v(self.ln_sw_w(w))
@@ -348,7 +392,12 @@ class _Block(nn.Module):
             plan.run_window,
             s.shape[0],
         )
-        agg = agg + _class_term(plan.stone_counts, self.e_sw.weight, agg.dtype)
+        if cfg.mixed_windows:
+            agg = agg + _edge_class_sum(
+                self.e_sw.weight, batch.inc_class, batch.inc_stone, s.shape[0], agg.dtype
+            )
+        else:
+            agg = agg + _class_term(plan.stone_counts, self.e_sw.weight, agg.dtype)
         s = s + self.drop(self.mlp_s(self.ln_sw_s(s), agg))
 
         # §5.3: attention over [token; stones], block-diagonal per position.
@@ -396,9 +445,11 @@ class MantisNet(nn.Module):
         self.cfg = cfg
         h = cfg.h
 
-        # §3: input embeddings.
+        # §3: input embeddings. The window vocabulary follows the scope:
+        # binary colour x pattern, or the ternary canonical patterns whose
+        # classes subsume colour and status.
         self.stone_table = nn.Embedding(2, h)  # own / opp
-        self.window_table = nn.Embedding(2 * NUM_PATTERNS, h)  # colour x pattern
+        self.window_table = nn.Embedding(cfg.window_vocab, h)
         self.token_base = nn.Parameter(torch.empty(h))
         self.token_moves = nn.Embedding(2, h)  # moves_remaining in {1, 2}
 
@@ -408,7 +459,7 @@ class MantisNet(nn.Module):
         # §6 policy decoder. MLP_P([h_a; g]) as a _PairMlp, so the g half of
         # its first layer runs per position, not per legal cell.
         self.p = nn.Linear(h, h, bias=False)
-        self.e_pw = nn.Embedding(DEC_CLASSES, h)
+        self.e_pw = nn.Embedding(cfg.dec_classes, h)
         self.e_bg = nn.Embedding(NEAREST_BUCKETS, h)
         self.mlp_p = _PairMlp(h, cfg.policy_hidden, 1)
 
@@ -416,7 +467,7 @@ class MantisNet(nn.Module):
         # parameters everywhere, three outcome logits per legal cell. KLENT's
         # categorical critic head.
         self.q = nn.Linear(h, h, bias=False)
-        self.e_qw = nn.Embedding(DEC_CLASSES, h)
+        self.e_qw = nn.Embedding(cfg.dec_classes, h)
         self.e_qbg = nn.Embedding(NEAREST_BUCKETS, h)
         self.mlp_q = _PairMlp(h, cfg.policy_hidden, CRITIC_LOGITS)
 
@@ -460,6 +511,12 @@ class MantisNet(nn.Module):
 
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""
+        cfg = self.cfg
+        if batch.mixed_windows != cfg.mixed_windows:
+            raise ValueError(
+                f"batch window scope mixed_windows={batch.mixed_windows} does "
+                f"not match the model's mixed_windows={cfg.mixed_windows}"
+            )
         s = self.stone_table(batch.stone_own)
         w = self.window_table(batch.window_feat)
         g = self.token_base + self.token_moves(batch.moves_idx)
@@ -470,9 +527,10 @@ class MantisNet(nn.Module):
             batch.inc_class,
             s.shape[0],
             w.shape[0],
-            OCC_CLASSES,
+            cfg.occ_classes,
+            histograms=not cfg.mixed_windows,
         )
-        pairs = self._pair_tables(batch)
+        pairs = self._pair_tables(batch) if cfg.window_attention else None
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         for block in self.blocks:
             s, w, g = block(s, w, g, batch, seq_lens, plan, pairs)
@@ -483,7 +541,18 @@ class MantisNet(nn.Module):
 
         ``dtype`` comes from a head linear the caller has already run, so the
         aggregation is built in whatever precision autocast chose for the head
-        GEMMs that consume it, without this forward assuming which that is."""
+        GEMMs that consume it, without this forward assuming which that is.
+
+        Binary scope: the parameter-free coefficient rows (window sum, class
+        histogram, background one-hot). Mixed scope: the histogram is too wide
+        at 726 classes, so the shared part is only the summed window rows and
+        each head adds its own gathered class rows in ``_cell_scores``."""
+        if self.cfg.mixed_windows:
+            gathered = w.index_select(0, batch.dec_window).float()
+            rows = torch.zeros(
+                batch.cell_pos.shape[0], w.shape[1], dtype=torch.float32, device=w.device
+            )
+            return rows.index_add_(0, batch.dec_cell, gathered).to(dtype)
         return decoder.aggregate(
             w.to(dtype),
             batch.dec_window,
@@ -507,11 +576,29 @@ class MantisNet(nn.Module):
         """One head's ``(N_cells, d_out)`` readout rows, off the shared
         aggregation. The head's projection and both its embedding tables live
         in the matrix that reads an aggregate row; the token half of the MLP
-        runs per position."""
-        matrix = decoder.head_matrix(
-            lin.weight, e_w.weight, e_bg.weight, mlp.lin_a.weight
-        )
-        pre = F.linear(rows, matrix, mlp.lin_a.bias)
+        runs per position.
+
+        The mixed scope composes the same quantity without the histogram:
+        ``lin_a(proj @ Σw + Σ e_class rows + e_bg row) + bias``, with the two
+        embedding sums gathered per edge and accumulated fp32."""
+        if self.cfg.mixed_windows:
+            n_cells, h = rows.shape[0], e_w.weight.shape[1]
+            extra = torch.zeros(
+                n_cells, h, dtype=torch.float32, device=rows.device
+            )
+            extra.index_add_(
+                0, batch.dec_cell, e_w.weight.index_select(0, batch.dec_class).float()
+            )
+            extra.index_add_(
+                0, batch.bg_cell, e_bg.weight.index_select(0, batch.bg_bucket).float()
+            )
+            base = F.linear(rows, lin.weight) + extra.to(rows.dtype)
+            pre = mlp.lin_a(base)
+        else:
+            matrix = decoder.head_matrix(
+                lin.weight, e_w.weight, e_bg.weight, mlp.lin_a.weight
+            )
+            pre = F.linear(rows, matrix, mlp.lin_a.bias)
         return mlp.out(F.relu(pre + g_half.index_select(0, batch.cell_pos)))
 
     def policy_head(self, w: Tensor, g: Tensor, batch: Batch) -> Tensor:

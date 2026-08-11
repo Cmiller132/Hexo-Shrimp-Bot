@@ -230,15 +230,19 @@ fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'
 ///
 /// The production twin of `mantisnet.builder`'s Python path, held equal to it
 /// field for field by that package's parity tests. Raises `ValueError` on a
-/// terminal position.
+/// terminal position. `mixed_windows` selects the window scope (Step 12
+/// knob): live one-colour windows by default, every nonempty candidate under
+/// the ternary tables when `true`.
 #[pyfunction]
+#[pyo3(signature = (positions, mixed_windows = false))]
 fn build_batch<'py>(
     py: Python<'py>,
     positions: Vec<PyRef<'py, Position>>,
+    mixed_windows: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let owned: Vec<engine::Position> = positions.iter().map(|p| p.inner.clone()).collect();
     let raw = py
-        .detach(|| encoder::build_batch(&owned))
+        .detach(|| encoder::build_batch(&owned, mixed_windows))
         .map_err(PyValueError::new_err)?;
     raw_to_dict(py, raw)
 }
@@ -246,13 +250,15 @@ fn build_batch<'py>(
 /// Replay each game's first `ts[i]` placements and build the batch, in
 /// parallel — the fitting path, where a stored position is a move prefix.
 #[pyfunction]
+#[pyo3(signature = (games, ts, mixed_windows = false))]
 fn build_batch_prefixes<'py>(
     py: Python<'py>,
     games: Vec<Vec<(i16, i16)>>,
     ts: Vec<usize>,
+    mixed_windows: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let raw = py
-        .detach(|| encoder::build_batch_prefixes(&games, &ts))
+        .detach(|| encoder::build_batch_prefixes(&games, &ts, mixed_windows))
         .map_err(PyValueError::new_err)?;
     raw_to_dict(py, raw)
 }

@@ -107,6 +107,71 @@ _OCC_CLASS = _orbit_classes(occupied=True)
 DEC_CLASSES = int(_DEC_CLASS.max()) + 1
 OCC_CLASSES = int(_OCC_CLASS.max()) + 1
 
+
+# --- Ternary tables for the mixed-window scope (MANTIS_GRAFT_SPEC §4, Step 12).
+#
+# Under the mixed scope every nonempty candidate window is a node, so a slot
+# is empty, own, or opponent: a window is a base-3 pattern over its six slots
+# (digit at 3^k is slot k, own = 1, opp = 2, mover-relative). A reflection
+# reverses the digit string; canonical form is the numeric minimum of the
+# pair. Own-only / opponent-only / mixed status is a pure function of the
+# canonical pattern (reversal permutes slots, never digits), so no separate
+# status feature exists. The all-own and all-opp patterns are terminal-only
+# and unreachable from a live position; they keep their vocabulary rows so
+# the class counts stay the asserted laws.
+
+_POW3 = 3 ** np.arange(WINDOW_LEN, dtype=np.int64)
+_TERN_DIGITS = (np.arange(729)[:, None] // _POW3[None, :]) % 3  # (729, 6)
+_TERN_REV = (_TERN_DIGITS[:, ::-1] * _POW3[None, :]).sum(axis=1)
+_TERN_CANON = np.minimum(np.arange(729, dtype=np.int64), _TERN_REV)
+
+# 378 orbits of 729 patterns under reversal (27 palindromes); 377 nonempty.
+_TERN_RANK = np.full(729, -1, dtype=np.int64)
+_TERN_RANK[np.unique(_TERN_CANON[1:])] = np.arange(377)
+_TERN_RANK = _TERN_RANK[_TERN_CANON]
+TERN_PATTERNS = 377
+assert len(np.unique(_TERN_CANON)) == 378 and int(_TERN_RANK.max()) + 1 == TERN_PATTERNS
+
+
+def _tern_joint_classes() -> tuple[np.ndarray, np.ndarray]:
+    """The ternary joint ``(pattern, slot)`` orbit tables, decoder and incidence.
+
+    One enumeration of the involution ``(p, s) -> (reverse3(p), 5 - s)`` over
+    all 729 x 6 pairs in ascending ``(p, s)`` order — 2187 orbits, asserted —
+    then re-ranked restrictions: empty slots of nonempty patterns give the
+    decoder table, occupied slots the incidence table. Their 726 + 1458
+    orbits are the asserted 2184 nonempty-pattern classes.
+    """
+    joint = np.full((729, WINDOW_LEN), -1, dtype=np.int64)
+    nxt = 0
+    for p in range(729):
+        rev = int(_TERN_REV[p])
+        for s in range(WINDOW_LEN):
+            if (p, s) <= (rev, WINDOW_LEN - 1 - s):
+                joint[p, s] = nxt
+                nxt += 1
+            else:
+                joint[p, s] = joint[rev, WINDOW_LEN - 1 - s]
+    assert nxt == 2187
+
+    def rerank(mask: np.ndarray) -> np.ndarray:
+        ids = np.unique(joint[mask])
+        table = np.full((729, WINDOW_LEN), -1, dtype=np.int64)
+        table[mask] = np.searchsorted(ids, joint[mask])
+        return table
+
+    empty_slot = _TERN_DIGITS == 0
+    dec = rerank(empty_slot & (np.arange(729) != 0)[:, None])
+    occ = rerank(~empty_slot)
+    return dec, occ
+
+
+_TERN_DEC_CLASS, _TERN_OCC_CLASS = _tern_joint_classes()
+TERN_DEC_CLASSES = int(_TERN_DEC_CLASS.max()) + 1
+TERN_OCC_CLASSES = int(_TERN_OCC_CLASS.max()) + 1
+assert TERN_DEC_CLASSES == 726 and TERN_OCC_CLASSES == 1458
+assert TERN_DEC_CLASSES + TERN_OCC_CLASSES == 2184
+
 # Coordinate packing: q, r fit i16, so 21 bits of headroom per component is
 # collision-free. Window identity packs the axis into the low two bits.
 _QSHIFT = 1 << 21
@@ -140,6 +205,9 @@ class PositionGraph:
     bg_cell: np.ndarray  # (n_bg,) int64: cells in no live window
     bg_bucket: np.ndarray  # (n_bg,) int64 in 0..7: nearest-stone bucket
     moves_remaining: int  # 1 or 2
+    # Window scope: False = live one-colour windows with binary classes,
+    # True = all nonempty windows with ternary classes (Step 12 knob).
+    mixed_windows: bool = False
 
     @property
     def n_stones(self) -> int:
@@ -156,6 +224,8 @@ def build(
     mover: int,
     legal_qr: np.ndarray,
     moves_remaining: int,
+    *,
+    mixed_windows: bool = False,
 ) -> PositionGraph:
     """Build one position's graph from the §11 input list.
 
@@ -163,6 +233,10 @@ def build(
     ``mover`` the side to move, ``legal_qr`` (n_legal, 2) int in engine legal
     order. Raises ``ValueError`` for a terminal position (no legal moves):
     terminal positions are a builder error, not a silent default.
+
+    ``mixed_windows`` selects the window scope: the default keeps live
+    one-colour windows under the binary tables; ``True`` keeps every nonempty
+    candidate under the ternary tables (Step 12 knob).
     """
     stone_qr = np.asarray(stone_qr, dtype=np.int64).reshape(-1, 2)
     stone_owner = np.asarray(stone_owner, dtype=np.int64).reshape(-1)
@@ -193,6 +267,7 @@ def build(
             bg_cell=np.arange(len(legal_qr), dtype=np.int64),
             bg_bucket=np.full(len(legal_qr), NEAREST_BUCKETS - 1, dtype=np.int64),
             moves_remaining=moves_remaining,
+            mixed_windows=mixed_windows,
         )
 
     stone_key = _pack(stone_qr)
@@ -233,30 +308,42 @@ def build(
     own_mask = (occ_own.astype(np.int64) << ks[None, :]).sum(axis=1)
     opp_mask = (occ_opp.astype(np.int64) << ks[None, :]).sum(axis=1)
 
-    # Live: stones of exactly one colour (§3.2). Every candidate has >= 1
-    # stone by construction. A full six is a completed win, which a
-    # non-terminal position cannot contain — and terminals were refused above.
-    live = (own_mask > 0) != (opp_mask > 0)
-    live_key = uniq_key[live]
-    colour = (opp_mask[live] > 0).astype(np.int64)
-    pattern = own_mask[live] | opp_mask[live]
-    rank = _PATTERN_RANK[_CANON[pattern]]
-    window_feat = colour * NUM_PATTERNS + rank
-    window_id = np.column_stack([u_axis[live], u_start[live, 0], u_start[live, 1]])
+    if mixed_windows:
+        # Every candidate is nonempty (it came through a stone), so all are
+        # kept. The ternary pattern carries the colours; a full six-own or
+        # six-opp digit string is a completed win, which a non-terminal
+        # position cannot contain — and terminals were refused above.
+        keep = np.ones(len(uniq_key), dtype=bool)
+        pattern = ((occ_own + 2 * occ_opp) * _POW3[None, :]).sum(axis=1)
+        window_feat = _TERN_RANK[pattern]
+        occ_table, dec_table = _TERN_OCC_CLASS, _TERN_DEC_CLASS
+    else:
+        # Live: stones of exactly one colour (§3.2). Every candidate has >= 1
+        # stone by construction. A full six is a completed win, which a
+        # non-terminal position cannot contain — and terminals were refused
+        # above.
+        keep = (own_mask > 0) != (opp_mask > 0)
+        colour = (opp_mask[keep] > 0).astype(np.int64)
+        pattern = own_mask[keep] | opp_mask[keep]
+        rank = _PATTERN_RANK[_CANON[pattern]]
+        window_feat = colour * NUM_PATTERNS + rank
+        occ_table, dec_table = _OCC_CLASS, _DEC_CLASS
+    live_key = uniq_key[keep]
+    window_id = np.column_stack([u_axis[keep], u_start[keep, 0], u_start[keep, 1]])
 
-    # Incidence: one entry per occupied slot of each live window. The class is
+    # Incidence: one entry per occupied slot of each kept window. The class is
     # joint in the window's occupancy and the stone's own slot (§4.3), off the
-    # raw mask in slot order — `pattern`, like the decoder classes below.
-    l_occupant = occupant[live]  # (n_w, 6)
+    # raw pattern in slot order — `pattern`, like the decoder classes below.
+    l_occupant = occupant[keep]  # (n_w, 6)
     w_idx, slot = np.nonzero(l_occupant >= 0)
     inc_stone = l_occupant[w_idx, slot]
     inc_window = w_idx.astype(np.int64)
-    inc_class = _OCC_CLASS[pattern[w_idx], slot]
+    inc_class = occ_table[pattern[w_idx], slot]
     if inc_class.size and inc_class.min() < 0:
         bad = int(np.argmin(inc_class))
         raise ValueError(
-            f"incidence entry {bad} pairs window mask "
-            f"{int(pattern[w_idx[bad]]):06b} with slot {int(slot[bad])}, "
+            f"incidence entry {bad} pairs window pattern "
+            f"{int(pattern[w_idx[bad]])} with slot {int(slot[bad])}, "
             f"which that window does not occupy"
         )
 
@@ -273,14 +360,14 @@ def build(
     dec_cell = flat // (3 * WINDOW_LEN)
     dec_window = wpos_clip[flat]
     # The class is joint in the window's occupancy and the candidate's own slot
-    # (§4.3), so it needs the window's raw mask in slot order — `pattern`, not
-    # the canonicalized rank the window embedding carries.
-    dec_class = _DEC_CLASS[pattern[dec_window], flat % WINDOW_LEN]
+    # (§4.3), so it needs the window's raw pattern in slot order — `pattern`,
+    # not the canonicalized rank the window embedding carries.
+    dec_class = dec_table[pattern[dec_window], flat % WINDOW_LEN]
     if dec_class.size and dec_class.min() < 0:
         bad = int(np.argmin(dec_class))
         raise ValueError(
-            f"decoder entry {bad} pairs window mask "
-            f"{int(pattern[dec_window[bad]]):06b} with slot "
+            f"decoder entry {bad} pairs window pattern "
+            f"{int(pattern[dec_window[bad]])} with slot "
             f"{int(flat[bad] % WINDOW_LEN)}, which that window already occupies"
         )
 
@@ -312,10 +399,11 @@ def build(
         bg_cell=bg_cell,
         bg_bucket=bg_bucket.astype(np.int64),
         moves_remaining=moves_remaining,
+        mixed_windows=mixed_windows,
     )
 
 
-def from_position(pos) -> PositionGraph:
+def from_position(pos, *, mixed_windows: bool = False) -> PositionGraph:
     """Build from a ``hexo_py.Position``. Terminal positions raise."""
     if pos.is_terminal:
         raise ValueError("terminal position: the builder refuses it")
@@ -327,7 +415,14 @@ def from_position(pos) -> PositionGraph:
         stone_qr = np.empty((0, 2), dtype=np.int64)
         stone_owner = np.empty(0, dtype=np.int64)
     legal = np.asarray(pos.legal_moves(), dtype=np.int64).reshape(-1, 2)
-    return build(stone_qr, stone_owner, pos.current_player, legal, pos.moves_remaining)
+    return build(
+        stone_qr,
+        stone_owner,
+        pos.current_player,
+        legal,
+        pos.moves_remaining,
+        mixed_windows=mixed_windows,
+    )
 
 
 @dataclass
@@ -340,6 +435,9 @@ class Batch:
     """
 
     n_pos: int
+    # Window scope of every graph in the batch (Step 12 knob); the model
+    # refuses a batch whose scope disagrees with its config.
+    mixed_windows: bool
     # Concatenated entity features.
     stone_own: torch.Tensor  # (N_s,) long
     window_feat: torch.Tensor  # (N_w,) long
@@ -421,12 +519,14 @@ def _relay_fields(
     dec_window: torch.Tensor,
     dec_class: torch.Tensor,
     n_windows: int,
+    mixed_windows: bool,
 ) -> dict:
-    tables = relay_tables(dec_cell, dec_window, dec_class, n_windows, DEC_CLASSES)
+    n_classes = TERN_DEC_CLASSES if mixed_windows else DEC_CLASSES
+    tables = relay_tables(dec_cell, dec_window, dec_class, n_windows, n_classes)
     return dict(zip(_RELAY_FIELDS, tables))
 
 
-def batch_from_arrays(**fields) -> Batch:
+def batch_from_arrays(*, mixed_windows: bool = False, **fields) -> Batch:
     """A ``Batch`` from per-tensor arrays, with the derived tables built here.
 
     Both external construction paths land on this one function — the
@@ -452,14 +552,19 @@ def batch_from_arrays(**fields) -> Batch:
             raise ValueError(f"{name}={value} disagrees with the derived {derived[name]}")
     return Batch(
         **derived,
+        mixed_windows=mixed_windows,
         **t,
         **_relay_fields(
-            t["dec_cell"], t["dec_window"], t["dec_class"], int(t["window_feat"].shape[0])
+            t["dec_cell"],
+            t["dec_window"],
+            t["dec_class"],
+            int(t["window_feat"].shape[0]),
+            mixed_windows,
         ),
     )
 
 
-def collate_positions(positions) -> Batch:
+def collate_positions(positions, *, mixed_windows: bool = False) -> Batch:
     """Build and collate positions with the Rust builder.
 
     ``hexo_py.build_batch`` runs in parallel with the GIL released and returns
@@ -468,10 +573,13 @@ def collate_positions(positions) -> Batch:
     """
     import hexo_py
 
-    return batch_from_arrays(**hexo_py.build_batch(list(positions)))
+    return batch_from_arrays(
+        mixed_windows=mixed_windows,
+        **hexo_py.build_batch(list(positions), mixed_windows),
+    )
 
 
-def collate_prefixes(games, ts) -> Batch:
+def collate_prefixes(games, ts, *, mixed_windows: bool = False) -> Batch:
     """Move prefixes to one collated batch: replay + build, in parallel.
 
     Stored fitting positions are move prefixes
@@ -479,13 +587,20 @@ def collate_prefixes(games, ts) -> Batch:
     """
     import hexo_py
 
-    return batch_from_arrays(**hexo_py.build_batch_prefixes(list(games), list(ts)))
+    return batch_from_arrays(
+        mixed_windows=mixed_windows,
+        **hexo_py.build_batch_prefixes(list(games), list(ts), mixed_windows),
+    )
 
 
 def collate(graphs: list[PositionGraph]) -> Batch:
     """Concatenate position graphs into one batch (§9)."""
     if not graphs:
         raise ValueError("empty batch")
+    scopes = {g.mixed_windows for g in graphs}
+    if len(scopes) != 1:
+        raise ValueError("refusing to collate graphs of mixed window scope")
+    mixed_windows = scopes.pop()
     p = len(graphs)
     ns = np.array([g.n_stones for g in graphs])
     nw = np.array([g.n_windows for g in graphs])
@@ -519,6 +634,7 @@ def collate(graphs: list[PositionGraph]) -> Batch:
 
     return Batch(
         n_pos=p,
+        mixed_windows=mixed_windows,
         stone_own=cat([g.stone_own for g in graphs]),
         window_feat=cat([g.window_feat for g in graphs]),
         window_id=window_id,
@@ -541,5 +657,7 @@ def collate(graphs: list[PositionGraph]) -> Batch:
         dec_class=dec_class,
         bg_cell=cat([g.bg_cell + cell_off[i] for i, g in enumerate(graphs)]),
         bg_bucket=cat([g.bg_bucket for g in graphs]),
-        **_relay_fields(dec_cell, dec_window, dec_class, int(win_off[-1])),
+        **_relay_fields(
+            dec_cell, dec_window, dec_class, int(win_off[-1]), mixed_windows
+        ),
     )

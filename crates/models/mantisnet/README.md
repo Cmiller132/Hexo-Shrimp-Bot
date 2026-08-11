@@ -11,11 +11,16 @@ backend) execution.
 ### Position encoder (`encoder`)
 
 Converts an `engine::Position` into the graph representation MantisNet consumes.
-Each position becomes a `Graph` of stones, live windows, stone-to-window
+Each position becomes a `Graph` of stones, windows, stone-to-window
 incidence edges, a decoder table mapping legal cells back to windows, and a
-background-distance table for legal cells that no live window covers. The
-encoder assigns reversal-invariant joint occupancy/slot classes to both incidence
-and decoder edges.
+background-distance table for legal cells that no kept window covers. The
+window scope is a build parameter (MANTIS_GRAFT_SPEC Step 12): the default
+keeps live one-colour windows under the binary occupancy tables; the mixed
+scope keeps every nonempty candidate under ternary slot patterns. The encoder
+assigns reversal-invariant joint pattern/slot classes to both incidence and
+decoder edges in the active scope's vocabulary. The wire format speaks the
+binary scope only, and a mixed bake replaces it under a
+`MODEL_REPR_VERSION` bump.
 
 The encoder has three output paths:
 

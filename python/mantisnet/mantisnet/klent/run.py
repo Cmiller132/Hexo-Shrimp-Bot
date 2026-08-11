@@ -134,7 +134,9 @@ def load_lab_cell(path: Path, model, model_kw: dict) -> None:
         raise ValueError(
             f"lab cell versions {cell['versions']} != this build {_versions()}"
         )
-    if strip_legacy_knobs(cell["model_kw"]) != strip_legacy_knobs(model_kw):
+    recorded = MantisConfig(**strip_legacy_knobs(dict(cell["model_kw"])))
+    running = MantisConfig(**strip_legacy_knobs(dict(model_kw)))
+    if recorded != running:
         raise ValueError(
             f"lab cell model_kw {cell['model_kw']} != this run's {model_kw}"
         )

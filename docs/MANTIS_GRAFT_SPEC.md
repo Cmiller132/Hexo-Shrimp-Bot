@@ -647,17 +647,30 @@ is terminal and refused; a full mixed window is legal.
 
 **Adaptation.** The builder's window walk keeps every deduplicated nonempty
 candidate instead of only one-colour ones; `window_feat` becomes the ternary
-class (+ status OWN_LIVE/OPP_LIVE/MIXED); stone incidence and decoder classes
-move from the binary 93-orbit tables to the ternary joint tables; the relay
-and (if still present) pair tables widen accordingly; Step 4's classes extend
-from 189 to the ternary 729. Full `MODEL_REPR_VERSION` bump and golden-vector
-regeneration.
+class. ACT carried a separate OWN_LIVE/OPP_LIVE/MIXED status feature, but
+reversal permutes slots and never digits, so status is a pure function of the
+canonical ternary class — the class subsumes it, and a separate status input
+would be a redundant dual encoding (implementation finding, 2026-08-10).
+Stone incidence and decoder classes move from the binary 93-orbit tables to
+the ternary joint tables (726 decoder / 1458 incidence); the relay tables
+widen accordingly; Step 4's classes extend from 189 to the ternary 729. The
+`MODEL_REPR_VERSION` bump and golden-vector regeneration happen **at bake**,
+when the wire format itself changes scope: while the knob exists the binary
+output stays byte-identical to the current version, and mixed screening
+artifacts are guarded by their recorded `model_config` plus the batch/model
+scope check.
 
 **Performance work.** Node count grows by the mixed-window fraction (measure
 it on the campaign corpus *before* building — the packet requesting this step
 must include the projected node/edge growth). Kernels are count-agnostic; the
 speed line is held or lost on node economy, so this step's performance work
-is measurement-driven layout tuning plus packer re-budgeting.
+is measurement-driven layout tuning plus packer re-budgeting. One layout
+change is forced by the vocabulary itself: the incumbent's class-histogram
+matmuls (the decoder coefficient block, the incidence `counts @ table`
+terms) are small-vocabulary economies that would cost hundreds of megabytes
+per batch at 726/1458 classes, so the mixed scope computes the identical
+sums as per-edge class-row gathers with fp32 scatter-add; fusing those
+gathers into the Triton kernels is D-arm work if profiling shows them hot.
 
 **Knob.** `mixed_windows: bool = False` (measured arm `True`), plus the
 resurrected `window_attention: bool = True` for the matrix below.
