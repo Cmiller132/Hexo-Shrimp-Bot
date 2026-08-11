@@ -83,8 +83,14 @@ compiled; val split scoring with horizon buckets via `step12_driver.py
 evaluate` (runs `evaluate_cell`, `include_state_value=True`).
 
 Done at handoff: all 5 benches; A s0-s2 trained+scored; B s0, B s1
-trained+scored. In flight: B s2 training (started 09:22 UTC). Pending: B s2
-eval, C×3, D×3 with evals. Runner: `~/step12_matrix.sh` (WSL), logs
+trained+scored. **B s2 was killed at 12:24 UTC (exit 143 after ~3 h of
+paging crawl; cause of the signal unknown — check dmesg/OOM-killer)**; the
+runner moved on to C s0. B s2's partial cell dir will be wiped and rebuilt
+automatically when the runner is relaunched after its current pass — or
+rebuild it directly: `uv run python step12_driver.py train B 2` then
+`evaluate B 2` from the clone. Pending: B s2 (rebuild), C×3, D×3 with
+evals. A 2-seed paired packet (A vs B on s0/s1) is already assemblable if
+the owner wants an early look. Runner: `~/step12_matrix.sh` (WSL), logs
 `~/step12-artifacts/progress.log`, per-stage logs beside it. Cells:
 `~/graft-bench/python/mantisnet/runs/lab/step12-matrix/arm{A,B,C,D}/s{0,1,2}`.
 
