@@ -69,18 +69,11 @@ def test_incidence_entries_arrive_in_window_order(positions):
     assert (batch.inc_window[1:] >= batch.inc_window[:-1]).all()
 
 
-def test_decoder_table_ordering_and_coverage(positions):
+def test_decoder_table_ordering(positions):
     for pos in positions:
         g = from_position(pos)
         legal = pos.legal_moves()
         assert g.n_legal == len(legal) == pos.legal_count
-
-        # §12.6: every legal cell is scored exactly once — window path and
-        # background path partition the index range.
-        window_cells = set(g.dec_cell.tolist())
-        bg_cells = set(g.bg_cell.tolist())
-        assert window_cells.isdisjoint(bg_cells)
-        assert window_cells | bg_cells == set(range(len(legal)))
 
         # §12.2: the table is asserted against `legal_moves[j]` itself — index
         # j's windows are exactly the live windows through the j-th legal cell.
@@ -89,7 +82,6 @@ def test_decoder_table_ordering_and_coverage(positions):
         rows_by_cell: dict[int, set] = {}
         for cell, w, c in zip(g.dec_cell, g.dec_window, g.dec_class):
             rows_by_cell.setdefault(int(cell), set()).add((tuple(g.window_id[w]), int(c)))
-        bucket_by_cell = dict(zip(g.bg_cell.tolist(), g.bg_bucket.tolist()))
         for j, (q, r) in enumerate(legal):
             expected = set()
             for axis, vec in enumerate(AXES):
@@ -98,13 +90,6 @@ def test_decoder_table_ordering_and_coverage(positions):
                     if wid in live:
                         expected.add((wid, int(_TERN_DEC_CLASS[oracle[wid], k])))
             assert rows_by_cell.get(j, set()) == expected, f"decoder row {j} at {(q, r)}"
-            if not expected:
-                dists = [
-                    max(abs(q - sq), abs(r - sr), abs((q - sq) + (r - sr)))
-                    for sq, sr, _p in pos.stones()
-                ]
-                bucket = min(min(dists), 8) - 1 if dists else 7
-                assert bucket_by_cell[j] == bucket
 
 
 def test_decoder_entries_arrive_in_cell_order(positions):
@@ -116,11 +101,13 @@ def test_decoder_entries_arrive_in_cell_order(positions):
     assert (batch.dec_cell[1:] >= batch.dec_cell[:-1]).all()
 
 
-def test_ply_zero_builds_background_only():
+def test_ply_zero_builds_empty_action_rows():
     g = from_position(hexo_py.Position())
     assert g.n_stones == 0 and g.n_windows == 0
     assert g.n_legal == 1
-    assert g.bg_cell.tolist() == [0] and g.bg_bucket.tolist() == [7]
+    assert g.dec_cell.size == 0
+    assert g.action_window_index.shape == (1, 3, 6)
+    assert (g.action_window_index == -1).all()
     assert g.moves_remaining == 1
 
 

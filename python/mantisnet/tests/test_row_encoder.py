@@ -28,7 +28,7 @@ _CUDA_ONLY = pytest.mark.skipif(
 def _batch():
     return collate(
         [
-            from_position(hexo_py.Position.replay(moves), action_rows=True)
+            from_position(hexo_py.Position.replay(moves))
             for moves in _GAMES
         ]
     )
@@ -231,7 +231,7 @@ def test_cuda_random_ragged_forward_and_gradients(case: str, dtype: torch.dtype)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_cuda_fixture_batch_forward_and_gradients(positions, dtype: torch.dtype):
     batch = collate(
-        [from_position(pos, action_rows=True) for pos in positions]
+        [from_position(pos) for pos in positions]
     ).to(_DEVICE)
     generator = torch.Generator(device=_DEVICE).manual_seed(91)
     pre_w = torch.randn(

@@ -1,12 +1,9 @@
 """Structural alias diagnostic (MANTIS_GRAFT_SPEC §4 Step 4; donor ACT §33).
 
-Two legal actions of one position alias when the builder-side inputs their
-decoder rows are computed from are identical — the model cannot score them
-apart, whatever its weights. The diagnostic reports alias groups under the
-incumbent per-cell inputs (window classes through the cell, or the background
-nearest-stone bucket) and under the Step 4 action-row inputs (all 18
-post-placement row classes, EMPTY rows as their slot orbits), so a packet can
-show what the row path merges and what it splits.
+Two legal actions of one position alias when all 18 post-placement row classes
+are identical, with EMPTY rows represented by their slot orbits. The model
+cannot score such actions apart through its structural action input, whatever
+its weights.
 
 The 64-bit signature hash is only a bucket index; groups are declared on
 exact signature equality within a bucket, never on the hash alone.
@@ -51,22 +48,8 @@ def _hash_signature(signature: tuple[int, ...]) -> int:
     return digest
 
 
-def _before_signatures(graph: PositionGraph) -> list[tuple[int, ...]]:
-    """Incumbent decoder inputs per legal cell: the sorted window-class
-    multiset through it, or a tagged background bucket."""
-    signatures: list[tuple[int, ...]] = [() for _ in range(graph.n_legal)]
-    order = np.argsort(graph.dec_cell, kind="stable")
-    cells = graph.dec_cell[order]
-    classes = graph.dec_class[order]
-    for cell, lo, hi in zip(*_runs(cells)):
-        signatures[cell] = (0, *sorted(int(c) for c in classes[lo:hi]))
-    for cell, bucket in zip(graph.bg_cell, graph.bg_bucket):
-        signatures[int(cell)] = (1, int(bucket))
-    return signatures
-
-
-def _after_signatures(graph: PositionGraph) -> list[tuple[int, ...]]:
-    """Step 4 inputs per legal cell: all 18 row classes, EMPTY rows carried
+def _signatures(graph: PositionGraph) -> list[tuple[int, ...]]:
+    """Action inputs per legal cell: all 18 row classes, EMPTY rows carried
     as their slot-orbit insert classes."""
     status = graph.action_pre_status
     post1 = graph.action_post1_class
@@ -76,15 +59,6 @@ def _after_signatures(graph: PositionGraph) -> list[tuple[int, ...]]:
     return [tuple(int(c) for c in row) for row in rows]
 
 
-def _runs(sorted_values: np.ndarray):
-    if len(sorted_values) == 0:
-        return (), (), ()
-    boundaries = np.flatnonzero(np.diff(sorted_values)) + 1
-    starts = np.concatenate([[0], boundaries])
-    stops = np.concatenate([boundaries, [len(sorted_values)]])
-    return sorted_values[starts].astype(int), starts, stops
-
-
 @dataclass
 class _Tally:
     actions: int = 0
@@ -92,7 +66,6 @@ class _Tally:
     groups: int = 0
     aliased_actions: int = 0
     max_group: int = 0
-    background_merged_groups: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -101,13 +74,11 @@ class _Tally:
             "alias_groups": self.groups,
             "aliased_actions": self.aliased_actions,
             "max_alias_group": self.max_group,
-            "groups_with_background_cells": self.background_merged_groups,
         }
 
 
 def _tally_position(
     signatures: list[tuple[int, ...]],
-    background: set[int],
     tally: _Tally,
     examples: list,
     legal_qr: np.ndarray,
@@ -126,8 +97,6 @@ def _tally_position(
                 tally.groups += 1
                 tally.aliased_actions += len(cells)
                 tally.max_group = max(tally.max_group, len(cells))
-                if any(cell in background for cell in cells):
-                    tally.background_merged_groups += 1
                 if len(examples) < example_cap:
                     examples.append(
                         [[int(q), int(r)] for q, r in legal_qr[cells]]
@@ -139,21 +108,15 @@ def alias_report(
     *,
     example_cap: int = 8,
 ) -> dict:
-    """Alias groups before/after the Step 4 row inputs over ``positions``."""
-    before, after = _Tally(), _Tally()
-    before_examples: list = []
-    after_examples: list = []
+    """Alias groups under the baked action-row inputs over ``positions``."""
+    tally = _Tally()
+    examples: list = []
     n_positions = 0
     for pos in positions:
-        graph = from_position(pos, action_rows=True)
+        graph = from_position(pos)
         legal_qr = np.asarray(pos.legal_moves(), dtype=np.int64).reshape(-1, 2)
-        background = {int(c) for c in graph.bg_cell}
         _tally_position(
-            _before_signatures(graph), background, before, before_examples,
-            legal_qr, example_cap,
-        )
-        _tally_position(
-            _after_signatures(graph), background, after, after_examples,
+            _signatures(graph), tally, examples,
             legal_qr, example_cap,
         )
         n_positions += 1
@@ -162,12 +125,8 @@ def alias_report(
     return {
         "mode": "alias",
         "positions": n_positions,
-        "before": before.as_dict(),
-        "after": after.as_dict(),
-        "sampled_alias_coordinates": {
-            "before": before_examples,
-            "after": after_examples,
-        },
+        "baked": tally.as_dict(),
+        "sampled_alias_coordinates": examples,
     }
 
 

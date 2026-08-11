@@ -28,14 +28,10 @@ types window pairs by colinear/crossing relations.
 
 Three heads read the trunk output:
 
-- **Policy decoder**: one raw logit per legal cell, routed through nonempty windows
-  or a background nearest-stone path. Under the live `action_rows` knob
-  (MANTIS_GRAFT_SPEC Step 4) the background path is replaced by a
-  counterfactual row encoder: each legal action's 18 post-placement windows
-  are gathered, typed by 729 joint `(post, slot)` classes, ReLU'd through a
-  shared first layer, summed per cell in fp32, and read by each head through
-  its own extension matrix. Batches must be built with the same knob; the
-  heads refuse a mismatch.
+- **Policy decoder**: one raw logit per legal cell. Each action's 18
+  post-placement windows are gathered, typed by 729 joint `(post, slot)`
+  classes, ReLU'd through a shared first layer, summed per cell in fp32, and
+  read through a policy-specific extension matrix.
 - **Action-value decoder**: three categorical logits per legal cell (positive,
   negative, zero return), composed into Q in (-1, 1) and committed mass M.
   Acting ranks by the mass-normalized score Q-tilde.
@@ -65,13 +61,13 @@ heads produce outputs in engine legal-move order.
 Positions batch by concatenation with per-position index offsets. Message
 passing never crosses positions; attention is masked block-diagonal. The
 builder emits stone tables, window tables with identities, incidence lists with
-joint slot classes, legal-cell decoder tables, and `moves_remaining`. All index
-tensors are precomputed; the forward contains no data-dependent index
-discovery.
+joint slot classes, legal-cell decoder tables, action-row classes and reverse
+views, and `moves_remaining`. All index tensors are mandatory and precomputed;
+the forward contains no data-dependent index discovery.
 
 ### Versioning
 
-`MODEL_REPR_VERSION` (model-owned, currently 4) covers the builder and every
+`MODEL_REPR_VERSION` (model-owned, currently 5) covers the builder and every
 feature encoding. `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing. Either bump invalidates checkpoints.
 
@@ -216,10 +212,9 @@ against a named baseline arm.
 The family registry identifies a checkpoint structurally from its model key
 set, native critic-readout width, and decoder-table row count. Configuration
 is inferred from state-dict tensor shapes, including the live
-`window_attention` knob from the presence of §5.1c tensors and the live
-`action_rows` knob from the presence of the row-encoder tensors. Shipped scoreable
-families for the ternary scope are `trinomial-joint`, `bipolar-joint`, and
-`scalar-joint`. Historic binary-scope families are rejected as unsupported.
+`window_attention` knob from the presence of §5.1c tensors. The row encoder is
+required. Shipped scoreable families are `trinomial-joint`, `bipolar-joint`,
+and `scalar-joint`; older representation families are rejected.
 
 ### Measurement commands
 

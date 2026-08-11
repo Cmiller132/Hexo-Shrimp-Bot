@@ -252,7 +252,7 @@ def test_the_manifest_identifies_both_checkpoints_and_the_match(checkpoints):
         assert result[side]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
         assert result[side]["iteration"] == iteration
         assert result[side]["versions"] == _versions()
-        assert result[side]["versions"]["MODEL_REPR_VERSION"] == 4
+        assert result[side]["versions"]["MODEL_REPR_VERSION"] == 5
     assert result["match"] == {
         "pairs": 1,
         "games": 2,
@@ -365,7 +365,7 @@ def test_head_to_head_refuses_a_representation_mismatch_and_names_the_bridge(
     older = _retagged(path_b, tmp_path / "v1.pt", MODEL_REPR_VERSION=1)
     with pytest.raises(ValueError, match=r"MODEL_REPR_VERSION") as refusal:
         _match(path_a, older)
-    assert "mantisnet.klent.graft" in str(refusal.value)
+    assert "cross-representation comparison is invalid" in str(refusal.value)
 
 
 @pytest.mark.parametrize(

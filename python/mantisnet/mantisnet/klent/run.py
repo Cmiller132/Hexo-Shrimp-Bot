@@ -200,7 +200,6 @@ def run_training(
         np.random.default_rng(int(rng.integers(2**63))),
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
-        action_rows=model.cfg.action_rows,
     )
 
     def submit_collect(pool, iteration):
@@ -538,8 +537,6 @@ def main(argv=None) -> None:
     elif out.exists() and any(out.iterdir()):
         raise SystemExit(f"{out} exists and is not empty; use --resume to continue it")
 
-    # Imported here: the lab package reaches back into klent.graft at import
-    # time, so a module-level import would be circular.
     from ..lab.variants import parse_model_kw
 
     torch.manual_seed(args.seed)

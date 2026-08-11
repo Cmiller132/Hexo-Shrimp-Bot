@@ -115,16 +115,6 @@ def test_rust_python_parity():
             assert getattr(rust, name) == value, name
 
 
-def test_decoder_routes_partition_legal_cells():
-    """Decoder and background routes partition every legal cell."""
-    for pos in _positions():
-        graph = from_position(pos)
-        covered = set(map(int, graph.dec_cell))
-        background = set(map(int, graph.bg_cell))
-        assert not covered & background
-        assert covered | background == set(range(graph.n_legal))
-
-
 _ARM_CONFIGS = {
     "attention-on": {},
     "attention-off": {"window_attention": False},

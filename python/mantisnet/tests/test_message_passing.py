@@ -18,6 +18,7 @@ import torch
 
 import mantisnet.message_passing as message_impl
 from mantisnet import TERN_OCC_CLASSES, collate, from_position
+from mantisnet.builder import ACTION_EMPTY
 from mantisnet.message_passing import (
     STONE_RUN,
     WINDOW_RUN,
@@ -95,13 +96,12 @@ def _batch_for_case(positions, case: str):
     single = [graph for graph in graphs if graph.n_stones == 1]
     assert len(empty) == len(single) == 1
 
-    # Ply zero is simultaneously the no-window trunk case and the
-    # background-only legal-cell case.  Pin both facts so fixture drift cannot
-    # quietly delete either edge case from the CUDA tests.
+    # Ply zero is the no-window trunk case and consists entirely of EMPTY
+    # action rows. Pin both facts so fixture drift cannot delete the edge case.
     zero = empty[0]
     assert zero.n_windows == len(zero.inc_stone) == 0
     assert len(zero.dec_cell) == 0
-    assert len(zero.bg_cell) == zero.n_legal
+    assert (zero.action_pre_status == ACTION_EMPTY).all()
 
     # A single stone owns all 18 candidate windows.  Thus window <- stone has
     # 18 one-entry reductions while stone <- window sends all 18 entries to one

@@ -32,8 +32,9 @@ _TENSOR_FIELDS = [
     "dec_cell",
     "dec_window",
     "dec_class",
-    "bg_cell",
-    "bg_bucket",
+    "act_class",
+    "act_rev",
+    "act_empty",
 ]
 
 

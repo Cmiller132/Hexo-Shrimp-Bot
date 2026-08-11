@@ -17,13 +17,14 @@ import math
 from pathlib import Path
 from typing import Any
 
+import hexo_py
+import numpy as np
 import torch
 from torch import Tensor, nn
 
 from ..builder import collate_prefixes
 from ..model import MantisConfig, MantisNet, compose_q, return_mass
 from ..segments import segment_ids, segment_sum
-from .graft import _probe_prefixes
 from .improve import improved_policy
 from .run import _versions
 
@@ -32,10 +33,38 @@ READOUT_KEYS = ("mlp_q.out.weight", "mlp_q.out.bias")
 MAX_ABS_DQ = 1e-5
 MAX_MEAN_KL = 1e-6
 ZERO_LOGIT = -20.0
+PROBE_SEED = 314_159
+PROBE_POSITIONS = 64
+PROBE_PLIES = (20, 60)
+_PROBE_ATTEMPTS = 100
 _CHECKPOINT_KEYS = frozenset(
     {"model", "optimizer", "iteration", "rng_state", "versions"}
 )
 _ADAM_FIELDS = ("step", "exp_avg", "exp_avg_sq")
+
+
+def _probe_prefixes() -> list[list[tuple[int, int]]]:
+    """The critic conversion's deterministic nonterminal move-prefix probe."""
+    rng = np.random.default_rng(PROBE_SEED)
+    low, high = PROBE_PLIES
+    prefixes: list[list[tuple[int, int]]] = []
+    for index in range(PROBE_POSITIONS):
+        plies = low + round(index * (high - low) / (PROBE_POSITIONS - 1))
+        for _attempt in range(_PROBE_ATTEMPTS):
+            position, moves = hexo_py.Position(), []
+            for _ in range(plies):
+                legal = position.legal_moves()
+                move = legal[int(rng.integers(len(legal)))]
+                position.advance(*move)
+                moves.append(move)
+            if not position.is_terminal:
+                break
+        else:
+            raise RuntimeError(
+                f"no nonterminal {plies}-ply playout in {_PROBE_ATTEMPTS} draws"
+            )
+        prefixes.append(moves)
+    return prefixes
 
 
 def _critic_rows(row: Tensor, zero: float = 0.0) -> Tensor:

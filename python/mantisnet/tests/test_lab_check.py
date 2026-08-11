@@ -29,10 +29,10 @@ def test_contract_battery_passes_for_mantis(monkeypatch):
     declared = VARIANTS["mantis"]
     collate_calls = 0
 
-    def tracked_collate(moves, ts, *, action_rows=False):
+    def tracked_collate(moves, ts):
         nonlocal collate_calls
         collate_calls += 1
-        return declared.collate(moves, ts, action_rows=action_rows)
+        return declared.collate(moves, ts)
 
     monkeypatch.setitem(VARIANTS, "mantis", replace(declared, collate=tracked_collate))
     result = run_check(

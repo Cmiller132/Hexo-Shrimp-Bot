@@ -15,9 +15,6 @@ Index conventions this module fixes (each is part of the representation):
 - Attention distance bucket: hex distance ``d >= 1`` maps to ``d - 1`` clamped
   to ``D_MAX - 1``; ``SELF`` is ``D_MAX``; ``TOKEN`` is ``D_MAX + 1`` and wins
   over ``SELF`` on the token–token pair.
-- Nearest-stone bucket: distance ``d`` in ``1..8`` maps to ``d - 1``. The one
-  stoneless position (ply 0) has no nearest stone; the clamp sends it to
-  bucket ``7``.
 """
 
 from __future__ import annotations
@@ -33,8 +30,6 @@ from .relay import relay_tables
 WINDOW_LEN = 6
 # Unit steps of the engine's axes, in canonical order Q, R, QR.
 AXES = np.array([[1, 0], [0, 1], [1, -1]], dtype=np.int64)
-LEGAL_RADIUS = 8
-NEAREST_BUCKETS = LEGAL_RADIUS
 
 
 # --- Ternary tables for the all-nonempty window scope.
@@ -178,15 +173,12 @@ class PositionGraph:
     dec_cell: np.ndarray  # (e_d,) int64: legal-cell index
     dec_window: np.ndarray  # (e_d,) int64: represented window through it
     dec_class: np.ndarray  # (e_d,) int64: the (pattern, slot) class, < TERN_DEC_CLASSES
-    bg_cell: np.ndarray  # (n_bg,) int64: cells in no represented window
-    bg_bucket: np.ndarray  # (n_bg,) int64 in 0..7: nearest-stone bucket
     moves_remaining: int  # 1 or 2
-    # Step 4 action-row tables, built only under the action_rows knob. Dense
-    # (n_legal, 3, 6): kept-window index or -1; post-placement class in the
-    # ternary vocabulary; pre-window status.
-    action_window_index: np.ndarray | None = None
-    action_post1_class: np.ndarray | None = None
-    action_pre_status: np.ndarray | None = None
+    # Dense (n_legal, 3, 6) action-row tables: kept-window index or -1;
+    # post-placement class in the ternary vocabulary; pre-window status.
+    action_window_index: np.ndarray
+    action_post1_class: np.ndarray
+    action_pre_status: np.ndarray
 
     @property
     def n_stones(self) -> int:
@@ -293,8 +285,6 @@ def build(
     mover: int,
     legal_qr: np.ndarray,
     moves_remaining: int,
-    *,
-    action_rows: bool = False,
 ) -> PositionGraph:
     """Build one position's graph from the §11 input list.
 
@@ -303,8 +293,8 @@ def build(
     order. Raises ``ValueError`` for a terminal position (no legal moves):
     terminal positions are a builder error, not a silent default.
 
-    Every nonempty candidate is kept under the ternary tables. ``action_rows``
-    additionally emits the Step 4 post-placement row tables.
+    Every nonempty candidate is kept under the ternary tables, and every legal
+    action carries its 18 post-placement rows.
     """
     stone_qr = np.asarray(stone_qr, dtype=np.int64).reshape(-1, 2)
     stone_owner = np.asarray(stone_owner, dtype=np.int64).reshape(-1)
@@ -318,14 +308,9 @@ def build(
     stone_own = (stone_owner != mover).astype(np.int64)
 
     if n_s == 0:
-        # Ply 0: no stones, no windows, every legal cell on the background
-        # path with the clamp bucket. Action rows are all EMPTY inserts.
+        # Ply 0: no stones or windows. Every action row is an EMPTY insert.
         empty_key = np.empty(0, dtype=np.int64)
-        actions = (
-            _action_tables(legal_qr, empty_key, empty_key, stone_own, empty_key)
-            if action_rows
-            else (None, None, None)
-        )
+        actions = _action_tables(legal_qr, empty_key, empty_key, stone_own, empty_key)
         return PositionGraph(
             stone_own=stone_own,
             stone_qr=stone_qr,
@@ -338,8 +323,6 @@ def build(
             dec_cell=np.empty(0, dtype=np.int64),
             dec_window=np.empty(0, dtype=np.int64),
             dec_class=np.empty(0, dtype=np.int64),
-            bg_cell=np.arange(len(legal_qr), dtype=np.int64),
-            bg_bucket=np.full(len(legal_qr), NEAREST_BUCKETS - 1, dtype=np.int64),
             moves_remaining=moves_remaining,
             action_window_index=actions[0],
             action_post1_class=actions[1],
@@ -430,24 +413,7 @@ def build(
             f"{int(flat[bad] % WINDOW_LEN)}, which that window already occupies"
         )
 
-    covered = np.zeros(n_legal, dtype=bool)
-    covered[dec_cell] = True
-    bg_cell = np.nonzero(~covered)[0].astype(np.int64)
-    if len(bg_cell):
-        # Nearest-stone hex distance, vectorised over (background cells, stones).
-        dq = legal_qr[bg_cell, 0][:, None] - stone_qr[None, :, 0]
-        dr = legal_qr[bg_cell, 1][:, None] - stone_qr[None, :, 1]
-        d = np.maximum(np.abs(dq), np.maximum(np.abs(dr), np.abs(dq + dr)))
-        nearest = d.min(axis=1)
-        bg_bucket = np.minimum(nearest, LEGAL_RADIUS) - 1
-    else:
-        bg_bucket = np.empty(0, dtype=np.int64)
-
-    actions = (
-        _action_tables(legal_qr, sorted_key, order, stone_own, live_key)
-        if action_rows
-        else (None, None, None)
-    )
+    actions = _action_tables(legal_qr, sorted_key, order, stone_own, live_key)
     return PositionGraph(
         stone_own=stone_own,
         stone_qr=stone_qr,
@@ -460,8 +426,6 @@ def build(
         dec_cell=dec_cell,
         dec_window=dec_window,
         dec_class=dec_class,
-        bg_cell=bg_cell,
-        bg_bucket=bg_bucket.astype(np.int64),
         moves_remaining=moves_remaining,
         action_window_index=actions[0],
         action_post1_class=actions[1],
@@ -469,7 +433,7 @@ def build(
     )
 
 
-def from_position(pos, *, action_rows: bool = False) -> PositionGraph:
+def from_position(pos) -> PositionGraph:
     """Build from a ``hexo_py.Position``. Terminal positions raise."""
     if pos.is_terminal:
         raise ValueError("terminal position: the builder refuses it")
@@ -487,7 +451,6 @@ def from_position(pos, *, action_rows: bool = False) -> PositionGraph:
         pos.current_player,
         legal,
         pos.moves_remaining,
-        action_rows=action_rows,
     )
 
 
@@ -529,8 +492,6 @@ class Batch:
     dec_cell: torch.Tensor  # (E_d,) long, global cell index
     dec_window: torch.Tensor  # (E_d,) long, global window index
     dec_class: torch.Tensor  # (E_d,) long, < TERN_DEC_CLASSES
-    bg_cell: torch.Tensor  # (N_bg,) long, global cell index
-    bg_bucket: torch.Tensor  # (N_bg,) long
     # Cell-pass relay (§5.1b): the decoder incidence sorted once at collation
     # into CSR views — by covered cell (relabelled compactly), by window, and
     # by class — so the pass runs as contiguous segment reductions.
@@ -545,15 +506,14 @@ class Batch:
     # derives them on its own device from window_id — the edge views cost
     # several times more to ship than to derive beside the model.
     #
-    # Step 4 action-row tables, present exactly when built with the
-    # ``action_rows`` knob. The kept rows (a nonempty candidate window through
+    # Action-row tables. The kept rows (a nonempty candidate window through
     # the action cell) are in bijection with the decoder incidence — the same
     # 18-candidate walk in the same order — so they ride the ``dec_*`` views
     # and only add their post-placement class; EMPTY rows collapse to
     # per-orbit counts against the shared empty base.
-    act_class: torch.Tensor | None = None  # (E_d,) long, < TERN_POST1_CLASSES
-    act_rev: torch.Tensor | None = None  # (E_d,) long: window-major edge order
-    act_empty: torch.Tensor | None = None  # (N_c, 3) long: EMPTY rows per orbit
+    act_class: torch.Tensor  # (E_d,) long, < TERN_POST1_CLASSES
+    act_rev: torch.Tensor  # (E_d,) long: window-major edge order
+    act_empty: torch.Tensor  # (N_c, 3) long: EMPTY rows per orbit
 
     def to(self, device) -> "Batch":
         """The same batch with every tensor on ``device``."""
@@ -635,22 +595,21 @@ def batch_from_arrays(**fields) -> Batch:
     )
 
 
-def collate_positions(positions, *, action_rows: bool = False) -> Batch:
+def collate_positions(positions) -> Batch:
     """Build and collate positions with the Rust builder.
 
     ``hexo_py.build_batch`` runs in parallel with the GIL released and returns
     the same fields as ``collate([from_position(p) ...])`` under
-    ``MODEL_REPR_VERSION``. ``action_rows`` selects the Step 4 row tables; the
-    batch must match the consuming model's knob.
+    ``MODEL_REPR_VERSION``.
     """
     import hexo_py
 
     return batch_from_arrays(
-        **hexo_py.build_batch(list(positions), action_rows=action_rows)
+        **hexo_py.build_batch(list(positions))
     )
 
 
-def collate_prefixes(games, ts, *, action_rows: bool = False) -> Batch:
+def collate_prefixes(games, ts) -> Batch:
     """Move prefixes to one collated batch: replay + build, in parallel.
 
     Stored fitting positions are move prefixes
@@ -659,7 +618,7 @@ def collate_prefixes(games, ts, *, action_rows: bool = False) -> Batch:
     import hexo_py
 
     return batch_from_arrays(
-        **hexo_py.build_batch_prefixes(list(games), list(ts), action_rows=action_rows)
+        **hexo_py.build_batch_prefixes(list(games), list(ts))
     )
 
 
@@ -706,9 +665,6 @@ def collate(graphs: list[PositionGraph]) -> Batch:
     """Concatenate position graphs into one batch (§9)."""
     if not graphs:
         raise ValueError("empty batch")
-    with_actions = [g.action_window_index is not None for g in graphs]
-    if any(with_actions) and not all(with_actions):
-        raise ValueError("cannot collate graphs with and without action rows")
     p = len(graphs)
     ns = np.array([g.n_stones for g in graphs])
     nw = np.array([g.n_windows for g in graphs])
@@ -762,8 +718,6 @@ def collate(graphs: list[PositionGraph]) -> Batch:
         dec_cell=dec_cell,
         dec_window=dec_window,
         dec_class=dec_class,
-        bg_cell=cat([g.bg_cell + cell_off[i] for i, g in enumerate(graphs)]),
-        bg_bucket=cat([g.bg_bucket for g in graphs]),
         **_relay_fields(dec_cell, dec_window, dec_class, int(win_off[-1])),
-        **(_action_fields(graphs, dec_window) if all(with_actions) else {}),
+        **_action_fields(graphs, dec_window),
     )

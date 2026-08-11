@@ -222,16 +222,12 @@ fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'
     d.set_item("dec_cell", PyArray1::from_vec(py, raw.dec_cell))?;
     d.set_item("dec_window", PyArray1::from_vec(py, raw.dec_window))?;
     d.set_item("dec_class", PyArray1::from_vec(py, raw.dec_class))?;
-    d.set_item("bg_cell", PyArray1::from_vec(py, raw.bg_cell))?;
-    d.set_item("bg_bucket", PyArray1::from_vec(py, raw.bg_bucket))?;
-    if let Some(actions) = raw.action_fields {
-        d.set_item("act_class", PyArray1::from_vec(py, actions.act_class))?;
-        d.set_item("act_rev", PyArray1::from_vec(py, actions.act_rev))?;
-        d.set_item(
-            "act_empty",
-            PyArray1::from_vec(py, actions.act_empty).reshape([n_cells, 3])?,
-        )?;
-    }
+    d.set_item("act_class", PyArray1::from_vec(py, raw.act_class))?;
+    d.set_item("act_rev", PyArray1::from_vec(py, raw.act_rev))?;
+    d.set_item(
+        "act_empty",
+        PyArray1::from_vec(py, raw.act_empty).reshape([n_cells, 3])?,
+    )?;
     Ok(d)
 }
 
@@ -242,15 +238,13 @@ fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'
 /// terminal position. Every nonempty window is represented under the ternary
 /// tables.
 #[pyfunction]
-#[pyo3(signature = (positions, action_rows = false))]
 fn build_batch<'py>(
     py: Python<'py>,
     positions: Vec<PyRef<'py, Position>>,
-    action_rows: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let owned: Vec<engine::Position> = positions.iter().map(|p| p.inner.clone()).collect();
     let raw = py
-        .detach(|| encoder::build_batch(&owned, action_rows))
+        .detach(|| encoder::build_batch(&owned))
         .map_err(PyValueError::new_err)?;
     raw_to_dict(py, raw)
 }
@@ -258,15 +252,13 @@ fn build_batch<'py>(
 /// Replay each game's first `ts[i]` placements and build the batch, in
 /// parallel — the fitting path, where a stored position is a move prefix.
 #[pyfunction]
-#[pyo3(signature = (games, ts, action_rows = false))]
 fn build_batch_prefixes<'py>(
     py: Python<'py>,
     games: Vec<Vec<(i16, i16)>>,
     ts: Vec<usize>,
-    action_rows: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let raw = py
-        .detach(|| encoder::build_batch_prefixes(&games, &ts, action_rows))
+        .detach(|| encoder::build_batch_prefixes(&games, &ts))
         .map_err(PyValueError::new_err)?;
     raw_to_dict(py, raw)
 }

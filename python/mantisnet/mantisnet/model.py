@@ -25,7 +25,6 @@ from . import message_passing, relay, row_encoder, window_pairs
 from .attention import fused_attention
 from .builder import (
     ACTION_EMPTY_CLASSES,
-    NEAREST_BUCKETS,
     TERN_DEC_CLASSES,
     TERN_OCC_CLASSES,
     TERN_PATTERNS,
@@ -51,11 +50,6 @@ class MantisConfig:
     dropout: float = 0.0
     # Live knob for the §5.1c typed window-pair attention stage.
     window_attention: bool = True
-    # Step 4 knob: encode every legal action from its 18 hypothetical
-    # post-placement windows, replacing the background nearest-bucket path.
-    # The batch must be built with the same setting; the cell heads refuse a
-    # mismatch.
-    action_rows: bool = False
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
@@ -121,6 +115,7 @@ LEGACY_BAKED_KNOBS: dict[str, object] = {
     "cell_pass_rounds": 1,
     "joint_incidence": True,
     "mixed_windows": True,
+    "action_rows": True,
 }
 
 
@@ -433,8 +428,6 @@ class MantisNet(nn.Module):
         # its first layer runs per position, not per legal cell.
         self.p = nn.Linear(h, h, bias=False)
         self.e_pw = nn.Embedding(cfg.dec_classes, h)
-        if not cfg.action_rows:
-            self.e_bg = nn.Embedding(NEAREST_BUCKETS, h)
         self.mlp_p = _PairMlp(h, cfg.policy_hidden, 1)
 
         # Appendix B action-value decoder: the same shape as §6 with its own
@@ -442,26 +435,21 @@ class MantisNet(nn.Module):
         # categorical critic head.
         self.q = nn.Linear(h, h, bias=False)
         self.e_qw = nn.Embedding(cfg.dec_classes, h)
-        if not cfg.action_rows:
-            self.e_qbg = nn.Embedding(NEAREST_BUCKETS, h)
         self.mlp_q = _PairMlp(h, cfg.policy_hidden, CRITIC_LOGITS)
 
-        if cfg.action_rows:
-            # Step 4 row encoder, shared by both heads: the row MLP's first
-            # layer is `act_proj` over window rows plus the 729-class relation
-            # table, and its second layer is folded into each head's extension
-            # matrix — the sum over a cell's ReLU'd hidden rows commutes with
-            # the linear, so the heads read the summed hidden directly.
-            self.act_proj = nn.Linear(h, h)
-            self.act_table = nn.Embedding(TERN_POST1_CLASSES, h)
-            self.act_empty_base = nn.Parameter(torch.empty(h))
-            self.p_act = nn.Linear(h, h, bias=False)
-            self.q_act = nn.Linear(h, h, bias=False)
-            self.register_buffer(
-                "act_empty_classes",
-                torch.tensor(ACTION_EMPTY_CLASSES, dtype=torch.long),
-                persistent=False,
-            )
+        # The shared row encoder supplies every legal action to both heads.
+        # Its second layer is folded into each head's extension matrix because
+        # summing the hidden rows commutes with that head-specific linear.
+        self.act_proj = nn.Linear(h, h)
+        self.act_table = nn.Embedding(TERN_POST1_CLASSES, h)
+        self.act_empty_base = nn.Parameter(torch.empty(h))
+        self.p_act = nn.Linear(h, h, bias=False)
+        self.q_act = nn.Linear(h, h, bias=False)
+        self.register_buffer(
+            "act_empty_classes",
+            torch.tensor(ACTION_EMPTY_CLASSES, dtype=torch.long),
+            persistent=False,
+        )
 
         # §7 value head.
         self.value_queries = nn.Parameter(torch.empty(cfg.value_queries, h))
@@ -481,8 +469,7 @@ class MantisNet(nn.Module):
                 nn.init.normal_(m.weight, std=0.02)
         nn.init.normal_(self.token_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
-        if self.cfg.action_rows:
-            nn.init.normal_(self.act_empty_base, std=0.02)
+        nn.init.normal_(self.act_empty_base, std=0.02)
         # Both decoder outputs start at zero, so the initial policy logits are
         # constant across legal cells and all outcome logits vanish, which makes
         # the initial action values exactly zero (appendix B).
@@ -531,17 +518,11 @@ class MantisNet(nn.Module):
         The 726-class histogram is too wide, so the shared part is only the
         run-reduced window rows and each head adds its own class-row sum in
         ``_cell_scores``."""
-        # The batch's decoder order is already cell-major; the reverse
-        # (window-major) view the backward reduces is derived beside the model,
-        # or taken from collation where the Step 4 fields already carry it.
+        # The batch's decoder order is cell-major; collation supplies the
+        # window-major view used by the backward reduction.
         with torch.no_grad():
-            order = (
-                batch.act_rev
-                if batch.act_rev is not None
-                else torch.argsort(batch.dec_window.to(torch.int32), stable=True)
-            )
-            rev_gather = batch.dec_cell.index_select(0, order)
-            rev_runs = batch.dec_window.index_select(0, order)
+            rev_gather = batch.dec_cell.index_select(0, batch.act_rev)
+            rev_runs = batch.dec_window.index_select(0, batch.act_rev)
         return message_passing.incidence_row_sum(
             w,
             batch.dec_window,
@@ -553,16 +534,8 @@ class MantisNet(nn.Module):
             message_passing.WINDOW_RUN,
         ).to(dtype)
 
-    def _check_action_scope(self, batch: Batch) -> None:
-        built = batch.act_class is not None
-        if built is not self.cfg.action_rows:
-            raise ValueError(
-                f"batch built with action_rows={built} for a model with "
-                f"action_rows={self.cfg.action_rows}"
-            )
-
-    def _action_rows(self, w: Tensor, batch: Batch) -> Tensor:
-        """Step 4: the summed row-encoder hidden per legal cell, fp32.
+    def _action_contribution(self, w: Tensor, batch: Batch) -> Tensor:
+        """The summed row-encoder hidden per legal cell, fp32.
 
         Kept rows run the fused encoder over the decoder-order edge views;
         EMPTY rows are the per-orbit counts times the three shared hidden
@@ -592,12 +565,12 @@ class MantisNet(nn.Module):
     def _cell_scores(
         self,
         rows: Tensor,
-        acts: Tensor | None,
+        acts: Tensor,
         g_half: Tensor,
         batch: Batch,
         lin: nn.Linear,
         e_w: nn.Embedding,
-        extend: nn.Module,
+        extend: nn.Linear,
         mlp: _PairMlp,
     ) -> Tensor:
         """One head's ``(N_cells, d_out)`` readout rows, off the shared
@@ -607,10 +580,8 @@ class MantisNet(nn.Module):
 
         The ternary scope composes the quantity without a histogram:
         ``lin_a(proj @ Σw + Σ e_class rows + extension) + bias``, the class
-        sum run-reduced fp32. ``extend`` is the head's other decoder input:
-        the background bucket table (``acts is None``), whose rows gather
-        onto unique destinations, or the action-row extension matrix reading
-        the shared encoder sum."""
+        sum run-reduced fp32. ``extend`` is the action-row extension matrix
+        reading the shared encoder sum."""
         extra = message_passing.class_row_sum(
             e_w.weight,
             batch.dec_class,
@@ -618,26 +589,20 @@ class MantisNet(nn.Module):
             rows.shape[0],
             message_passing.STONE_RUN,
         )
-        base = F.linear(rows, lin.weight)
-        if acts is None:
-            extra = extra.index_add(
-                0, batch.bg_cell, extend.weight.index_select(0, batch.bg_bucket).float()
-            )
-        else:
-            base = base + F.linear(acts.to(rows.dtype), extend.weight)
+        base = F.linear(rows, lin.weight) + F.linear(
+            acts.to(rows.dtype), extend.weight
+        )
         base = base + extra.to(rows.dtype)
         pre = mlp.lin_a(base)
         return mlp.out(F.relu(pre + g_half.index_select(0, batch.cell_pos)))
 
     def policy_head(self, w: Tensor, g: Tensor, batch: Batch) -> Tensor:
         """§6: one raw policy logit per legal cell, engine legal order."""
-        self._check_action_scope(batch)
-        acts = self._action_rows(w, batch) if self.cfg.action_rows else None
+        acts = self._action_contribution(w, batch)
         g_half = self.mlp_p.lin_b(g)
         rows = self._decoder_rows(w, batch, g_half.dtype)
-        extend = self.p_act if self.cfg.action_rows else self.e_bg
         return self._cell_scores(
-            rows, acts, g_half, batch, self.p, self.e_pw, extend, self.mlp_p
+            rows, acts, g_half, batch, self.p, self.e_pw, self.p_act, self.mlp_p
         ).squeeze(-1)
 
     def cell_head_logits(
@@ -650,18 +615,15 @@ class MantisNet(nn.Module):
         the selected row; acting composes its score and value from the same
         logits, so one pass answers both.
         """
-        self._check_action_scope(batch)
-        acts = self._action_rows(w, batch) if self.cfg.action_rows else None
+        acts = self._action_contribution(w, batch)
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
         rows = self._decoder_rows(w, batch, g_p.dtype)
-        p_extend = self.p_act if self.cfg.action_rows else self.e_bg
-        q_extend = self.q_act if self.cfg.action_rows else self.e_qbg
         return (
             self._cell_scores(
-                rows, acts, g_p, batch, self.p, self.e_pw, p_extend, self.mlp_p
+                rows, acts, g_p, batch, self.p, self.e_pw, self.p_act, self.mlp_p
             ).squeeze(-1),
             self._cell_scores(
-                rows, acts, g_q, batch, self.q, self.e_qw, q_extend, self.mlp_q
+                rows, acts, g_q, batch, self.q, self.e_qw, self.q_act, self.mlp_q
             ),
         )
 

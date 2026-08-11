@@ -88,7 +88,6 @@ class Collector:
         rng: np.random.Generator,
         pair_budget: int = 24_000_000,
         cell_budget: int = 2_400_000,
-        action_rows: bool = False,
     ) -> None:
         import hexo_py
 
@@ -99,9 +98,6 @@ class Collector:
         self.tau = tau
         self.lam = lam
         self.rng = rng
-        # Batches must match the evaluating model's Step 4 knob; the module
-        # binding stays patchable (bench times it), so only the flag is bound.
-        self.action_rows = action_rows
         self.pair_budget = pair_budget
         self.cell_budget = cell_budget
         # The cap is one quarter of the cohort, clamped to 64–256 slots.
@@ -130,10 +126,7 @@ class Collector:
                 )
                 batches = [
                     collate_pool.submit(
-                        lambda c: collate_positions(
-                            [self.positions[i] for i in c],
-                            action_rows=self.action_rows,
-                        ),
+                        lambda c: collate_positions([self.positions[i] for i in c]),
                         chunk,
                     )
                     for chunk in chunks

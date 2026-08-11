@@ -208,7 +208,7 @@ durable record.
 | 1 | `dead-key-bias` | remove softmax key biases | parity + speed |
 | 2 | `state-latents` | 4 invariant state latents replace the token | full |
 | 3 | `wa-removal` | remove typed window-pair attention | full, speed-gain expected |
-| 4 | `action-rows` | 18 counterfactual post-placement rows per legal action | full |
+| 4 | `action-rows` | 18 counterfactual post-placement rows per legal action — **ACCEPTED** | full |
 | 5 | `tactical-scalars` | deterministic per-action tactical features | full |
 | 6 | `action-latents` | 2 action-set latents over the legal set | full |
 | 7 | `gated-incidence` | relation-gated trunk messages | full |
@@ -454,12 +454,17 @@ legal action; the step stands or falls on making that near-free:
 - `chunk_cost` gains the per-position row count so the packer charges
   honestly; budgets re-tuned in-step.
 
-**Knob.** `action_rows: bool = False` (measured arm `True`).
+**Knob.** Baked as `action_rows: True`; the field and nearest-bucket decoder
+path are deleted, and `LEGACY_BAKED_KNOBS` records the accepted value.
 
 **Gates & bake.** Full protocol; this step gets the most scrutiny on speed
 gate item 3 (collection runs the decoder too). On accept: background path
 deleted, `action_rows: True` into `LEGACY_BAKED_KNOBS`, alias diagnostic
 output archived in the packet.
+
+**Owner verdict (2026-08-11): ACCEPTED.** Action rows are the only decoder
+extension. Their batch fields are mandatory, and representation version 5
+invalidates checkpoints from the knob era.
 
 ### Step 5 — `tactical-scalars`
 

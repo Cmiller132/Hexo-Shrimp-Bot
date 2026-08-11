@@ -35,12 +35,10 @@ _BATCH_TENSORS = (
     "dec_cell",
     "dec_window",
     "dec_class",
-    "bg_cell",
-    "bg_bucket",
+    "act_class",
+    "act_rev",
+    "act_empty",
 )
-
-# The Step 4 fields, present exactly when the batch was built with the knob.
-_ACTION_TENSORS = ("act_class", "act_rev", "act_empty")
 
 
 def _forward(model, batch, device: str):
@@ -156,19 +154,16 @@ def _check_decoder_coverage(model, cases, device: str, collate_fn) -> int:
         pos = case.position
         graph = from_position(pos)
         batch = _collate_cases([case], collate_fn)
-        expected_bg = {
+        covered = set(map(int, batch.dec_cell))
+        expected = {
             i
             for i, move in enumerate(pos.legal_moves())
-            if not _covered_by_window(graph, move)
+            if _covered_by_window(graph, move)
         }
-        got_bg = set(map(int, batch.bg_cell))
-        covered = set(map(int, batch.dec_cell))
-        if got_bg != expected_bg:
+        if covered != expected:
             raise ValueError(
-                f"decoder background mismatch: {sorted(got_bg ^ expected_bg)[:8]}"
+                f"decoder incidence mismatch: {sorted(covered ^ expected)[:8]}"
             )
-        if got_bg & covered or got_bg | covered != set(range(graph.n_legal)):
-            raise ValueError("decoder routes do not partition every legal cell")
         output = _forward(model, batch, device)
         if len(output.policy_logits) != graph.n_legal or len(output.q_values) != graph.n_legal:
             raise ValueError(
@@ -188,24 +183,16 @@ def _assert_batches_equal(rust, python) -> None:
         a, b = getattr(rust, name), getattr(python, name)
         if a.dtype != b.dtype or not torch.equal(a, b):
             raise ValueError(f"Rust/Python builder disagreement in {name}")
-    for name in _ACTION_TENSORS:
-        a, b = getattr(rust, name), getattr(python, name)
-        if (a is None) != (b is None):
-            raise ValueError(f"Rust/Python builder disagreement in {name} presence")
-        if a is not None and (a.dtype != b.dtype or not torch.equal(a, b)):
-            raise ValueError(f"Rust/Python builder disagreement in {name}")
-
-
-def _check_builder_agreement(cases, collate_fn, action_rows: bool) -> int:
+def _check_builder_agreement(cases, collate_fn) -> int:
     batch = _collate_cases(cases, collate_fn)
     _assert_batches_equal(
         batch,
-        collate([from_position(case.position, action_rows=action_rows) for case in cases]),
+        collate([from_position(case.position) for case in cases]),
     )
     for case in cases:
         _assert_batches_equal(
             _collate_cases([case], collate_fn),
-            collate([from_position(case.position, action_rows=action_rows)]),
+            collate([from_position(case.position)]),
         )
     return len(cases)
 
@@ -230,7 +217,7 @@ def contract_battery(
             model, cases, device, collate_fn
         ),
         "python_rust_positions": (
-            _check_builder_agreement(cases, collate_fn, model.cfg.action_rows)
+            _check_builder_agreement(cases, collate_fn)
             if rust_collate
             else None
         ),

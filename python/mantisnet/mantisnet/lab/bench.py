@@ -346,9 +346,6 @@ def _collect(
         np.random.default_rng(seed),
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
-        action_rows=bool(
-            getattr(model, "cfg", None) is not None and model.cfg.action_rows
-        ),
     )
     timer = PhaseTimer(evaluate)
     _vram_reset(device)
