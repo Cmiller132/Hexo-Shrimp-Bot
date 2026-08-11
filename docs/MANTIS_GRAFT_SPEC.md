@@ -134,6 +134,11 @@ Each screen:
   and the per-distance-from-end-bucket and per-phase splits of the above. A
   step must not be promoted on an unregistered metric, and a secondary-metric
   collapse is grounds for the owner to reject a primary-metric win.
+- **Horizon tables are mandatory in every packet** (owner ruling
+  2026-08-10): the full per-distance-from-end-bucket paired tables — policy
+  top-1 per bucket, critic sign accuracy and v̂ MAE per bucket — with
+  per-bucket deltas and intervals. A horizon-bucket collapse blocks
+  promotion even when the overall primaries win.
 - **Statistics:** per-seed paired deltas; report mean Δ, 95% t-interval, and
   per-seed sign counts for every metric. "Statistically significant" means the
   interval excludes zero on a primary metric. The test split is consulted only
@@ -152,7 +157,10 @@ Standing rules for the verdict stage:
 
 - A **neutral or barely-negative** result never auto-removes a candidate. The
   packet is presented and the owner rules; "it measured ≈0" is a finding, not
-  a deletion warrant.
+  a deletion warrant. Standing owner preference (2026-08-10): when a
+  candidate is benchmark-neutral but architecturally fundamental — it
+  removes an alias, completes a representation, or carries clear mechanism —
+  the recommendation leans **keep**; the owner still rules.
 - A significant result on one metric with contradiction on another is
   presented as exactly that — no silent metric arbitration.
 - Rejected steps are recorded in `docs/ABLATIONS.md` with their full numbers
@@ -671,6 +679,11 @@ bake**; exploratory arms may run slower during measurement without being
 auto-rejected. The owner judges the speed/strength trade from the full
 matrix. If the baked combination has `window_attention` off, Step 3's
 removal trial is subsumed and its deletion work happens here.
+
+Owner-set screen design (2026-08-10, overnight run): the full 2×2 factorial
+(A baseline, B mixed, C mixed+wa-off, D baseline+wa-off), **3 seeds**,
+larger per-cell training budgets (~400k train samples per cell, identical
+deterministic subset across arms and seeds, recorded in the recipe).
 
 ### Step 13 — `cell-nodes`
 
