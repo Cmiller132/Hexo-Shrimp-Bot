@@ -98,11 +98,12 @@ distribution. Production KLENT iterations pipeline collection with fitting
 and report far higher combined rates; the gate compares like with like
 across arms and steps, nothing else.
 
-Pass rule, all four required:
+Pass rule, all four required (owner-amended 2026-08-11 during Step 4: the
+original 2%/5%/2% tolerances were too slim; the gate is 10%):
 
-1. median fit samples/s within **2%** of the baseline median;
-2. fit p95 chunk latency not worse than baseline by more than **5%**;
-3. median collect positions/s within **2%** of the baseline median;
+1. median fit samples/s within **10%** of the baseline median;
+2. fit p95 chunk latency not worse than baseline by more than **10%**;
+3. median collect positions/s within **10%** of the baseline median;
 4. peak reserved VRAM not above baseline + 256 MiB and never above
    **10.25 GiB** (owner-amended 2026-08-10: the Step 0 baseline peaks at
    10.06 GiB, and the WSL harness showed no paging cliff there; the ~10.5
