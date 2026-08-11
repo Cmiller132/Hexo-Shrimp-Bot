@@ -29,7 +29,13 @@ types window pairs by colinear/crossing relations.
 Three heads read the trunk output:
 
 - **Policy decoder**: one raw logit per legal cell, routed through nonempty windows
-  or a background nearest-stone path.
+  or a background nearest-stone path. Under the live `action_rows` knob
+  (MANTIS_GRAFT_SPEC Step 4) the background path is replaced by a
+  counterfactual row encoder: each legal action's 18 post-placement windows
+  are gathered, typed by 729 joint `(post, slot)` classes, ReLU'd through a
+  shared first layer, summed per cell in fp32, and read by each head through
+  its own extension matrix. Batches must be built with the same knob; the
+  heads refuse a mismatch.
 - **Action-value decoder**: three categorical logits per legal cell (positive,
   negative, zero return), composed into Q in (-1, 1) and committed mass M.
   Acting ranks by the mass-normalized score Q-tilde.
@@ -210,7 +216,8 @@ against a named baseline arm.
 The family registry identifies a checkpoint structurally from its model key
 set, native critic-readout width, and decoder-table row count. Configuration
 is inferred from state-dict tensor shapes, including the live
-`window_attention` knob from the presence of §5.1c tensors. Shipped scoreable
+`window_attention` knob from the presence of §5.1c tensors and the live
+`action_rows` knob from the presence of the row-encoder tensors. Shipped scoreable
 families for the ternary scope are `trinomial-joint`, `bipolar-joint`, and
 `scalar-joint`. Historic binary-scope families are rejected as unsupported.
 
@@ -232,6 +239,7 @@ families for the ternary scope are `trinomial-joint`, `bipolar-joint`, and
 | `profile fit` | Profile optimizer steps and bucket kernel self-time |
 | `mass` | Measure committed mass, Q/M behavior, and acting-floor sensitivity |
 | `check` | Run D6, batch-parity, decoder-coverage, and builder contracts |
+| `alias` | Report structural alias groups before/after the Step 4 row inputs |
 | `smoke` | Tiny end-to-end freeze, CPU cell, evaluation, and report |
 
 ## Control deck

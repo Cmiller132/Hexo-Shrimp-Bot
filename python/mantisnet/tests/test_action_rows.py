@@ -1,16 +1,25 @@
-"""Step 4 action-row tables: class laws, successor-board oracle, D6.
+"""Step 4 action-row tables: class laws, successor-board oracle, D6,
+collation, and the knob-on model path.
 
 The builder's 18 hypothetical post-placement windows per legal action are
 checked against an independent oracle that actually plays each action on a
-board copy and reads the successor's windows from the engine walk.
+board copy and reads the successor's windows from the engine walk. The
+collated views are recomputed here from the dense tables, and the knob-on
+model is held to the same D6, initialization, and registry contracts as
+every other arm.
 """
 
 from __future__ import annotations
 
 import numpy as np
+import pytest
+import torch
+
 import hexo_py
+from mantisnet import builder
 from mantisnet.builder import (
     ACTION_EMPTY,
+    ACTION_EMPTY_CLASSES,
     ACTION_MIXED,
     ACTION_OPP,
     ACTION_OWN,
@@ -18,8 +27,10 @@ from mantisnet.builder import (
     WINDOW_LEN,
     _TERN_POST1_CLASS,
     _TERN_REV,
+    collate,
     from_position,
 )
+from mantisnet.model import MantisConfig, MantisNet
 
 AXES = ((1, 0), (0, 1), (1, -1))
 
@@ -168,3 +179,231 @@ def test_action_rows_default_off():
     assert graph.action_window_index is None
     assert graph.action_post1_class is None
     assert graph.action_pre_status is None
+
+
+# --------------------------------------------------------------------------
+# Collation
+
+
+def _graphs():
+    return [
+        from_position(hexo_py.Position.replay(moves), action_rows=True)
+        for moves in _GAMES
+    ]
+
+
+def test_collated_action_fields_match_the_dense_tables():
+    """`act_class`, `act_rev`, and `act_empty` recomputed independently from
+    the per-position dense tables."""
+    graphs = _graphs()
+    batch = collate(graphs)
+
+    classes, counts, cell_off = [], [], 0
+    for graph in graphs:
+        status = graph.action_pre_status
+        for a in range(graph.n_legal):
+            for axis in range(3):
+                for k in range(WINDOW_LEN):
+                    if status[a, axis, k] != ACTION_EMPTY:
+                        classes.append(int(graph.action_post1_class[a, axis, k]))
+        for a in range(graph.n_legal):
+            row = [0, 0, 0]
+            for axis in range(3):
+                for k in range(WINDOW_LEN):
+                    if status[a, axis, k] == ACTION_EMPTY:
+                        row[min(k, WINDOW_LEN - 1 - k)] += 1
+            counts.append(row)
+        cell_off += graph.n_legal
+
+    assert batch.act_class.tolist() == classes
+    assert batch.act_empty.tolist() == counts
+    # Every candidate row is kept or EMPTY: kept degree + empty count is 18.
+    kept = torch.bincount(batch.dec_cell, minlength=batch.n_cells)
+    assert torch.equal(kept + batch.act_empty.sum(dim=1), torch.full_like(kept, 18))
+
+    # The reverse view is the stable window-major permutation.
+    rev = batch.act_rev
+    assert sorted(rev.tolist()) == list(range(len(batch.dec_window)))
+    by_window = batch.dec_window.index_select(0, rev)
+    assert torch.equal(by_window, by_window.sort(stable=True).values)
+    same = by_window[1:] == by_window[:-1]
+    assert (rev[1:][same] > rev[:-1][same]).all()
+
+
+def test_collate_refuses_mixed_action_scopes():
+    on = from_position(hexo_py.Position.replay(_GAMES[2]), action_rows=True)
+    off = from_position(hexo_py.Position.replay(_GAMES[3]))
+    with pytest.raises(ValueError, match="with and without action rows"):
+        collate([on, off])
+
+
+def test_action_fields_absent_without_the_knob():
+    batch = collate(
+        [from_position(hexo_py.Position.replay(moves)) for moves in _GAMES]
+    )
+    assert batch.act_class is None
+    assert batch.act_rev is None
+    assert batch.act_empty is None
+
+
+def test_rust_python_action_collation_parity():
+    """Rust and Python builders agree on every field under the knob."""
+    rust = builder.collate_prefixes(
+        _GAMES, [len(g) for g in _GAMES], action_rows=True
+    )
+    python = collate(_graphs())
+    for name, value in vars(python).items():
+        got = getattr(rust, name)
+        if isinstance(value, torch.Tensor):
+            assert got.dtype == value.dtype and torch.equal(got, value), name
+        else:
+            assert got == value, name
+
+
+# --------------------------------------------------------------------------
+# The knob-on model
+
+
+def _small_config(**kw):
+    return MantisConfig(
+        h=32, heads=2, blocks=2, policy_hidden=32, value_hidden=32,
+        action_rows=True, **kw,
+    )
+
+
+def test_empty_orbit_classes_are_the_three_empty_insert_orbits():
+    assert len(ACTION_EMPTY_CLASSES) == 3
+    for k in range(WINDOW_LEN):
+        orbit = min(k, WINDOW_LEN - 1 - k)
+        assert _TERN_POST1_CLASS[3**k, k] == ACTION_EMPTY_CLASSES[orbit]
+
+
+def test_knob_on_swaps_the_background_path_for_the_row_encoder():
+    model = MantisNet(_small_config())
+    names = {name for name, _ in model.named_parameters()}
+    assert {"act_proj.weight", "act_proj.bias", "act_table.weight",
+            "act_empty_base", "p_act.weight", "q_act.weight"} <= names
+    assert not any(name.startswith(("e_bg", "e_qbg")) for name in names)
+    assert model.act_table.weight.shape == (TERN_POST1_CLASSES, 32)
+
+    off = MantisNet(MantisConfig())
+    off_names = {name for name, _ in off.named_parameters()}
+    assert "e_bg.weight" in off_names and "e_qbg.weight" in off_names
+    assert not any("act_" in name for name in off_names)
+
+
+def test_scope_mismatch_is_refused_both_ways():
+    on_batch = collate(_graphs())
+    off_batch = collate(
+        [from_position(hexo_py.Position.replay(moves)) for moves in _GAMES]
+    )
+    on_model = MantisNet(_small_config()).eval()
+    off_model = MantisNet(
+        MantisConfig(h=32, heads=2, blocks=2, policy_hidden=32, value_hidden=32)
+    ).eval()
+    with pytest.raises(ValueError, match="action_rows"):
+        on_model(off_batch, 0.2)
+    with pytest.raises(ValueError, match="action_rows"):
+        off_model(on_batch, 0.2)
+
+
+def test_knob_on_forward_runs_and_initial_decoders_are_zero():
+    torch.manual_seed(0)
+    model = MantisNet(_small_config()).eval()
+    batch = collate(_graphs())
+    with torch.no_grad():
+        out = model(batch, 0.2)
+    assert out.policy_logits.shape[0] == batch.n_cells
+    assert torch.isfinite(out.policy_logits).all()
+    # Zero-initialized decoder outputs: exactly zero action values, and
+    # constant policy logits within each position.
+    assert torch.equal(out.q_values, torch.zeros_like(out.q_values))
+    for lo, hi in zip(batch.legal_offsets[:-1], batch.legal_offsets[1:]):
+        logits = out.policy_logits[lo:hi]
+        assert torch.allclose(logits, logits[:1].expand_as(logits))
+
+
+def test_knob_on_gradients_reach_the_action_parameters():
+    torch.manual_seed(3)
+    model = MantisNet(_small_config())
+    with torch.no_grad():
+        for head in (model.mlp_p, model.mlp_q):
+            torch.nn.init.normal_(head.out.weight, std=0.1)
+    batch = collate(_graphs())
+    out = model(batch, 0.2)
+    (out.policy_logits.sum() + out.q_values.sum()).backward()
+    for name in ("act_proj.weight", "act_table.weight", "act_empty_base",
+                 "p_act.weight", "q_act.weight"):
+        grad = dict(model.named_parameters())[name].grad
+        assert grad is not None and grad.abs().sum() > 0, name
+
+
+def test_knob_on_outputs_are_d6_invariant():
+    from mantisnet.klent import telemetry
+
+    torch.manual_seed(1)
+    model = MantisNet(_small_config()).eval()
+    transform = telemetry.D6_TRANSFORMS[1]
+    for moves in _GAMES[2:]:
+        pos = hexo_py.Position.replay(moves)
+        base = collate([from_position(pos, action_rows=True)])
+        turned_pos = hexo_py.Position.replay([transform(m) for m in moves])
+        turned = collate([from_position(turned_pos, action_rows=True)])
+        with torch.no_grad():
+            got = model(base, 0.2)
+            got_turned = model(turned, 0.2)
+        assert torch.allclose(got.value, got_turned.value, atol=1e-5)
+        for head in ("policy_logits", "q_values"):
+            base_map = dict(zip(pos.legal_moves(), getattr(got, head).tolist()))
+            turned_map = dict(
+                zip(turned_pos.legal_moves(), getattr(got_turned, head).tolist())
+            )
+            assert set(turned_map) == {transform(m) for m in base_map}
+            for move, score in base_map.items():
+                assert turned_map[transform(move)] == pytest.approx(score, abs=1e-5)
+
+
+def test_knob_on_checkpoint_round_trips_through_the_family_registry(tmp_path):
+    from mantisnet.lab.families import infer_config, load_checkpoint
+
+    cfg = MantisConfig(action_rows=True)
+    torch.manual_seed(2)
+    model = MantisNet(cfg)
+    inferred = infer_config(model.state_dict())
+    assert inferred.action_rows
+
+    path = tmp_path / "rows.pt"
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "versions": {
+                "RULES_VERSION": hexo_py.RULES_VERSION,
+                "ACTION_ORDER_VERSION": hexo_py.ACTION_ORDER_VERSION,
+            },
+            "model_config": {"action_rows": True},
+            "iteration": 3,
+        },
+        path,
+    )
+    loaded = load_checkpoint(path)
+    assert loaded.config.action_rows
+
+    batch = collate(_graphs())
+    with torch.no_grad():
+        reference = MantisNet(cfg).eval()
+        reference.load_state_dict(model.state_dict())
+        expected = reference(batch, 0.2)
+        got_policy, _score, got_q = loaded.model.cell_heads(
+            *loaded.model.trunk(batch)[1:], batch, 0.2
+        )
+    assert torch.allclose(got_policy, expected.policy_logits, atol=1e-6)
+    assert torch.allclose(got_q, expected.q_values, atol=1e-6)
+
+
+def test_knob_on_parameter_count_is_pinned():
+    # Incumbent 3,866,597, minus the two 8x128 background tables, plus the
+    # row encoder: act_proj 16,512 + act_table 93,312 + base 128 + two
+    # 128x128 extension matrices 32,768.
+    assert sum(
+        p.numel() for p in MantisNet(MantisConfig(action_rows=True)).parameters()
+    ) == 3_866_597 - 2_048 + 142_720

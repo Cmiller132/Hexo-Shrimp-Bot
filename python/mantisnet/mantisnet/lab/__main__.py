@@ -236,6 +236,15 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--seed", type=int, default=0)
     _device(check)
 
+    alias = commands.add_parser(
+        "alias", help="structural alias diagnostic over corpus positions"
+    )
+    alias.add_argument("--corpus", required=True, help="frozen corpus path or name")
+    alias.add_argument("--split", choices=("train", "val", "test"), default="val")
+    alias.add_argument("--sample", type=int, default=2_000)
+    alias.add_argument("--seed", type=int, default=0)
+    alias.add_argument("--examples", type=int, default=8)
+
     smoke = commands.add_parser("smoke", help="tiny CPU freeze/train/evaluate/report")
     smoke.add_argument(
         "--work-dir", help="retain artifacts here (default: a temporary directory)"
@@ -416,6 +425,20 @@ def main(argv=None) -> None:
         if values.get("corpus"):
             values["corpus"] = _named_path(values["corpus"], Path("runs/corpora"))
         run_check(**values)
+        return
+
+    if args.command == "alias":
+        from .alias import corpus_alias_report
+
+        _json(
+            corpus_alias_report(
+                _named_path(args.corpus, Path("runs/corpora")),
+                split=args.split,
+                sample=args.sample,
+                seed=args.seed,
+                example_cap=args.examples,
+            )
+        )
         return
 
     if args.command == "smoke":

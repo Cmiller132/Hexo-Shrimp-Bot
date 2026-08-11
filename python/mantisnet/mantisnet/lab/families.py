@@ -19,6 +19,7 @@ from ..builder import (
     TERN_DEC_CLASSES,
     TERN_OCC_CLASSES,
     TERN_PATTERNS,
+    TERN_POST1_CLASSES,
 )
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
 from ..model import MantisConfig, MantisNet, ModelOutput, strip_legacy_knobs
@@ -164,7 +165,6 @@ _COMMON_KEYS = {
     "ln_out.bias",
     "p.weight",
     "e_pw.weight",
-    "e_bg.weight",
     "mlp_p.lin_a.weight",
     "mlp_p.lin_a.bias",
     "mlp_p.lin_b.weight",
@@ -172,7 +172,6 @@ _COMMON_KEYS = {
     "mlp_p.out.bias",
     "q.weight",
     "e_qw.weight",
-    "e_qbg.weight",
     "mlp_q.lin_a.weight",
     "mlp_q.lin_a.bias",
     "mlp_q.lin_b.weight",
@@ -185,6 +184,15 @@ _COMMON_KEYS = {
     "mlp_v.0.bias",
     "mlp_v.2.weight",
     "mlp_v.2.bias",
+}
+
+# The two decoder inputs the Step 4 knob swaps: the background bucket tables
+# (knob off) against the shared row encoder and per-head extension matrices
+# (knob on).
+_BG_KEYS = {"e_bg.weight", "e_qbg.weight"}
+_ACT_KEYS = {
+    "act_proj.weight", "act_proj.bias", "act_table.weight", "act_empty_base",
+    "p_act.weight", "q_act.weight",
 }
 
 _BLOCK_SUFFIXES = {
@@ -227,6 +235,7 @@ class _Knobs:
     joint_incidence: bool
     window_attention: bool
     mixed_windows: bool
+    action_rows: bool
 
 
 def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
@@ -261,11 +270,13 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         ),
         window_attention="blocks.0.wa_bias" in state_dict,
         mixed_windows=mixed,
+        action_rows="act_table.weight" in state_dict,
     )
 
 
-# The profile this build instantiates. Window attention remains live, so its
-# value is normalized during profile comparison.
+# The profile this build instantiates. Window attention and the Step 4 row
+# encoder remain live knobs, so their values are normalized during profile
+# comparison.
 _BAKED = _Knobs(
     axis_bias=True,
     off_axis_bias=False,
@@ -274,6 +285,7 @@ _BAKED = _Knobs(
     joint_incidence=True,
     window_attention=True,
     mixed_windows=True,
+    action_rows=False,
 )
 
 
@@ -283,6 +295,7 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
         for index in range(blocks)
         for suffix in _BLOCK_SUFFIXES
     }
+    keys |= _ACT_KEYS if knobs.action_rows else _BG_KEYS
     for index in range(blocks):
         prefix = f"blocks.{index}."
         if knobs.axis_bias:
@@ -356,12 +369,10 @@ def _expected_shapes(
         "token_moves.weight": (2, h),
         "ln_out.weight": (h,), "ln_out.bias": (h,),
         "p.weight": (h, h), "e_pw.weight": (table_rows, h),
-        "e_bg.weight": (NEAREST_BUCKETS, h),
         "mlp_p.lin_a.weight": (ph, h), "mlp_p.lin_a.bias": (ph,),
         "mlp_p.lin_b.weight": (ph, h), "mlp_p.out.weight": (1, ph),
         "mlp_p.out.bias": (1,),
         "q.weight": (h, h), "e_qw.weight": (table_rows, h),
-        "e_qbg.weight": (NEAREST_BUCKETS, h),
         "mlp_q.lin_a.weight": (ph, h), "mlp_q.lin_a.bias": (ph,),
         "mlp_q.lin_b.weight": (ph, h),
         "mlp_q.out.weight": (critic_width, ph),
@@ -370,6 +381,18 @@ def _expected_shapes(
         "mlp_v.0.weight": (vh, q * h), "mlp_v.0.bias": (vh,),
         "mlp_v.2.weight": (k, vh), "mlp_v.2.bias": (k,),
     }
+    if cfg.action_rows:
+        shapes.update({
+            "act_proj.weight": (h, h), "act_proj.bias": (h,),
+            "act_table.weight": (TERN_POST1_CLASSES, h),
+            "act_empty_base": (h,),
+            "p_act.weight": (h, h), "q_act.weight": (h, h),
+        })
+    else:
+        shapes.update({
+            "e_bg.weight": (NEAREST_BUCKETS, h),
+            "e_qbg.weight": (NEAREST_BUCKETS, h),
+        })
     fh = cfg.ffn_factor * h
     ln_names = ["ln_ws_s", "ln_ws_w", "ln_cp_in", "ln_cp_w", "ln_sw_w",
                 "ln_sw_s", "ln_attn", "ln_ffn"]
@@ -487,7 +510,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         )
 
     knobs = _knob_profile(state_dict, blocks)
-    if replace(knobs, window_attention=True) != _BAKED:
+    if replace(knobs, window_attention=True, action_rows=False) != _BAKED:
         raise ValueError(
             f"state dict trunk profile {knobs} is not the baked architecture "
             f"{_BAKED}; checkpoints predating a baked stage are not "
@@ -506,6 +529,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         value_hidden=value_hidden,
         dropout=0.0,
         window_attention=knobs.window_attention,
+        action_rows=knobs.action_rows,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")

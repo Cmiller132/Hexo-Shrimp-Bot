@@ -13,14 +13,21 @@ backend) execution.
 Converts an `engine::Position` into the graph representation MantisNet consumes.
 Each position becomes a `Graph` of stones, windows, stone-to-window
 incidence edges, a decoder table mapping legal cells back to windows, and a
-background-distance table for legal cells that no kept window covers. The
-window scope is a build parameter (MANTIS_GRAFT_SPEC Step 12): the default
-keeps live one-colour windows under the binary occupancy tables; the mixed
-scope keeps every nonempty candidate under ternary slot patterns. The encoder
-assigns reversal-invariant joint pattern/slot classes to both incidence and
-decoder edges in the active scope's vocabulary. The wire format speaks the
-binary scope only, and a mixed bake replaces it under a
-`MODEL_REPR_VERSION` bump.
+background-distance table for legal cells that no kept window covers. Every
+nonempty candidate window is kept under the ternary slot patterns
+(MANTIS_GRAFT_SPEC Step 12, baked): the encoder assigns reversal-invariant
+joint pattern/slot classes to both incidence and decoder edges in the
+377/726/1458 ternary vocabulary, and the wire format speaks that scope under
+`MODEL_REPR_VERSION` 4.
+
+`build(position, action_rows)` additionally emits the Step 4 dense action-row
+tables — each legal action's 18 hypothetical post-placement windows with
+their 729 joint `(post, slot)` classes and pre-insert statuses — behind the
+campaign knob. Collation derives the model's views from them: the kept rows
+are asserted to be the decoder incidence in the same order (`act_class`), the
+stable window-major edge permutation (`act_rev`), and per-cell EMPTY-row
+counts by slot orbit (`act_empty`). The wire format does not carry them while
+the knob is live; a bake extends it under a `MODEL_REPR_VERSION` bump.
 
 The encoder has three output paths:
 

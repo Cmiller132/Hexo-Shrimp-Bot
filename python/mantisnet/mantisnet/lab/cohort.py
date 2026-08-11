@@ -91,6 +91,12 @@ def selfplay_cohort(
         rng=np.random.default_rng(seed),
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
+        # A bare ``evaluate`` carries no config; a knob mismatch behind it is
+        # caught loudly by the model's own batch scope check.
+        action_rows=bool(
+            model is not None and getattr(model, "cfg", None) is not None
+            and model.cfg.action_rows
+        ),
     )
     if steps == 0:
         positions = list(collector.positions)

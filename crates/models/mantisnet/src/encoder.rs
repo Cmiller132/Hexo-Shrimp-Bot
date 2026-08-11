@@ -202,6 +202,7 @@ const ACTION_OWN: i64 = 0;
 const ACTION_OPP: i64 = 1;
 const ACTION_EMPTY: i64 = 2;
 const ACTION_MIXED: i64 = 3;
+const ACTION_EMPTY_ORBITS: usize = 3;
 
 fn pack(c: engine::HexCoord) -> i64 {
     c.q as i64 * QSHIFT + c.r as i64
@@ -977,6 +978,99 @@ pub struct RawBatch {
     pub bg_cell: Vec<i64>,
     /// Nearest-stone distance bucket for each background legal cell.
     pub bg_bucket: Vec<i64>,
+    /// Step 4 action-row views, present only when the graphs were built with
+    /// action rows enabled.
+    pub action_fields: Option<RawActionFields>,
+}
+
+/// Collated Step 4 action-row views.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RawActionFields {
+    /// Post-placement class for each decoder incidence, in decoder order.
+    pub act_class: Vec<i64>,
+    /// Stable window-major permutation of the decoder incidences.
+    pub act_rev: Vec<i64>,
+    /// EMPTY-row counts in `(legal cell, slot orbit)` row-major order.
+    pub act_empty: Vec<i64>,
+}
+
+fn collate_action_fields(graphs: &[Graph], dec_window: &[i64]) -> RawActionFields {
+    let mut act_class = Vec::with_capacity(dec_window.len());
+    let mut act_empty = Vec::with_capacity(
+        graphs
+            .iter()
+            .map(|graph| graph.n_legal * ACTION_EMPTY_ORBITS)
+            .sum(),
+    );
+
+    for graph in graphs {
+        let rows = graph.n_legal * engine::WINDOWS_PER_PLACEMENT;
+        assert_eq!(
+            graph.action_window_index.len(),
+            rows,
+            "action-row window table has the wrong dense row count"
+        );
+        assert_eq!(
+            graph.action_post1_class.len(),
+            rows,
+            "action-row class table has the wrong dense row count"
+        );
+        assert_eq!(
+            graph.action_pre_status.len(),
+            rows,
+            "action-row status table has the wrong dense row count"
+        );
+
+        let kept_flat: Vec<usize> = graph
+            .action_pre_status
+            .iter()
+            .enumerate()
+            .filter_map(|(flat, &status)| (status != ACTION_EMPTY).then_some(flat))
+            .collect();
+        assert_eq!(
+            kept_flat.len(),
+            graph.dec_cell.len(),
+            "action-row cells disagree with the decoder walk: kept-row count diverged"
+        );
+        for (&flat, &cell) in kept_flat.iter().zip(&graph.dec_cell) {
+            assert_eq!(
+                flat / engine::WINDOWS_PER_PLACEMENT,
+                cell as usize,
+                "action-row cells disagree with the decoder walk: kept row {flat} maps to a different cell"
+            );
+        }
+        let kept_windows: Vec<i64> = kept_flat
+            .iter()
+            .map(|&flat| graph.action_window_index[flat])
+            .collect();
+        assert_eq!(
+            kept_windows, graph.dec_window,
+            "action-row windows disagree with the decoder walk"
+        );
+        act_class.extend(kept_flat.iter().map(|&flat| graph.action_post1_class[flat]));
+
+        for cell in 0..graph.n_legal {
+            let mut counts = [0i64; ACTION_EMPTY_ORBITS];
+            let base = cell * engine::WINDOWS_PER_PLACEMENT;
+            for axis in 0..engine::Axis::ALL.len() {
+                for slot in 0..engine::WINDOW_LEN {
+                    let flat = base + axis * engine::WINDOW_LEN + slot;
+                    if graph.action_pre_status[flat] == ACTION_EMPTY {
+                        counts[slot.min(engine::WINDOW_LEN - 1 - slot)] += 1;
+                    }
+                }
+            }
+            act_empty.extend_from_slice(&counts);
+        }
+    }
+
+    let mut act_rev: Vec<i64> = (0..dec_window.len() as i64).collect();
+    act_rev.sort_by_key(|&edge| dec_window[edge as usize]);
+    RawActionFields {
+        act_class,
+        act_rev,
+        act_empty,
+    }
 }
 
 /// Collate position-local graphs into one globally indexed ragged batch.
@@ -1013,6 +1107,7 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
         dec_class: vec![],
         bg_cell: vec![],
         bg_bucket: vec![],
+        action_fields: None,
     };
 
     let (mut stone_off, mut win_off, mut cell_off) = (0i64, 0i64, 0i64);
@@ -1057,6 +1152,17 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
         stone_off += ns as i64;
         win_off += nw as i64;
     }
+    let with_actions: Vec<bool> = graphs
+        .iter()
+        .map(|graph| !graph.action_window_index.is_empty())
+        .collect();
+    assert!(
+        !with_actions.iter().any(|&enabled| enabled) || with_actions.iter().all(|&enabled| enabled),
+        "cannot collate graphs with and without action rows"
+    );
+    if with_actions.iter().all(|&enabled| enabled) && !graphs.is_empty() {
+        out.action_fields = Some(collate_action_fields(graphs, &out.dec_window));
+    }
     out
 }
 
@@ -1075,16 +1181,20 @@ pub fn decode_batch<'a>(items: impl IntoIterator<Item = &'a [u8]>) -> Result<Raw
 }
 
 /// Build every position in parallel, then collate.
-pub fn build_batch(positions: &[engine::Position]) -> Result<RawBatch, String> {
+pub fn build_batch(positions: &[engine::Position], action_rows: bool) -> Result<RawBatch, String> {
     let graphs: Vec<Graph> = positions
         .par_iter()
-        .map(|pos| build(pos, false))
+        .map(|pos| build(pos, action_rows))
         .collect::<Result<_, _>>()?;
     Ok(collate(&graphs))
 }
 
 /// Replay each game's first `t` placements, then build, in parallel.
-pub fn build_batch_prefixes(games: &[Vec<(i16, i16)>], ts: &[usize]) -> Result<RawBatch, String> {
+pub fn build_batch_prefixes(
+    games: &[Vec<(i16, i16)>],
+    ts: &[usize],
+    action_rows: bool,
+) -> Result<RawBatch, String> {
     if games.len() != ts.len() {
         return Err("games and ts must have equal length".into());
     }
@@ -1103,7 +1213,7 @@ pub fn build_batch_prefixes(games: &[Vec<(i16, i16)>], ts: &[usize]) -> Result<R
                 .map(|&(q, r)| engine::Action::new(engine::HexCoord::new(q, r)))
                 .collect();
             let pos = engine::Position::replay(&actions).map_err(|e| e.to_string())?;
-            build(&pos, false)
+            build(&pos, action_rows)
         })
         .collect::<Result<_, _>>()?;
     Ok(collate(&graphs))
@@ -1112,6 +1222,35 @@ pub fn build_batch_prefixes(games: &[Vec<(i16, i16)>], ts: &[usize]) -> Result<R
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const FIXTURE_GAMES: &[&[(i16, i16)]] = &[
+        &[],
+        &[(0, 0)],
+        &[(0, 0), (1, 0), (2, 0)],
+        &[(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)],
+        &[
+            (0, 0),
+            (0, 1),
+            (0, 2),
+            (1, 0),
+            (2, 0),
+            (0, 3),
+            (0, 4),
+            (3, 0),
+        ],
+        &[
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (0, 1),
+            (1, 1),
+            (2, 1),
+            (3, -1),
+            (0, 2),
+            (4, -1),
+            (-1, 2),
+        ],
+    ];
 
     fn replay(moves: &[(i16, i16)]) -> engine::Position {
         let actions: Vec<_> = moves
@@ -1172,36 +1311,8 @@ mod tests {
 
     #[test]
     fn action_rows_match_successor_windows() {
-        let games: &[&[(i16, i16)]] = &[
-            &[],
-            &[(0, 0)],
-            &[(0, 0), (1, 0), (2, 0)],
-            &[(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)],
-            &[
-                (0, 0),
-                (0, 1),
-                (0, 2),
-                (1, 0),
-                (2, 0),
-                (0, 3),
-                (0, 4),
-                (3, 0),
-            ],
-            &[
-                (0, 0),
-                (1, 0),
-                (2, 0),
-                (0, 1),
-                (1, 1),
-                (2, 1),
-                (3, -1),
-                (0, 2),
-                (4, -1),
-                (-1, 2),
-            ],
-        ];
         let mut rows_checked = 0;
-        for &moves in games {
+        for &moves in FIXTURE_GAMES {
             let position = replay(moves);
             let mover = position.current_player();
             let graph = build(&position, true).expect("fixture graph builds");
@@ -1279,6 +1390,70 @@ mod tests {
     }
 
     #[test]
+    fn collated_action_fields_match_the_dense_fixture_rows() {
+        let games: Vec<Vec<(i16, i16)>> =
+            FIXTURE_GAMES.iter().map(|moves| moves.to_vec()).collect();
+        let ts: Vec<usize> = games.iter().map(Vec::len).collect();
+        let raw = build_batch_prefixes(&games, &ts, true).expect("fixture prefixes build");
+        let actions = raw
+            .action_fields
+            .as_ref()
+            .expect("the action fields are present");
+
+        let graphs: Vec<Graph> = FIXTURE_GAMES
+            .iter()
+            .map(|moves| build(&replay(moves), true).expect("fixture graph builds"))
+            .collect();
+        let mut expected_class = Vec::new();
+        let mut expected_empty = Vec::new();
+        for graph in &graphs {
+            for cell in 0..graph.n_legal {
+                let mut counts = [0i64; ACTION_EMPTY_ORBITS];
+                for axis in 0..engine::Axis::ALL.len() {
+                    for slot in 0..engine::WINDOW_LEN {
+                        let flat =
+                            cell * engine::WINDOWS_PER_PLACEMENT + axis * engine::WINDOW_LEN + slot;
+                        if graph.action_pre_status[flat] == ACTION_EMPTY {
+                            counts[slot.min(engine::WINDOW_LEN - 1 - slot)] += 1;
+                        } else {
+                            expected_class.push(graph.action_post1_class[flat]);
+                        }
+                    }
+                }
+                expected_empty.extend_from_slice(&counts);
+            }
+        }
+        let mut expected_rev: Vec<i64> = (0..raw.dec_window.len() as i64).collect();
+        expected_rev.sort_by_key(|&edge| raw.dec_window[edge as usize]);
+
+        assert_eq!(actions.act_class, expected_class);
+        assert_eq!(actions.act_rev, expected_rev);
+        assert_eq!(actions.act_empty, expected_empty);
+    }
+
+    #[test]
+    fn ply_zero_prefix_collates_six_empty_rows_per_slot_orbit() {
+        let raw = build_batch_prefixes(&[vec![]], &[0], true).expect("the opening is live");
+        let actions = raw.action_fields.expect("the action fields are present");
+        assert!(actions.act_class.is_empty());
+        assert!(actions.act_rev.is_empty());
+        assert_eq!(actions.act_empty, [6, 6, 6]);
+    }
+
+    #[test]
+    fn disabling_batch_action_rows_only_omits_the_optional_fields() {
+        let positions: Vec<engine::Position> =
+            FIXTURE_GAMES.iter().map(|moves| replay(moves)).collect();
+        let off = build_batch(&positions, false).expect("fixture batch builds");
+        assert!(off.action_fields.is_none());
+
+        let mut enabled = build_batch(&positions, true).expect("fixture batch builds");
+        assert!(enabled.action_fields.is_some());
+        enabled.action_fields = None;
+        assert_eq!(off, enabled);
+    }
+
+    #[test]
     fn disabling_action_rows_leaves_the_graph_core_unchanged() {
         let position = replay(&[(0, 0), (1, 0), (2, 0), (0, 1), (1, 1), (2, 1)]);
         let off = build(&position, false).expect("fixture graph builds");
@@ -1295,7 +1470,7 @@ mod tests {
 
     #[test]
     fn the_opening_batch_has_only_the_token_and_background_cell() {
-        let raw = build_batch(&[engine::Position::new()]).expect("the opening is live");
+        let raw = build_batch(&[engine::Position::new()], false).expect("the opening is live");
 
         assert_eq!(raw.n_pos, 1);
         assert_eq!(raw.max_t, 1);
@@ -1318,6 +1493,7 @@ mod tests {
         assert!(raw.dec_class.is_empty());
         assert_eq!(raw.bg_cell, [0]);
         assert_eq!(raw.bg_bucket, [NEAREST_BUCKETS - 1]);
+        assert!(raw.action_fields.is_none());
     }
 
     #[test]
@@ -1358,18 +1534,20 @@ mod tests {
             .collect();
         let position = engine::Position::replay(&actions).expect("legal fixture");
 
-        let direct = build_batch(&[position]).expect("live position");
+        let direct = build_batch(&[position], false).expect("live position");
         let replayed =
-            build_batch_prefixes(&[moves], &[actions.len()]).expect("legal prefix fixture");
+            build_batch_prefixes(&[moves], &[actions.len()], false).expect("legal prefix fixture");
         assert_eq!(direct, replayed);
     }
 
     #[test]
     fn malformed_prefix_requests_are_refused() {
-        let unequal = build_batch_prefixes(&[vec![(0, 0)]], &[]).expect_err("lengths must agree");
+        let unequal =
+            build_batch_prefixes(&[vec![(0, 0)]], &[], false).expect_err("lengths must agree");
         assert_eq!(unequal, "games and ts must have equal length");
 
-        let too_long = build_batch_prefixes(&[vec![(0, 0)]], &[2]).expect_err("prefix is too long");
+        let too_long =
+            build_batch_prefixes(&[vec![(0, 0)]], &[2], false).expect_err("prefix is too long");
         assert_eq!(too_long, "prefix length 2 exceeds game length 1");
     }
 
@@ -1385,7 +1563,7 @@ mod tests {
 
         let decoded =
             decode_batch(items.iter().map(Vec::as_slice)).expect("encoder output is valid");
-        let direct = build_batch(&positions).expect("all positions are live");
+        let direct = build_batch(&positions, false).expect("all positions are live");
         assert_eq!(decoded, direct);
     }
 

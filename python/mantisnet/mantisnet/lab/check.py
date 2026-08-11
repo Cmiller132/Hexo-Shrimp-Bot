@@ -39,6 +39,9 @@ _BATCH_TENSORS = (
     "bg_bucket",
 )
 
+# The Step 4 fields, present exactly when the batch was built with the knob.
+_ACTION_TENSORS = ("act_class", "act_rev", "act_empty")
+
 
 def _forward(model, batch, device: str):
     batch = batch.to(device)
@@ -185,18 +188,24 @@ def _assert_batches_equal(rust, python) -> None:
         a, b = getattr(rust, name), getattr(python, name)
         if a.dtype != b.dtype or not torch.equal(a, b):
             raise ValueError(f"Rust/Python builder disagreement in {name}")
+    for name in _ACTION_TENSORS:
+        a, b = getattr(rust, name), getattr(python, name)
+        if (a is None) != (b is None):
+            raise ValueError(f"Rust/Python builder disagreement in {name} presence")
+        if a is not None and (a.dtype != b.dtype or not torch.equal(a, b)):
+            raise ValueError(f"Rust/Python builder disagreement in {name}")
 
 
-def _check_builder_agreement(cases, collate_fn) -> int:
+def _check_builder_agreement(cases, collate_fn, action_rows: bool) -> int:
     batch = _collate_cases(cases, collate_fn)
     _assert_batches_equal(
         batch,
-        collate([from_position(case.position) for case in cases]),
+        collate([from_position(case.position, action_rows=action_rows) for case in cases]),
     )
     for case in cases:
         _assert_batches_equal(
             _collate_cases([case], collate_fn),
-            collate([from_position(case.position)]),
+            collate([from_position(case.position, action_rows=action_rows)]),
         )
     return len(cases)
 
@@ -221,7 +230,7 @@ def contract_battery(
             model, cases, device, collate_fn
         ),
         "python_rust_positions": (
-            _check_builder_agreement(cases, collate_fn)
+            _check_builder_agreement(cases, collate_fn, model.cfg.action_rows)
             if rust_collate
             else None
         ),

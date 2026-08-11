@@ -132,6 +132,19 @@ def _tern_post1_classes() -> np.ndarray:
 _TERN_POST1_CLASS = _tern_post1_classes()
 TERN_POST1_CLASSES = 729
 
+# The classes of an own stone inserted into an empty candidate window: post
+# pattern ``3**k`` at slot ``k``. Reversal folds slot ``k`` onto ``5 - k``, so
+# the six inserts occupy three orbits, indexed by ``min(k, 5 - k)``. A cell's
+# EMPTY rows are collated as counts over these orbits — the shared empty base
+# makes every EMPTY row of one orbit the same hidden row.
+ACTION_EMPTY_ORBITS = 3
+ACTION_EMPTY_CLASSES = tuple(int(_TERN_POST1_CLASS[3**k, k]) for k in range(3))
+assert len(set(ACTION_EMPTY_CLASSES)) == ACTION_EMPTY_ORBITS
+assert all(
+    _TERN_POST1_CLASS[3**k, k] == _TERN_POST1_CLASS[3 ** (5 - k), 5 - k]
+    for k in range(WINDOW_LEN)
+)
+
 # Pre-window statuses of an action row.
 ACTION_OWN, ACTION_OPP, ACTION_EMPTY, ACTION_MIXED = 0, 1, 2, 3
 
@@ -531,6 +544,16 @@ class Batch:
     # The §5.1c window-pair views are not collated: a window_attention model
     # derives them on its own device from window_id — the edge views cost
     # several times more to ship than to derive beside the model.
+    #
+    # Step 4 action-row tables, present exactly when built with the
+    # ``action_rows`` knob. The kept rows (a nonempty candidate window through
+    # the action cell) are in bijection with the decoder incidence — the same
+    # 18-candidate walk in the same order — so they ride the ``dec_*`` views
+    # and only add their post-placement class; EMPTY rows collapse to
+    # per-orbit counts against the shared empty base.
+    act_class: torch.Tensor | None = None  # (E_d,) long, < TERN_POST1_CLASSES
+    act_rev: torch.Tensor | None = None  # (E_d,) long: window-major edge order
+    act_empty: torch.Tensor | None = None  # (N_c, 3) long: EMPTY rows per orbit
 
     def to(self, device) -> "Batch":
         """The same batch with every tensor on ``device``."""
@@ -612,19 +635,22 @@ def batch_from_arrays(**fields) -> Batch:
     )
 
 
-def collate_positions(positions) -> Batch:
+def collate_positions(positions, *, action_rows: bool = False) -> Batch:
     """Build and collate positions with the Rust builder.
 
     ``hexo_py.build_batch`` runs in parallel with the GIL released and returns
     the same fields as ``collate([from_position(p) ...])`` under
-    ``MODEL_REPR_VERSION``.
+    ``MODEL_REPR_VERSION``. ``action_rows`` selects the Step 4 row tables; the
+    batch must match the consuming model's knob.
     """
     import hexo_py
 
-    return batch_from_arrays(**hexo_py.build_batch(list(positions)))
+    return batch_from_arrays(
+        **hexo_py.build_batch(list(positions), action_rows=action_rows)
+    )
 
 
-def collate_prefixes(games, ts) -> Batch:
+def collate_prefixes(games, ts, *, action_rows: bool = False) -> Batch:
     """Move prefixes to one collated batch: replay + build, in parallel.
 
     Stored fitting positions are move prefixes
@@ -632,13 +658,57 @@ def collate_prefixes(games, ts) -> Batch:
     """
     import hexo_py
 
-    return batch_from_arrays(**hexo_py.build_batch_prefixes(list(games), list(ts)))
+    return batch_from_arrays(
+        **hexo_py.build_batch_prefixes(list(games), list(ts), action_rows=action_rows)
+    )
+
+
+_ACTION_SLOT_ORBIT = np.minimum(np.arange(WINDOW_LEN), WINDOW_LEN - 1 - np.arange(WINDOW_LEN))
+
+
+def _action_fields(graphs: list[PositionGraph], dec_window: torch.Tensor) -> dict:
+    """The Step 4 collated views, from the per-position dense row tables.
+
+    The kept-row/decoder bijection is asserted per position — the two tables
+    come from the same walk, and a silent divergence here would misclass every
+    row downstream (the symmetric-bug hazard the audit tier exists for).
+    """
+    classes, counts = [], []
+    for g in graphs:
+        status = g.action_pre_status.reshape(g.n_legal, -1)
+        kept = (status != ACTION_EMPTY).ravel()
+        flat = np.nonzero(kept)[0]
+        if not np.array_equal(flat // (3 * WINDOW_LEN), g.dec_cell):
+            raise ValueError("action-row cells disagree with the decoder walk")
+        if not np.array_equal(g.action_window_index.ravel()[kept], g.dec_window):
+            raise ValueError("action-row windows disagree with the decoder walk")
+        classes.append(g.action_post1_class.ravel()[kept])
+        empty = (status == ACTION_EMPTY).reshape(g.n_legal, 3, WINDOW_LEN)
+        counts.append(
+            np.stack(
+                [empty[:, :, _ACTION_SLOT_ORBIT == o].sum(axis=(1, 2)) for o in range(ACTION_EMPTY_ORBITS)],
+                axis=1,
+            )
+        )
+    act_class = np.concatenate(classes) if classes else np.empty(0, dtype=np.int64)
+    return {
+        "act_class": torch.from_numpy(act_class.astype(np.int64)),
+        "act_rev": torch.from_numpy(
+            np.argsort(dec_window.numpy(), kind="stable").astype(np.int64)
+        ),
+        "act_empty": torch.from_numpy(
+            np.concatenate(counts).astype(np.int64).reshape(-1, ACTION_EMPTY_ORBITS)
+        ),
+    }
 
 
 def collate(graphs: list[PositionGraph]) -> Batch:
     """Concatenate position graphs into one batch (§9)."""
     if not graphs:
         raise ValueError("empty batch")
+    with_actions = [g.action_window_index is not None for g in graphs]
+    if any(with_actions) and not all(with_actions):
+        raise ValueError("cannot collate graphs with and without action rows")
     p = len(graphs)
     ns = np.array([g.n_stones for g in graphs])
     nw = np.array([g.n_windows for g in graphs])
@@ -695,4 +765,5 @@ def collate(graphs: list[PositionGraph]) -> Batch:
         bg_cell=cat([g.bg_cell + cell_off[i] for i, g in enumerate(graphs)]),
         bg_bucket=cat([g.bg_bucket for g in graphs]),
         **_relay_fields(dec_cell, dec_window, dec_class, int(win_off[-1])),
+        **(_action_fields(graphs, dec_window) if all(with_actions) else {}),
     )
