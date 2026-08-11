@@ -657,88 +657,6 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
     })
 }
 
-fn action_tables(
-    pos: &engine::Position,
-    mover: engine::Player,
-    legal: &[engine::HexCoord],
-    live_keys: &[i64],
-) -> Result<ActionTables, String> {
-    let rows = legal
-        .len()
-        .checked_mul(engine::WINDOWS_PER_PLACEMENT)
-        .ok_or_else(|| "action row count overflows usize".to_owned())?;
-    let mut window_index = Vec::with_capacity(rows);
-    let mut post1_class = Vec::with_capacity(rows);
-    let mut pre_status = Vec::with_capacity(rows);
-
-    for (action, &cell) in legal.iter().enumerate() {
-        if let Some(owner) = pos.get(cell) {
-            return Err(format!(
-                "legal action {action} at ({}, {}) is occupied by {owner:?}",
-                cell.q, cell.r
-            ));
-        }
-
-        // The engine gathers the eleven cells around the action once per
-        // canonical axis and returns the six candidate slots axis-major.
-        for (row, wr) in pos.windows_through(cell).into_iter().enumerate() {
-            let axis = row / engine::WINDOW_LEN;
-            let slot = row % engine::WINDOW_LEN;
-            debug_assert_eq!(wr.window.axis, engine::Axis::ALL[axis]);
-            debug_assert_eq!(wr.window.cell(slot), cell);
-
-            let m0 = wr.mask.mask(engine::Player::P0);
-            let m1 = wr.mask.mask(engine::Player::P1);
-            let (own, opp) = if mover == engine::Player::P0 {
-                (m0, m1)
-            } else {
-                (m1, m0)
-            };
-            if (own | opp) >> slot & 1 != 0 {
-                return Err(format!(
-                    "legal action {action} at ({}, {}) is occupied in axis {axis}, slot {slot}",
-                    cell.q, cell.r
-                ));
-            }
-
-            let status = match (own != 0, opp != 0) {
-                (true, false) => ACTION_OWN,
-                (false, true) => ACTION_OPP,
-                (false, false) => ACTION_EMPTY,
-                (true, true) => ACTION_MIXED,
-            };
-            let mut pre = 0usize;
-            for (k, &power) in POW3.iter().enumerate() {
-                let digit = ((own >> k) & 1) as usize + 2 * ((opp >> k) & 1) as usize;
-                pre += digit * power as usize;
-            }
-            let post = pre + POW3[slot] as usize;
-            let class = TERN_POST1_CLASS[post * engine::WINDOW_LEN + slot] as i64;
-            if class < 0 {
-                return Err("a post-placement row lost its own stone".to_owned());
-            }
-
-            let key = pack(wr.window.start) * 4 + axis as i64;
-            let found = live_keys
-                .binary_search(&key)
-                .map_or(-1, |index| index as i64);
-            let kept = status != ACTION_EMPTY;
-            if (found >= 0) != kept {
-                return Err("the kept-window set disagrees with the action-row walk".to_owned());
-            }
-
-            window_index.push(found);
-            post1_class.push(class);
-            pre_status.push(status);
-        }
-    }
-    Ok(ActionTables {
-        window_index,
-        post1_class,
-        pre_status,
-    })
-}
-
 /// Build one live position's graph with indices local to that position.
 ///
 /// Returns an error for terminal positions.
@@ -771,12 +689,21 @@ pub fn build(pos: &engine::Position, action_rows: bool) -> Result<Graph, String>
     let n_legal = legal.len();
 
     if stones.is_empty() {
-        // Ply 0: one legal cell, background path, the clamp bucket.
-        let actions = if action_rows {
-            action_tables(pos, mover, &legal, &[])?
-        } else {
-            ActionTables::default()
-        };
+        // Ply 0: one legal cell, background path, the clamp bucket. Every
+        // action row is an empty insert: no window, slot-orbit class.
+        let mut actions = ActionTables::default();
+        if action_rows {
+            for _ in 0..n_legal {
+                for row in 0..engine::WINDOWS_PER_PLACEMENT {
+                    let slot = row % engine::WINDOW_LEN;
+                    actions.window_index.push(-1);
+                    actions.post1_class.push(
+                        TERN_POST1_CLASS[POW3[slot] as usize * engine::WINDOW_LEN + slot] as i64,
+                    );
+                    actions.pre_status.push(ACTION_EMPTY);
+                }
+            }
+        }
         return Ok(Graph {
             stone_own,
             stone_qr,
@@ -862,21 +789,37 @@ pub fn build(pos: &engine::Position, action_rows: bool) -> Result<Graph, String>
         }
     }
 
-    // Decoder table: legal-cell-major, then (axis, offset) order.
+    // Decoder table: legal-cell-major, then (axis, offset) order. The Step 4
+    // action rows ride the same walk: the candidate's mask gives the row's
+    // status and pre pattern, the inserted stone is one power-of-three away,
+    // and the decoder's own binary search is the kept-window index — no
+    // second engine walk. The kept/decoder agreement stays asserted per row.
     let mut dec_cell = Vec::new();
     let mut dec_window = Vec::new();
     let mut dec_class = Vec::new();
     let mut bg_cell = Vec::new();
     let mut bg_bucket = Vec::new();
+    let mut actions = ActionTables::default();
+    if action_rows {
+        let rows = n_legal
+            .checked_mul(engine::WINDOWS_PER_PLACEMENT)
+            .ok_or_else(|| "action row count overflows usize".to_owned())?;
+        actions.window_index.reserve(rows);
+        actions.post1_class.reserve(rows);
+        actions.pre_status.reserve(rows);
+    }
     for (j, &cell) in legal.iter().enumerate() {
         let mut covered = false;
         for (i, wr) in pos.windows_through(cell).into_iter().enumerate() {
-            if !wr.window.start.is_valid() {
-                continue;
-            }
-            let key = pack(wr.window.start) * 4 + wr.window.axis.index() as i64;
-            if let Ok(w) = live_keys.binary_search(&key) {
-                let slot = i % 6;
+            let slot = i % 6;
+            let found = if wr.window.start.is_valid() {
+                let key = pack(wr.window.start) * 4 + wr.window.axis.index() as i64;
+                live_keys.binary_search(&key).map_or(-1, |w| w as i64)
+            } else {
+                -1
+            };
+            if found >= 0 {
+                let w = found as usize;
                 let class = TERN_DEC_CLASS[patterns[w] as usize * 6 + slot] as i64;
                 assert!(
                     class >= 0,
@@ -889,6 +832,44 @@ pub fn build(pos: &engine::Position, action_rows: bool) -> Result<Graph, String>
                 dec_class.push(class);
                 covered = true;
             }
+            if action_rows {
+                let m0 = wr.mask.mask(engine::Player::P0);
+                let m1 = wr.mask.mask(engine::Player::P1);
+                let (own, opp) = if mover == engine::Player::P0 {
+                    (m0, m1)
+                } else {
+                    (m1, m0)
+                };
+                if (own | opp) >> slot & 1 != 0 {
+                    return Err(format!(
+                        "legal action {j} at ({}, {}) is occupied in slot {slot}",
+                        cell.q, cell.r
+                    ));
+                }
+                let status = match (own != 0, opp != 0) {
+                    (true, false) => ACTION_OWN,
+                    (false, true) => ACTION_OPP,
+                    (false, false) => ACTION_EMPTY,
+                    (true, true) => ACTION_MIXED,
+                };
+                let mut pre = 0usize;
+                for (k, &power) in POW3.iter().enumerate() {
+                    let digit = ((own >> k) & 1) as usize + 2 * ((opp >> k) & 1) as usize;
+                    pre += digit * power as usize;
+                }
+                let class = TERN_POST1_CLASS
+                    [(pre + POW3[slot] as usize) * engine::WINDOW_LEN + slot]
+                    as i64;
+                if class < 0 {
+                    return Err("a post-placement row lost its own stone".to_owned());
+                }
+                if (found >= 0) != (status != ACTION_EMPTY) {
+                    return Err("the kept-window set disagrees with the action-row walk".to_owned());
+                }
+                actions.window_index.push(found);
+                actions.post1_class.push(class);
+                actions.pre_status.push(status);
+            }
         }
         if !covered {
             let nearest = stones
@@ -900,12 +881,6 @@ pub fn build(pos: &engine::Position, action_rows: bool) -> Result<Graph, String>
             bg_bucket.push(nearest.min(NEAREST_BUCKETS) - 1);
         }
     }
-
-    let actions = if action_rows {
-        action_tables(pos, mover, &legal, &live_keys)?
-    } else {
-        ActionTables::default()
-    };
 
     Ok(Graph {
         stone_own,
