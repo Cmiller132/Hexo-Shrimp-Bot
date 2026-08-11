@@ -298,6 +298,8 @@ def evaluate_cell(
     tau: float = 0.1,
     lam: float = 0.01,
     mass_floor: float = 0.2,
+    pair_budget: int = KlentConfig.collect_pair_budget,
+    cell_budget: int = KlentConfig.collect_cell_budget,
 ) -> dict[str, object]:
     """Load a lab cell, score it, and replace its matching scores file."""
 
@@ -357,6 +359,8 @@ def evaluate_cell(
         tau=tau,
         lam=lam,
         mass_floor=mass_floor,
+        pair_budget=pair_budget,
+        cell_budget=cell_budget,
     )
     scores = {
         "scores_format": 1,
