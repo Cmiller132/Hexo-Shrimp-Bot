@@ -16,9 +16,10 @@ other-axis claimants of its sixteen claimed cells (the six slots plus
 ``_REACH`` on each end).  ``wa_tables`` therefore derives a cell-major
 claimant CSR — ``n_w * 16`` entries however dense the scope — plus a small
 explicit colinear/self edge list, and the kernels walk claims instead of
-edges: per (window, head), the colinear run (degree <= 23) and sixteen
-claim runs (claimants per cell <= 48: sixteen spans on each of three
-axes), one online softmax across all of them.  Under the mixed-window
+edges: one program per window covering every head at once, the colinear
+run (degree <= 23) and sixteen claim runs (claimants per cell <= 48:
+sixteen spans on each of three axes), one online softmax across all of
+them.  Under the mixed-window
 scope this replaces tens of millions of
 materialized edges with a few hundred MB of claims, and the per-edge
 ``dscore`` array of the old backward disappears: the bias gradient
@@ -291,7 +292,7 @@ _EDGE_SLICE = 2_000_000
 # sixteen spans on each of three axes) in two.
 _WA_BLOCK_E = 32
 _WA_BLOCK_CLS = 64  # next power of two over WA_CLASSES
-_WA_NUM_WARPS = 1
+_WA_NUM_WARPS = 4
 
 _FAILED_SHAPES: dict[tuple[object, ...], str] = {}
 _FAILED_BACKWARD_SHAPES: dict[tuple[object, ...], str] = {}
@@ -321,25 +322,32 @@ if triton is not None:
         stride_bias,
         HEADS: tl.constexpr,
         HD: tl.constexpr,
+        BLOCK_H: tl.constexpr,
         BLOCK_HD: tl.constexpr,
         BLOCK_E: tl.constexpr,
         CLAIM_SPAN: tl.constexpr,
     ):
-        # One (destination window, head) per program: one online softmax over
-        # the colinear run and the sixteen claim runs, saving only the max
-        # and denominator. A window's head programs are consecutive, so
-        # their gathers of the same source rows reuse cache lines.
-        pid = tl.program_id(0)
-        w = pid // HEADS
-        a = pid % HEADS
+        # One destination window per program, every head at once: the colinear
+        # and claim runs are walked a single time for all heads, and each
+        # gathered source row is HEADS*HD consecutive elements, so the index
+        # traffic is amortized HEADS-fold and the row loads coalesce. The
+        # colinear run always holds SELF, so the first tile seeds the softmax
+        # max before any claim run can be empty.
+        w = tl.program_id(0)
+        h_offs = tl.arange(0, BLOCK_H)
         offs = tl.arange(0, BLOCK_HD)
-        live = offs < HD
-        row = (w * HEADS + a) * HD
-        q_row = tl.load(q_ptr + row + offs, mask=live, other=0.0).to(tl.float32)
+        h_live = h_offs < HEADS
+        live = h_live[:, None] & (offs[None, :] < HD)
+        base_row = w * HEADS * HD
+        q_tile = tl.load(
+            q_ptr + base_row + h_offs[:, None] * HD + offs[None, :],
+            mask=live,
+            other=0.0,
+        ).to(tl.float32)
         ax_w = tl.load(waxis_ptr + w)
-        m = -float("inf")
-        l = 0.0
-        acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+        m = tl.full([BLOCK_H], -float("inf"), dtype=tl.float32)
+        l = tl.zeros([BLOCK_H], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_H, BLOCK_HD], dtype=tl.float32)
 
         start = tl.load(colptr_ptr + w)
         end = tl.load(colptr_ptr + w + 1)
@@ -349,25 +357,31 @@ if triton is not None:
             s_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0)
             c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0)
             k_tile = tl.load(
-                k_ptr + (s_idx[:, None] * HEADS + a) * HD + offs[None, :],
-                mask=ok[:, None] & live[None, :],
+                k_ptr
+                + (s_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                + offs[None, None, :],
+                mask=ok[:, None, None] & live[None, :, :],
                 other=0.0,
             ).to(tl.float32)
-            score = tl.sum(q_row[None, :] * k_tile, axis=1) * scale
+            score = tl.sum(q_tile[None, :, :] * k_tile, axis=2) * scale
             score += tl.load(
-                bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
+                bias_ptr + h_offs[None, :] * stride_bias + c_idx[:, None],
+                mask=ok[:, None] & h_live[None, :],
+                other=0.0,
             ).to(tl.float32)
-            score = tl.where(ok, score, -float("inf"))
+            score = tl.where(ok[:, None], score, -float("inf"))
             m_new = tl.maximum(m, tl.max(score, axis=0))
             rescale = tl.exp(m - m_new)
-            p = tl.exp(score - m_new)
+            p = tl.exp(score - m_new[None, :])
             l = l * rescale + tl.sum(p, axis=0)
             v_tile = tl.load(
-                v_ptr + (s_idx[:, None] * HEADS + a) * HD + offs[None, :],
-                mask=ok[:, None] & live[None, :],
+                v_ptr
+                + (s_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                + offs[None, None, :],
+                mask=ok[:, None, None] & live[None, :, :],
                 other=0.0,
             ).to(tl.float32)
-            acc = acc * rescale + tl.sum(p[:, None] * v_tile, axis=0)
+            acc = acc * rescale[:, None] + tl.sum(p[:, :, None] * v_tile, axis=0)
             m = m_new
 
         for k_slot in tl.static_range(CLAIM_SPAN):
@@ -389,30 +403,42 @@ if triton is not None:
                 f_u = tl.load(clfold_ptr + eids, mask=ok, other=0)
                 c_idx = 11 + f_own * 6 + f_u
                 k_tile = tl.load(
-                    k_ptr + (u[:, None] * HEADS + a) * HD + offs[None, :],
-                    mask=ok[:, None] & live[None, :],
+                    k_ptr
+                    + (u[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                    + offs[None, None, :],
+                    mask=ok[:, None, None] & live[None, :, :],
                     other=0.0,
                 ).to(tl.float32)
-                score = tl.sum(q_row[None, :] * k_tile, axis=1) * scale
+                score = tl.sum(q_tile[None, :, :] * k_tile, axis=2) * scale
                 score += tl.load(
-                    bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
+                    bias_ptr + h_offs[None, :] * stride_bias + c_idx[:, None],
+                    mask=ok[:, None] & h_live[None, :],
+                    other=0.0,
                 ).to(tl.float32)
-                score = tl.where(ok, score, -float("inf"))
+                score = tl.where(ok[:, None], score, -float("inf"))
                 m_new = tl.maximum(m, tl.max(score, axis=0))
                 rescale = tl.exp(m - m_new)
-                p = tl.exp(score - m_new)
+                p = tl.exp(score - m_new[None, :])
                 l = l * rescale + tl.sum(p, axis=0)
                 v_tile = tl.load(
-                    v_ptr + (u[:, None] * HEADS + a) * HD + offs[None, :],
-                    mask=ok[:, None] & live[None, :],
+                    v_ptr
+                    + (u[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                    + offs[None, None, :],
+                    mask=ok[:, None, None] & live[None, :, :],
                     other=0.0,
                 ).to(tl.float32)
-                acc = acc * rescale + tl.sum(p[:, None] * v_tile, axis=0)
+                acc = acc * rescale[:, None] + tl.sum(
+                    p[:, :, None] * v_tile, axis=0
+                )
                 m = m_new
 
-        tl.store(out_ptr + row + offs, acc / l, mask=live)
-        tl.store(m_ptr + w * HEADS + a, m)
-        tl.store(l_ptr + w * HEADS + a, l)
+        tl.store(
+            out_ptr + base_row + h_offs[:, None] * HD + offs[None, :],
+            acc / l[:, None],
+            mask=live,
+        )
+        tl.store(m_ptr + w * HEADS + h_offs, m, mask=h_live)
+        tl.store(l_ptr + w * HEADS + h_offs, l, mask=h_live)
 
     @triton.jit
     def _wa_dq_kernel(
@@ -439,30 +465,40 @@ if triton is not None:
         stride_bias,
         HEADS: tl.constexpr,
         HD: tl.constexpr,
+        BLOCK_H: tl.constexpr,
         BLOCK_HD: tl.constexpr,
         BLOCK_E: tl.constexpr,
         BLOCK_CLS: tl.constexpr,
         CLAIM_SPAN: tl.constexpr,
     ):
-        # Destination sweep: recompute alpha from the saved stats, accumulate
-        # dq and this program's per-class dscore sums in registers — one
-        # deterministic pass, no atomics. The per-program bias partials are
-        # summed by a fixed torch reduction afterwards.
-        pid = tl.program_id(0)
-        w = pid // HEADS
-        a = pid % HEADS
+        # Destination sweep, every head at once: recompute alpha from the
+        # saved stats, accumulate dq and this program's per-(head, class)
+        # dscore sums in registers — one deterministic pass, no atomics. The
+        # per-program bias partials are summed by a fixed torch reduction
+        # afterwards.
+        w = tl.program_id(0)
+        h_offs = tl.arange(0, BLOCK_H)
         offs = tl.arange(0, BLOCK_HD)
-        live = offs < HD
+        h_live = h_offs < HEADS
+        live = h_live[:, None] & (offs[None, :] < HD)
         cls_range = tl.arange(0, BLOCK_CLS)
-        row = (w * HEADS + a) * HD
-        q_row = tl.load(q_ptr + row + offs, mask=live, other=0.0).to(tl.float32)
-        go_row = tl.load(go_ptr + row + offs, mask=live, other=0.0).to(tl.float32)
+        base_row = w * HEADS * HD
+        q_tile = tl.load(
+            q_ptr + base_row + h_offs[:, None] * HD + offs[None, :],
+            mask=live,
+            other=0.0,
+        ).to(tl.float32)
+        go_tile = tl.load(
+            go_ptr + base_row + h_offs[:, None] * HD + offs[None, :],
+            mask=live,
+            other=0.0,
+        ).to(tl.float32)
         ax_w = tl.load(waxis_ptr + w)
-        m = tl.load(m_ptr + w * HEADS + a)
-        l = tl.load(l_ptr + w * HEADS + a)
-        delta = tl.load(delta_ptr + w * HEADS + a)
-        acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
-        acc_bias = tl.zeros([BLOCK_CLS], dtype=tl.float32)
+        m = tl.load(m_ptr + w * HEADS + h_offs, mask=h_live, other=0.0)
+        l = tl.load(l_ptr + w * HEADS + h_offs, mask=h_live, other=1.0)
+        delta = tl.load(delta_ptr + w * HEADS + h_offs, mask=h_live, other=0.0)
+        acc = tl.zeros([BLOCK_H, BLOCK_HD], dtype=tl.float32)
+        acc_bias = tl.zeros([BLOCK_H, BLOCK_CLS], dtype=tl.float32)
 
         start = tl.load(colptr_ptr + w)
         end = tl.load(colptr_ptr + w + 1)
@@ -472,24 +508,38 @@ if triton is not None:
             s_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0)
             c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0)
             k_tile = tl.load(
-                k_ptr + (s_idx[:, None] * HEADS + a) * HD + offs[None, :],
-                mask=ok[:, None] & live[None, :],
+                k_ptr
+                + (s_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                + offs[None, None, :],
+                mask=ok[:, None, None] & live[None, :, :],
                 other=0.0,
             ).to(tl.float32)
-            score = tl.sum(q_row[None, :] * k_tile, axis=1) * scale
+            score = tl.sum(q_tile[None, :, :] * k_tile, axis=2) * scale
             score += tl.load(
-                bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
-            ).to(tl.float32)
-            alpha = tl.where(ok, tl.exp(score - m) / l, 0.0)
-            v_tile = tl.load(
-                v_ptr + (s_idx[:, None] * HEADS + a) * HD + offs[None, :],
-                mask=ok[:, None] & live[None, :],
+                bias_ptr + h_offs[None, :] * stride_bias + c_idx[:, None],
+                mask=ok[:, None] & h_live[None, :],
                 other=0.0,
             ).to(tl.float32)
-            ds = alpha * (tl.sum(go_row[None, :] * v_tile, axis=1) - delta)
-            acc += tl.sum(ds[:, None] * k_tile, axis=0)
+            alpha = tl.where(
+                ok[:, None], tl.exp(score - m[None, :]) / l[None, :], 0.0
+            )
+            v_tile = tl.load(
+                v_ptr
+                + (s_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                + offs[None, None, :],
+                mask=ok[:, None, None] & live[None, :, :],
+                other=0.0,
+            ).to(tl.float32)
+            ds = alpha * (
+                tl.sum(go_tile[None, :, :] * v_tile, axis=2) - delta[None, :]
+            )
+            acc += tl.sum(ds[:, :, None] * k_tile, axis=0)
             acc_bias += tl.sum(
-                tl.where(c_idx[:, None] == cls_range[None, :], ds[:, None], 0.0),
+                tl.where(
+                    c_idx[:, None, None] == cls_range[None, None, :],
+                    ds[:, :, None],
+                    0.0,
+                ),
                 axis=0,
             )
 
@@ -512,34 +562,53 @@ if triton is not None:
                 f_u = tl.load(clfold_ptr + eids, mask=ok, other=0)
                 c_idx = 11 + f_own * 6 + f_u
                 k_tile = tl.load(
-                    k_ptr + (u[:, None] * HEADS + a) * HD + offs[None, :],
-                    mask=ok[:, None] & live[None, :],
+                    k_ptr
+                    + (u[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                    + offs[None, None, :],
+                    mask=ok[:, None, None] & live[None, :, :],
                     other=0.0,
                 ).to(tl.float32)
-                score = tl.sum(q_row[None, :] * k_tile, axis=1) * scale
+                score = tl.sum(q_tile[None, :, :] * k_tile, axis=2) * scale
                 score += tl.load(
-                    bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
-                ).to(tl.float32)
-                alpha = tl.where(ok, tl.exp(score - m) / l, 0.0)
-                v_tile = tl.load(
-                    v_ptr + (u[:, None] * HEADS + a) * HD + offs[None, :],
-                    mask=ok[:, None] & live[None, :],
+                    bias_ptr + h_offs[None, :] * stride_bias + c_idx[:, None],
+                    mask=ok[:, None] & h_live[None, :],
                     other=0.0,
                 ).to(tl.float32)
-                ds = alpha * (tl.sum(go_row[None, :] * v_tile, axis=1) - delta)
-                acc += tl.sum(ds[:, None] * k_tile, axis=0)
+                alpha = tl.where(
+                    ok[:, None], tl.exp(score - m[None, :]) / l[None, :], 0.0
+                )
+                v_tile = tl.load(
+                    v_ptr
+                    + (u[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                    + offs[None, None, :],
+                    mask=ok[:, None, None] & live[None, :, :],
+                    other=0.0,
+                ).to(tl.float32)
+                ds = alpha * (
+                    tl.sum(go_tile[None, :, :] * v_tile, axis=2) - delta[None, :]
+                )
+                acc += tl.sum(ds[:, :, None] * k_tile, axis=0)
                 acc_bias += tl.sum(
                     tl.where(
-                        c_idx[:, None] == cls_range[None, :], ds[:, None], 0.0
+                        c_idx[:, None, None] == cls_range[None, None, :],
+                        ds[:, :, None],
+                        0.0,
                     ),
                     axis=0,
                 )
 
         element = dq_ptr.dtype.element_ty
-        tl.store(dq_ptr + row + offs, (acc * scale).to(element), mask=live)
         tl.store(
-            partial_ptr + pid * BLOCK_CLS + cls_range,
+            dq_ptr + base_row + h_offs[:, None] * HD + offs[None, :],
+            (acc * scale).to(element),
+            mask=live,
+        )
+        tl.store(
+            partial_ptr
+            + (w * HEADS + h_offs[:, None]) * BLOCK_CLS
+            + cls_range[None, :],
             acc_bias,
+            mask=h_live[:, None],
         )
 
     @triton.jit
@@ -567,26 +636,35 @@ if triton is not None:
         stride_bias,
         HEADS: tl.constexpr,
         HD: tl.constexpr,
+        BLOCK_H: tl.constexpr,
         BLOCK_HD: tl.constexpr,
         BLOCK_E: tl.constexpr,
         CLAIM_SPAN: tl.constexpr,
     ):
-        # Source sweep over the same relation set: this program's k and v
-        # rows are fixed, the destinations' rows and stats are gathered per
-        # partner. Colinear and SELF are reversal-symmetric so the
-        # destination-major run doubles as the source view; a claim's
+        # Source sweep over the same relation set, every head at once: this
+        # program's k and v rows are fixed, the destinations' rows and stats
+        # are gathered per partner. Colinear and SELF are reversal-symmetric
+        # so the destination-major run doubles as the source view; a claim's
         # crossing partners see this window with the folds' roles swapped.
-        pid = tl.program_id(0)
-        s = pid // HEADS
-        a = pid % HEADS
+        s = tl.program_id(0)
+        h_offs = tl.arange(0, BLOCK_H)
         offs = tl.arange(0, BLOCK_HD)
-        live = offs < HD
-        row = (s * HEADS + a) * HD
-        k_row = tl.load(k_ptr + row + offs, mask=live, other=0.0).to(tl.float32)
-        v_row = tl.load(v_ptr + row + offs, mask=live, other=0.0).to(tl.float32)
+        h_live = h_offs < HEADS
+        live = h_live[:, None] & (offs[None, :] < HD)
+        base_row = s * HEADS * HD
+        k_tile = tl.load(
+            k_ptr + base_row + h_offs[:, None] * HD + offs[None, :],
+            mask=live,
+            other=0.0,
+        ).to(tl.float32)
+        v_tile = tl.load(
+            v_ptr + base_row + h_offs[:, None] * HD + offs[None, :],
+            mask=live,
+            other=0.0,
+        ).to(tl.float32)
         ax_s = tl.load(waxis_ptr + s)
-        acc_k = tl.zeros([BLOCK_HD], dtype=tl.float32)
-        acc_v = tl.zeros([BLOCK_HD], dtype=tl.float32)
+        acc_k = tl.zeros([BLOCK_H, BLOCK_HD], dtype=tl.float32)
+        acc_v = tl.zeros([BLOCK_H, BLOCK_HD], dtype=tl.float32)
 
         start = tl.load(colptr_ptr + s)
         end = tl.load(colptr_ptr + s + 1)
@@ -596,26 +674,47 @@ if triton is not None:
             d_idx = tl.load(colsrc_ptr + eids, mask=ok, other=0)
             c_idx = tl.load(colcls_ptr + eids, mask=ok, other=0)
             q_tile = tl.load(
-                q_ptr + (d_idx[:, None] * HEADS + a) * HD + offs[None, :],
-                mask=ok[:, None] & live[None, :],
+                q_ptr
+                + (d_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                + offs[None, None, :],
+                mask=ok[:, None, None] & live[None, :, :],
                 other=0.0,
             ).to(tl.float32)
             go_tile = tl.load(
-                go_ptr + (d_idx[:, None] * HEADS + a) * HD + offs[None, :],
-                mask=ok[:, None] & live[None, :],
+                go_ptr
+                + (d_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                + offs[None, None, :],
+                mask=ok[:, None, None] & live[None, :, :],
                 other=0.0,
             ).to(tl.float32)
-            m_e = tl.load(m_ptr + d_idx * HEADS + a, mask=ok, other=0.0)
-            l_e = tl.load(l_ptr + d_idx * HEADS + a, mask=ok, other=1.0)
-            delta_e = tl.load(delta_ptr + d_idx * HEADS + a, mask=ok, other=0.0)
-            score = tl.sum(q_tile * k_row[None, :], axis=1) * scale
+            stat_mask = ok[:, None] & h_live[None, :]
+            m_e = tl.load(
+                m_ptr + d_idx[:, None] * HEADS + h_offs[None, :],
+                mask=stat_mask,
+                other=0.0,
+            )
+            l_e = tl.load(
+                l_ptr + d_idx[:, None] * HEADS + h_offs[None, :],
+                mask=stat_mask,
+                other=1.0,
+            )
+            delta_e = tl.load(
+                delta_ptr + d_idx[:, None] * HEADS + h_offs[None, :],
+                mask=stat_mask,
+                other=0.0,
+            )
+            score = tl.sum(q_tile * k_tile[None, :, :], axis=2) * scale
             score += tl.load(
-                bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
+                bias_ptr + h_offs[None, :] * stride_bias + c_idx[:, None],
+                mask=stat_mask,
+                other=0.0,
             ).to(tl.float32)
-            alpha = tl.where(ok, tl.exp(score - m_e) / l_e, 0.0)
-            ds = alpha * (tl.sum(go_tile * v_row[None, :], axis=1) - delta_e)
-            acc_k += tl.sum(ds[:, None] * q_tile, axis=0)
-            acc_v += tl.sum(alpha[:, None] * go_tile, axis=0)
+            alpha = tl.where(ok[:, None], tl.exp(score - m_e) / l_e, 0.0)
+            ds = alpha * (
+                tl.sum(go_tile * v_tile[None, :, :], axis=2) - delta_e
+            )
+            acc_k += tl.sum(ds[:, :, None] * q_tile, axis=0)
+            acc_v += tl.sum(alpha[:, :, None] * go_tile, axis=0)
 
         for k_slot in tl.static_range(CLAIM_SPAN):
             # fold(t) of this claim slot, folded at trace time: static_range
@@ -636,32 +735,59 @@ if triton is not None:
                 f_d = tl.load(clfold_ptr + eids, mask=ok, other=0)
                 c_idx = 11 + f_d * 6 + f_own
                 q_tile = tl.load(
-                    q_ptr + (d_idx[:, None] * HEADS + a) * HD + offs[None, :],
-                    mask=ok[:, None] & live[None, :],
+                    q_ptr
+                    + (d_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                    + offs[None, None, :],
+                    mask=ok[:, None, None] & live[None, :, :],
                     other=0.0,
                 ).to(tl.float32)
                 go_tile = tl.load(
-                    go_ptr + (d_idx[:, None] * HEADS + a) * HD + offs[None, :],
-                    mask=ok[:, None] & live[None, :],
+                    go_ptr
+                    + (d_idx[:, None, None] * HEADS + h_offs[None, :, None]) * HD
+                    + offs[None, None, :],
+                    mask=ok[:, None, None] & live[None, :, :],
                     other=0.0,
                 ).to(tl.float32)
-                m_e = tl.load(m_ptr + d_idx * HEADS + a, mask=ok, other=0.0)
-                l_e = tl.load(l_ptr + d_idx * HEADS + a, mask=ok, other=1.0)
-                delta_e = tl.load(
-                    delta_ptr + d_idx * HEADS + a, mask=ok, other=0.0
+                stat_mask = ok[:, None] & h_live[None, :]
+                m_e = tl.load(
+                    m_ptr + d_idx[:, None] * HEADS + h_offs[None, :],
+                    mask=stat_mask,
+                    other=0.0,
                 )
-                score = tl.sum(q_tile * k_row[None, :], axis=1) * scale
+                l_e = tl.load(
+                    l_ptr + d_idx[:, None] * HEADS + h_offs[None, :],
+                    mask=stat_mask,
+                    other=1.0,
+                )
+                delta_e = tl.load(
+                    delta_ptr + d_idx[:, None] * HEADS + h_offs[None, :],
+                    mask=stat_mask,
+                    other=0.0,
+                )
+                score = tl.sum(q_tile * k_tile[None, :, :], axis=2) * scale
                 score += tl.load(
-                    bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
+                    bias_ptr + h_offs[None, :] * stride_bias + c_idx[:, None],
+                    mask=stat_mask,
+                    other=0.0,
                 ).to(tl.float32)
-                alpha = tl.where(ok, tl.exp(score - m_e) / l_e, 0.0)
-                ds = alpha * (tl.sum(go_tile * v_row[None, :], axis=1) - delta_e)
-                acc_k += tl.sum(ds[:, None] * q_tile, axis=0)
-                acc_v += tl.sum(alpha[:, None] * go_tile, axis=0)
+                alpha = tl.where(ok[:, None], tl.exp(score - m_e) / l_e, 0.0)
+                ds = alpha * (
+                    tl.sum(go_tile * v_tile[None, :, :], axis=2) - delta_e
+                )
+                acc_k += tl.sum(ds[:, :, None] * q_tile, axis=0)
+                acc_v += tl.sum(alpha[:, :, None] * go_tile, axis=0)
 
         element = dk_ptr.dtype.element_ty
-        tl.store(dk_ptr + row + offs, (acc_k * scale).to(element), mask=live)
-        tl.store(dv_ptr + row + offs, acc_v.to(element), mask=live)
+        tl.store(
+            dk_ptr + base_row + h_offs[:, None] * HD + offs[None, :],
+            (acc_k * scale).to(element),
+            mask=live,
+        )
+        tl.store(
+            dv_ptr + base_row + h_offs[:, None] * HD + offs[None, :],
+            acc_v.to(element),
+            mask=live,
+        )
 
 
 def _edge_dst(ptr: Tensor) -> Tensor:
@@ -824,7 +950,7 @@ def _launch_forward(q, k, v, bias, tables: WaTables):
     out = torch.empty((n_w, heads, hd), dtype=torch.float32, device=q.device)
     m = torch.empty((n_w, heads), dtype=torch.float32, device=q.device)
     l = torch.empty((n_w, heads), dtype=torch.float32, device=q.device)
-    _wa_forward_kernel[(n_w * heads,)](
+    _wa_forward_kernel[(n_w,)](
         q,
         k,
         v,
@@ -837,6 +963,7 @@ def _launch_forward(q, k, v, bias, tables: WaTables):
         bias.stride(0),
         HEADS=heads,
         HD=hd,
+        BLOCK_H=triton.next_power_of_2(heads),
         BLOCK_HD=triton.next_power_of_2(hd),
         BLOCK_E=_WA_BLOCK_E,
         CLAIM_SPAN=_CLAIM_SPAN,
@@ -850,14 +977,14 @@ def _launch_backward(q, k, v, bias, tables: WaTables, m, l, delta, go):
     scale = 1.0 / math.sqrt(hd)
     block_hd = triton.next_power_of_2(hd)
     dq = torch.empty_like(q)
-    # One partial row per (window, head) program keeps the bias gradient
-    # atomics-free and run-to-run deterministic; the fixed-tree torch sum
-    # finishes it. The buffer is (N_w * heads, 64) fp32 — far below the
-    # per-edge dscore array this design retires.
+    # One partial (head, class) block per window program keeps the bias
+    # gradient atomics-free and run-to-run deterministic; the fixed-tree
+    # torch sum finishes it. The buffer is (N_w * heads, 64) fp32 — far
+    # below the per-edge dscore array this design retires.
     partial = torch.empty(
         (n_w * heads, _WA_BLOCK_CLS), dtype=torch.float32, device=q.device
     )
-    _wa_dq_kernel[(n_w * heads,)](
+    _wa_dq_kernel[(n_w,)](
         q,
         k,
         v,
@@ -873,6 +1000,7 @@ def _launch_backward(q, k, v, bias, tables: WaTables, m, l, delta, go):
         bias.stride(0),
         HEADS=heads,
         HD=hd,
+        BLOCK_H=triton.next_power_of_2(heads),
         BLOCK_HD=block_hd,
         BLOCK_E=_WA_BLOCK_E,
         BLOCK_CLS=_WA_BLOCK_CLS,
@@ -886,7 +1014,7 @@ def _launch_backward(q, k, v, bias, tables: WaTables, m, l, delta, go):
     ).to(bias.dtype)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    _wa_dkdv_kernel[(n_w * heads,)](
+    _wa_dkdv_kernel[(n_w,)](
         q,
         k,
         v,
@@ -902,6 +1030,7 @@ def _launch_backward(q, k, v, bias, tables: WaTables, m, l, delta, go):
         bias.stride(0),
         HEADS=heads,
         HD=hd,
+        BLOCK_H=triton.next_power_of_2(heads),
         BLOCK_HD=block_hd,
         BLOCK_E=_WA_BLOCK_E,
         CLAIM_SPAN=_CLAIM_SPAN,
