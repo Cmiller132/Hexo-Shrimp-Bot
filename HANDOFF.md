@@ -97,6 +97,9 @@ handles the missing seed and reports per-metric n). Runner: `~/step12_matrix.sh`
 - The runner is **idempotent**: if it dies, relaunch
   `nohup bash ~/step12_matrix.sh > ~/step12-artifacts/nohup3.log 2>&1 &`
   from WSL — complete benches/cells are skipped, partial cells rebuilt.
+  A 12:57 UTC relaunch from a non-login shell failed with exit 127 (`uv`
+  not on PATH); the runner now exports `$HOME/.local/bin` itself, so any
+  shell works. B s2 is still the one missing cell after that no-op pass.
 - **B cells are WDDM-paging slow** (~1-2 h each): arm B training sits at the
   card's edge (torch ~9.3 GiB + ~2.5 GiB desktop ambient ≈ 12 GiB), so WSL
   pages. Math is unaffected; only wall-clock. C/D peaks are 2.4 GiB and run
