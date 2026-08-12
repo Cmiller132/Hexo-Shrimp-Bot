@@ -187,12 +187,19 @@ def _check_builder_agreement(cases, collate_fn) -> int:
     batch = _collate_cases(cases, collate_fn)
     _assert_batches_equal(
         batch,
-        collate([from_position(case.position) for case in cases]),
+        collate(
+            [from_position(case.position) for case in cases],
+            state_latents=batch.state_latents,
+        ),
     )
     for case in cases:
+        batch = _collate_cases([case], collate_fn)
         _assert_batches_equal(
-            _collate_cases([case], collate_fn),
-            collate([from_position(case.position)]),
+            batch,
+            collate(
+                [from_position(case.position)],
+                state_latents=batch.state_latents,
+            ),
         )
     return len(cases)
 

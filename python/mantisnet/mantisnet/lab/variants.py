@@ -7,6 +7,7 @@ ablations are typed ``MantisConfig`` overrides, not separate variants.
 
 from __future__ import annotations
 
+import functools
 import math
 from dataclasses import dataclass, fields
 from typing import Callable, Mapping, Sequence, get_type_hints
@@ -132,9 +133,11 @@ def variant_spec(name: str) -> VariantSpec:
 
 
 def scoped_collate(name: str, model: nn.Module) -> Collate:
-    """The variant's collate callable."""
-    del model
-    return variant_spec(name).collate
+    """The variant's collate callable bound to its transient batch scope."""
+    return functools.partial(
+        variant_spec(name).collate,
+        state_latents=model.cfg.state_latents,
+    )
 
 
 def build_variant(

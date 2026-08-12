@@ -460,10 +460,15 @@ class Batch:
 
     Every index tensor is precomputed here; the forward performs no
     data-dependent index discovery (§9). Attention and the value readout use
-    per-position padded layouts with the token at slot 0.
+    per-position padded layouts with global context in the leading slot(s).
     """
 
     n_pos: int
+    # The number of global rows occupying the stone-attention prefix. Zero
+    # names the incumbent one-token layout; four names the Step 2 latent
+    # layout. The serialized Rust batch remains the incumbent layout and is
+    # expanded here only for the measured arm.
+    state_latents: int
     # Concatenated entity features.
     stone_own: torch.Tensor  # (N_s,) long
     window_feat: torch.Tensor  # (N_w,) long
@@ -476,12 +481,12 @@ class Batch:
     inc_stone: torch.Tensor  # (E,) long
     inc_window: torch.Tensor  # (E,) long
     inc_class: torch.Tensor  # (E,) long
-    # Stone-attention padding: rows [token; stones] per position, width max_t.
+    # Stone-attention padding: rows [global context; stones] per position.
     max_t: int
     stone_slot: torch.Tensor  # (N_s,) long, flat index into (P * max_t)
-    coords: torch.Tensor  # (P, max_t, 2) int32; row 0 and padding are zeros
+    coords: torch.Tensor  # (P, max_t, 2) int32; global rows and padding are zero
     attn_valid: torch.Tensor  # (P, max_t) bool
-    # Value-readout padding: rows [token; windows] per position, width max_w.
+    # Value-readout padding: rows [pooled global; windows] per position.
     max_w: int
     window_slot: torch.Tensor  # (N_w,) long, flat index into (P * max_w)
     value_valid: torch.Tensor  # (P, max_w) bool
@@ -559,7 +564,48 @@ def _relay_fields(
     return dict(zip(_RELAY_FIELDS, tables))
 
 
-def batch_from_arrays(**fields) -> Batch:
+def _expand_state_latent_rows(
+    tensors: dict[str, torch.Tensor], state_latents: int
+) -> dict[str, torch.Tensor]:
+    """Grow ``[token; stones]`` to ``[latents; stones]`` for Step 2.
+
+    Rust continues to emit the incumbent layout. The extra rows contain no
+    input data: they are parameter-backed model state, so Python collation can
+    insert their zero coordinates and validity prefix without changing the
+    wire representation.
+    """
+    if state_latents == 0:
+        return tensors
+    if state_latents != 4:
+        raise ValueError(
+            f"state_latents must be one of {{0, 4}}, got {state_latents}"
+        )
+
+    coords = tensors["coords"]
+    valid = tensors["attn_valid"]
+    stone_slot = tensors["stone_slot"]
+    positions, old_width = valid.shape
+    extra = state_latents - 1
+    new_width = old_width + extra
+
+    grown_coords = coords.new_zeros((positions, new_width, 2))
+    grown_coords[:, state_latents:] = coords[:, 1:]
+    grown_valid = valid.new_zeros((positions, new_width))
+    grown_valid[:, :state_latents] = True
+    grown_valid[:, state_latents:] = valid[:, 1:]
+
+    old_position = torch.div(stone_slot, old_width, rounding_mode="floor")
+    old_row = stone_slot.remainder(old_width)
+    grown_slot = old_position * new_width + old_row + extra
+    return {
+        **tensors,
+        "coords": grown_coords,
+        "attn_valid": grown_valid,
+        "stone_slot": grown_slot,
+    }
+
+
+def batch_from_arrays(*, state_latents: int = 0, **fields) -> Batch:
     """A ``Batch`` from per-tensor arrays, with the derived tables built here.
 
     Both external construction paths land on this one function — the
@@ -573,7 +619,16 @@ def batch_from_arrays(**fields) -> Batch:
         for name in ("n_pos", "max_t", "max_w", "n_cells")
         if name in fields
     }
-    t = {name: torch.as_tensor(value) for name, value in fields.items()}
+    if state_latents not in (0, 4):
+        raise ValueError(
+            f"state_latents must be one of {{0, 4}}, got {state_latents}"
+        )
+    if "max_t" in scalars and state_latents:
+        scalars["max_t"] += state_latents - 1
+    t = _expand_state_latent_rows(
+        {name: torch.as_tensor(value) for name, value in fields.items()},
+        state_latents,
+    )
     derived = {
         "n_pos": int(t["attn_valid"].shape[0]),
         "max_t": int(t["attn_valid"].shape[1]),
@@ -585,6 +640,7 @@ def batch_from_arrays(**fields) -> Batch:
             raise ValueError(f"{name}={value} disagrees with the derived {derived[name]}")
     return Batch(
         **derived,
+        state_latents=state_latents,
         **t,
         **_relay_fields(
             t["dec_cell"],
@@ -595,7 +651,7 @@ def batch_from_arrays(**fields) -> Batch:
     )
 
 
-def collate_positions(positions) -> Batch:
+def collate_positions(positions, *, state_latents: int = 0) -> Batch:
     """Build and collate positions with the Rust builder.
 
     ``hexo_py.build_batch`` runs in parallel with the GIL released and returns
@@ -605,11 +661,12 @@ def collate_positions(positions) -> Batch:
     import hexo_py
 
     return batch_from_arrays(
+        state_latents=state_latents,
         **hexo_py.build_batch(list(positions))
     )
 
 
-def collate_prefixes(games, ts) -> Batch:
+def collate_prefixes(games, ts, *, state_latents: int = 0) -> Batch:
     """Move prefixes to one collated batch: replay + build, in parallel.
 
     Stored fitting positions are move prefixes
@@ -618,6 +675,7 @@ def collate_prefixes(games, ts) -> Batch:
     import hexo_py
 
     return batch_from_arrays(
+        state_latents=state_latents,
         **hexo_py.build_batch_prefixes(list(games), list(ts))
     )
 
@@ -661,10 +719,14 @@ def _action_fields(graphs: list[PositionGraph], dec_window: torch.Tensor) -> dic
     }
 
 
-def collate(graphs: list[PositionGraph]) -> Batch:
+def collate(graphs: list[PositionGraph], *, state_latents: int = 0) -> Batch:
     """Concatenate position graphs into one batch (§9)."""
     if not graphs:
         raise ValueError("empty batch")
+    if state_latents not in (0, 4):
+        raise ValueError(
+            f"state_latents must be one of {{0, 4}}, got {state_latents}"
+        )
     p = len(graphs)
     ns = np.array([g.n_stones for g in graphs])
     nw = np.array([g.n_windows for g in graphs])
@@ -673,23 +735,26 @@ def collate(graphs: list[PositionGraph]) -> Batch:
     win_off = np.concatenate([[0], np.cumsum(nw)])
     cell_off = np.concatenate([[0], np.cumsum(nl)])
 
-    max_t = int(ns.max()) + 1
+    global_rows = max(1, state_latents)
+    max_t = int(ns.max()) + global_rows
     max_w = int(nw.max()) + 1
 
     coords = np.zeros((p, max_t, 2), dtype=np.int32)
     attn_valid = np.zeros((p, max_t), dtype=bool)
-    attn_valid[:, 0] = True
+    attn_valid[:, :global_rows] = True
     value_valid = np.zeros((p, max_w), dtype=bool)
     value_valid[:, 0] = True
     for i, g in enumerate(graphs):
-        coords[i, 1 : 1 + g.n_stones] = g.stone_qr
-        attn_valid[i, 1 : 1 + g.n_stones] = True
+        coords[i, global_rows : global_rows + g.n_stones] = g.stone_qr
+        attn_valid[i, global_rows : global_rows + g.n_stones] = True
         value_valid[i, 1 : 1 + g.n_windows] = True
 
     def cat(parts, dtype=np.int64):
         return torch.from_numpy(np.concatenate(parts).astype(dtype)) if parts else torch.empty(0, dtype=torch.long)
 
-    stone_slot = cat([i * max_t + 1 + np.arange(g.n_stones) for i, g in enumerate(graphs)])
+    stone_slot = cat(
+        [i * max_t + global_rows + np.arange(g.n_stones) for i, g in enumerate(graphs)]
+    )
     window_slot = cat([i * max_w + 1 + np.arange(g.n_windows) for i, g in enumerate(graphs)])
     window_id = cat([g.window_id for g in graphs]).view(-1, 3)
     dec_cell = cat([g.dec_cell + cell_off[i] for i, g in enumerate(graphs)])
@@ -698,6 +763,7 @@ def collate(graphs: list[PositionGraph]) -> Batch:
 
     return Batch(
         n_pos=p,
+        state_latents=state_latents,
         stone_own=cat([g.stone_own for g in graphs]),
         window_feat=cat([g.window_feat for g in graphs]),
         window_id=window_id,

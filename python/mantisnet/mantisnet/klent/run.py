@@ -200,6 +200,7 @@ def run_training(
         np.random.default_rng(int(rng.integers(2**63))),
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
+        state_latents=model.cfg.state_latents,
     )
 
     def submit_collect(pool, iteration):

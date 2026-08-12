@@ -91,6 +91,7 @@ def selfplay_cohort(
         rng=np.random.default_rng(seed),
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
+        state_latents=getattr(evaluate, "state_latents", 0),
     )
     if steps == 0:
         positions = list(collector.positions)

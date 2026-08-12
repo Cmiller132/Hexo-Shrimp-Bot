@@ -9,8 +9,9 @@ supervised laboratory harness, and the Shrimp Control Deck telemetry dashboard. 
 ## The model: MantisNet
 
 MantisNet is a graph network whose nodes are stones, nonempty win windows, and one
-global token. It has no cell grid, no coordinate inputs, and no empty-cell
-nodes.
+global token. The transient `state_latents` campaign knob replaces that token
+with four invariant state latents when set to `4`; its default `0` is the token
+path exactly. It has no cell grid, no coordinate inputs, and no empty-cell nodes.
 
 A **window** is six consecutive cells along one hex axis. Every nonempty
 candidate window is represented under ternary slot patterns
@@ -212,9 +213,10 @@ against a named baseline arm.
 The family registry identifies a checkpoint structurally from its model key
 set, native critic-readout width, and decoder-table row count. Configuration
 is inferred from state-dict tensor shapes, including the live
-`window_attention` knob from the presence of §5.1c tensors. The row encoder is
-required. Shipped scoreable families are `trinomial-joint`, `bipolar-joint`,
-and `scalar-joint`; older representation families are rejected.
+`window_attention` knob from the presence of §5.1c tensors and the live
+`state_latents` knob from the global base and per-block latent tensors. The row
+encoder is required. Shipped scoreable families are `trinomial-joint`,
+`bipolar-joint`, and `scalar-joint`; older representation families are rejected.
 
 ### Measurement commands
 

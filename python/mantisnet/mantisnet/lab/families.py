@@ -158,7 +158,6 @@ def _block_count(state_dict: Mapping[str, Tensor]) -> int | None:
 _COMMON_KEYS = {
     "stone_table.weight",
     "window_table.weight",
-    "token_base",
     "token_moves.weight",
     "ln_out.weight",
     "ln_out.bias",
@@ -219,6 +218,22 @@ _WA_SUFFIXES = {
     "wk_wa.weight", "wv_wa.weight", "wv_wa.bias",
     "wo_wa.weight", "wo_wa.bias", "wa_bias",
 }
+_LATENT_SUFFIXES = {
+    "latent_ln_read_q.weight", "latent_ln_read_q.bias",
+    "latent_ln_read_w.weight", "latent_ln_read_w.bias",
+    "latent_wq_read.weight", "latent_wq_read.bias", "latent_wk_read.weight",
+    "latent_wv_read.weight", "latent_wv_read.bias",
+    "latent_wo_read.weight", "latent_wo_read.bias",
+    "latent_ln_mix.weight", "latent_ln_mix.bias",
+    "latent_wq_mix.weight", "latent_wq_mix.bias", "latent_wk_mix.weight",
+    "latent_wv_mix.weight", "latent_wv_mix.bias",
+    "latent_wo_mix.weight", "latent_wo_mix.bias",
+    "latent_ln_bcast_q.weight", "latent_ln_bcast_q.bias",
+    "latent_ln_bcast_l.weight", "latent_ln_bcast_l.bias",
+    "latent_wq_bcast.weight", "latent_wq_bcast.bias",
+    "latent_wk_bcast.weight", "latent_wv_bcast.weight", "latent_wv_bcast.bias",
+    "latent_wo_bcast.weight", "latent_wo_bcast.bias",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,6 +245,7 @@ class _Knobs:
     joint_incidence: bool
     window_attention: bool
     mixed_windows: bool
+    state_latents: int
 
 
 def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
@@ -251,6 +267,7 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         and window_table.shape[0] == TERN_PATTERNS
     )
     e_ws = state_dict.get("blocks.0.e_ws.weight")
+    latent_base = state_dict.get("latent_base")
     return _Knobs(
         axis_bias="blocks.0.axis_bias" in state_dict,
         off_axis_bias="blocks.0.off_axis_bias" in state_dict,
@@ -264,6 +281,11 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         ),
         window_attention="blocks.0.wa_bias" in state_dict,
         mixed_windows=mixed,
+        state_latents=(
+            int(latent_base.shape[0])
+            if isinstance(latent_base, Tensor) and latent_base.ndim == 2
+            else 0
+        ),
     )
 
 
@@ -277,6 +299,7 @@ _BAKED = _Knobs(
     joint_incidence=True,
     window_attention=True,
     mixed_windows=True,
+    state_latents=0,
 )
 
 
@@ -286,6 +309,7 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
         for index in range(blocks)
         for suffix in _BLOCK_SUFFIXES
     }
+    keys.add("latent_base" if knobs.state_latents else "token_base")
     keys |= _ACT_KEYS
     for index in range(blocks):
         prefix = f"blocks.{index}."
@@ -295,6 +319,8 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
             keys.add(prefix + "off_axis_bias")
         if knobs.window_attention:
             keys |= {prefix + suffix for suffix in _WA_SUFFIXES}
+        if knobs.state_latents:
+            keys |= {prefix + suffix for suffix in _LATENT_SUFFIXES}
         if knobs.cell_pass and index >= knobs.cell_pass_from:
             keys |= {prefix + suffix for suffix in _CP_SUFFIXES}
     return keys
@@ -356,7 +382,6 @@ def _expected_shapes(
     shapes = {
         "stone_table.weight": (2, h),
         "window_table.weight": (cfg.window_vocab, h),
-        "token_base": (h,),
         "token_moves.weight": (2, h),
         "ln_out.weight": (h,), "ln_out.bias": (h,),
         "p.weight": (h, h), "e_pw.weight": (table_rows, h),
@@ -372,6 +397,10 @@ def _expected_shapes(
         "mlp_v.0.weight": (vh, q * h), "mlp_v.0.bias": (vh,),
         "mlp_v.2.weight": (k, vh), "mlp_v.2.bias": (k,),
     }
+    if cfg.state_latents:
+        shapes["latent_base"] = (cfg.state_latents, h)
+    else:
+        shapes["token_base"] = (h,)
     shapes.update({
         "act_proj.weight": (h, h), "act_proj.bias": (h,),
         "act_table.weight": (TERN_POST1_CLASSES, h),
@@ -387,6 +416,19 @@ def _expected_shapes(
         ln_names.append("ln_wa")
         biased += ["wq_wa", "wv_wa", "wo_wa"]
         bias_free.append("wk_wa")
+    if cfg.state_latents:
+        ln_names += [
+            "latent_ln_read_q", "latent_ln_read_w", "latent_ln_mix",
+            "latent_ln_bcast_q", "latent_ln_bcast_l",
+        ]
+        biased += [
+            "latent_wq_read", "latent_wv_read", "latent_wo_read",
+            "latent_wq_mix", "latent_wv_mix", "latent_wo_mix",
+            "latent_wq_bcast", "latent_wv_bcast", "latent_wo_bcast",
+        ]
+        bias_free += [
+            "latent_wk_read", "latent_wk_mix", "latent_wk_bcast",
+        ]
     for index in range(cfg.blocks):
         prefix = f"blocks.{index}."
         for name in ln_names:
@@ -495,7 +537,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         )
 
     knobs = _knob_profile(state_dict, blocks)
-    if replace(knobs, window_attention=True) != _BAKED:
+    if replace(knobs, window_attention=True, state_latents=0) != _BAKED:
         raise ValueError(
             f"state dict trunk profile {knobs} is not the baked architecture "
             f"{_BAKED}; checkpoints predating a baked stage are not "
@@ -514,6 +556,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         value_hidden=value_hidden,
         dropout=0.0,
         window_attention=knobs.window_attention,
+        state_latents=knobs.state_latents,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")
@@ -717,6 +760,7 @@ def composition_evaluate(model, composition: Composition, cfg: KlentConfig):
                 composition.q_value(critic).cpu(),
             )
 
+    evaluate.state_latents = model.cfg.state_latents
     return evaluate
 
 

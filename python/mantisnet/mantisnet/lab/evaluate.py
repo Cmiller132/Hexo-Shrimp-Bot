@@ -22,6 +22,7 @@ from .train import (
     current_versions,
     pack_inference_indices,
     sample_sizes,
+    scoped_attention_lengths,
 )
 from .variants import build_variant, count_parameters, scoped_collate
 
@@ -143,6 +144,7 @@ def evaluate_model(
     if not len(samples):
         raise ValueError(f"corpus split {split!r} is empty")
     lengths, cells = sample_sizes(frozen, samples)
+    lengths = scoped_attention_lengths(lengths, model)
     chunks = pack_inference_indices(
         lengths,
         cells,

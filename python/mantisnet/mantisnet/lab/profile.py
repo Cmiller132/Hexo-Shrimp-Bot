@@ -220,7 +220,9 @@ def profile_trunk(
         device=device,
         compile=compile,
     )
-    batch = collate_positions(positions).to(device)
+    batch = collate_positions(
+        positions, state_latents=model.cfg.state_latents
+    ).to(device)
     with torch.no_grad(), torch.autocast(
         device, torch.bfloat16, enabled=device == "cuda"
     ):
@@ -456,7 +458,9 @@ def profile_decode(
         device=device,
         compile=compile,
     )
-    batch = collate_positions(positions).to(device)
+    batch = collate_positions(
+        positions, state_latents=model.cfg.state_latents
+    ).to(device)
     trunk_s = decode_s = 0.0
     with torch.no_grad(), torch.autocast(
         device, torch.bfloat16, enabled=device == "cuda"
@@ -558,7 +562,9 @@ def profile_seam(
         device=device,
         compile=compile,
     )
-    batch = collate_positions(positions)
+    batch = collate_positions(
+        positions, state_latents=model.cfg.state_latents
+    )
 
     def measure(fn):
         sums = [0.0, 0.0, 0.0]
