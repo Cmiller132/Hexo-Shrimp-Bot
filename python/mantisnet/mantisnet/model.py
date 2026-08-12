@@ -329,42 +329,40 @@ class _Block(nn.Module):
         out = self.wo_wa(out.reshape(n_w, cfg.h).to(z.dtype))
         return w + self.drop(out)
 
-    @staticmethod
-    def _masked_softmax(scores: Tensor, valid: Tensor) -> Tensor:
-        """fp32 masked softmax, returning zero for an empty key set."""
-        masked = scores.float()
-        masked = masked.masked_fill(~valid, torch.finfo(masked.dtype).min)
-        weights = masked.softmax(dim=-1)
-        return torch.where(valid, weights, torch.zeros_like(weights))
-
     def _window_latent_cycle(
         self, w: Tensor, g: Tensor, batch: Batch
     ) -> tuple[Tensor, Tensor]:
-        """Latents read padded windows, self-mix, then broadcast to windows."""
+        """Latents read ragged windows, self-mix, then broadcast to windows."""
         cfg = self.cfg
         p, slots, h = g.shape
-        max_w = batch.value_valid.shape[1]
         heads, head_dim = cfg.heads, h // cfg.heads
+        window_pos = batch.window_slot // batch.max_w
 
-        # Read. Row zero belongs to the value head's global context, not the
-        # window set, so it remains masked here; this also gives an empty board
-        # a well-defined zero read instead of a softmax over padding.
-        window_rows = w.new_zeros(p * max_w, h)
-        if batch.window_slot.numel():
-            window_rows.index_copy_(
-                0, batch.window_slot, self.latent_ln_read_w(w).to(window_rows.dtype)
-            )
-        window_rows = window_rows.view(p, max_w, h)
+        # Read. Segment reductions normalize each latent over only its
+        # position's real windows; positions with no windows retain a zero read.
+        window_rows = self.latent_ln_read_w(w)
         q = self.latent_wq_read(self.latent_ln_read_q(g)).view(
             p, slots, heads, head_dim
         )
-        k = self.latent_wk_read(window_rows).view(p, max_w, heads, head_dim)
-        v = self.latent_wv_read(window_rows).view(p, max_w, heads, head_dim)
-        scores = torch.einsum("pkhd,pthd->phkt", q, k) / math.sqrt(head_dim)
-        window_valid = batch.value_valid.clone()
-        window_valid[:, 0] = False
-        weights = self._masked_softmax(scores, window_valid[:, None, None, :])
-        read = torch.einsum("phkt,pthd->pkhd", weights, v.float())
+        k = self.latent_wk_read(window_rows).view(-1, heads, head_dim)
+        v = self.latent_wv_read(window_rows).view(-1, heads, head_dim)
+        scores = (
+            torch.einsum("nkhd,nhd->nkh", q.index_select(0, window_pos), k).float()
+            / math.sqrt(head_dim)
+        )
+        score_max = scores.new_full(
+            (p, slots, heads), torch.finfo(scores.dtype).min
+        ).index_reduce_(
+            0, window_pos, scores, "amax", include_self=True
+        )
+        weights = (scores - score_max.index_select(0, window_pos)).exp()
+        weight_sum = scores.new_zeros(p, slots, heads).index_add_(
+            0, window_pos, weights
+        )
+        weights = weights / weight_sum.index_select(0, window_pos)
+        read = scores.new_zeros(p, slots, heads, head_dim).index_add_(
+            0, window_pos, weights[..., None] * v[:, None].float()
+        )
         delta = self.latent_wo_read(read.reshape(p, slots, h).to(g.dtype))
         g = g + self.drop(delta)
 
@@ -380,25 +378,19 @@ class _Block(nn.Module):
         delta = self.latent_wo_mix(mixed.reshape(p, slots, h).to(g.dtype))
         g = g + self.drop(delta)
 
-        # Broadcast. Queries use the same padded window layout. Padding is
-        # harmless because only collated window slots are gathered back.
-        query_rows = w.new_zeros(p * max_w, h)
-        if batch.window_slot.numel():
-            query_rows.index_copy_(
-                0, batch.window_slot, self.latent_ln_bcast_q(w).to(query_rows.dtype)
-            )
-        query_rows = query_rows.view(p, max_w, h)
+        # Broadcast. Each real window attends over its position's four latents.
+        query_rows = self.latent_ln_bcast_q(w)
         latent_rows = self.latent_ln_bcast_l(g)
-        q = self.latent_wq_bcast(query_rows).view(p, max_w, heads, head_dim)
+        q = self.latent_wq_bcast(query_rows).view(-1, heads, head_dim)
         k = self.latent_wk_bcast(latent_rows).view(p, slots, heads, head_dim)
         v = self.latent_wv_bcast(latent_rows).view(p, slots, heads, head_dim)
-        scores = torch.einsum("pthd,pkhd->phtk", q, k) / math.sqrt(head_dim)
+        k = k.index_select(0, window_pos)
+        v = v.index_select(0, window_pos)
+        scores = torch.einsum("nhd,nkhd->nhk", q, k) / math.sqrt(head_dim)
         weights = scores.float().softmax(dim=-1)
-        broadcast = torch.einsum("phtk,pkhd->pthd", weights, v.float())
-        delta = self.latent_wo_bcast(
-            broadcast.reshape(p * max_w, h).to(w.dtype)
-        )
-        w = w + self.drop(delta.index_select(0, batch.window_slot))
+        broadcast = torch.einsum("nhk,nkhd->nhd", weights, v.float())
+        delta = self.latent_wo_bcast(broadcast.reshape(-1, h).to(w.dtype))
+        w = w + self.drop(delta)
         return w, g
 
     def forward(
