@@ -276,10 +276,12 @@ class PhaseTimer(AbstractContextManager):
         )
         original_chunk, original_collate, original_improved = self._saved
 
-        def chunk_live(positions, live, pair_budget, cell_budget, cap):
+        def chunk_live(positions, live, pair_budget, cell_budget, cap, state_latents=0):
             self.steps.append(time.perf_counter())
             start = time.perf_counter()
-            out = original_chunk(positions, live, pair_budget, cell_budget, cap)
+            out = original_chunk(
+                positions, live, pair_budget, cell_budget, cap, state_latents
+            )
             self._add("chunk", time.perf_counter() - start)
             return out
 

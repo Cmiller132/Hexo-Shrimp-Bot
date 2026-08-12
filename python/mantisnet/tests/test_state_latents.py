@@ -235,6 +235,14 @@ def test_pair_budget_counts_the_three_extra_rows():
     assert _chunk_live(positions, [0, 1], 60, 10, 10) == [[0, 1]]
     assert _chunk_live(positions, [0, 1], 60, 10, 10, state_latents=4) == [[0], [1]]
 
+    # The collect bench's PhaseTimer wrapper must forward the collector's
+    # positional state_latents argument, not pin the old five-arg shape.
+    from mantisnet.klent import selfplay
+    from mantisnet.lab.bench import PhaseTimer
+
+    with PhaseTimer(lambda batch: batch):
+        assert selfplay._chunk_live(positions, [0, 1], 60, 10, 10, 4) == [[0], [1]]
+
     base = torch.tensor([5, 9]).numpy()
     off = scoped_attention_lengths(base, MantisNet(MantisConfig()))
     on = scoped_attention_lengths(base, MantisNet(_config()))
