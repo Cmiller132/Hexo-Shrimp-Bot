@@ -71,9 +71,8 @@ cells (Step 12 matrix, Step 4 screen).
   fields silently lag the checkout (bit us at the Step 2 gate: the cached
   knob-era wheel still emitted `bg_cell`). Then sanity-load a
   `step4-screen/armB` checkpoint through `lab.families.load_checkpoint`.
-- The dwm.exe VRAM leak regrows (~2.6 GiB within an hour); only an elevated
-  `taskkill /f /im dwm.exe` clears it. Lean budgets are the standing
-  mitigation. WDDM paging signature: 100% util at ~60 W on the 270 W 4070 Ti.
+- WDDM paging signature: 100% util at ~60 W on the 270 W 4070 Ti. Lean
+  budgets are the standing mitigation.
 - pytest on Windows needs `--basetemp` outside the repo. `uv sync` without
   `--all-extras` drops the deck extras (fastapi) and breaks collection.
 
