@@ -80,9 +80,7 @@ def probe_mass(
         )
     else:
         positions = corpus_cohort(corpus, split=split, count=envs, seed=seed)
-    batch = collate_positions(
-        positions, state_latents=model.cfg.state_latents
-    ).to(device)
+    batch = collate_positions(positions).to(device)
     with torch.no_grad(), torch.autocast(
         device, torch.bfloat16, enabled=cfg.autocast
     ):

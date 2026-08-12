@@ -1,4 +1,4 @@
-"""Step 2 state-latent layout, literal attention oracle, and knob contracts."""
+"""Baked state-latent layout, literal attention oracle, and accounting."""
 
 from __future__ import annotations
 
@@ -9,9 +9,10 @@ import pytest
 import torch
 
 from mantisnet import MantisConfig, MantisNet, collate, collate_positions, from_position
+from mantisnet import window_latents
 from mantisnet.attention import _bucket_index
 from mantisnet.klent.selfplay import _chunk_live
-from mantisnet.lab.families import infer_config
+from mantisnet.lab.families import infer_config, load_checkpoint
 from mantisnet.lab.train import scoped_attention_lengths
 
 
@@ -24,38 +25,27 @@ def _config(**overrides) -> MantisConfig:
         value_bins=5,
         policy_hidden=16,
         value_hidden=16,
-        state_latents=4,
     )
     values.update(overrides)
     return MantisConfig(**values)
 
 
-def test_state_latent_knob_is_a_path_selector():
-    for value in (-1, 1, 2, 3, 5, 8):
-        with pytest.raises(ValueError, match=r"\{0, 4\}"):
-            MantisConfig(state_latents=value)
-    assert MantisConfig().state_latents == 0
-    assert MantisConfig(state_latents=4).state_latents == 4
-
-
-def test_knob_off_has_no_latent_parameters_and_keeps_the_parameter_pin():
+def test_baked_model_has_only_latent_parameters_and_keeps_the_parameter_pin():
     model = MantisNet(MantisConfig())
-    assert not any("latent" in name for name, _ in model.named_parameters())
-    assert "token_base" in model.state_dict()
-    assert sum(parameter.numel() for parameter in model.parameters()) == 4_007_269
+    assert model.latent_base.shape == (4, model.cfg.h)
+    assert "token_base" not in model.state_dict()
+    assert sum(parameter.numel() for parameter in model.parameters()) == 4_803_813
 
 
-def test_knob_on_python_and_rust_collation_grow_only_the_global_prefix(positions):
+def test_python_and_rust_collation_match_the_baked_global_prefix(positions):
     selected = positions[:5]
-    incumbent = collate_positions(selected)
-    rust = collate_positions(selected, state_latents=4)
-    python = collate(
-        [from_position(position) for position in selected], state_latents=4
-    )
+    graphs = [from_position(position) for position in selected]
+    rust = collate_positions(selected)
+    python = collate(graphs)
 
-    assert rust.state_latents == python.state_latents == 4
-    assert rust.max_t == incumbent.max_t + 3
+    assert rust.max_t == max(graph.n_stones for graph in graphs) + 4
     assert torch.equal(rust.attn_valid[:, :4], torch.ones_like(rust.attn_valid[:, :4]))
+    assert torch.count_nonzero(rust.coords[:, :4]) == 0
     for name, value in vars(python).items():
         got = getattr(rust, name)
         if isinstance(value, torch.Tensor):
@@ -63,19 +53,17 @@ def test_knob_on_python_and_rust_collation_grow_only_the_global_prefix(positions
         else:
             assert got == value, name
 
-    # The Rust wire batch remains incumbent-shaped; expansion preserves all
-    # stone rows while shifting their padded slots by exactly K-1.
-    old_width, new_width = incumbent.max_t, rust.max_t
-    old_pos = incumbent.stone_slot // old_width
-    old_row = incumbent.stone_slot % old_width
-    expected = old_pos * new_width + old_row + 3
+    expected = torch.cat(
+        [
+            torch.arange(graph.n_stones) + position * rust.max_t + 4
+            for position, graph in enumerate(graphs)
+        ]
+    )
     assert torch.equal(rust.stone_slot, expected)
 
 
 def test_every_latent_pair_uses_the_token_bias_bucket(positions):
-    batch = collate(
-        [from_position(position) for position in positions[:4]], state_latents=4
-    )
+    batch = collate([from_position(position) for position in positions[:4]])
     seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
     bucket, _valid = _bucket_index(
         batch.coords, seq_lens, batch.max_t, d_max=3, global_rows=4
@@ -93,15 +81,16 @@ def test_window_read_mix_broadcast_matches_literal_fp32_reference(positions):
     torch.manual_seed(41)
     cfg = _config()
     block = MantisNet(cfg).blocks[0].eval()
-    batch = collate(
-        [from_position(position) for position in positions[:6]], state_latents=4
-    )
+    batch = collate([from_position(position) for position in positions[:6]])
     w = torch.randn(batch.window_feat.shape[0], cfg.h)
     g = torch.randn(batch.n_pos, 4, cfg.h)
 
-    actual_w, actual_g = block._window_latent_cycle(w, g, batch)
     heads, head_dim = cfg.heads, cfg.h // cfg.heads
     window_pos = batch.window_slot // batch.max_w
+    offsets, order = window_latents.window_latent_layout(window_pos, batch.n_pos)
+    actual_w, actual_g = block._window_latent_cycle(
+        w, g, batch, (window_pos, offsets, order)
+    )
 
     # Read: each latent attends only the real windows of its own position.
     q = block.latent_wq_read(block.latent_ln_read_q(g)).view(
@@ -170,9 +159,7 @@ def test_final_ln_mean_is_the_only_global_reader_context(positions):
     torch.manual_seed(43)
     cfg = _config(blocks=0)
     model = MantisNet(cfg).eval()
-    batch = collate(
-        [from_position(position) for position in positions[:4]], state_latents=4
-    )
+    batch = collate([from_position(position) for position in positions[:4]])
     _s, w, pooled = model.trunk(batch)
     raw = model.latent_base[None] + model.token_moves(batch.moves_idx)[:, None]
     expected = model.ln_out(raw).mean(dim=1)
@@ -190,15 +177,15 @@ def test_final_ln_mean_is_the_only_global_reader_context(positions):
 
 
 @torch.no_grad()
-def test_knob_on_batching_finiteness_and_fresh_zero_contracts(positions):
+def test_batching_finiteness_and_fresh_zero_contracts(positions):
     torch.manual_seed(47)
     cfg = _config(blocks=2)
     model = MantisNet(cfg).eval()
     graphs = [from_position(position) for position in positions]
-    batched = model(collate(graphs, state_latents=4), 0.2)
+    batched = model(collate(graphs), 0.2)
     offset = 0
     for position, graph in enumerate(graphs):
-        single = model(collate([graph], state_latents=4), 0.2)
+        single = model(collate([graph]), 0.2)
         count = graph.n_legal
         for name in ("policy_logits", "q_score", "q_values"):
             torch.testing.assert_close(
@@ -217,13 +204,36 @@ def test_knob_on_batching_finiteness_and_fresh_zero_contracts(positions):
     assert torch.count_nonzero(batched.q_values) == 0
 
 
-def test_knob_on_key_projections_are_bias_free_and_checkpoint_infers_config():
+def test_key_projections_are_bias_free_and_checkpoint_infers_config():
     model = MantisNet(_config())
     parameters = dict(model.named_parameters())
     for name in ("read", "mix", "bcast"):
         assert f"blocks.0.latent_wk_{name}.weight" in parameters
         assert f"blocks.0.latent_wk_{name}.bias" not in parameters
-    assert infer_config(model.state_dict()).state_latents == 4
+    assert infer_config(model.state_dict()) == model.cfg
+
+
+def test_pre_bake_single_token_checkpoint_refuses_as_a_baked_stage(tmp_path):
+    model = MantisNet(_config())
+    state = dict(model.state_dict())
+    state["token_base"] = torch.zeros(model.cfg.h)
+    del state["latent_base"]
+    for key in list(state):
+        if ".latent_" in key:
+            del state[key]
+    path = tmp_path / "single-token.pt"
+    torch.save(
+        {
+            "model": state,
+            "versions": {
+                "RULES_VERSION": hexo_py.RULES_VERSION,
+                "ACTION_ORDER_VERSION": hexo_py.ACTION_ORDER_VERSION,
+            },
+        },
+        path,
+    )
+    with pytest.raises(ValueError, match="predating a baked stage"):
+        load_checkpoint(path)
 
 
 def test_pair_budget_counts_the_three_extra_rows():
@@ -232,19 +242,17 @@ def test_pair_budget_counts_the_three_extra_rows():
         legal_count = 1
 
     positions = [Position(), Position()]
-    assert _chunk_live(positions, [0, 1], 60, 10, 10) == [[0, 1]]
-    assert _chunk_live(positions, [0, 1], 60, 10, 10, state_latents=4) == [[0], [1]]
+    assert _chunk_live(positions, [0, 1], 60, 10, 10) == [[0], [1]]
 
-    # The collect bench's PhaseTimer wrapper must forward the collector's
-    # positional state_latents argument, not pin the old five-arg shape.
+    # The collect bench's PhaseTimer wrapper preserves the five-argument seam.
     from mantisnet.klent import selfplay
     from mantisnet.lab.bench import PhaseTimer
 
     with PhaseTimer(lambda batch: batch):
-        assert selfplay._chunk_live(positions, [0, 1], 60, 10, 10, 4) == [[0], [1]]
+        assert selfplay._chunk_live(positions, [0, 1], 60, 10, 10) == [[0], [1]]
 
 
-def test_bench_collect_threads_the_knob_end_to_end(capsys):
+def test_bench_collect_and_packer_use_the_baked_layout_end_to_end(capsys):
     from mantisnet.lab.bench import bench_collect
 
     report = bench_collect(
@@ -253,13 +261,9 @@ def test_bench_collect_threads_the_knob_end_to_end(capsys):
         cap=6,
         seed=3,
         device="cpu",
-        model_kw={"state_latents": 4},
     )
     capsys.readouterr()
     assert report["samples"] > 0 and report["steps"] > 0
 
     base = torch.tensor([5, 9]).numpy()
-    off = scoped_attention_lengths(base, MantisNet(MantisConfig()))
-    on = scoped_attention_lengths(base, MantisNet(_config()))
-    assert off is base
-    assert on.tolist() == [8, 12]
+    assert scoped_attention_lengths(base).tolist() == [8, 12]

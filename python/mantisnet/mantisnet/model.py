@@ -50,19 +50,12 @@ class MantisConfig:
     dropout: float = 0.0
     # Live knob for the §5.1c typed window-pair attention stage.
     window_attention: bool = True
-    # Step 2 knob: zero keeps the single-token path; four selects the measured
-    # invariant-latent path. This is a path selector, not a tunable width.
-    state_latents: int = 0
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
             raise ValueError(f"H={self.h} must divide into A={self.heads} heads")
         if self.value_bins % 2 == 0:
             raise ValueError(f"K={self.value_bins} must be odd so an exact-zero bin exists")
-        if self.state_latents not in (0, 4):
-            raise ValueError(
-                f"state_latents must be one of {{0, 4}}, got {self.state_latents}"
-            )
 
     @property
     def window_vocab(self) -> int:
@@ -123,6 +116,7 @@ LEGACY_BAKED_KNOBS: dict[str, object] = {
     "joint_incidence": True,
     "mixed_windows": True,
     "action_rows": True,
+    "state_latents": 4,
 }
 
 
@@ -237,36 +231,35 @@ class _Block(nn.Module):
             self.wa_bias = nn.Parameter(
                 torch.zeros(cfg.heads, window_pairs.WA_CLASSES)
             )
-        if cfg.state_latents:
-            # Window read, latent self-mix, and window broadcast. Every key
-            # projection is bias-free because a shared key bias cancels from
-            # its softmax row.
-            self.latent_ln_read_q = nn.LayerNorm(h)
-            self.latent_ln_read_w = nn.LayerNorm(h)
-            self.latent_wq_read = nn.Linear(h, h)
-            self.latent_wk_read = nn.Linear(h, h, bias=False)
-            self.latent_wv_read = nn.Linear(h, h)
-            self.latent_wo_read = nn.Linear(h, h)
+        # Window read, latent self-mix, and window broadcast. Every key
+        # projection is bias-free because a shared key bias cancels from
+        # its softmax row.
+        self.latent_ln_read_q = nn.LayerNorm(h)
+        self.latent_ln_read_w = nn.LayerNorm(h)
+        self.latent_wq_read = nn.Linear(h, h)
+        self.latent_wk_read = nn.Linear(h, h, bias=False)
+        self.latent_wv_read = nn.Linear(h, h)
+        self.latent_wo_read = nn.Linear(h, h)
 
-            self.latent_ln_mix = nn.LayerNorm(h)
-            self.latent_wq_mix = nn.Linear(h, h)
-            self.latent_wk_mix = nn.Linear(h, h, bias=False)
-            self.latent_wv_mix = nn.Linear(h, h)
-            self.latent_wo_mix = nn.Linear(h, h)
+        self.latent_ln_mix = nn.LayerNorm(h)
+        self.latent_wq_mix = nn.Linear(h, h)
+        self.latent_wk_mix = nn.Linear(h, h, bias=False)
+        self.latent_wv_mix = nn.Linear(h, h)
+        self.latent_wo_mix = nn.Linear(h, h)
 
-            self.latent_ln_bcast_q = nn.LayerNorm(h)
-            self.latent_ln_bcast_l = nn.LayerNorm(h)
-            self.latent_wq_bcast = nn.Linear(h, h)
-            self.latent_wk_bcast = nn.Linear(h, h, bias=False)
-            self.latent_wv_bcast = nn.Linear(h, h)
-            self.latent_wo_bcast = nn.Linear(h, h)
+        self.latent_ln_bcast_q = nn.LayerNorm(h)
+        self.latent_ln_bcast_l = nn.LayerNorm(h)
+        self.latent_wq_bcast = nn.Linear(h, h)
+        self.latent_wk_bcast = nn.Linear(h, h, bias=False)
+        self.latent_wv_bcast = nn.Linear(h, h)
+        self.latent_wo_bcast = nn.Linear(h, h)
         # §5.2 stone <- windows
         self.ln_sw_w = nn.LayerNorm(h)
         self.ln_sw_s = nn.LayerNorm(h)
         self.v = nn.Linear(h, h, bias=False)
         self.e_sw = nn.Embedding(cfg.occ_classes, h)
         self.mlp_s = _PairMlp(h, h, h)
-        # §5.3 stone self-attention + token
+        # §5.3 stone self-attention + state latents
         self.ln_attn = nn.LayerNorm(h)
         self.wq = nn.Linear(h, h)
         self.wk = nn.Linear(h, h, bias=False)
@@ -334,17 +327,13 @@ class _Block(nn.Module):
         w: Tensor,
         g: Tensor,
         batch: Batch,
-        layout: tuple[Tensor, Tensor, Tensor] | None = None,
+        layout: tuple[Tensor, Tensor, Tensor],
     ) -> tuple[Tensor, Tensor]:
         """Latents read flat windows, self-mix, then broadcast to windows."""
         cfg = self.cfg
         p, slots, h = g.shape
         heads, head_dim = cfg.heads, h // cfg.heads
-        if layout is None:
-            window_pos = batch.window_slot // batch.max_w
-            offsets, order = window_latents.window_latent_layout(window_pos, p)
-        else:
-            window_pos, offsets, order = layout
+        window_pos, offsets, order = layout
 
         # The fused op owns gather, fp32 scores, softmax, and weighted sum.
         # An empty position run returns an exact zero read delta.
@@ -394,7 +383,7 @@ class _Block(nn.Module):
         seq_lens: Tensor,
         plan: message_passing.IncidencePlan,
         pairs,
-        latent_layout: tuple[Tensor, Tensor, Tensor] | None,
+        latent_layout: tuple[Tensor, Tensor, Tensor],
     ) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.cfg
         # Sizes come from tensor shapes, not the Batch's ints: under
@@ -459,7 +448,7 @@ class _Block(nn.Module):
 
         # §5.3: attention over [global rows; stones], block-diagonal per position.
         rows = s.new_zeros(p * max_t, cfg.h)
-        global_rows = max(1, cfg.state_latents)
+        global_rows = 4
         global_slot = (
             torch.arange(p, device=s.device)[:, None] * max_t
             + torch.arange(global_rows, device=s.device)[None, :]
@@ -489,11 +478,8 @@ class _Block(nn.Module):
         out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(p * max_t, cfg.h)
         s = s + self.drop(out.index_select(0, batch.stone_slot))
         global_delta = out.index_select(0, global_slot)
-        if cfg.state_latents:
-            g = g + self.drop(global_delta.view(p, global_rows, cfg.h))
-            w, g = self._window_latent_cycle(w, g, batch, latent_layout)
-        else:
-            g = g + self.drop(global_delta.view(p, cfg.h))
+        g = g + self.drop(global_delta.view(p, global_rows, cfg.h))
+        w, g = self._window_latent_cycle(w, g, batch, latent_layout)
 
         # FFN over the same rows — row-independent, so no padding needed.
         global_flat = g.reshape(-1, cfg.h)
@@ -501,11 +487,7 @@ class _Block(nn.Module):
         rows = self.drop(self.ffn(self.ln_ffn(rows)))
         s = s + rows[: s.shape[0]]
         global_flat = global_flat + rows[s.shape[0] :]
-        g = (
-            global_flat.view(p, global_rows, cfg.h)
-            if cfg.state_latents
-            else global_flat.view(p, cfg.h)
-        )
+        g = global_flat.view(p, global_rows, cfg.h)
         return s, w, g
 
 
@@ -521,10 +503,7 @@ class MantisNet(nn.Module):
         # §3: ternary canonical patterns subsume colour and status.
         self.stone_table = nn.Embedding(2, h)  # own / opp
         self.window_table = nn.Embedding(cfg.window_vocab, h)
-        if cfg.state_latents:
-            self.latent_base = nn.Parameter(torch.empty(cfg.state_latents, h))
-        else:
-            self.token_base = nn.Parameter(torch.empty(h))
+        self.latent_base = nn.Parameter(torch.empty(4, h))
         self.token_moves = nn.Embedding(2, h)  # moves_remaining in {1, 2}
 
         self.blocks = nn.ModuleList(_Block(cfg) for _index in range(cfg.blocks))
@@ -568,15 +547,12 @@ class MantisNet(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        # §10: embeddings, the token base, and the value queries N(0, 0.02);
+        # §10: embeddings, the latent base, and the value queries N(0, 0.02);
         # bias tables zero (already); linears framework-default.
         for m in self.modules():
             if isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
-        if self.cfg.state_latents:
-            nn.init.normal_(self.latent_base, std=0.02)
-        else:
-            nn.init.normal_(self.token_base, std=0.02)
+        nn.init.normal_(self.latent_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
         nn.init.normal_(self.act_empty_base, std=0.02)
         # Both decoder outputs start at zero, so the initial policy logits are
@@ -602,19 +578,10 @@ class MantisNet(nn.Module):
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
         """Embeddings through the B blocks and the shared final LN (§5)."""
         cfg = self.cfg
-        if batch.state_latents != cfg.state_latents:
-            raise ValueError(
-                f"batch built with state_latents={batch.state_latents} for a "
-                f"model with state_latents={cfg.state_latents}"
-            )
         s = self.stone_table(batch.stone_own)
         w = self.window_table(batch.window_feat)
         moves = self.token_moves(batch.moves_idx)
-        g = (
-            self.latent_base[None, :, :] + moves[:, None, :]
-            if cfg.state_latents
-            else self.token_base + moves
-        )
+        g = self.latent_base[None, :, :] + moves[:, None, :]
 
         plan = message_passing.incidence_plan(
             batch.inc_stone,
@@ -622,21 +589,17 @@ class MantisNet(nn.Module):
             batch.inc_class,
         )
         pairs = self._pair_tables(batch) if cfg.window_attention else None
-        latent_layout = None
-        if cfg.state_latents:
-            window_pos = batch.window_slot // batch.max_w
-            offsets, order = window_latents.window_latent_layout(
-                window_pos, g.shape[0]
-            )
-            latent_layout = (window_pos, offsets, order)
+        window_pos = batch.window_slot // batch.max_w
+        offsets, order = window_latents.window_latent_layout(
+            window_pos, g.shape[0]
+        )
+        latent_layout = (window_pos, offsets, order)
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         for block in self.blocks:
             s, w, g = block(
                 s, w, g, batch, seq_lens, plan, pairs, latent_layout
             )
-        global_rows = self.ln_out(g)
-        if cfg.state_latents:
-            global_rows = global_rows.mean(dim=1)
+        global_rows = self.ln_out(g).mean(dim=1)
         return self.ln_out(s), self.ln_out(w), global_rows
 
     def _decoder_rows(self, w: Tensor, batch: Batch, dtype: torch.dtype) -> Tensor:

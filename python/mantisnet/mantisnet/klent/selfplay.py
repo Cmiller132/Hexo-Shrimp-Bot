@@ -51,7 +51,6 @@ def _chunk_live(
     pair_budget: int,
     cell_budget: int,
     cap: int,
-    state_latents: int = 0,
 ):
     """Split ``live`` into consecutive chunks under the memory budgets and
     the position-count ``cap``."""
@@ -59,7 +58,7 @@ def _chunk_live(
     chunk: list[int] = []
     max_t, cells = 0, 0
     for i in live:
-        t_pad = positions[i].stone_count + max(1, state_latents)
+        t_pad = positions[i].stone_count + 4
         c = positions[i].legal_count
         t = max(max_t, t_pad)
         if chunk and (
@@ -93,7 +92,6 @@ class Collector:
         rng: np.random.Generator,
         pair_budget: int = 24_000_000,
         cell_budget: int = 2_400_000,
-        state_latents: int = 0,
     ) -> None:
         import hexo_py
 
@@ -106,11 +104,6 @@ class Collector:
         self.rng = rng
         self.pair_budget = pair_budget
         self.cell_budget = cell_budget
-        if state_latents not in (0, 4):
-            raise ValueError(
-                f"state_latents must be one of {{0, 4}}, got {state_latents}"
-            )
-        self.state_latents = state_latents
         # The cap is one quarter of the cohort, clamped to 64–256 slots.
         self.chunk_cap = min(envs, max(64, envs // 4))
 
@@ -133,13 +126,12 @@ class Collector:
                 )
                 chunks = _chunk_live(
                     self.positions, order, self.pair_budget, self.cell_budget,
-                    self.chunk_cap, self.state_latents,
+                    self.chunk_cap,
                 )
                 batches = [
                     collate_pool.submit(
                         lambda c: collate_positions(
-                            [self.positions[i] for i in c],
-                            state_latents=self.state_latents,
+                            [self.positions[i] for i in c]
                         ),
                         chunk,
                     )

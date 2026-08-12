@@ -17,7 +17,7 @@ import pytest
 import torch
 
 import mantisnet.message_passing as message_impl
-from mantisnet import TERN_OCC_CLASSES, collate, from_position
+from mantisnet import TERN_OCC_CLASSES, collate, from_position, window_latents
 from mantisnet.builder import ACTION_EMPTY
 from mantisnet.message_passing import (
     STONE_RUN,
@@ -315,13 +315,18 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
         with torch.autocast("cuda", torch.bfloat16):
             s = model.stone_table(batch.stone_own)
             w = model.window_table(batch.window_feat)
-            g = model.token_base + model.token_moves(batch.moves_idx)
+            g = model.latent_base[None] + model.token_moves(batch.moves_idx)[:, None]
+            window_pos = batch.window_slot // batch.max_w
+            offsets, order = window_latents.window_latent_layout(
+                window_pos, batch.n_pos
+            )
+            layout = (window_pos, offsets, order)
             seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
-            fast = block(s, w, g, batch, seq_lens, plan, pairs, None)
+            fast = block(s, w, g, batch, seq_lens, plan, pairs, layout)
 
             monkeypatch.setattr(message_impl, "aggregate_to_windows", windows)
             monkeypatch.setattr(message_impl, "aggregate_to_stones", stones)
-            reference = block(s, w, g, batch, seq_lens, plan, pairs, None)
+            reference = block(s, w, g, batch, seq_lens, plan, pairs, layout)
     finally:
         model.to("cpu")
 

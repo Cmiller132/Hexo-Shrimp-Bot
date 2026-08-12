@@ -18,7 +18,7 @@ window is kept under the ternary slot patterns
 (MANTIS_GRAFT_SPEC Step 12, baked): the encoder assigns reversal-invariant
 joint pattern/slot classes to both incidence and decoder edges in the
 377/726/1458 ternary vocabulary, and the wire format speaks that scope under
-`MODEL_REPR_VERSION` 5.
+`MODEL_REPR_VERSION` 6.
 
 `build(position)` emits each legal action's 18 hypothetical post-placement
 windows with their 729 joint `(post, slot)` classes and pre-insert statuses.
@@ -39,7 +39,9 @@ The encoder has three output paths:
   collates them into a `RawBatch`.
 
 `RawBatch` is the flat, globally-indexed tensor layout the forward boundary
-accepts.
+accepts. Its stone-attention table begins with four valid global rows whose
+coordinates are zero; stone slots begin at row four, and padding follows the
+last stone.
 
 ### Forward boundary (`forward`)
 

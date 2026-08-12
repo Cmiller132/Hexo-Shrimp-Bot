@@ -17,9 +17,7 @@ def argmax_choose(model, device: str = "cpu"):
     """Batched chooser returning the policy head's argmax over each legal set."""
 
     def choose(positions, _rng):
-        batch = collate_positions(
-            positions, state_latents=model.cfg.state_latents
-        ).to(device)
+        batch = collate_positions(positions).to(device)
         with torch.no_grad():
             _s, w, g = model.trunk(batch)
             logits = model.policy_head(w, g, batch).cpu()

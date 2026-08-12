@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from .. import message_passing
+from .. import message_passing, window_latents
 from ..attention import fused_attention
 from ..builder import collate_positions
 from ..optim import make_adam
@@ -61,11 +61,14 @@ _TRUNK_STAGES = (
     "window_attention",
     "stone_from_windows",
     "attention",
+    "latent_cycle",
     "ffn",
 )
 
 
-def _replicated_block(block, s, w, g, batch, seq_lens, plan, pairs, device, timings):
+def _replicated_block(
+    block, s, w, g, batch, seq_lens, plan, pairs, latent_layout, device, timings
+):
     """Transcribe one ``_Block`` without hooks or model instrumentation."""
     cfg = block.cfg
 
@@ -131,8 +134,11 @@ def _replicated_block(block, s, w, g, batch, seq_lens, plan, pairs, device, timi
         nonlocal s, g
         p, max_t = g.shape[0], batch.attn_valid.shape[1]
         rows = s.new_zeros(p * max_t, cfg.h)
-        token_slot = torch.arange(p, device=s.device) * max_t
-        rows.index_copy_(0, token_slot, g)
+        global_slot = (
+            torch.arange(p, device=s.device)[:, None] * max_t
+            + torch.arange(4, device=s.device)[None, :]
+        ).reshape(-1)
+        rows.index_copy_(0, global_slot, g.reshape(-1, cfg.h))
         rows.index_copy_(0, batch.stone_slot, s)
         z = block.ln_attn(rows.view(p, max_t, cfg.h))
         hd = cfg.h // cfg.heads
@@ -140,22 +146,35 @@ def _replicated_block(block, s, w, g, batch, seq_lens, plan, pairs, device, timi
         k = block.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         v = block.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         out = fused_attention(
-            q, k, v, batch.coords, seq_lens, block.dist_bias, block.axis_bias
+            q, k, v, batch.coords, seq_lens, block.dist_bias, block.axis_bias, 4
         )
         out = block.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(
             p * max_t, cfg.h
         )
         s = s + block.drop(out.index_select(0, batch.stone_slot))
-        g = g + block.drop(out.index_select(0, token_slot))
+        g = g + block.drop(out.index_select(0, global_slot).view(p, 4, cfg.h))
+
+    def latent_cycle():
+        nonlocal w, g
+        w, g = block._window_latent_cycle(w, g, batch, latent_layout)
 
     def ffn():
         nonlocal s, g
-        rows = torch.cat([s, g], dim=0)
+        global_flat = g.reshape(-1, cfg.h)
+        rows = torch.cat([s, global_flat], dim=0)
         rows = block.drop(block.ffn(block.ln_ffn(rows)))
         s = s + rows[: s.shape[0]]
-        g = g + rows[s.shape[0] :]
+        g = (global_flat + rows[s.shape[0] :]).view(g.shape)
 
-    stages = (window_from_stones, cell_pass, window_attention, stone_from_windows, attention, ffn)
+    stages = (
+        window_from_stones,
+        cell_pass,
+        window_attention,
+        stone_from_windows,
+        attention,
+        latent_cycle,
+        ffn,
+    )
     for name, stage in zip(_TRUNK_STAGES, stages):
         _, dt = _elapsed(device, stage)
         timings[name] += dt
@@ -165,22 +184,30 @@ def _replicated_block(block, s, w, g, batch, seq_lens, plan, pairs, device, timi
 def _replicated_trunk(model, batch, device: str):
     s = model.stone_table(batch.stone_own)
     w = model.window_table(batch.window_feat)
-    g = model.token_base + model.token_moves(batch.moves_idx)
+    g = model.latent_base[None] + model.token_moves(batch.moves_idx)[:, None]
     plan = message_passing.incidence_plan(
         batch.inc_stone,
         batch.inc_window,
         batch.inc_class,
     )
     pairs = model._pair_tables(batch) if model.cfg.window_attention else None
+    window_pos = batch.window_slot // batch.max_w
+    offsets, order = window_latents.window_latent_layout(window_pos, g.shape[0])
+    latent_layout = (window_pos, offsets, order)
     seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
     per_block = []
     for block in model.blocks:
         timings = {name: 0.0 for name in _TRUNK_STAGES}
         s, w, g = _replicated_block(
-            block, s, w, g, batch, seq_lens, plan, pairs, device, timings
+            block, s, w, g, batch, seq_lens, plan, pairs, latent_layout, device,
+            timings,
         )
         per_block.append(timings)
-    return (model.ln_out(s), model.ln_out(w), model.ln_out(g)), per_block
+    return (
+        model.ln_out(s),
+        model.ln_out(w),
+        model.ln_out(g).mean(dim=1),
+    ), per_block
 
 
 def _assert_trunk_match(expected, actual, *, atol: float = 1e-5) -> None:
@@ -220,9 +247,7 @@ def profile_trunk(
         device=device,
         compile=compile,
     )
-    batch = collate_positions(
-        positions, state_latents=model.cfg.state_latents
-    ).to(device)
+    batch = collate_positions(positions).to(device)
     with torch.no_grad(), torch.autocast(
         device, torch.bfloat16, enabled=device == "cuda"
     ):
@@ -458,9 +483,7 @@ def profile_decode(
         device=device,
         compile=compile,
     )
-    batch = collate_positions(
-        positions, state_latents=model.cfg.state_latents
-    ).to(device)
+    batch = collate_positions(positions).to(device)
     trunk_s = decode_s = 0.0
     with torch.no_grad(), torch.autocast(
         device, torch.bfloat16, enabled=device == "cuda"
@@ -562,9 +585,7 @@ def profile_seam(
         device=device,
         compile=compile,
     )
-    batch = collate_positions(
-        positions, state_latents=model.cfg.state_latents
-    )
+    batch = collate_positions(positions)
 
     def measure(fn):
         sums = [0.0, 0.0, 0.0]

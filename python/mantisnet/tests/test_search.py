@@ -115,7 +115,7 @@ def test_depth_exposes_an_opponent_reply_trap():
         offsets = batch.legal_offsets.tolist()
         for row in range(batch.n_pos):
             lo, hi = offsets[row], offsets[row + 1]
-            stones = int(batch.attn_valid[row].sum()) - 1
+            stones = int(batch.attn_valid[row].sum()) - 4
             depth = stones - root_stones
             if depth == 0:
                 # This gap fixes candidate order for the seeded Gumbels while

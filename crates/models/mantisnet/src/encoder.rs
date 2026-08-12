@@ -902,9 +902,9 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
 pub struct RawBatch {
     /// Number of positions in the batch.
     pub n_pos: usize,
-    /// Padded width of each position's `[token; stones]` table.
+    /// Padded width of each position's `[four state latents; stones]` table.
     pub max_t: usize,
-    /// Padded width of each position's `[token; windows]` table.
+    /// Padded width of each position's `[pooled global context; windows]` table.
     pub max_w: usize,
     /// Stone owner features, relative to each position's mover.
     pub stone_own: Vec<i64>,
@@ -1029,7 +1029,7 @@ fn collate_action_fields(graphs: &[Graph], dec_window: &[i64]) -> (Vec<i64>, Vec
 /// Collate position-local graphs into one globally indexed ragged batch.
 pub fn collate(graphs: &[Graph]) -> RawBatch {
     let p = graphs.len();
-    let max_t = graphs.iter().map(|g| g.stone_own.len()).max().unwrap_or(0) + 1;
+    let max_t = graphs.iter().map(|g| g.stone_own.len()).max().unwrap_or(0) + 4;
     let max_w = graphs
         .iter()
         .map(|g| g.window_feat.len())
@@ -1077,15 +1077,15 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
             .extend(g.inc_window.iter().map(|&w| w + win_off));
         out.inc_class.extend_from_slice(&g.inc_class);
         out.stone_slot
-            .extend((0..ns).map(|j| (i * max_t + 1 + j) as i64));
+            .extend((0..ns).map(|j| (i * max_t + 4 + j) as i64));
         out.window_slot
             .extend((0..nw).map(|j| (i * max_w + 1 + j) as i64));
-        out.attn_valid[i * max_t] = true;
+        out.attn_valid[i * max_t..i * max_t + 4].fill(true);
         out.value_valid[i * max_w] = true;
         for (j, qr) in g.stone_qr.iter().enumerate() {
-            out.coords[(i * max_t + 1 + j) * 2] = qr[0];
-            out.coords[(i * max_t + 1 + j) * 2 + 1] = qr[1];
-            out.attn_valid[i * max_t + 1 + j] = true;
+            out.coords[(i * max_t + 4 + j) * 2] = qr[0];
+            out.coords[(i * max_t + 4 + j) * 2 + 1] = qr[1];
+            out.attn_valid[i * max_t + 4 + j] = true;
         }
         for j in 0..nw {
             out.value_valid[i * max_w + 1 + j] = true;
@@ -1369,11 +1369,11 @@ mod tests {
     }
 
     #[test]
-    fn the_opening_batch_has_only_the_token_and_empty_action_rows() {
+    fn the_opening_batch_has_only_the_state_latents_and_empty_action_rows() {
         let raw = build_batch(&[engine::Position::new()]).expect("the opening is live");
 
         assert_eq!(raw.n_pos, 1);
-        assert_eq!(raw.max_t, 1);
+        assert_eq!(raw.max_t, 4);
         assert_eq!(raw.max_w, 1);
         assert!(raw.stone_own.is_empty());
         assert!(raw.window_feat.is_empty());
@@ -1382,8 +1382,8 @@ mod tests {
         assert!(raw.inc_window.is_empty());
         assert!(raw.inc_class.is_empty());
         assert!(raw.stone_slot.is_empty());
-        assert_eq!(raw.coords, [0, 0]);
-        assert_eq!(raw.attn_valid, [true]);
+        assert_eq!(raw.coords, [0; 8]);
+        assert_eq!(raw.attn_valid, [true; 4]);
         assert!(raw.window_slot.is_empty());
         assert_eq!(raw.value_valid, [true]);
         assert_eq!(raw.legal_offsets, [0, 1]);

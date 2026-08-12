@@ -180,13 +180,11 @@ def bench_forward(
     graphs = [from_position(p) for p in positions]
     build_s = time.perf_counter() - start
     start = time.perf_counter()
-    collate(graphs, state_latents=model.cfg.state_latents)
+    collate(graphs)
     collate_s = time.perf_counter() - start
-    collate_positions(
-        positions, state_latents=model.cfg.state_latents
-    )  # Rayon startup is not part of the measurement.
+    collate_positions(positions)  # Rayon startup is not part of the measurement.
     start = time.perf_counter()
-    batch = collate_positions(positions, state_latents=model.cfg.state_latents)
+    batch = collate_positions(positions)
     rust_s = time.perf_counter() - start
 
     batch_d = batch.to(device)
@@ -276,18 +274,16 @@ class PhaseTimer(AbstractContextManager):
         )
         original_chunk, original_collate, original_improved = self._saved
 
-        def chunk_live(positions, live, pair_budget, cell_budget, cap, state_latents=0):
+        def chunk_live(positions, live, pair_budget, cell_budget, cap):
             self.steps.append(time.perf_counter())
             start = time.perf_counter()
-            out = original_chunk(
-                positions, live, pair_budget, cell_budget, cap, state_latents
-            )
+            out = original_chunk(positions, live, pair_budget, cell_budget, cap)
             self._add("chunk", time.perf_counter() - start)
             return out
 
-        def timed_collate(positions, **kw):
+        def timed_collate(positions):
             start = time.perf_counter()
-            out = original_collate(positions, **kw)
+            out = original_collate(positions)
             self._add("collate", time.perf_counter() - start)
             return out
 
@@ -350,7 +346,6 @@ def _collect(
         np.random.default_rng(seed),
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
-        state_latents=model.cfg.state_latents,
     )
     timer = PhaseTimer(evaluate)
     _vram_reset(device)
@@ -621,14 +616,10 @@ def bench_sweep(
                 cfg.collect_pair_budget,
                 cfg.collect_cell_budget,
                 len(positions),
-                model.cfg.state_latents,
             )
             for chunk in chunks:
                 evaluate(
-                    collate_positions(
-                        [positions[i] for i in chunk],
-                        state_latents=model.cfg.state_latents,
-                    )
+                    collate_positions([positions[i] for i in chunk])
                 )
             _sync(device)
             _vram_reset(device)
@@ -637,10 +628,7 @@ def bench_sweep(
             for _ in range(iters):
                 for chunk in chunks:
                     start = time.perf_counter()
-                    batch = collate_positions(
-                        [positions[i] for i in chunk],
-                        state_latents=model.cfg.state_latents,
-                    )
+                    batch = collate_positions([positions[i] for i in chunk])
                     after_collate = time.perf_counter()
                     policy, score, q = evaluate(batch)
                     after_forward = time.perf_counter()

@@ -117,11 +117,10 @@ def network_evaluate(model, cfg: KlentConfig):
                 compose_q(critic_logits).cpu(),
             )
 
-    evaluate.state_latents = model.cfg.state_latents
     return evaluate
 
 
-def _rebuild(samples: list[Sample], state_latents: int = 0):
+def _rebuild(samples: list[Sample]):
     """Rebuild buffered move prefixes in parallel into one batch.
 
     Each stored π′ length must equal its replayed position's legal count
@@ -130,7 +129,6 @@ def _rebuild(samples: list[Sample], state_latents: int = 0):
     batch = collate_prefixes(
         [s.moves for s in samples],
         [s.t for s in samples],
-        state_latents=state_latents,
     )
     counts = (batch.legal_offsets[1:] - batch.legal_offsets[:-1]).tolist()
     for s, count in zip(samples, counts):
@@ -142,12 +140,10 @@ def _rebuild(samples: list[Sample], state_latents: int = 0):
     return batch
 
 
-def _pack(
-    samples: list[Sample], order, cfg: KlentConfig, state_latents: int = 0
-) -> list[list[int]]:
+def _pack(samples: list[Sample], order, cfg: KlentConfig) -> list[list[int]]:
     """Compatibility wrapper for the shared fit-loop packer."""
     return pack_chunks(
-        [s.t + max(1, state_latents) for s in samples],
+        [s.t + 4 for s in samples],
         [len(s.improved) for s in samples],
         order,
         FitBudgets(cfg.batch_size, cfg.pair_budget, cfg.cell_budget),
@@ -174,13 +170,11 @@ def fit(
     totals remain on-device until the returned sample-weighted means are read."""
     model.train()
     policy_q = _policy_q_fn(cfg)
-    state_latents = model.cfg.state_latents
-
     pin = torch.device(cfg.device).type == "cuda"
 
     def prep(indices: list[int]):
         chunk = [samples[i] for i in indices]
-        batch = _rebuild(chunk, state_latents)
+        batch = _rebuild(chunk)
         target = torch.from_numpy(np.concatenate([s.improved for s in chunk]))
         ranks = torch.tensor([s.rank for s in chunk])
         returns = torch.tensor([s.g for s in chunk], dtype=torch.float32)
@@ -236,7 +230,7 @@ def fit(
         model,
         optimizer,
         rng,
-        lengths=[s.t + max(1, state_latents) for s in samples],
+        lengths=[s.t + 4 for s in samples],
         cells=[len(s.improved) for s in samples],
         budgets=FitBudgets(cfg.batch_size, cfg.pair_budget, cfg.cell_budget),
         prepare=prep,

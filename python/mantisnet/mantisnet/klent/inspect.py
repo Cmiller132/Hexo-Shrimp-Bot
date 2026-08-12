@@ -49,9 +49,7 @@ def inspect_position(
     if position.is_terminal:
         raise ValueError(f"the position after {t} plies is terminal: nothing to choose")
 
-    batch = collate_prefixes(
-        [moves], [t], state_latents=model.cfg.state_latents
-    ).to(device)
+    batch = collate_prefixes([moves], [t]).to(device)
     with torch.no_grad():
         _s, w, g = model.trunk(batch)
         logits, q_score, q_values = model.cell_heads(w, g, batch, mass_floor)

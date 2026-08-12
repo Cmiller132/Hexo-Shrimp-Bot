@@ -299,7 +299,7 @@ _BAKED = _Knobs(
     joint_incidence=True,
     window_attention=True,
     mixed_windows=True,
-    state_latents=0,
+    state_latents=4,
 )
 
 
@@ -309,7 +309,7 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
         for index in range(blocks)
         for suffix in _BLOCK_SUFFIXES
     }
-    keys.add("latent_base" if knobs.state_latents else "token_base")
+    keys.add("latent_base")
     keys |= _ACT_KEYS
     for index in range(blocks):
         prefix = f"blocks.{index}."
@@ -319,8 +319,7 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
             keys.add(prefix + "off_axis_bias")
         if knobs.window_attention:
             keys |= {prefix + suffix for suffix in _WA_SUFFIXES}
-        if knobs.state_latents:
-            keys |= {prefix + suffix for suffix in _LATENT_SUFFIXES}
+        keys |= {prefix + suffix for suffix in _LATENT_SUFFIXES}
         if knobs.cell_pass and index >= knobs.cell_pass_from:
             keys |= {prefix + suffix for suffix in _CP_SUFFIXES}
     return keys
@@ -397,10 +396,7 @@ def _expected_shapes(
         "mlp_v.0.weight": (vh, q * h), "mlp_v.0.bias": (vh,),
         "mlp_v.2.weight": (k, vh), "mlp_v.2.bias": (k,),
     }
-    if cfg.state_latents:
-        shapes["latent_base"] = (cfg.state_latents, h)
-    else:
-        shapes["token_base"] = (h,)
+    shapes["latent_base"] = (4, h)
     shapes.update({
         "act_proj.weight": (h, h), "act_proj.bias": (h,),
         "act_table.weight": (TERN_POST1_CLASSES, h),
@@ -416,19 +412,18 @@ def _expected_shapes(
         ln_names.append("ln_wa")
         biased += ["wq_wa", "wv_wa", "wo_wa"]
         bias_free.append("wk_wa")
-    if cfg.state_latents:
-        ln_names += [
-            "latent_ln_read_q", "latent_ln_read_w", "latent_ln_mix",
-            "latent_ln_bcast_q", "latent_ln_bcast_l",
-        ]
-        biased += [
-            "latent_wq_read", "latent_wv_read", "latent_wo_read",
-            "latent_wq_mix", "latent_wv_mix", "latent_wo_mix",
-            "latent_wq_bcast", "latent_wv_bcast", "latent_wo_bcast",
-        ]
-        bias_free += [
-            "latent_wk_read", "latent_wk_mix", "latent_wk_bcast",
-        ]
+    ln_names += [
+        "latent_ln_read_q", "latent_ln_read_w", "latent_ln_mix",
+        "latent_ln_bcast_q", "latent_ln_bcast_l",
+    ]
+    biased += [
+        "latent_wq_read", "latent_wv_read", "latent_wo_read",
+        "latent_wq_mix", "latent_wv_mix", "latent_wo_mix",
+        "latent_wq_bcast", "latent_wv_bcast", "latent_wo_bcast",
+    ]
+    bias_free += [
+        "latent_wk_read", "latent_wk_mix", "latent_wk_bcast",
+    ]
     for index in range(cfg.blocks):
         prefix = f"blocks.{index}."
         for name in ln_names:
@@ -459,6 +454,15 @@ def _expected_shapes(
         shapes[prefix + "ffn.2.weight"] = (h, fh)
         shapes[prefix + "ffn.2.bias"] = (h,)
     return shapes
+
+
+def _baked_profile_error(knobs: _Knobs) -> ValueError:
+    return ValueError(
+        f"state dict trunk profile {knobs} is not the baked architecture "
+        f"{_BAKED}; checkpoints predating a baked stage are not "
+        "instantiable in this build and must be measured from a build of "
+        "their era (see python/mantisnet/README.md)"
+    )
 
 
 def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
@@ -537,13 +541,8 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         )
 
     knobs = _knob_profile(state_dict, blocks)
-    if replace(knobs, window_attention=True, state_latents=0) != _BAKED:
-        raise ValueError(
-            f"state dict trunk profile {knobs} is not the baked architecture "
-            f"{_BAKED}; checkpoints predating a baked stage are not "
-            "instantiable in this build and must be measured from a build of "
-            "their era (see python/mantisnet/README.md)"
-        )
+    if replace(knobs, window_attention=True) != _BAKED:
+        raise _baked_profile_error(knobs)
     cfg = MantisConfig(
         h=h,
         blocks=blocks,
@@ -556,7 +555,6 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         value_hidden=value_hidden,
         dropout=0.0,
         window_attention=knobs.window_attention,
-        state_latents=knobs.state_latents,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")
@@ -671,6 +669,11 @@ def load_checkpoint(
     # They never affected a softmax output, so the lab can score the checkpoint
     # exactly after dropping them. Ordinary KLENT loaders remain strict.
     state = _drop_dead_key_biases(raw["model"])
+    blocks = _block_count(state)
+    if blocks is not None:
+        knobs = _knob_profile(state, blocks)
+        if knobs.state_latents != _BAKED.state_latents:
+            raise _baked_profile_error(knobs)
     versions = raw.get("versions")
     if not isinstance(versions, Mapping):
         raise ValueError(f"checkpoint {checkpoint_path} has no versions mapping")
@@ -760,7 +763,6 @@ def composition_evaluate(model, composition: Composition, cfg: KlentConfig):
                 composition.q_value(critic).cpu(),
             )
 
-    evaluate.state_latents = model.cfg.state_latents
     return evaluate
 
 

@@ -676,9 +676,7 @@ def create_app(
         try:
             _path, model = request.app.state.inference.get(body.checkpoint)
             t = len(body.moves) if body.t is None else body.t
-            batch = collate_prefixes(
-                [body.moves], [t], state_latents=model.cfg.state_latents
-            ).to(
+            batch = collate_prefixes([body.moves], [t]).to(
                 request.app.state.inference.device
             )
             captures: list[dict[str, torch.Tensor]] = [

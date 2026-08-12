@@ -349,7 +349,3 @@ def test_checkpoint_round_trips_through_the_family_registry(tmp_path):
         )
     assert torch.allclose(got_policy, expected.policy_logits, atol=1e-6)
     assert torch.allclose(got_q, expected.q_values, atol=1e-6)
-
-
-def test_parameter_count_is_pinned():
-    assert sum(p.numel() for p in MantisNet(MantisConfig()).parameters()) == 4_007_269

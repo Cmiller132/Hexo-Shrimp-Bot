@@ -116,8 +116,7 @@ def gumbel_choose(
         if parent is None:
             raise ValueError("gumbel chooser needs an RNG")
 
-        state_latents = getattr(evaluate, "state_latents", 0)
-        root_batch = collate_positions(positions, state_latents=state_latents)
+        root_batch = collate_positions(positions)
         root_logits, root_score, root_q = evaluate(root_batch)
         root_logits = root_logits.float().cpu()
         root_score = root_score.float().cpu()
@@ -233,8 +232,7 @@ def gumbel_choose(
                 if not pending:
                     continue
                 leaf_batch = collate_positions(
-                    [line.position for _search, line in pending],
-                    state_latents=state_latents,
+                    [line.position for _search, line in pending]
                 )
                 logits, q_score, q_values = evaluate(leaf_batch)
                 logits = logits.float().cpu()

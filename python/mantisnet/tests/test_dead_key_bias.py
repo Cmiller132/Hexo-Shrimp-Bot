@@ -41,13 +41,15 @@ def test_constant_post_projection_key_bias_cancels_in_both_cpu_attention_paths(
     block = net.blocks[0]
     heads, head_dim = cfg.heads, cfg.h // cfg.heads
 
-    # Real padded [token; stones] rows and geometry from the collated batch.
+    # Real padded [state latents; stones] rows and geometry from the batch.
     stones = net.stone_table(batch.stone_own)
-    token = net.token_base + net.token_moves(batch.moves_idx)
-    n_pos, max_t = token.shape[0], batch.attn_valid.shape[1]
+    latents = net.latent_base[None] + net.token_moves(batch.moves_idx)[:, None]
+    n_pos, max_t = latents.shape[0], batch.attn_valid.shape[1]
     rows = stones.new_zeros(n_pos * max_t, cfg.h)
-    token_slot = torch.arange(n_pos) * max_t
-    rows.index_copy_(0, token_slot, token)
+    latent_slot = (
+        torch.arange(n_pos)[:, None] * max_t + torch.arange(4)[None, :]
+    ).reshape(-1)
+    rows.index_copy_(0, latent_slot, latents.reshape(-1, cfg.h))
     rows.index_copy_(0, batch.stone_slot, stones)
     z = block.ln_attn(rows.view(n_pos, max_t, cfg.h))
     q = block.wq(z).view(n_pos, max_t, heads, head_dim).transpose(1, 2)
@@ -56,7 +58,7 @@ def test_constant_post_projection_key_bias_cancels_in_both_cpu_attention_paths(
     seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
     key_bias = torch.linspace(0.125, 1.0, cfg.h).view(heads, head_dim)
     stone_expected = fused_attention(
-        q, k, v, batch.coords, seq_lens, block.dist_bias, block.axis_bias
+        q, k, v, batch.coords, seq_lens, block.dist_bias, block.axis_bias, 4
     )
     stone_actual = fused_attention(
         q,
@@ -66,6 +68,7 @@ def test_constant_post_projection_key_bias_cancels_in_both_cpu_attention_paths(
         seq_lens,
         block.dist_bias,
         block.axis_bias,
+        4,
     )
 
     # Real window rows and pair relations from the same collated batch.

@@ -187,19 +187,13 @@ def _check_builder_agreement(cases, collate_fn) -> int:
     batch = _collate_cases(cases, collate_fn)
     _assert_batches_equal(
         batch,
-        collate(
-            [from_position(case.position) for case in cases],
-            state_latents=batch.state_latents,
-        ),
+        collate([from_position(case.position) for case in cases]),
     )
     for case in cases:
         batch = _collate_cases([case], collate_fn)
         _assert_batches_equal(
             batch,
-            collate(
-                [from_position(case.position)],
-                state_latents=batch.state_latents,
-            ),
+            collate([from_position(case.position)]),
         )
     return len(cases)
 
@@ -293,7 +287,7 @@ def run_check(
         **contract_battery(
             model,
             cases,
-            collate_fn=scoped_collate(variant, model),
+            collate_fn=scoped_collate(variant),
             device=device,
             rust_collate=spec.rust_collate,
         ),

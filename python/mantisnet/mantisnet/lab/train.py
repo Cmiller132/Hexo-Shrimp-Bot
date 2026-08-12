@@ -184,10 +184,9 @@ def sample_sizes(corpus: FrozenCorpus, samples: SampleSplit) -> tuple[np.ndarray
     return lengths, cells
 
 
-def scoped_attention_lengths(lengths: np.ndarray, model) -> np.ndarray:
-    """Add the measured arm's K-1 global rows to padded-pair accounting."""
-    extra = max(1, model.cfg.state_latents) - 1
-    return lengths if extra == 0 else lengths + extra
+def scoped_attention_lengths(lengths: np.ndarray) -> np.ndarray:
+    """Grow ``sample_sizes``' one global row to the four-row layout."""
+    return lengths + 3
 
 
 def pack_inference_indices(
@@ -306,13 +305,13 @@ def fit_supervised_epoch(
     frozen = _as_corpus(corpus)
     samples = _fit_samples(frozen, split, cfg)
     lengths, cells = sizes if sizes is not None else sample_sizes(frozen, samples)
-    lengths = scoped_attention_lengths(lengths, model)
+    lengths = scoped_attention_lengths(lengths)
     if len(lengths) != len(samples):
         raise ValueError(
             f"precomputed sizes cover {len(lengths)} samples but the fitted "
             f"split has {len(samples)} after the recipe's train_subset cap"
         )
-    collate = scoped_collate(variant, model)
+    collate = scoped_collate(variant)
     forward = _supervised_fn(cfg.compile)
     device_type = torch.device(cfg.device).type
 
@@ -395,14 +394,14 @@ def validate_supervised(
     if not len(samples):
         raise ValueError(f"corpus split {split!r} is empty")
     lengths, cells = sizes if sizes is not None else sample_sizes(frozen, samples)
-    lengths = scoped_attention_lengths(lengths, model)
+    lengths = scoped_attention_lengths(lengths)
     chunks = pack_inference_indices(
         lengths,
         cells,
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
     )
-    collate = scoped_collate(variant, model)
+    collate = scoped_collate(variant)
     forward = _supervised_fn(cfg.compile)
     device_type = torch.device(cfg.device).type
     correct = 0

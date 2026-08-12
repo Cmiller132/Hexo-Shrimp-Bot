@@ -8,10 +8,9 @@ supervised laboratory harness, and the Shrimp Control Deck telemetry dashboard. 
 
 ## The model: MantisNet
 
-MantisNet is a graph network whose nodes are stones, nonempty win windows, and one
-global token. The transient `state_latents` campaign knob replaces that token
-with four invariant state latents when set to `4`; its default `0` is the token
-path exactly. It has no cell grid, no coordinate inputs, and no empty-cell nodes.
+MantisNet is a graph network whose nodes are stones, nonempty win windows, and
+four invariant state latents. It has no cell grid, no coordinate inputs, and no
+empty-cell nodes.
 
 A **window** is six consecutive cells along one hex axis. Every nonempty
 candidate window is represented under ternary slot patterns
@@ -25,7 +24,9 @@ The **trunk** interleaves bipartite message passing (stones to/from windows)
 with self-attention over the stone set biased by hex distance. A cell-pass
 relay lets windows exchange state through shared empty cells, and a
 window-attention layer (the live `window_attention` knob, on by default)
-types window pairs by colinear/crossing relations.
+types window pairs by colinear/crossing relations. In every block the four
+latents read the real windows, self-mix, and broadcast back to those windows;
+their final normalized mean is the global context consumed by the heads.
 
 Three heads read the trunk output:
 
@@ -68,7 +69,7 @@ the forward contains no data-dependent index discovery.
 
 ### Versioning
 
-`MODEL_REPR_VERSION` (model-owned, currently 5) covers the builder and every
+`MODEL_REPR_VERSION` (model-owned, currently 6) covers the builder and every
 feature encoding. `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing. Either bump invalidates checkpoints.
 
@@ -213,9 +214,9 @@ against a named baseline arm.
 The family registry identifies a checkpoint structurally from its model key
 set, native critic-readout width, and decoder-table row count. Configuration
 is inferred from state-dict tensor shapes, including the live
-`window_attention` knob from the presence of §5.1c tensors and the live
-`state_latents` knob from the global base and per-block latent tensors. The row
-encoder is required. Shipped scoreable families are `trinomial-joint`,
+`window_attention` knob from the presence of §5.1c tensors. The latent base,
+per-block latent cycle, and row encoder are required. Shipped scoreable families
+are `trinomial-joint`,
 `bipolar-joint`, and `scalar-joint`; older representation families are rejected.
 
 ### Measurement commands

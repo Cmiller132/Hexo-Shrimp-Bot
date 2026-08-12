@@ -144,14 +144,14 @@ def evaluate_model(
     if not len(samples):
         raise ValueError(f"corpus split {split!r} is empty")
     lengths, cells = sample_sizes(frozen, samples)
-    lengths = scoped_attention_lengths(lengths, model)
+    lengths = scoped_attention_lengths(lengths)
     chunks = pack_inference_indices(
         lengths,
         cells,
         pair_budget=pair_budget,
         cell_budget=cell_budget,
     )
-    collate = scoped_collate(variant, model)
+    collate = scoped_collate(variant)
     device_type = torch.device(device).type
     expected_autocast = device_type == "cuda"
     if autocast is not None and autocast is not expected_autocast:
