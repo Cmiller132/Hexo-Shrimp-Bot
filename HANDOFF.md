@@ -64,10 +64,13 @@ cells (Step 12 matrix, Step 4 screen).
 
 - **WSL clone `~/graft-bench` sits clean at `3fec94b`** (knob era) with all
   Step 4 artifacts under `runs/lab/step4-screen` and `runs/lab/step4-epochs4`,
-  bench artifacts in `~/step4-artifacts`. To sync: `git fetch` + checkout
-  `22e7844`, then `uv sync` in `python/mantisnet` to rebuild `hexo_py` at
-  repr 5, then sanity-load a `step4-screen/armB` checkpoint through
-  `lab.families.load_checkpoint`.
+  bench artifacts in `~/step4-artifacts`. To sync: `git fetch` + checkout,
+  then in `python/mantisnet` run `uv sync --all-extras
+  --reinstall-package hexo-py` — the version number never changes, so a
+  plain `uv sync` serves a STALE CACHED WHEEL of `hexo_py` and the batch
+  fields silently lag the checkout (bit us at the Step 2 gate: the cached
+  knob-era wheel still emitted `bg_cell`). Then sanity-load a
+  `step4-screen/armB` checkpoint through `lab.families.load_checkpoint`.
 - The dwm.exe VRAM leak regrows (~2.6 GiB within an hour); only an elevated
   `taskkill /f /im dwm.exe` clears it. Lean budgets are the standing
   mitigation. WDDM paging signature: 100% util at ~60 W on the 270 W 4070 Ti.
