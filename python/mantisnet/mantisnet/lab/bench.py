@@ -350,6 +350,7 @@ def _collect(
         np.random.default_rng(seed),
         pair_budget=cfg.collect_pair_budget,
         cell_budget=cfg.collect_cell_budget,
+        state_latents=model.cfg.state_latents,
     )
     timer = PhaseTimer(evaluate)
     _vram_reset(device)

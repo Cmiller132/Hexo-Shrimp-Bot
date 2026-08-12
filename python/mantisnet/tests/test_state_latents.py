@@ -243,6 +243,21 @@ def test_pair_budget_counts_the_three_extra_rows():
     with PhaseTimer(lambda batch: batch):
         assert selfplay._chunk_live(positions, [0, 1], 60, 10, 10, 4) == [[0], [1]]
 
+
+def test_bench_collect_threads_the_knob_end_to_end(capsys):
+    from mantisnet.lab.bench import bench_collect
+
+    report = bench_collect(
+        games=1,
+        envs=2,
+        cap=6,
+        seed=3,
+        device="cpu",
+        model_kw={"state_latents": 4},
+    )
+    capsys.readouterr()
+    assert report["samples"] > 0 and report["steps"] > 0
+
     base = torch.tensor([5, 9]).numpy()
     off = scoped_attention_lengths(base, MantisNet(MantisConfig()))
     on = scoped_attention_lengths(base, MantisNet(_config()))
