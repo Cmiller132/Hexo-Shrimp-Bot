@@ -151,10 +151,15 @@ def test_rng_consumes_sample_then_chunk_permutations_only():
     model = _ScalarModel()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
     prepared: list[list[int]] = []
+    consumed: list[list[int]] = []
 
     def prepare(indices):
         prepared.append(list(indices))
         return indices
+
+    def step(payload):
+        consumed.append(list(payload))
+        return model.weight * 0.0, {}
 
     fit_epoch(
         model,
@@ -164,13 +169,16 @@ def test_rng_consumes_sample_then_chunk_permutations_only():
         cells=[1] * 8,
         budgets=FitBudgets(batch_size=3, pair_budget=1_000, cell_budget=1_000),
         prepare=prepare,
-        step=lambda _payload: (model.weight * 0.0, {}),
+        step=step,
         lock=_ObservedLock(),
     )
 
     # Stable descending packing after the first fixed permutation gives
     # [[0, 1, 3], [2, 4, 5], [7, 6]]; the second permutation is [2, 0, 1].
-    assert prepared == [[7, 6], [0, 1, 3], [2, 4, 5]]
+    # Preparation runs on the prefetch pool, so only its multiset is
+    # guaranteed; consumption order is the packed permutation exactly.
+    assert sorted(prepared) == [[0, 1, 3], [2, 4, 5], [7, 6]]
+    assert consumed == [[7, 6], [0, 1, 3], [2, 4, 5]]
     assert rng.calls == [8, 3]
     assert rng.outputs == []
 
