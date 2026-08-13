@@ -490,9 +490,11 @@ def profile_decode(
     ):
         model(batch, 0.2)
         for _ in range(iters):
-            (s, w, g), dt = _elapsed(device, lambda: model.trunk(batch))
+            (s, w, g, cells), dt = _elapsed(device, lambda: model.trunk(batch))
             trunk_s += dt
-            _, dt = _elapsed(device, lambda: model.cell_heads(w, g, batch, 0.2))
+            _, dt = _elapsed(
+                device, lambda: model.cell_heads(w, g, cells, batch, 0.2)
+            )
             decode_s += dt
 
         compiled_ms = None
@@ -507,9 +509,9 @@ def profile_decode(
                 compiled_total += dt
             compiled_ms = compiled_total / iters * 1e3
 
-        _s, w, g = model.trunk(batch)
+        _s, w, g, cells = model.trunk(batch)
         with torch.profiler.profile(activities=_profile_activities(device)) as prof:
-            model.cell_heads(w, g, batch, 0.2)
+            model.cell_heads(w, g, cells, batch, 0.2)
             _sync(device)
     table = prof.key_averages().table(
         sort_by="self_cuda_time_total" if device == "cuda" else "self_cpu_time_total",

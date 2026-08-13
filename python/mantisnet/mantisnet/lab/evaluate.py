@@ -109,8 +109,8 @@ def _horizon_block(
 
 
 def _evaluation_heads(model, batch, include_state_value: bool):
-    _stones, windows, token = model.trunk(batch)
-    policy, critic = model.cell_head_logits(windows, token, batch)
+    _stones, windows, token, cells = model.trunk(batch)
+    policy, critic = model.cell_head_logits(windows, token, cells, batch)
     value = model.value_head(windows, token, batch)[0] if include_state_value else None
     return policy, critic, value
 

@@ -21,7 +21,14 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from . import message_passing, relay, row_encoder, window_latents, window_pairs
+from . import (
+    cell_latents,
+    message_passing,
+    relay,
+    row_encoder,
+    window_latents,
+    window_pairs,
+)
 from .attention import fused_attention
 from .builder import (
     ACTION_EMPTY_CLASSES,
@@ -50,12 +57,30 @@ class MantisConfig:
     dropout: float = 0.0
     # Live knob for the §5.1c typed window-pair attention stage.
     window_attention: bool = True
+    # §5.1c claim reach: 5 is the donor geometry; 0 restricts the crossing
+    # join to pairs sharing an in-span cell (Step 15 arm E, pricing the
+    # out-of-span crossing signal). A path selector, not a tunable radius.
+    claim_reach: int = 5
+    # Step 15 knobs: cell latents replace the §5.1b relay with persistent
+    # typed state on the covered legal cells; the line pass runs whole-line
+    # window attention in the §5.1c slot.
+    cell_latents: bool = False
+    line_pass: bool = False
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
             raise ValueError(f"H={self.h} must divide into A={self.heads} heads")
         if self.value_bins % 2 == 0:
             raise ValueError(f"K={self.value_bins} must be odd so an exact-zero bin exists")
+        if self.claim_reach not in (0, 5):
+            raise ValueError(
+                f"claim_reach must be one of {{0, 5}}, got {self.claim_reach}"
+            )
+        if self.claim_reach == 0 and not self.window_attention:
+            raise ValueError(
+                "claim_reach=0 modifies the §5.1c stage, which "
+                "window_attention=False removes; the knob would be inert"
+            )
 
     @property
     def window_vocab(self) -> int:
@@ -215,12 +240,32 @@ class _Block(nn.Module):
         self.u = nn.Linear(h, h, bias=False)
         self.e_ws = nn.Embedding(cfg.occ_classes, h)
         self.mlp_w = _PairMlp(h, h, h)
-        # §5.1b window <- windows through their shared empty cells.
-        self.ln_cp_in = nn.LayerNorm(h)
-        self.u_cp = nn.Linear(h, h, bias=False)
-        self.e_cp = nn.Embedding(cfg.dec_classes, h)
-        self.ln_cp_w = nn.LayerNorm(h)
-        self.mlp_cp = _PairMlp(h, h, h)
+        # §5.1b window <- windows through their shared empty cells: with the
+        # cell-latent knob on, the shared cells hold persistent typed state
+        # (cells read their windows with class value rows, windows read back
+        # bias-typed); off, the transient relay.
+        if cfg.cell_latents:
+            self.ln_cr_c = nn.LayerNorm(h)
+            self.ln_cr_w = nn.LayerNorm(h)
+            self.cr_wq = nn.Linear(h, h)
+            self.cr_wk = nn.Linear(h, h, bias=False)
+            self.cr_wv = nn.Linear(h, h)
+            self.cr_wo = nn.Linear(h, h)
+            self.cr_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.dec_classes))
+            self.cr_vclass = nn.Embedding(cfg.dec_classes, h)
+            self.ln_wr_w = nn.LayerNorm(h)
+            self.ln_wr_c = nn.LayerNorm(h)
+            self.wr_wq = nn.Linear(h, h)
+            self.wr_wk = nn.Linear(h, h, bias=False)
+            self.wr_wv = nn.Linear(h, h)
+            self.wr_wo = nn.Linear(h, h)
+            self.wr_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.dec_classes))
+        else:
+            self.ln_cp_in = nn.LayerNorm(h)
+            self.u_cp = nn.Linear(h, h, bias=False)
+            self.e_cp = nn.Embedding(cfg.dec_classes, h)
+            self.ln_cp_w = nn.LayerNorm(h)
+            self.mlp_cp = _PairMlp(h, h, h)
         # §5.1c window <- windows through typed pair relations.
         if cfg.window_attention:
             self.ln_wa = nn.LayerNorm(h)
@@ -230,6 +275,17 @@ class _Block(nn.Module):
             self.wo_wa = nn.Linear(h, h)
             self.wa_bias = nn.Parameter(
                 torch.zeros(cfg.heads, window_pairs.WA_CLASSES)
+            )
+        if cfg.line_pass:
+            # Whole-line window attention: the §5.1c colinear vocabulary at
+            # unbounded offset, on the same edge-attention kernels.
+            self.ln_lp = nn.LayerNorm(h)
+            self.lp_wq = nn.Linear(h, h)
+            self.lp_wk = nn.Linear(h, h, bias=False)
+            self.lp_wv = nn.Linear(h, h)
+            self.lp_wo = nn.Linear(h, h)
+            self.lp_bias = nn.Parameter(
+                torch.zeros(cfg.heads, cell_latents.LINE_CLASSES)
             )
         # Window read, latent self-mix, and window broadcast. Every key
         # projection is bias-free because a shared key bias cancels from
@@ -298,6 +354,61 @@ class _Block(nn.Module):
             edge_ccell,
         )
         return w + self.drop(self.mlp_cp(self.ln_cp_w(w), agg))
+
+    def _cell_stage(
+        self, w: Tensor, c: Tensor, ctab: cell_latents.CellTables
+    ) -> tuple[Tensor, Tensor]:
+        """§5.1b as persistent state: cells read their at most 18 containing
+        windows with per-class score bias and class value rows, then windows
+        read back from their at most 5 empty cells bias-typed. A full window
+        has no empty cells and reads zero. Both ops run their scores,
+        softmax, and weighted sums in fp32 whatever autocast chose for the
+        projections."""
+        cfg = self.cfg
+        heads, hd = cfg.heads, cfg.h // cfg.heads
+        n_c, n_w = c.shape[0], w.shape[0]
+
+        zc = self.ln_cr_c(c)
+        zw = self.ln_cr_w(w)
+        read = cell_latents.cell_read(
+            self.cr_wq(zc).view(n_c, heads, hd),
+            self.cr_wk(zw).view(n_w, heads, hd),
+            self.cr_wv(zw).view(n_w, heads, hd),
+            self.cr_bias,
+            self.cr_vclass.weight,
+            ctab,
+        )
+        c = c + self.drop(self.cr_wo(read.reshape(n_c, cfg.h).to(zc.dtype)))
+
+        zw = self.ln_wr_w(w)
+        zc = self.ln_wr_c(c)
+        back = cell_latents.window_read(
+            self.wr_wq(zw).view(n_w, heads, hd),
+            self.wr_wk(zc).view(n_c, heads, hd),
+            self.wr_wv(zc).view(n_c, heads, hd),
+            self.wr_bias,
+            ctab,
+        )
+        w = w + self.drop(self.wr_wo(back.reshape(n_w, cfg.h).to(zw.dtype)))
+        return w, c
+
+    def _line_pass(self, w: Tensor, lines) -> Tensor:
+        """Whole-line attention over each window's colinear edges, on the
+        §5.1c edge op with the 13-class line vocabulary. ``lines`` is the
+        trunk's per-batch ``PairTables``, derived once on device."""
+        cfg = self.cfg
+        heads, hd = cfg.heads, cfg.h // cfg.heads
+        n_w = w.shape[0]
+
+        z = self.ln_lp(w)
+        out = window_pairs.edge_attention(
+            self.lp_wq(z).view(n_w, heads, hd),
+            self.lp_wk(z).view(n_w, heads, hd),
+            self.lp_wv(z).view(n_w, heads, hd),
+            self.lp_bias,
+            *lines,
+        )
+        return w + self.drop(self.lp_wo(out.reshape(n_w, cfg.h).to(z.dtype)))
 
     def _window_attention(self, w: Tensor, pairs) -> Tensor:
         """§5.1c: multi-head attention over each window's relation edges.
@@ -379,12 +490,15 @@ class _Block(nn.Module):
         s: Tensor,
         w: Tensor,
         g: Tensor,
+        c: Tensor | None,
         batch: Batch,
         seq_lens: Tensor,
         plan: message_passing.IncidencePlan,
         pairs,
         latent_layout: tuple[Tensor, Tensor, Tensor],
-    ) -> tuple[Tensor, Tensor, Tensor]:
+        lines,
+        ctab: cell_latents.CellTables | None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         cfg = self.cfg
         # Sizes come from tensor shapes, not the Batch's ints: under
         # torch.compile they become symbolic, so one graph serves every shape.
@@ -414,18 +528,23 @@ class _Block(nn.Module):
         ).to(agg.dtype)
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
-        w = self._cell_pass(
-            w,
-            batch.relay_cell_ptr,
-            batch.relay_window,
-            batch.relay_class,
-            batch.relay_win_ptr,
-            batch.relay_wcell,
-            batch.relay_cls_ptr,
-            batch.relay_ccell,
-        )
+        if cfg.cell_latents:
+            w, c = self._cell_stage(w, c, ctab)
+        else:
+            w = self._cell_pass(
+                w,
+                batch.relay_cell_ptr,
+                batch.relay_window,
+                batch.relay_class,
+                batch.relay_win_ptr,
+                batch.relay_wcell,
+                batch.relay_cls_ptr,
+                batch.relay_ccell,
+            )
         if cfg.window_attention:
             w = self._window_attention(w, pairs)
+        if cfg.line_pass:
+            w = self._line_pass(w, lines)
 
         # §5.2: stones aggregate their windows.
         y = self.v(self.ln_sw_w(w))
@@ -488,7 +607,7 @@ class _Block(nn.Module):
         s = s + rows[: s.shape[0]]
         global_flat = global_flat + rows[s.shape[0] :]
         g = global_flat.view(p, global_rows, cfg.h)
-        return s, w, g
+        return s, w, g, c
 
 
 class MantisNet(nn.Module):
@@ -505,6 +624,11 @@ class MantisNet(nn.Module):
         self.window_table = nn.Embedding(cfg.window_vocab, h)
         self.latent_base = nn.Parameter(torch.empty(4, h))
         self.token_moves = nn.Embedding(2, h)  # moves_remaining in {1, 2}
+        if cfg.cell_latents:
+            # Every covered cell starts from one learned row; identity
+            # accrues through the typed reads. Legal cells no live window
+            # covers keep this row at the decoder — far-ring semantics.
+            self.cell_base = nn.Parameter(torch.empty(h))
 
         self.blocks = nn.ModuleList(_Block(cfg) for _index in range(cfg.blocks))
         self.ln_out = nn.LayerNorm(h)  # shared final LN over S, W, g (§5)
@@ -553,6 +677,8 @@ class MantisNet(nn.Module):
             if isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
         nn.init.normal_(self.latent_base, std=0.02)
+        if self.cfg.cell_latents:
+            nn.init.normal_(self.cell_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
         nn.init.normal_(self.act_empty_base, std=0.02)
         # Both decoder outputs start at zero, so the initial policy logits are
@@ -571,12 +697,40 @@ class MantisNet(nn.Module):
         # source view shares the destination view's arrays (reversal
         # closure), reassembled here because ops may not return aliases.
         ptr, src, cls, scls, cptr, cedge = window_pairs.derive_pair_tables(
-            batch.window_id, batch.window_slot // batch.max_w
+            batch.window_id, batch.window_slot // batch.max_w, self.cfg.claim_reach
         )
         return window_pairs.PairTables(ptr, src, cls, ptr, src, scls, cptr, cedge)
 
-    def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
-        """Embeddings through the B blocks and the shared final LN (§5)."""
+    def _line_tables(self, batch: Batch) -> window_pairs.PairTables:
+        # Born on device for the same reasons as the §5.1c tables. Line
+        # classes are reversal-symmetric, so the source view shares the
+        # destination view's arrays outright.
+        ptr, src, cls, cptr, cedge = cell_latents.derive_line_tables(
+            batch.window_id, batch.window_slot // batch.max_w
+        )
+        return window_pairs.PairTables(ptr, src, cls, ptr, src, cls, cptr, cedge)
+
+    def _cell_tables(self, batch: Batch, n_windows: int) -> cell_latents.CellTables:
+        # The decoder incidence resorted into the cell-attention views, with
+        # the covered -> legal mapping the heads scatter refined latents by.
+        return cell_latents.CellTables(
+            *cell_latents.derive_cell_tables(
+                batch.dec_cell,
+                batch.dec_window,
+                batch.dec_class,
+                n_windows,
+                self.cfg.dec_classes,
+            )
+        )
+
+    def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+        """Embeddings through the B blocks and the shared final LN (§5).
+
+        The fourth output is the refined cell latents scattered into the
+        decoder's legal order — ``(N_cells, H)``, already through the shared
+        LN — when the knob is on, else ``None``. Uncovered legal cells carry
+        the learned base row.
+        """
         cfg = self.cfg
         s = self.stone_table(batch.stone_own)
         w = self.window_table(batch.window_feat)
@@ -594,13 +748,26 @@ class MantisNet(nn.Module):
             window_pos, g.shape[0]
         )
         latent_layout = (window_pos, offsets, order)
+        lines = self._line_tables(batch) if cfg.line_pass else None
+        ctab = c = None
+        if cfg.cell_latents:
+            ctab = self._cell_tables(batch, w.shape[0])
+            c = self.cell_base.expand(ctab.covered.shape[0], cfg.h)
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         for block in self.blocks:
-            s, w, g = block(
-                s, w, g, batch, seq_lens, plan, pairs, latent_layout
+            s, w, g, c = block(
+                s, w, g, c, batch, seq_lens, plan, pairs, latent_layout, lines, ctab
             )
         global_rows = self.ln_out(g).mean(dim=1)
-        return self.ln_out(s), self.ln_out(w), global_rows
+        cells = None
+        if cfg.cell_latents:
+            cells = (
+                self.ln_out(self.cell_base)
+                .expand(batch.cell_pos.shape[0], cfg.h)
+                .clone()
+            )
+            cells.index_copy_(0, ctab.covered, self.ln_out(c).to(cells.dtype))
+        return self.ln_out(s), self.ln_out(w), global_rows, cells
 
     def _decoder_rows(self, w: Tensor, batch: Batch, dtype: torch.dtype) -> Tensor:
         """The pass over the decoder incidence, shared by both cell heads.
@@ -627,6 +794,24 @@ class MantisNet(nn.Module):
             message_passing.STONE_RUN,
             message_passing.WINDOW_RUN,
         ).to(dtype)
+
+    def _decoder_input(
+        self, w: Tensor, cells: Tensor | None, batch: Batch, dtype: torch.dtype
+    ) -> Tensor:
+        """The per-legal-cell rows both heads read: the trunk's refined cell
+        latents when that knob is on, the one-shot window aggregate
+        otherwise. A ``cells`` value that disagrees with the config is a
+        caller wiring bug, not a fallback opportunity."""
+        if self.cfg.cell_latents:
+            if cells is None:
+                raise ValueError(
+                    "cell_latents is on but the trunk's cell rows were not "
+                    "passed to the decoder"
+                )
+            return cells.to(dtype)
+        if cells is not None:
+            raise ValueError("cell rows were passed but cell_latents is off")
+        return self._decoder_rows(w, batch, dtype)
 
     def _action_contribution(self, w: Tensor, batch: Batch) -> Tensor:
         """The summed row-encoder hidden per legal cell, fp32.
@@ -690,28 +875,30 @@ class MantisNet(nn.Module):
         pre = mlp.lin_a(base)
         return mlp.out(F.relu(pre + g_half.index_select(0, batch.cell_pos)))
 
-    def policy_head(self, w: Tensor, g: Tensor, batch: Batch) -> Tensor:
+    def policy_head(
+        self, w: Tensor, g: Tensor, cells: Tensor | None, batch: Batch
+    ) -> Tensor:
         """§6: one raw policy logit per legal cell, engine legal order."""
         acts = self._action_contribution(w, batch)
         g_half = self.mlp_p.lin_b(g)
-        rows = self._decoder_rows(w, batch, g_half.dtype)
+        rows = self._decoder_input(w, cells, batch, g_half.dtype)
         return self._cell_scores(
             rows, acts, g_half, batch, self.p, self.e_pw, self.p_act, self.mlp_p
         ).squeeze(-1)
 
     def cell_head_logits(
-        self, w: Tensor, g: Tensor, batch: Batch
+        self, w: Tensor, g: Tensor, cells: Tensor | None, batch: Batch
     ) -> tuple[Tensor, Tensor]:
         """§6 policy logits ``(N,)`` and categorical logits ``(N, 3)``.
 
-        Both heads use the same parameter-free incidence aggregation and own
-        separate decoder parameters. Fitting takes one categorical score on
-        the selected row; acting composes its score and value from the same
-        logits, so one pass answers both.
+        Both heads read the same per-cell rows and own separate decoder
+        parameters. Fitting takes one categorical score on the selected row;
+        acting composes its score and value from the same logits, so one
+        pass answers both.
         """
         acts = self._action_contribution(w, batch)
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
-        rows = self._decoder_rows(w, batch, g_p.dtype)
+        rows = self._decoder_input(w, cells, batch, g_p.dtype)
         return (
             self._cell_scores(
                 rows, acts, g_p, batch, self.p, self.e_pw, self.p_act, self.mlp_p
@@ -722,13 +909,18 @@ class MantisNet(nn.Module):
         )
 
     def cell_heads(
-        self, w: Tensor, g: Tensor, batch: Batch, mass_floor: float
+        self,
+        w: Tensor,
+        g: Tensor,
+        cells: Tensor | None,
+        batch: Batch,
+        mass_floor: float,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Return policy logits, acting scores, and values in legal order.
 
         π′ ranks by the score; v̂ and the λ-return use the unscaled value.
         """
-        policy_logits, critic_logits = self.cell_head_logits(w, g, batch)
+        policy_logits, critic_logits = self.cell_head_logits(w, g, cells, batch)
         return (
             policy_logits,
             compose_acting_q(critic_logits, batch.legal_offsets, mass_floor),
@@ -763,9 +955,11 @@ class MantisNet(nn.Module):
     def forward(self, batch: Batch, mass_floor: float) -> ModelOutput:
         """Every head. KLENT's loop composes `trunk` with the two heads it
         trains instead, skipping the value readout it never reads."""
-        s_, w, g = self.trunk(batch)
+        s_, w, g, cells = self.trunk(batch)
         value, value_dist, value_logits = self.value_head(w, g, batch)
-        policy_logits, q_score, q_values = self.cell_heads(w, g, batch, mass_floor)
+        policy_logits, q_score, q_values = self.cell_heads(
+            w, g, cells, batch, mass_floor
+        )
         return ModelOutput(
             policy_logits=policy_logits,
             q_score=q_score,

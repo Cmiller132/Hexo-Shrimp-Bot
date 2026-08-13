@@ -122,8 +122,8 @@ def test_every_scoreable_family_identifies_loads_and_runs_full_forward(
 def test_scalar_joint_matches_native_tanh_and_trigraft_transform(tmp_path):
     loaded = load_checkpoint(_write(tmp_path, "scalar-joint"), device="cpu")
     batch = collate_prefixes([[]], [0])
-    _s, windows, token = loaded.model.trunk(batch)
-    _policy, logits = loaded.model.cell_head_logits(windows, token, batch)
+    _s, windows, token, cells = loaded.model.trunk(batch)
+    _policy, logits = loaded.model.cell_head_logits(windows, token, cells, batch)
     scalar = loaded.composition.q_value(logits)
     grafted = torch.cat((logits, -logits, torch.full_like(logits, -20.0)), dim=-1)
     assert torch.equal(scalar, logits.squeeze(-1).tanh())

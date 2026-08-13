@@ -25,7 +25,9 @@ def _fold(t: int) -> int:
     return 2 + min(-t if t < 0 else t - 5, 3)
 
 
-def _oracle_relation(a: tuple[int, int, int], b: tuple[int, int, int]):
+def _oracle_relation(
+    a: tuple[int, int, int], b: tuple[int, int, int], reach: int = 5
+):
     """The directed class of edge b -> a, or None. Brute force, one pair."""
     (ax_a, q_a, r_a), (ax_b, q_b, r_b) = a, b
     if ax_a == ax_b:
@@ -50,7 +52,7 @@ def _oracle_relation(a: tuple[int, int, int], b: tuple[int, int, int]):
         q_b + u * int(vb[0]),
         r_b + u * int(vb[1]),
     )
-    if not (-5 <= t <= 10 and -5 <= u <= 10):
+    if not (-reach <= t <= 5 + reach and -reach <= u <= 5 + reach):
         return None
     return 11 + _fold(t) * 6 + _fold(u)
 
@@ -94,6 +96,43 @@ def test_pair_tables_match_the_brute_force(positions):
                 if relation is not None:
                     expected.add((i, j, relation))
         assert got == expected
+
+
+def test_reach_zero_tables_match_the_brute_force(positions):
+    # Claim reach 0 (arm E) keeps a crossing only when the shared cell is
+    # in-span for both windows; colinear, SELF, and the in-span fold values
+    # are untouched, so shared edges keep their reach-5 classes.
+    for pos in positions[::3]:
+        g = from_position(pos)
+        ids = [tuple(map(int, row)) for row in g.window_id]
+        n_w = len(ids)
+        window_id = torch.from_numpy(g.window_id)
+        tables = pair_tables(
+            window_id, torch.zeros(n_w, dtype=torch.long), reach=0
+        )
+
+        got = set()
+        for dst in range(n_w):
+            for e in range(int(tables.ptr[dst]), int(tables.ptr[dst + 1])):
+                got.add((dst, int(tables.src[e]), int(tables.cls[e])))
+
+        expected = {(w, w, 47) for w in range(n_w)}
+        for i in range(n_w):
+            for j in range(n_w):
+                if i == j:
+                    continue
+                relation = _oracle_relation(ids[i], ids[j], reach=0)
+                if relation is not None:
+                    expected.add((i, j, relation))
+        assert got == expected
+
+
+def test_reach_outside_the_claim_geometry_is_refused():
+    window_id = torch.zeros((1, 3), dtype=torch.long)
+    window_pos = torch.zeros(1, dtype=torch.long)
+    for reach in (-1, 6):
+        with pytest.raises(ValueError, match=r"reach must lie in \[0, 5\]"):
+            pair_tables(window_id, window_pos, reach=reach)
 
 
 def test_the_three_views_hold_the_same_edges(positions):

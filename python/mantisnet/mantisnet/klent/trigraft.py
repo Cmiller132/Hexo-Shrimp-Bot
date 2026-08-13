@@ -234,12 +234,14 @@ def _measure(
     prefixes = _probe_prefixes()
     batch = collate_prefixes(prefixes, [len(moves) for moves in prefixes])
 
-    _s, parent_w, parent_g = parent.trunk(batch)
-    policy_parent, scalar = parent.cell_head_logits(parent_w, parent_g, batch)
+    _s, parent_w, parent_g, parent_cells = parent.trunk(batch)
+    policy_parent, scalar = parent.cell_head_logits(
+        parent_w, parent_g, parent_cells, batch
+    )
     q_parent = torch.tanh(scalar.squeeze(-1).float())
 
-    _s, w, g = model.trunk(batch)
-    policy_new, score_new, q_new = model.cell_heads(w, g, batch, mass_floor)
+    _s, w, g, cells = model.trunk(batch)
+    policy_new, score_new, q_new = model.cell_heads(w, g, cells, batch, mass_floor)
     offsets = batch.legal_offsets
     pi_parent = improved_policy(
         policy_parent.double(), q_parent.double(), q_parent.double(), offsets,
@@ -257,7 +259,7 @@ def _measure(
     kl = segment_sum(terms, segment_ids(offsets), batch.n_pos)
     delta = (q_new - q_parent).abs()
     p_pos, p_neg = return_mass(
-        model.cell_head_logits(w, g, batch)[1]
+        model.cell_head_logits(w, g, cells, batch)[1]
     )
     return {
         "probe_positions": batch.n_pos,

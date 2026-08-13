@@ -79,9 +79,9 @@ def test_action_values_are_the_categorical_return_masses_composed(positions):
     """Appendix B's composition, written out against the raw readout rows."""
     net = _critic_model()
     batch = collate([from_position(p) for p in positions])
-    _s, w, g = net.trunk(batch)
-    policy_logits, _score, q = net.cell_heads(w, g, batch, 0.2)
-    raw_policy, critic_logits = net.cell_head_logits(w, g, batch)
+    _s, w, g, cells = net.trunk(batch)
+    policy_logits, _score, q = net.cell_heads(w, g, cells, batch, 0.2)
+    raw_policy, critic_logits = net.cell_head_logits(w, g, cells, batch)
 
     assert torch.equal(raw_policy, policy_logits)
     assert critic_logits.shape == (q.shape[0], CRITIC_LOGITS)

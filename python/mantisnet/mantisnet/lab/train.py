@@ -257,8 +257,8 @@ def collate_samples(
 
 
 def _supervised_heads(model, batch: Batch):
-    _stones, windows, token = model.trunk(batch)
-    policy, critic = model.cell_head_logits(windows, token, batch)
+    _stones, windows, token, cells = model.trunk(batch)
+    policy, critic = model.cell_head_logits(windows, token, cells, batch)
     value, _value_dist, value_logits = model.value_head(windows, token, batch)
     return policy, critic, value, value_logits
 

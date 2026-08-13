@@ -160,7 +160,7 @@ def test_final_ln_mean_is_the_only_global_reader_context(positions):
     cfg = _config(blocks=0)
     model = MantisNet(cfg).eval()
     batch = collate([from_position(position) for position in positions[:4]])
-    _s, w, pooled = model.trunk(batch)
+    _s, w, pooled, _cells = model.trunk(batch)
     raw = model.latent_base[None] + model.token_moves(batch.moves_idx)[:, None]
     expected = model.ln_out(raw).mean(dim=1)
     torch.testing.assert_close(pooled, expected)
@@ -168,8 +168,8 @@ def test_final_ln_mean_is_the_only_global_reader_context(positions):
     with torch.no_grad():
         model.mlp_p.out.weight.normal_(std=0.1)
         model.mlp_q.out.weight.normal_(std=0.1)
-    got_heads = model.cell_head_logits(w, pooled, batch)
-    ref_heads = model.cell_head_logits(w, expected, batch)
+    got_heads = model.cell_head_logits(w, pooled, None, batch)
+    ref_heads = model.cell_head_logits(w, expected, None, batch)
     got_value = model.value_head(w, pooled, batch)
     ref_value = model.value_head(w, expected, batch)
     for got, reference in (*zip(got_heads, ref_heads), *zip(got_value, ref_value)):

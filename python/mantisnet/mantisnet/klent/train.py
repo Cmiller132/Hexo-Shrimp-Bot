@@ -73,8 +73,8 @@ def _policy_q(model, batch):
     It returns policy logits and the critic's raw categorical logits. The
     fitter scores the taken row; acting composes both Q roles outside.
     """
-    _s, w, g = model.trunk(batch)
-    return model.cell_head_logits(w, g, batch)
+    _s, w, g, cells = model.trunk(batch)
+    return model.cell_head_logits(w, g, cells, batch)
 
 
 # One symbolic-shape graph serves every batch; compiled lazily, shared by

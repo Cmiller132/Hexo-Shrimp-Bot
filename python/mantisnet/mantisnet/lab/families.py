@@ -20,6 +20,7 @@ from ..builder import (
     TERN_PATTERNS,
     TERN_POST1_CLASSES,
 )
+from ..cell_latents import LINE_CLASSES
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
 from ..model import MantisConfig, MantisNet, ModelOutput, strip_legacy_knobs
 from ..segments import segment_ids, segment_max
@@ -119,8 +120,8 @@ class FamilyMantisNet(MantisNet):
         self.mlp_q.out = nn.Linear(cfg.policy_hidden, composition.width)
         self.family_composition = composition
 
-    def cell_heads(self, w, g, batch, mass_floor):
-        policy, critic = self.cell_head_logits(w, g, batch)
+    def cell_heads(self, w, g, cells, batch, mass_floor):
+        policy, critic = self.cell_head_logits(w, g, cells, batch)
         composition = self.family_composition
         return (
             policy,
@@ -129,10 +130,10 @@ class FamilyMantisNet(MantisNet):
         )
 
     def forward(self, batch, mass_floor: float) -> ModelOutput:
-        _stones, windows, token = self.trunk(batch)
+        _stones, windows, token, cells = self.trunk(batch)
         value, value_dist, value_logits = self.value_head(windows, token, batch)
         policy, q_score, q_values = self.cell_heads(
-            windows, token, batch, mass_floor
+            windows, token, cells, batch, mass_floor
         )
         return ModelOutput(
             policy_logits=policy,
@@ -234,6 +235,22 @@ _LATENT_SUFFIXES = {
     "latent_wk_bcast.weight", "latent_wv_bcast.weight", "latent_wv_bcast.bias",
     "latent_wo_bcast.weight", "latent_wo_bcast.bias",
 }
+_CELL_SUFFIXES = {
+    "ln_cr_c.weight", "ln_cr_c.bias", "ln_cr_w.weight", "ln_cr_w.bias",
+    "cr_wq.weight", "cr_wq.bias", "cr_wk.weight",
+    "cr_wv.weight", "cr_wv.bias", "cr_wo.weight", "cr_wo.bias",
+    "cr_bias", "cr_vclass.weight",
+    "ln_wr_w.weight", "ln_wr_w.bias", "ln_wr_c.weight", "ln_wr_c.bias",
+    "wr_wq.weight", "wr_wq.bias", "wr_wk.weight",
+    "wr_wv.weight", "wr_wv.bias", "wr_wo.weight", "wr_wo.bias",
+    "wr_bias",
+}
+_LP_SUFFIXES = {
+    "ln_lp.weight", "ln_lp.bias",
+    "lp_wq.weight", "lp_wq.bias", "lp_wk.weight",
+    "lp_wv.weight", "lp_wv.bias", "lp_wo.weight", "lp_wo.bias",
+    "lp_bias",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +263,8 @@ class _Knobs:
     window_attention: bool
     mixed_windows: bool
     state_latents: int
+    cell_latents: bool
+    line_pass: bool
 
 
 def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
@@ -286,6 +305,8 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
             if isinstance(latent_base, Tensor) and latent_base.ndim == 2
             else 0
         ),
+        cell_latents="cell_base" in state_dict,
+        line_pass="blocks.0.lp_bias" in state_dict,
     )
 
 
@@ -300,6 +321,8 @@ _BAKED = _Knobs(
     window_attention=True,
     mixed_windows=True,
     state_latents=4,
+    cell_latents=False,
+    line_pass=False,
 )
 
 
@@ -310,6 +333,8 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
         for suffix in _BLOCK_SUFFIXES
     }
     keys.add("latent_base")
+    if knobs.cell_latents:
+        keys.add("cell_base")
     keys |= _ACT_KEYS
     for index in range(blocks):
         prefix = f"blocks.{index}."
@@ -319,7 +344,11 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
             keys.add(prefix + "off_axis_bias")
         if knobs.window_attention:
             keys |= {prefix + suffix for suffix in _WA_SUFFIXES}
+        if knobs.line_pass:
+            keys |= {prefix + suffix for suffix in _LP_SUFFIXES}
         keys |= {prefix + suffix for suffix in _LATENT_SUFFIXES}
+        if knobs.cell_latents:
+            keys |= {prefix + suffix for suffix in _CELL_SUFFIXES}
         if knobs.cell_pass and index >= knobs.cell_pass_from:
             keys |= {prefix + suffix for suffix in _CP_SUFFIXES}
     return keys
@@ -403,15 +432,27 @@ def _expected_shapes(
         "act_empty_base": (h,),
         "p_act.weight": (h, h), "q_act.weight": (h, h),
     })
+    if cfg.cell_latents:
+        shapes["cell_base"] = (h,)
     fh = cfg.ffn_factor * h
-    ln_names = ["ln_ws_s", "ln_ws_w", "ln_cp_in", "ln_cp_w", "ln_sw_w",
+    ln_names = ["ln_ws_s", "ln_ws_w", "ln_sw_w",
                 "ln_sw_s", "ln_attn", "ln_ffn"]
     biased = ["wq", "wv", "wo"]
     bias_free = ["wk"]
+    if not cfg.cell_latents:
+        ln_names += ["ln_cp_in", "ln_cp_w"]
+    else:
+        ln_names += ["ln_cr_c", "ln_cr_w", "ln_wr_w", "ln_wr_c"]
+        biased += ["cr_wq", "cr_wv", "cr_wo", "wr_wq", "wr_wv", "wr_wo"]
+        bias_free += ["cr_wk", "wr_wk"]
     if cfg.window_attention:
         ln_names.append("ln_wa")
         biased += ["wq_wa", "wv_wa", "wo_wa"]
         bias_free.append("wk_wa")
+    if cfg.line_pass:
+        ln_names.append("ln_lp")
+        biased += ["lp_wq", "lp_wv", "lp_wo"]
+        bias_free.append("lp_wk")
     ln_names += [
         "latent_ln_read_q", "latent_ln_read_w", "latent_ln_mix",
         "latent_ln_bcast_q", "latent_ln_bcast_l",
@@ -429,12 +470,20 @@ def _expected_shapes(
         for name in ln_names:
             shapes[prefix + name + ".weight"] = (h,)
             shapes[prefix + name + ".bias"] = (h,)
-        for name in ("u", "v", "u_cp"):
+        mlps = ["mlp_w", "mlp_s"]
+        for name in ("u", "v"):
             shapes[prefix + name + ".weight"] = (h, h)
         for name in ("e_ws", "e_sw"):
             shapes[prefix + name + ".weight"] = (cfg.occ_classes, h)
-        shapes[prefix + "e_cp.weight"] = (cfg.dec_classes, h)
-        for name in ("mlp_w", "mlp_s", "mlp_cp"):
+        if cfg.cell_latents:
+            shapes[prefix + "cr_bias"] = (cfg.heads, cfg.dec_classes)
+            shapes[prefix + "cr_vclass.weight"] = (cfg.dec_classes, h)
+            shapes[prefix + "wr_bias"] = (cfg.heads, cfg.dec_classes)
+        else:
+            shapes[prefix + "u_cp.weight"] = (h, h)
+            shapes[prefix + "e_cp.weight"] = (cfg.dec_classes, h)
+            mlps.append("mlp_cp")
+        for name in mlps:
             shapes[prefix + name + ".lin_a.weight"] = (h, h)
             shapes[prefix + name + ".lin_a.bias"] = (h,)
             shapes[prefix + name + ".lin_b.weight"] = (h, h)
@@ -447,6 +496,8 @@ def _expected_shapes(
             shapes[prefix + name + ".weight"] = (h, h)
         if cfg.window_attention:
             shapes[prefix + "wa_bias"] = (cfg.heads, WA_CLASSES)
+        if cfg.line_pass:
+            shapes[prefix + "lp_bias"] = (cfg.heads, LINE_CLASSES)
         shapes[prefix + "dist_bias"] = (cfg.heads, cfg.d_max + 2)
         shapes[prefix + "axis_bias"] = (cfg.heads, cfg.d_max)
         shapes[prefix + "ffn.0.weight"] = (fh, h)
@@ -541,7 +592,18 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         )
 
     knobs = _knob_profile(state_dict, blocks)
-    if replace(knobs, window_attention=True) != _BAKED:
+    # The live knobs read off the dict are accepted as-is; everything else —
+    # including the baked latents, and the relay, which is present exactly
+    # when the cell-latent stage has not replaced it — must be the baked
+    # profile.
+    expected = replace(
+        _BAKED,
+        window_attention=knobs.window_attention,
+        cell_latents=knobs.cell_latents,
+        line_pass=knobs.line_pass,
+        cell_pass=not knobs.cell_latents,
+    )
+    if knobs != expected:
         raise _baked_profile_error(knobs)
     cfg = MantisConfig(
         h=h,
@@ -555,6 +617,8 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         value_hidden=value_hidden,
         dropout=0.0,
         window_attention=knobs.window_attention,
+        cell_latents=knobs.cell_latents,
+        line_pass=knobs.line_pass,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")
@@ -726,11 +790,14 @@ def load_checkpoint(
                 f"checkpoint {checkpoint_path} model_config is not a mapping"
             )
         recorded_cfg = MantisConfig(**strip_legacy_knobs(dict(recorded)))
-        if replace(recorded_cfg, dropout=0.0) != config:
+        # claim_reach leaves no tensor trace, so shape inference cannot see
+        # it; it is compared out here and adopted from the record below.
+        if replace(recorded_cfg, dropout=0.0, claim_reach=config.claim_reach) != config:
             raise ValueError(
                 f"checkpoint model_config {recorded_cfg} does not match the "
                 f"configuration inferred from its tensors {config}"
             )
+        config = replace(config, claim_reach=recorded_cfg.claim_reach)
     model = entry.load(state, config, device)
     assert entry.composition is not None
     return LoadedCheckpoint(

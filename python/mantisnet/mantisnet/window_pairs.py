@@ -90,16 +90,24 @@ class PairTables(NamedTuple):
     cedge: Tensor  # (E,) destination-order edge ids, class order
 
 
-def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
+def pair_tables(
+    window_id: Tensor, window_pos: Tensor, reach: int = _REACH
+) -> PairTables:
     """Derive every §5.1c edge view from the batch's window identities.
 
     ``window_id`` is the batch's ``(N_w, 3)`` identity table and
-    ``window_pos`` the ``(N_w,)`` position of each window.
+    ``window_pos`` the ``(N_w,)`` position of each window. ``reach`` is the
+    claim reach of the crossing join: each window claims that many cells
+    beyond each span end. At 0 a crossing pair must share an in-span cell;
+    the class vocabulary is unchanged, the out-of-span fold rows simply
+    never occur. Colinear edges and SELF do not depend on it.
     """
     if window_id.ndim != 2 or window_id.shape[1] != 3:
         raise ValueError("window_id must have shape (N_w, 3)")
     if window_pos.shape != window_id.shape[:1]:
         raise ValueError("window_pos must have one entry per window")
+    if not 0 <= reach <= _REACH:
+        raise ValueError(f"reach must lie in [0, {_REACH}], got {reach}")
     n_w = window_id.shape[0]
     device = window_id.device
     axis, sq, sr = window_id.unbind(1)
@@ -135,7 +143,7 @@ def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
     # different axes is a crossing within reach, and a crossing pair shares
     # exactly one cell, so segmented pair enumeration yields each directed
     # edge once — O(cells + pairs), no per-shift rescan of the runs.
-    t_ext = torch.arange(-_REACH, 6 + _REACH, device=device)
+    t_ext = torch.arange(-reach, 6 + reach, device=device)
     vec = _AXES.to(device)[axis]  # (N_w, 2)
     cq = sq[:, None] + t_ext[None, :] * vec[:, 0:1]
     cr = sr[:, None] + t_ext[None, :] * vec[:, 1:2]
@@ -150,7 +158,10 @@ def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
     rwin = cwin[corder]
     rt = ct[corder]
     raxis = axis[rwin]
-    fold = _FOLD.to(device)
+    # The reach-r fold table is the middle slice of the full one: _FOLD is
+    # indexed by t + _REACH over t in -_REACH..5+_REACH, so restricting t to
+    # -reach..5+reach keeps in-span values identical across reaches.
+    fold = _FOLD[_REACH - reach : _REACH + 6 + reach].to(device)
     n_cells = rkey.shape[0]
     if n_cells:
         slot = torch.arange(n_cells, device=device)
@@ -170,8 +181,8 @@ def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
         second = second.index_select(0, hit)
         wi = rwin.index_select(0, first)
         wj = rwin.index_select(0, second)
-        fi = fold[rt.index_select(0, first) + _REACH]
-        fj = fold[rt.index_select(0, second) + _REACH]
+        fi = fold[rt.index_select(0, first) + reach]
+        fj = fold[rt.index_select(0, second) + reach]
         dsts.append(torch.cat([wi, wj]))
         srcs.append(torch.cat([wj, wi]))
         classes.append(torch.cat([11 + fi * 6 + fj, 11 + fj * 6 + fi]))
@@ -207,7 +218,7 @@ def pair_tables(window_id: Tensor, window_pos: Tensor) -> PairTables:
 
 @torch.library.custom_op("mantisnet::pair_tables", mutates_args=())
 def derive_pair_tables(
-    window_id: Tensor, window_pos: Tensor
+    window_id: Tensor, window_pos: Tensor, reach: int
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """``pair_tables``' distinct tensors as an opaque op for the trunk.
 
@@ -218,7 +229,7 @@ def derive_pair_tables(
     return aliases, so the source view's shared ``ptr``/``src`` arrays are
     reassembled into ``PairTables`` by the caller.
     """
-    tables = pair_tables(window_id, window_pos)
+    tables = pair_tables(window_id, window_pos, reach)
     return (
         tables.ptr,
         tables.src,
@@ -230,7 +241,7 @@ def derive_pair_tables(
 
 
 @derive_pair_tables.register_fake
-def _(window_id, window_pos):
+def _(window_id, window_pos, reach):
     n_w = window_id.shape[0]
     e = torch.library.get_ctx().new_dynamic_size()
 
