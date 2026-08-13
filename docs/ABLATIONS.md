@@ -984,6 +984,17 @@ peak 10.06 GiB.
 | Verification | full pytest **398 passed, 3 skipped** and `cargo xtask verify` all gates green at `22e7844`; parameter pin 4,007,269 (`test_action_rows.py`; +140,672 over Step 12's 3,866,597 — the 729×h table plus projections, minus the bg embeddings); the 729-class encoding is checked against an engine-grounded successor-board oracle, including opponent digits. Knob-era arm-B checkpoints are the baked state-dict shape and load unchanged; pre-Step-4 dicts refuse loudly via `LEGACY_BAKED_KNOBS`. |
 | Disposition | **ACCEPTED and baked** (owner, 2026-08-11: collect accepted at −12.29% mid-gate; approval on the third seed group). The bg nearest-bucket path (`e_bg`/`e_qbg`) is deleted in both languages; `action_rows: True` joins `LEGACY_BAKED_KNOBS`; `MODEL_REPR_VERSION` 5. `klent.graft` (the repr v1→v2 converter, three generations stale) retired with its tests; its probe helper is inlined into `trigraft`. |
 
+### Window-attention removal — measured negative (Step 3 preview at Step 2 scope)
+
+| Field | Record |
+| --- | --- |
+| Code | No model change: screen arms compose the two live knobs (C `state_latents: 4, window_attention: False`; D `window_attention: False`) at `0875eb0` — §5.1c and the window-latent cycle are independently gated. Parameter cross-check: C 4,538,341 = D 3,741,797 + 796,544 (the latent stack); A − D = 265,472 (per-block wa projections + `wa_bias`). |
+| Screen | Owner-posed hypothesis (2026-08-12): the Step 2 latents' window read/broadcast might subsume §5.1c window attention. Arms C/D × seeds 0–4, 4 epochs, Step 2 lean recipe on `mnorm-late-v1`, same sweep as the completed A/B cells (`runs/lab/step2-epochs4`) → a wattn × latents 2×2 factorial with 5 paired seeds per contrast. C/D cells ran at `0875eb0`; model math is identical to the A/B rev (the ragged rewrite was reverted before launch). |
+| Primaries | D−A (removal alone): top-1 −1.927 ±0.834 pp [0+/5−] and top-3 −1.688 ±1.115 pp [0+/5−] — the factorial's only intervals excluding zero; state MAE +1.224 ±1.369 e−2 [5+/0−]. C−B (removal given latents): critic sign −1.279 ±1.470 pp [1+/4−]; state MAE +0.714 ±1.682 e−2 [4+/1−] — Step 2's calibration gain largely erased; top-1 −1.221 ±3.272 pp on a 4.39 pp seed range. C−D: state MAE −1.905 ±2.113 e−2 [0+/5−] — the latents' own calibration contribution survives without wattn. The two mechanisms are complementary, not redundant. |
+| Horizon | The damage concentrates near-terminal: D−A v̂ sign at moves 1–4 mean −9.31 pp (seed 4 −39.0); D−A state MAE at 1–4 +6.27 e−2; C−B state MAE at 1–4 +5.75 e−2. No optimist-basin cell (4-epoch screen), but all five D cells sit at mean_pred/mean_abs +0.4–0.6 — a uniform optimism tilt absent in A and B. |
+| Stability | wattn also stabilizes policy training: per-arm top-1 seed ranges A 0.67 / B 1.36 / D 1.63 / C 4.39 pp. |
+| Disposition | **wattn stays**; the latents-subsume-wattn hypothesis is rejected. Bears directly on spec Step 3 (window-attention removal trial): this factorial is Step 3's screen shape at 5 paired seeds, measured negative at post-Step-4 scope — owner to rule whether Step 3 still runs. |
+
 ## Provenance
 
 | Source | Use in this record |

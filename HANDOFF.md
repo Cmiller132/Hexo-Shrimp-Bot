@@ -62,9 +62,12 @@ cells (Step 12 matrix, Step 4 screen).
 
 ## Operational state
 
-- **WSL clone `~/graft-bench` sits clean at `3fec94b`** (knob era) with all
-  Step 4 artifacts under `runs/lab/step4-screen` and `runs/lab/step4-epochs4`,
-  bench artifacts in `~/step4-artifacts`. To sync: `git fetch` + checkout,
+- **WSL clone `~/graft-bench` sits clean at `0875eb0`** with Step 4
+  artifacts under `runs/lab/step4-screen` / `runs/lab/step4-epochs4`
+  (`~/step4-artifacts`), the Step 2 screen plus the wattn factorial under
+  `runs/lab/step2-epochs4` (arms A/B/C/D; gate artifacts
+  `~/step2-artifacts-padded`, factorial packet `~/step2cd-artifacts`;
+  untracked drivers `step2_driver.py`, `step2cd_packet.py`). To sync: `git fetch` + checkout,
   then in `python/mantisnet` run `uv sync --all-extras
   --reinstall-package hexo-py` — the version number never changes, so a
   plain `uv sync` serves a STALE CACHED WHEEL of `hexo_py` and the batch
@@ -84,3 +87,8 @@ latents replacing the single global token); Step 5 (`tactical-scalars`)
 depends on Step 4's rows and is now unblocked. **Step 2 has the owner's go
 (2026-08-11 night) and is in flight** — knob first, full protocol, 4-epoch
 screen seeds. The bake still needs its own owner approval.
+
+The wattn × latents factorial (2026-08-12, ABLATIONS "Window-attention
+removal — measured negative") pre-ran Step 3's question at 5 paired
+seeds: removal is measured-negative with or without latents. Owner to
+rule whether Step 3 still runs as its own step.
