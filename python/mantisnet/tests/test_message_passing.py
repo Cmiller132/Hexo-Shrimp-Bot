@@ -317,11 +317,11 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
             w = model.window_table(batch.window_feat)
             g = model.token_base + model.token_moves(batch.moves_idx)
             seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
-            fast = block(s, w, g, batch, seq_lens, plan, pairs)
+            fast = block(s, w, g, batch, seq_lens, plan, pairs, None)
 
             monkeypatch.setattr(message_impl, "aggregate_to_windows", windows)
             monkeypatch.setattr(message_impl, "aggregate_to_stones", stones)
-            reference = block(s, w, g, batch, seq_lens, plan, pairs)
+            reference = block(s, w, g, batch, seq_lens, plan, pairs, None)
     finally:
         model.to("cpu")
 

@@ -21,7 +21,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from . import message_passing, relay, row_encoder, window_pairs
+from . import message_passing, relay, row_encoder, window_latents, window_pairs
 from .attention import fused_attention
 from .builder import (
     ACTION_EMPTY_CLASSES,
@@ -329,42 +329,32 @@ class _Block(nn.Module):
         out = self.wo_wa(out.reshape(n_w, cfg.h).to(z.dtype))
         return w + self.drop(out)
 
-    @staticmethod
-    def _masked_softmax(scores: Tensor, valid: Tensor) -> Tensor:
-        """fp32 masked softmax, returning zero for an empty key set."""
-        masked = scores.float()
-        masked = masked.masked_fill(~valid, torch.finfo(masked.dtype).min)
-        weights = masked.softmax(dim=-1)
-        return torch.where(valid, weights, torch.zeros_like(weights))
-
     def _window_latent_cycle(
-        self, w: Tensor, g: Tensor, batch: Batch
+        self,
+        w: Tensor,
+        g: Tensor,
+        batch: Batch,
+        layout: tuple[Tensor, Tensor, Tensor] | None = None,
     ) -> tuple[Tensor, Tensor]:
-        """Latents read padded windows, self-mix, then broadcast to windows."""
+        """Latents read flat windows, self-mix, then broadcast to windows."""
         cfg = self.cfg
         p, slots, h = g.shape
-        max_w = batch.value_valid.shape[1]
         heads, head_dim = cfg.heads, h // cfg.heads
+        if layout is None:
+            window_pos = batch.window_slot // batch.max_w
+            offsets, order = window_latents.window_latent_layout(window_pos, p)
+        else:
+            window_pos, offsets, order = layout
 
-        # Read. Row zero belongs to the value head's global context, not the
-        # window set, so it remains masked here; this also gives an empty board
-        # a well-defined zero read instead of a softmax over padding.
-        window_rows = w.new_zeros(p * max_w, h)
-        if batch.window_slot.numel():
-            window_rows.index_copy_(
-                0, batch.window_slot, self.latent_ln_read_w(w).to(window_rows.dtype)
-            )
-        window_rows = window_rows.view(p, max_w, h)
+        # The fused op owns gather, fp32 scores, softmax, and weighted sum.
+        # An empty position run returns an exact zero read delta.
         q = self.latent_wq_read(self.latent_ln_read_q(g)).view(
             p, slots, heads, head_dim
         )
-        k = self.latent_wk_read(window_rows).view(p, max_w, heads, head_dim)
-        v = self.latent_wv_read(window_rows).view(p, max_w, heads, head_dim)
-        scores = torch.einsum("pkhd,pthd->phkt", q, k) / math.sqrt(head_dim)
-        window_valid = batch.value_valid.clone()
-        window_valid[:, 0] = False
-        weights = self._masked_softmax(scores, window_valid[:, None, None, :])
-        read = torch.einsum("phkt,pthd->pkhd", weights, v.float())
+        window_rows = self.latent_ln_read_w(w)
+        k = self.latent_wk_read(window_rows).view(-1, heads, head_dim)
+        v = self.latent_wv_read(window_rows).view(-1, heads, head_dim)
+        read = window_latents.read_attention(q, k, v, window_pos, offsets, order)
         delta = self.latent_wo_read(read.reshape(p, slots, h).to(g.dtype))
         g = g + self.drop(delta)
 
@@ -380,25 +370,19 @@ class _Block(nn.Module):
         delta = self.latent_wo_mix(mixed.reshape(p, slots, h).to(g.dtype))
         g = g + self.drop(delta)
 
-        # Broadcast. Queries use the same padded window layout. Padding is
-        # harmless because only collated window slots are gathered back.
-        query_rows = w.new_zeros(p * max_w, h)
-        if batch.window_slot.numel():
-            query_rows.index_copy_(
-                0, batch.window_slot, self.latent_ln_bcast_q(w).to(query_rows.dtype)
-            )
-        query_rows = query_rows.view(p, max_w, h)
+        # K is fixed at four, so the fused op uses multiply-sum reductions
+        # rather than a small-dimension dot and returns flat window rows.
         latent_rows = self.latent_ln_bcast_l(g)
-        q = self.latent_wq_bcast(query_rows).view(p, max_w, heads, head_dim)
+        q = self.latent_wq_bcast(self.latent_ln_bcast_q(w)).view(
+            -1, heads, head_dim
+        )
         k = self.latent_wk_bcast(latent_rows).view(p, slots, heads, head_dim)
         v = self.latent_wv_bcast(latent_rows).view(p, slots, heads, head_dim)
-        scores = torch.einsum("pthd,pkhd->phtk", q, k) / math.sqrt(head_dim)
-        weights = scores.float().softmax(dim=-1)
-        broadcast = torch.einsum("phtk,pkhd->pthd", weights, v.float())
-        delta = self.latent_wo_bcast(
-            broadcast.reshape(p * max_w, h).to(w.dtype)
+        broadcast = window_latents.broadcast_attention(
+            q, k, v, window_pos, offsets, order
         )
-        w = w + self.drop(delta.index_select(0, batch.window_slot))
+        delta = self.latent_wo_bcast(broadcast.reshape(-1, h).to(w.dtype))
+        w = w + self.drop(delta)
         return w, g
 
     def forward(
@@ -410,6 +394,7 @@ class _Block(nn.Module):
         seq_lens: Tensor,
         plan: message_passing.IncidencePlan,
         pairs,
+        latent_layout: tuple[Tensor, Tensor, Tensor] | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         cfg = self.cfg
         # Sizes come from tensor shapes, not the Batch's ints: under
@@ -506,7 +491,7 @@ class _Block(nn.Module):
         global_delta = out.index_select(0, global_slot)
         if cfg.state_latents:
             g = g + self.drop(global_delta.view(p, global_rows, cfg.h))
-            w, g = self._window_latent_cycle(w, g, batch)
+            w, g = self._window_latent_cycle(w, g, batch, latent_layout)
         else:
             g = g + self.drop(global_delta.view(p, cfg.h))
 
@@ -637,9 +622,18 @@ class MantisNet(nn.Module):
             batch.inc_class,
         )
         pairs = self._pair_tables(batch) if cfg.window_attention else None
+        latent_layout = None
+        if cfg.state_latents:
+            window_pos = batch.window_slot // batch.max_w
+            offsets, order = window_latents.window_latent_layout(
+                window_pos, g.shape[0]
+            )
+            latent_layout = (window_pos, offsets, order)
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         for block in self.blocks:
-            s, w, g = block(s, w, g, batch, seq_lens, plan, pairs)
+            s, w, g = block(
+                s, w, g, batch, seq_lens, plan, pairs, latent_layout
+            )
         global_rows = self.ln_out(g)
         if cfg.state_latents:
             global_rows = global_rows.mean(dim=1)
