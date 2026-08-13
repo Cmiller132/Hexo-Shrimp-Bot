@@ -322,16 +322,20 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
             )
             layout = (window_pos, offsets, order)
             seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
-            fast = block(s, w, g, batch, seq_lens, plan, pairs, layout)
+            fast = block(
+                s, w, g, None, batch, seq_lens, plan, pairs, layout, None, None
+            )
 
             monkeypatch.setattr(message_impl, "aggregate_to_windows", windows)
             monkeypatch.setattr(message_impl, "aggregate_to_stones", stones)
-            reference = block(s, w, g, batch, seq_lens, plan, pairs, layout)
+            reference = block(
+                s, w, g, None, batch, seq_lens, plan, pairs, layout, None, None
+            )
     finally:
         model.to("cpu")
 
     assert seen == {"windows", "stones"}
-    for actual, expected in zip(fast, reference):
+    for actual, expected in zip(fast[:3], reference[:3]):
         torch.testing.assert_close(actual, expected, rtol=2.0e-5, atol=2.0e-5)
 
 

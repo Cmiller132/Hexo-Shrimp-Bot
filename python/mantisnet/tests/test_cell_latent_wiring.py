@@ -34,11 +34,8 @@ def _config(**overrides) -> MantisConfig:
     return MantisConfig(**values)
 
 
-def _batch(positions, count=6, state_latents=0):
-    return collate(
-        [from_position(position) for position in positions[:count]],
-        state_latents=state_latents,
-    )
+def _batch(positions, count=6):
+    return collate([from_position(position) for position in positions[:count]])
 
 
 def test_the_knobs_are_path_selectors():
