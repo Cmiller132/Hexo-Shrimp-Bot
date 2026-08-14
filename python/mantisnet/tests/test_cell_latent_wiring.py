@@ -130,7 +130,7 @@ def test_the_decoder_input_contract_fails_loudly(positions):
         _s, w_off, g_off, cells_off = off.trunk(batch)
         _s, w_on, g_on, cells_on = on.trunk(batch)
         assert cells_off is None
-        with pytest.raises(ValueError, match="cell_latents is off"):
+        with pytest.raises(ValueError, match="cell state is off"):
             off.cell_head_logits(w_off, g_off, cells_on, batch)
         with pytest.raises(ValueError, match="were not passed"):
             on.cell_head_logits(w_on, g_on, None, batch)

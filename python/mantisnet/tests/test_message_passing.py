@@ -323,13 +323,15 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
             layout = (window_pos, offsets, order)
             seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
             fast = block(
-                s, w, g, None, batch, seq_lens, plan, pairs, layout, None, None
+                s, w, g, None, batch, seq_lens, plan, pairs, layout,
+                None, None, None, None,
             )
 
             monkeypatch.setattr(message_impl, "aggregate_to_windows", windows)
             monkeypatch.setattr(message_impl, "aggregate_to_stones", stones)
             reference = block(
-                s, w, g, None, batch, seq_lens, plan, pairs, layout, None, None
+                s, w, g, None, batch, seq_lens, plan, pairs, layout,
+                None, None, None, None,
             )
     finally:
         model.to("cpu")
