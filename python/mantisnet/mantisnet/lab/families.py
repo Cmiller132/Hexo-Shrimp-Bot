@@ -21,6 +21,7 @@ from ..builder import (
     TERN_POST1_CLASSES,
 )
 from ..cell_latents import LINE_CLASSES
+from ..cell_nodes import ADJACENCY_CLASSES, NEAREST_BUCKETS, RADIUS_CLASSES
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
 from ..model import MantisConfig, MantisNet, ModelOutput, strip_legacy_knobs
 from ..segments import segment_ids, segment_max
@@ -245,6 +246,18 @@ _CELL_SUFFIXES = {
     "wr_wv.weight", "wr_wv.bias", "wr_wo.weight", "wr_wo.bias",
     "wr_bias",
 }
+_RADIUS_SUFFIXES = {
+    "ln_radius_c.weight", "ln_radius_c.bias", "ln_radius_s.weight", "ln_radius_s.bias",
+    "radius_wq.weight", "radius_wq.bias", "radius_wk.weight",
+    "radius_wv.weight", "radius_wv.bias", "radius_wo.weight", "radius_wo.bias",
+    "radius_bias", "radius_vclass.weight",
+}
+_ADJACENCY_SUFFIXES = {
+    "ln_adj_q.weight", "ln_adj_q.bias", "ln_adj_k.weight", "ln_adj_k.bias",
+    "adj_wq.weight", "adj_wq.bias", "adj_wk.weight",
+    "adj_wv.weight", "adj_wv.bias", "adj_wo.weight", "adj_wo.bias",
+    "adj_bias", "adj_vclass.weight",
+}
 _LP_SUFFIXES = {
     "ln_lp.weight", "ln_lp.bias",
     "lp_wq.weight", "lp_wq.bias", "lp_wk.weight",
@@ -265,6 +278,8 @@ class _Knobs:
     state_latents: int
     cell_latents: bool
     line_pass: bool
+    cell_nodes: bool
+    cell_adjacency: bool
 
 
 def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
@@ -305,8 +320,12 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
             if isinstance(latent_base, Tensor) and latent_base.ndim == 2
             else 0
         ),
-        cell_latents="cell_base" in state_dict,
+        cell_latents=(
+            "cell_base" in state_dict and "cell_occupancy_table.weight" not in state_dict
+        ),
         line_pass="blocks.0.lp_bias" in state_dict,
+        cell_nodes="cell_occupancy_table.weight" in state_dict,
+        cell_adjacency="blocks.0.adj_bias" in state_dict,
     )
 
 
@@ -323,6 +342,8 @@ _BAKED = _Knobs(
     state_latents=4,
     cell_latents=False,
     line_pass=False,
+    cell_nodes=False,
+    cell_adjacency=False,
 )
 
 
@@ -333,8 +354,14 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
         for suffix in _BLOCK_SUFFIXES
     }
     keys.add("latent_base")
-    if knobs.cell_latents:
+    if knobs.cell_latents or knobs.cell_nodes:
         keys.add("cell_base")
+    if knobs.cell_nodes:
+        keys |= {
+            "cell_occupancy_table.weight",
+            "cell_legal_table.weight",
+            "cell_nearest_table.weight",
+        }
     keys |= _ACT_KEYS
     for index in range(blocks):
         prefix = f"blocks.{index}."
@@ -347,8 +374,12 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
         if knobs.line_pass:
             keys |= {prefix + suffix for suffix in _LP_SUFFIXES}
         keys |= {prefix + suffix for suffix in _LATENT_SUFFIXES}
-        if knobs.cell_latents:
+        if knobs.cell_latents or knobs.cell_nodes:
             keys |= {prefix + suffix for suffix in _CELL_SUFFIXES}
+        if knobs.cell_nodes:
+            keys |= {prefix + suffix for suffix in _RADIUS_SUFFIXES}
+        if knobs.cell_adjacency:
+            keys |= {prefix + suffix for suffix in _ADJACENCY_SUFFIXES}
         if knobs.cell_pass and index >= knobs.cell_pass_from:
             keys |= {prefix + suffix for suffix in _CP_SUFFIXES}
     return keys
@@ -432,19 +463,31 @@ def _expected_shapes(
         "act_empty_base": (h,),
         "p_act.weight": (h, h), "q_act.weight": (h, h),
     })
-    if cfg.cell_latents:
+    if cfg.uses_cell_state:
         shapes["cell_base"] = (h,)
+    if cfg.cell_nodes:
+        shapes["cell_occupancy_table.weight"] = (3, h)
+        shapes["cell_legal_table.weight"] = (2, h)
+        shapes["cell_nearest_table.weight"] = (NEAREST_BUCKETS, h)
     fh = cfg.ffn_factor * h
     ln_names = ["ln_ws_s", "ln_ws_w", "ln_sw_w",
                 "ln_sw_s", "ln_attn", "ln_ffn"]
     biased = ["wq", "wv", "wo"]
     bias_free = ["wk"]
-    if not cfg.cell_latents:
+    if not cfg.uses_cell_state:
         ln_names += ["ln_cp_in", "ln_cp_w"]
     else:
         ln_names += ["ln_cr_c", "ln_cr_w", "ln_wr_w", "ln_wr_c"]
         biased += ["cr_wq", "cr_wv", "cr_wo", "wr_wq", "wr_wv", "wr_wo"]
         bias_free += ["cr_wk", "wr_wk"]
+    if cfg.cell_nodes:
+        ln_names += ["ln_radius_c", "ln_radius_s"]
+        biased += ["radius_wq", "radius_wv", "radius_wo"]
+        bias_free += ["radius_wk"]
+    if cfg.cell_adjacency:
+        ln_names += ["ln_adj_q", "ln_adj_k"]
+        biased += ["adj_wq", "adj_wv", "adj_wo"]
+        bias_free += ["adj_wk"]
     if cfg.window_attention:
         ln_names.append("ln_wa")
         biased += ["wq_wa", "wv_wa", "wo_wa"]
@@ -475,7 +518,7 @@ def _expected_shapes(
             shapes[prefix + name + ".weight"] = (h, h)
         for name in ("e_ws", "e_sw"):
             shapes[prefix + name + ".weight"] = (cfg.occ_classes, h)
-        if cfg.cell_latents:
+        if cfg.uses_cell_state:
             shapes[prefix + "cr_bias"] = (cfg.heads, cfg.dec_classes)
             shapes[prefix + "cr_vclass.weight"] = (cfg.dec_classes, h)
             shapes[prefix + "wr_bias"] = (cfg.heads, cfg.dec_classes)
@@ -483,6 +526,12 @@ def _expected_shapes(
             shapes[prefix + "u_cp.weight"] = (h, h)
             shapes[prefix + "e_cp.weight"] = (cfg.dec_classes, h)
             mlps.append("mlp_cp")
+        if cfg.cell_nodes:
+            shapes[prefix + "radius_bias"] = (cfg.heads, RADIUS_CLASSES)
+            shapes[prefix + "radius_vclass.weight"] = (RADIUS_CLASSES, h)
+        if cfg.cell_adjacency:
+            shapes[prefix + "adj_bias"] = (cfg.heads, ADJACENCY_CLASSES)
+            shapes[prefix + "adj_vclass.weight"] = (ADJACENCY_CLASSES, h)
         for name in mlps:
             shapes[prefix + name + ".lin_a.weight"] = (h, h)
             shapes[prefix + name + ".lin_a.bias"] = (h,)
@@ -601,7 +650,9 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         window_attention=knobs.window_attention,
         cell_latents=knobs.cell_latents,
         line_pass=knobs.line_pass,
-        cell_pass=not knobs.cell_latents,
+        cell_nodes=knobs.cell_nodes,
+        cell_adjacency=knobs.cell_adjacency,
+        cell_pass=not (knobs.cell_latents or knobs.cell_nodes),
     )
     if knobs != expected:
         raise _baked_profile_error(knobs)
@@ -619,6 +670,8 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         window_attention=knobs.window_attention,
         cell_latents=knobs.cell_latents,
         line_pass=knobs.line_pass,
+        cell_nodes=knobs.cell_nodes,
+        cell_adjacency=knobs.cell_adjacency,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")

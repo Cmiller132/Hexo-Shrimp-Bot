@@ -8,9 +8,11 @@ supervised laboratory harness, and the Shrimp Control Deck telemetry dashboard. 
 
 ## The model: MantisNet
 
-MantisNet is a graph network whose nodes are stones, nonempty win windows, and
-four invariant state latents. It has no cell grid, no coordinate inputs, and no
-empty-cell nodes.
+MantisNet is a graph network whose incumbent nodes are stones, nonempty win
+windows, and four invariant state latents. The transient `cell_nodes` Step 13
+knob extends the Step 15 persistent-cell path to every legal cell. It consumes
+only mover-relative cell fields and D6-canonical relative geometry; absolute
+cell coordinates never enter the model.
 
 A **window** is six consecutive cells along one hex axis. Every nonempty
 candidate window is represented under ternary slot patterns
@@ -27,6 +29,14 @@ window-attention layer (the live `window_attention` knob, on by default)
 types window pairs by colinear/crossing relations. In every block the four
 latents read the real windows, self-mix, and broadcast back to those windows;
 their final normalized mean is the global context consumed by the heads.
+
+With `cell_nodes=True`, uncovered legal cells initialize from occupancy,
+legality, and nearest-stone-distance embeddings, while covered cells retain
+the Step 15 learned-base initialization. In every block cells also attend to
+all stones within radius 8 through exact orbit-48, source-owner, and on-axis
+classes. `cell_adjacency=True` is a separate sub-knob adding directed
+distance-one cell messages with axis-shared weights; it is refused unless
+`cell_nodes` is enabled.
 
 Three heads read the trunk output:
 
@@ -64,12 +74,14 @@ Positions batch by concatenation with per-position index offsets. Message
 passing never crosses positions; attention is masked block-diagonal. The
 builder emits stone tables, window tables with identities, incidence lists with
 joint slot classes, legal-cell decoder tables, action-row classes and reverse
-views, and `moves_remaining`. All index tensors are mandatory and precomputed;
-the forward contains no data-dependent index discovery.
+views, cell invariant fields, radius edges, adjacency edges, and
+`moves_remaining`. All index tensors are mandatory. Device-side CSR views are
+derived once per forward through opaque operations so compiled execution has
+no graph break.
 
 ### Versioning
 
-`MODEL_REPR_VERSION` (model-owned, currently 6) covers the builder and every
+`MODEL_REPR_VERSION` (model-owned, currently 7) covers the builder and every
 feature encoding. `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing. Either bump invalidates checkpoints.
 
@@ -369,6 +381,8 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `__init__.py` | Public exports: model, builder, losses, representation constants |
 | `model.py` | `MantisConfig`, `MantisNet` trunk, policy/action-value/state-value heads, `ModelOutput` |
 | `builder.py` | Position-to-graph representation, Rust batch conversion, collation, version constants |
+| `cell_latents.py` | Step 15 typed legal-cell/window attention and whole-line table derivation |
+| `cell_nodes.py` | Step 13 radius/adjacency edge plans on the typed cell-attention kernels |
 | `attention.py` | Fused coordinate-biased multi-head attention with Triton kernel and reference path |
 | `decoder.py` | Shared legal-cell incidence aggregation for policy and action-value heads |
 | `message_passing.py` | Fused incidence aggregation for the two trunk message-passing directions |

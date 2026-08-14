@@ -30,6 +30,60 @@ from .relay import relay_tables
 WINDOW_LEN = 6
 # Unit steps of the engine's axes, in canonical order Q, R, QR.
 AXES = np.array([[1, 0], [0, 1], [1, -1]], dtype=np.int64)
+ORBIT48_CLASSES = 48
+CELL_NEAREST_UNREACHED = 9
+
+
+def _rotate(qr: tuple[int, int]) -> tuple[int, int]:
+    q, r = qr
+    return -r, q + r
+
+
+def _reflect(qr: tuple[int, int]) -> tuple[int, int]:
+    q, r = qr
+    return r, q
+
+
+def _canonical_displacement(qr: tuple[int, int]) -> tuple[int, int]:
+    images = []
+    for seed in (qr, _reflect(qr)):
+        image = seed
+        for _ in range(6):
+            images.append(image)
+            image = _rotate(image)
+    return min(images)
+
+
+def _hex_distance(qr: np.ndarray) -> np.ndarray:
+    return np.maximum.reduce(
+        [np.abs(qr[..., 0]), np.abs(qr[..., 1]), np.abs(qr[..., 0] + qr[..., 1])]
+    )
+
+
+_ORBIT_REPRESENTATIVES = sorted(
+    {
+        (max(abs(q), abs(r), abs(q + r)), *_canonical_displacement((q, r)))
+        for q in range(-12, 13)
+        for r in range(-12, 13)
+        if 1 <= max(abs(q), abs(r), abs(q + r)) <= 12
+    }
+)
+assert len(_ORBIT_REPRESENTATIVES) == ORBIT48_CLASSES
+_ORBIT_RANK = {
+    (q, r): index for index, (_distance, q, r) in enumerate(_ORBIT_REPRESENTATIVES)
+}
+
+
+def orbit48_id(dq: int, dr: int, radius: int = 12) -> int:
+    """Frozen D6 displacement class; radii outside ``1..12`` are refused."""
+    if not 1 <= radius <= 12:
+        raise ValueError(f"orbit radius must lie in 1..12, got {radius}")
+    distance = max(abs(dq), abs(dr), abs(dq + dr))
+    if not 1 <= distance <= radius:
+        raise ValueError(
+            f"displacement ({dq}, {dr}) has distance {distance}, outside 1..={radius}"
+        )
+    return _ORBIT_RANK[_canonical_displacement((dq, dr))]
 
 
 # --- Ternary tables for the all-nonempty window scope.
@@ -170,6 +224,18 @@ class PositionGraph:
     inc_class: np.ndarray  # (e,) int64, < TERN_OCC_CLASSES
     # Policy decoder table over legal cells, in engine legal order.
     n_legal: int
+    cell_qr: np.ndarray  # (n_legal, 2), builder/debug only
+    cell_occupancy: np.ndarray  # EMPTY/OWN/OPP relative to mover
+    cell_is_legal: np.ndarray  # (n_legal,) bool-as-int
+    cell_nearest: np.ndarray  # 1..8, or 9 at the stone-free opening
+    radius_src: np.ndarray  # stone source index
+    radius_dst: np.ndarray  # legal-cell destination index
+    radius_orbit: np.ndarray  # exact D6 orbit in 0..47
+    radius_own: np.ndarray  # source occupancy: own=0, opp=1
+    radius_on_axis: np.ndarray  # invariant boolean
+    adjacency_src: np.ndarray  # directed legal-cell source
+    adjacency_dst: np.ndarray  # directed legal-cell destination
+    adjacency_axis: np.ndarray  # structural axis route in 0..2
     dec_cell: np.ndarray  # (e_d,) int64: legal-cell index
     dec_window: np.ndarray  # (e_d,) int64: represented window through it
     dec_class: np.ndarray  # (e_d,) int64: the (pattern, slot) class, < TERN_DEC_CLASSES
@@ -279,6 +345,69 @@ def _action_tables(
     return window_index, post1, status
 
 
+def _cell_node_fields(
+    stone_qr: np.ndarray, stone_own: np.ndarray, legal_qr: np.ndarray
+) -> dict[str, np.ndarray]:
+    n_legal = len(legal_qr)
+    occupancy = np.zeros(n_legal, dtype=np.int64)
+    is_legal = np.ones(n_legal, dtype=np.int64)
+    if len(stone_qr):
+        displacement = legal_qr[:, None, :] - stone_qr[None, :, :]
+        distance = _hex_distance(displacement)
+        nearest = distance.min(axis=1).astype(np.int64)
+        if np.any(nearest > 8) or np.any(nearest == 0):
+            raise ValueError("legal cells must be empty and within radius 8 of a stone")
+        dst, src = np.nonzero((distance >= 1) & (distance <= 8))
+        delta = displacement[dst, src]
+        orbit = np.fromiter(
+            (orbit48_id(int(q), int(r)) for q, r in delta),
+            dtype=np.int64,
+            count=len(delta),
+        )
+        on_axis = (
+            (delta[:, 0] == 0)
+            | (delta[:, 1] == 0)
+            | (delta[:, 0] + delta[:, 1] == 0)
+        ).astype(np.int64)
+        radius_src = src.astype(np.int64)
+        radius_dst = dst.astype(np.int64)
+        radius_own = stone_own[src]
+    else:
+        nearest = np.full(n_legal, CELL_NEAREST_UNREACHED, dtype=np.int64)
+        radius_src = radius_dst = orbit = radius_own = on_axis = np.empty(
+            0, dtype=np.int64
+        )
+
+    index = {tuple(map(int, qr)): row for row, qr in enumerate(legal_qr)}
+    adjacency = []
+    for source, qr in enumerate(legal_qr):
+        for axis, step in enumerate(AXES):
+            for sign in (-1, 1):
+                destination = index.get(tuple(map(int, qr + sign * step)))
+                if destination is not None:
+                    adjacency.append((destination, source, axis))
+    adjacency.sort()
+    if adjacency:
+        adj = np.asarray(adjacency, dtype=np.int64)
+        adjacency_dst, adjacency_src, adjacency_axis = adj.T
+    else:
+        adjacency_src = adjacency_dst = adjacency_axis = np.empty(0, dtype=np.int64)
+    return {
+        "cell_qr": legal_qr.copy(),
+        "cell_occupancy": occupancy,
+        "cell_is_legal": is_legal,
+        "cell_nearest": nearest,
+        "radius_src": radius_src,
+        "radius_dst": radius_dst,
+        "radius_orbit": orbit,
+        "radius_own": radius_own,
+        "radius_on_axis": on_axis,
+        "adjacency_src": adjacency_src,
+        "adjacency_dst": adjacency_dst,
+        "adjacency_axis": adjacency_axis,
+    }
+
+
 def build(
     stone_qr: np.ndarray,
     stone_owner: np.ndarray,
@@ -306,6 +435,7 @@ def build(
 
     n_s = len(stone_qr)
     stone_own = (stone_owner != mover).astype(np.int64)
+    cell_nodes = _cell_node_fields(stone_qr, stone_own, legal_qr)
 
     if n_s == 0:
         # Ply 0: no stones or windows. Every action row is an EMPTY insert.
@@ -320,6 +450,7 @@ def build(
             inc_window=np.empty(0, dtype=np.int64),
             inc_class=np.empty(0, dtype=np.int64),
             n_legal=len(legal_qr),
+            **cell_nodes,
             dec_cell=np.empty(0, dtype=np.int64),
             dec_window=np.empty(0, dtype=np.int64),
             dec_class=np.empty(0, dtype=np.int64),
@@ -423,6 +554,7 @@ def build(
         inc_window=inc_window,
         inc_class=inc_class,
         n_legal=n_legal,
+        **cell_nodes,
         dec_cell=dec_cell,
         dec_window=dec_window,
         dec_class=dec_class,
@@ -489,6 +621,17 @@ class Batch:
     n_cells: int
     legal_offsets: torch.Tensor  # (P + 1,) long
     cell_pos: torch.Tensor  # (N_c,) long: position of each cell
+    cell_occupancy: torch.Tensor  # (N_c,) EMPTY/OWN/OPP relative to mover
+    cell_is_legal: torch.Tensor  # (N_c,) bool-as-long
+    cell_nearest: torch.Tensor  # (N_c,) 1..8, or opening sentinel 9
+    radius_src: torch.Tensor  # (E_r,) global stone source
+    radius_dst: torch.Tensor  # (E_r,) global legal-cell destination
+    radius_orbit: torch.Tensor  # (E_r,) exact D6 class
+    radius_own: torch.Tensor  # (E_r,) source own/opp
+    radius_on_axis: torch.Tensor  # (E_r,) invariant bool
+    adjacency_src: torch.Tensor  # (E_a,) global legal-cell source
+    adjacency_dst: torch.Tensor  # (E_a,) global legal-cell destination
+    adjacency_axis: torch.Tensor  # (E_a,) structural axis route
     dec_cell: torch.Tensor  # (E_d,) long, global cell index
     dec_window: torch.Tensor  # (E_d,) long, global window index
     dec_class: torch.Tensor  # (E_d,) long, < TERN_DEC_CLASSES
@@ -714,6 +857,21 @@ def collate(graphs: list[PositionGraph]) -> Batch:
         n_cells=int(cell_off[-1]),
         legal_offsets=torch.from_numpy(cell_off.astype(np.int64)),
         cell_pos=cat([np.full(g.n_legal, i) for i, g in enumerate(graphs)]),
+        cell_occupancy=cat([g.cell_occupancy for g in graphs]),
+        cell_is_legal=cat([g.cell_is_legal for g in graphs]),
+        cell_nearest=cat([g.cell_nearest for g in graphs]),
+        radius_src=cat([g.radius_src + stone_off[i] for i, g in enumerate(graphs)]),
+        radius_dst=cat([g.radius_dst + cell_off[i] for i, g in enumerate(graphs)]),
+        radius_orbit=cat([g.radius_orbit for g in graphs]),
+        radius_own=cat([g.radius_own for g in graphs]),
+        radius_on_axis=cat([g.radius_on_axis for g in graphs]),
+        adjacency_src=cat(
+            [g.adjacency_src + cell_off[i] for i, g in enumerate(graphs)]
+        ),
+        adjacency_dst=cat(
+            [g.adjacency_dst + cell_off[i] for i, g in enumerate(graphs)]
+        ),
+        adjacency_axis=cat([g.adjacency_axis for g in graphs]),
         dec_cell=dec_cell,
         dec_window=dec_window,
         dec_class=dec_class,

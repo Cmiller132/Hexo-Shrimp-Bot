@@ -219,6 +219,35 @@ fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'
     )?;
     d.set_item("legal_offsets", PyArray1::from_vec(py, raw.legal_offsets))?;
     d.set_item("cell_pos", PyArray1::from_vec(py, raw.cell_pos))?;
+    d.set_item(
+        "cell_occupancy",
+        PyArray1::from_vec(py, raw.cell_occupancy),
+    )?;
+    d.set_item(
+        "cell_is_legal",
+        PyArray1::from_vec(py, raw.cell_is_legal),
+    )?;
+    d.set_item("cell_nearest", PyArray1::from_vec(py, raw.cell_nearest))?;
+    d.set_item("radius_src", PyArray1::from_vec(py, raw.radius_src))?;
+    d.set_item("radius_dst", PyArray1::from_vec(py, raw.radius_dst))?;
+    d.set_item("radius_orbit", PyArray1::from_vec(py, raw.radius_orbit))?;
+    d.set_item("radius_own", PyArray1::from_vec(py, raw.radius_own))?;
+    d.set_item(
+        "radius_on_axis",
+        PyArray1::from_vec(py, raw.radius_on_axis),
+    )?;
+    d.set_item(
+        "adjacency_src",
+        PyArray1::from_vec(py, raw.adjacency_src),
+    )?;
+    d.set_item(
+        "adjacency_dst",
+        PyArray1::from_vec(py, raw.adjacency_dst),
+    )?;
+    d.set_item(
+        "adjacency_axis",
+        PyArray1::from_vec(py, raw.adjacency_axis),
+    )?;
     d.set_item("dec_cell", PyArray1::from_vec(py, raw.dec_cell))?;
     d.set_item("dec_window", PyArray1::from_vec(py, raw.dec_window))?;
     d.set_item("dec_class", PyArray1::from_vec(py, raw.dec_class))?;

@@ -12,13 +12,17 @@ backend) execution.
 
 Converts an `engine::Position` into the graph representation MantisNet consumes.
 Each position becomes a `Graph` of stones, windows, stone-to-window
-incidence edges, a decoder table mapping legal cells back to windows, and
-dense post-placement rows for every legal action. Every nonempty candidate
+incidence edges, a decoder table mapping legal cells back to windows, dense
+post-placement rows for every legal action, and the Step 13 legal-cell fields.
+Those fields are mover-relative occupancy, legality, nearest-stone distance,
+stone-to-cell radius-8 edges under the generated 48-orbit D6 vocabulary, and
+directed distance-one cell adjacency with structural axis routes. Every
+nonempty candidate
 window is kept under the ternary slot patterns
 (MANTIS_GRAFT_SPEC Step 12, baked): the encoder assigns reversal-invariant
 joint pattern/slot classes to both incidence and decoder edges in the
 377/726/1458 ternary vocabulary, and the wire format speaks that scope under
-`MODEL_REPR_VERSION` 6.
+`MODEL_REPR_VERSION` 7.
 
 `build(position)` emits each legal action's 18 hypothetical post-placement
 windows with their 729 joint `(post, slot)` classes and pre-insert statuses.

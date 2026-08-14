@@ -8,11 +8,115 @@
 use hexo_engine as engine;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
+use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::OnceLock;
 
 const QSHIFT: i64 = 1 << 21;
 const WIRE_MAGIC: &[u8; 8] = b"MANTIS\x00\x01";
-const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 4 + 4 + 5 * 4;
+const WIRE_HEADER_LEN: usize = WIRE_MAGIC.len() + 4 + 4 + 7 * 4;
+const MAX_ORBIT_RADIUS: i16 = 12;
+const ORBIT48_CLASSES: usize = 48;
+const CELL_NEAREST_UNREACHED: i64 = engine::LEGAL_RADIUS as i64 + 1;
+
+fn displacement_distance(q: i16, r: i16) -> usize {
+    let (q, r) = (i32::from(q), i32::from(r));
+    q.abs().max(r.abs()).max((q + r).abs()) as usize
+}
+
+fn rotate((q, r): (i16, i16)) -> (i16, i16) {
+    (-r, q + r)
+}
+
+fn reflect((q, r): (i16, i16)) -> (i16, i16) {
+    (r, q)
+}
+
+fn canonical_displacement(displacement: (i16, i16)) -> (i16, i16) {
+    let mut best = displacement;
+    for reflected in [false, true] {
+        let mut image = if reflected {
+            reflect(displacement)
+        } else {
+            displacement
+        };
+        for _ in 0..6 {
+            best = best.min(image);
+            image = rotate(image);
+        }
+    }
+    best
+}
+
+struct OrbitTable {
+    grid: Vec<i8>,
+}
+
+fn generate_orbit_table() -> OrbitTable {
+    let mut representatives = BTreeSet::new();
+    for dq in -MAX_ORBIT_RADIUS..=MAX_ORBIT_RADIUS {
+        for dr in -MAX_ORBIT_RADIUS..=MAX_ORBIT_RADIUS {
+            let distance = displacement_distance(dq, dr);
+            if (1..=MAX_ORBIT_RADIUS as usize).contains(&distance) {
+                let (cq, cr) = canonical_displacement((dq, dr));
+                representatives.insert((distance, cq, cr));
+            }
+        }
+    }
+    assert_eq!(representatives.len(), ORBIT48_CLASSES);
+    let rank: FxHashMap<_, _> = representatives
+        .into_iter()
+        .enumerate()
+        .map(|(id, (_distance, q, r))| ((q, r), id as i8))
+        .collect();
+    let side = usize::from((2 * MAX_ORBIT_RADIUS + 1) as u16);
+    let mut grid = vec![-1i8; side * side];
+    for dq in -MAX_ORBIT_RADIUS..=MAX_ORBIT_RADIUS {
+        for dr in -MAX_ORBIT_RADIUS..=MAX_ORBIT_RADIUS {
+            let distance = displacement_distance(dq, dr);
+            if (1..=MAX_ORBIT_RADIUS as usize).contains(&distance) {
+                let row = usize::from((dq + MAX_ORBIT_RADIUS) as u16);
+                let col = usize::from((dr + MAX_ORBIT_RADIUS) as u16);
+                grid[row * side + col] = rank[&canonical_displacement((dq, dr))];
+            }
+        }
+    }
+    OrbitTable { grid }
+}
+
+fn orbit_id(dq: i16, dr: i16, radius: usize) -> Result<i64, String> {
+    if radius == 0 || radius > MAX_ORBIT_RADIUS as usize {
+        return Err(format!(
+            "orbit radius must lie in 1..={}, got {radius}",
+            MAX_ORBIT_RADIUS
+        ));
+    }
+    let distance = displacement_distance(dq, dr);
+    if !(1..=radius).contains(&distance) {
+        return Err(format!(
+            "displacement ({dq}, {dr}) has distance {distance}, outside 1..={radius}"
+        ));
+    }
+    static TABLE: OnceLock<OrbitTable> = OnceLock::new();
+    let side = usize::from((2 * MAX_ORBIT_RADIUS + 1) as u16);
+    let row = usize::from((dq + MAX_ORBIT_RADIUS) as u16);
+    let col = usize::from((dr + MAX_ORBIT_RADIUS) as u16);
+    Ok(i64::from(
+        TABLE.get_or_init(generate_orbit_table).grid[row * side + col],
+    ))
+}
+
+fn structural_axis(dq: i16, dr: i16) -> Option<i64> {
+    if dr == 0 {
+        Some(0)
+    } else if dq == 0 {
+        Some(1)
+    } else if dq + dr == 0 {
+        Some(2)
+    } else {
+        None
+    }
+}
 
 /// Number of reversal-canonical nonempty ternary window patterns.
 ///
@@ -218,6 +322,18 @@ pub struct Graph {
     inc_window: Vec<i64>,
     inc_class: Vec<i64>,
     n_legal: usize,
+    cell_qr: Vec<[i32; 2]>,
+    cell_occupancy: Vec<i64>,
+    cell_is_legal: Vec<i64>,
+    cell_nearest: Vec<i64>,
+    radius_src: Vec<i64>,
+    radius_dst: Vec<i64>,
+    radius_orbit: Vec<i64>,
+    radius_own: Vec<i64>,
+    radius_on_axis: Vec<i64>,
+    adjacency_src: Vec<i64>,
+    adjacency_dst: Vec<i64>,
+    adjacency_axis: Vec<i64>,
     dec_cell: Vec<i64>,
     dec_window: Vec<i64>,
     dec_class: Vec<i64>,
@@ -276,6 +392,8 @@ struct WireCounts {
     incidences: usize,
     legal: usize,
     decoder: usize,
+    radius: usize,
+    adjacency: usize,
 }
 
 impl WireCounts {
@@ -286,18 +404,24 @@ impl WireCounts {
             incidences: graph.inc_stone.len(),
             legal: graph.n_legal,
             decoder: graph.dec_cell.len(),
+            radius: graph.radius_src.len(),
+            adjacency: graph.adjacency_src.len(),
         }
     }
 
     fn payload_len(self) -> Option<usize> {
         // Per-stone: 8 (own) + 8 (qr). Per-window: 32 (feat + id triple).
-        // Per-incidence and decoder edge: 24 each. Each legal cell has 18
+        // Per-incidence and decoder edge: 24 each. Cell features use 24 bytes,
+        // radius edges 40, and adjacency edges 24. Each legal cell has 18
         // action rows carrying three i64 values.
         self.stones
             .checked_mul(16)?
             .checked_add(self.windows.checked_mul(32)?)?
             .checked_add(self.incidences.checked_mul(24)?)?
             .checked_add(self.decoder.checked_mul(24)?)?
+            .checked_add(self.legal.checked_mul(24)?)?
+            .checked_add(self.radius.checked_mul(40)?)?
+            .checked_add(self.adjacency.checked_mul(24)?)?
             .checked_add(
                 self.legal
                     .checked_mul(engine::WINDOWS_PER_PLACEMENT)?
@@ -385,6 +509,7 @@ fn append_i64s(out: &mut Vec<u8>, values: &[i64]) {
 /// magic[8], MODEL_REPR_VERSION:u32,
 /// moves_remaining:u8, reserved_zero[3],
 /// stones:u32, windows:u32, incidences:u32, legal:u32, decoder:u32,
+/// radius_edges:u32, adjacency_edges:u32,
 /// stone_own[stones]:i64,
 /// stone_qr[stones][2]:i32,
 /// window_feat[windows]:i64,
@@ -393,6 +518,12 @@ fn append_i64s(out: &mut Vec<u8>, values: &[i64]) {
 /// inc_class[incidences]:i64,
 /// dec_cell[decoder]:i64, dec_window[decoder]:i64,
 /// dec_class[decoder]:i64,
+/// cell_occupancy[legal]:i64, cell_is_legal[legal]:i64,
+/// cell_nearest[legal]:i64,
+/// radius_src[radius]:i64, radius_dst[radius]:i64, radius_orbit[radius]:i64,
+/// radius_own[radius]:i64, radius_on_axis[radius]:i64,
+/// adjacency_src[adjacency]:i64, adjacency_dst[adjacency]:i64,
+/// adjacency_axis[adjacency]:i64,
 /// action_window_index[legal][18]:i64,
 /// action_post1_class[legal][18]:i64,
 /// action_pre_status[legal][18]:i64
@@ -410,6 +541,8 @@ pub fn encode_position(position: &engine::Position, out: &mut Vec<u8>) {
         count_u32(counts.incidences, "incidence"),
         count_u32(counts.legal, "legal-cell"),
         count_u32(counts.decoder, "decoder"),
+        count_u32(counts.radius, "radius edge"),
+        count_u32(counts.adjacency, "adjacency edge"),
     ];
     let payload_len = counts
         .payload_len()
@@ -437,6 +570,17 @@ pub fn encode_position(position: &engine::Position, out: &mut Vec<u8>) {
     append_i64s(out, &graph.dec_cell);
     append_i64s(out, &graph.dec_window);
     append_i64s(out, &graph.dec_class);
+    append_i64s(out, &graph.cell_occupancy);
+    append_i64s(out, &graph.cell_is_legal);
+    append_i64s(out, &graph.cell_nearest);
+    append_i64s(out, &graph.radius_src);
+    append_i64s(out, &graph.radius_dst);
+    append_i64s(out, &graph.radius_orbit);
+    append_i64s(out, &graph.radius_own);
+    append_i64s(out, &graph.radius_on_axis);
+    append_i64s(out, &graph.adjacency_src);
+    append_i64s(out, &graph.adjacency_dst);
+    append_i64s(out, &graph.adjacency_axis);
     append_i64s(out, &graph.action_window_index);
     append_i64s(out, &graph.action_post1_class);
     append_i64s(out, &graph.action_pre_status);
@@ -514,6 +658,8 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
         incidences: read_count(&mut reader, bytes.len(), "incidences")?,
         legal: read_count(&mut reader, bytes.len(), "legal cells")?,
         decoder: read_count(&mut reader, bytes.len(), "decoder incidences")?,
+        radius: read_count(&mut reader, bytes.len(), "radius edges")?,
+        adjacency: read_count(&mut reader, bytes.len(), "adjacency edges")?,
     };
     if counts.legal == 0 {
         return Err(WireError::new("a live position must have a legal cell"));
@@ -607,6 +753,59 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
         }
     }
 
+    let cell_occupancy = read_i64_vec(&mut reader, counts.legal, "cell_occupancy")?;
+    let cell_is_legal = read_i64_vec(&mut reader, counts.legal, "cell_is_legal")?;
+    let cell_nearest = read_i64_vec(&mut reader, counts.legal, "cell_nearest")?;
+    for (index, &value) in cell_occupancy.iter().enumerate() {
+        if !(0..3).contains(&value) {
+            return Err(invalid_feature("cell_occupancy", index, value));
+        }
+    }
+    for (index, &value) in cell_is_legal.iter().enumerate() {
+        if !matches!(value, 0 | 1) {
+            return Err(invalid_feature("cell_is_legal", index, value));
+        }
+    }
+    for (index, &value) in cell_nearest.iter().enumerate() {
+        if !(0..=CELL_NEAREST_UNREACHED).contains(&value) {
+            return Err(invalid_feature("cell_nearest", index, value));
+        }
+    }
+
+    let radius_src = read_i64_vec(&mut reader, counts.radius, "radius_src")?;
+    let radius_dst = read_i64_vec(&mut reader, counts.radius, "radius_dst")?;
+    let radius_orbit = read_i64_vec(&mut reader, counts.radius, "radius_orbit")?;
+    let radius_own = read_i64_vec(&mut reader, counts.radius, "radius_own")?;
+    let radius_on_axis = read_i64_vec(&mut reader, counts.radius, "radius_on_axis")?;
+    validate_indices(&radius_src, counts.stones, "radius_src")?;
+    validate_indices(&radius_dst, counts.legal, "radius_dst")?;
+    for (index, &value) in radius_orbit.iter().enumerate() {
+        if !(0..ORBIT48_CLASSES as i64).contains(&value) {
+            return Err(invalid_feature("radius_orbit", index, value));
+        }
+    }
+    for (field, values) in [
+        ("radius_own", radius_own.as_slice()),
+        ("radius_on_axis", radius_on_axis.as_slice()),
+    ] {
+        for (index, &value) in values.iter().enumerate() {
+            if !matches!(value, 0 | 1) {
+                return Err(invalid_feature(field, index, value));
+            }
+        }
+    }
+
+    let adjacency_src = read_i64_vec(&mut reader, counts.adjacency, "adjacency_src")?;
+    let adjacency_dst = read_i64_vec(&mut reader, counts.adjacency, "adjacency_dst")?;
+    let adjacency_axis = read_i64_vec(&mut reader, counts.adjacency, "adjacency_axis")?;
+    validate_indices(&adjacency_src, counts.legal, "adjacency_src")?;
+    validate_indices(&adjacency_dst, counts.legal, "adjacency_dst")?;
+    for (index, &value) in adjacency_axis.iter().enumerate() {
+        if !(0..3).contains(&value) {
+            return Err(invalid_feature("adjacency_axis", index, value));
+        }
+    }
+
     let action_count = counts
         .legal
         .checked_mul(engine::WINDOWS_PER_PLACEMENT)
@@ -666,6 +865,18 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
         inc_window,
         inc_class,
         n_legal: counts.legal,
+        cell_qr: vec![],
+        cell_occupancy,
+        cell_is_legal,
+        cell_nearest,
+        radius_src,
+        radius_dst,
+        radius_orbit,
+        radius_own,
+        radius_on_axis,
+        adjacency_src,
+        adjacency_dst,
+        adjacency_axis,
         dec_cell,
         dec_window,
         dec_class,
@@ -674,6 +885,111 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
         action_post1_class,
         action_pre_status,
     })
+}
+
+#[allow(clippy::type_complexity)]
+fn cell_node_fields(
+    stones: &[(engine::HexCoord, engine::Player)],
+    stone_own: &[i64],
+    legal: &[engine::HexCoord],
+) -> Result<
+    (
+        Vec<[i32; 2]>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+    ),
+    String,
+> {
+    let cell_qr = legal
+        .iter()
+        .map(|cell| [i32::from(cell.q), i32::from(cell.r)])
+        .collect();
+    let cell_occupancy = vec![0; legal.len()];
+    let cell_is_legal = vec![1; legal.len()];
+    let mut cell_nearest = vec![CELL_NEAREST_UNREACHED; legal.len()];
+    let mut radius_src = Vec::new();
+    let mut radius_dst = Vec::new();
+    let mut radius_orbit = Vec::new();
+    let mut radius_own = Vec::new();
+    let mut radius_on_axis = Vec::new();
+
+    for (destination, cell) in legal.iter().enumerate() {
+        for (source, &(stone, _)) in stones.iter().enumerate() {
+            let dq = cell.q - stone.q;
+            let dr = cell.r - stone.r;
+            let distance = displacement_distance(dq, dr);
+            cell_nearest[destination] = cell_nearest[destination].min(distance as i64);
+            if distance <= engine::LEGAL_RADIUS as usize {
+                if distance == 0 {
+                    return Err(format!(
+                        "legal cell ({}, {}) is occupied by stone {source}",
+                        cell.q, cell.r
+                    ));
+                }
+                radius_src.push(source as i64);
+                radius_dst.push(destination as i64);
+                radius_orbit.push(orbit_id(dq, dr, MAX_ORBIT_RADIUS as usize)?);
+                radius_own.push(stone_own[source]);
+                radius_on_axis.push(i64::from(structural_axis(dq, dr).is_some()));
+            }
+        }
+        if !stones.is_empty() && cell_nearest[destination] > engine::LEGAL_RADIUS as i64 {
+            return Err(format!(
+                "legal cell ({}, {}) has no stone within legality radius",
+                cell.q, cell.r
+            ));
+        }
+    }
+
+    let cell_index: FxHashMap<_, _> = legal
+        .iter()
+        .enumerate()
+        .map(|(index, &coord)| (pack(coord), index as i64))
+        .collect();
+    let axes = [(1i16, 0i16), (0, 1), (1, -1)];
+    let mut adjacency = Vec::with_capacity(legal.len() * 6);
+    for (source, cell) in legal.iter().enumerate() {
+        for (axis, &(dq, dr)) in axes.iter().enumerate() {
+            for sign in [-1i16, 1] {
+                let neighbor = engine::HexCoord::new(cell.q + sign * dq, cell.r + sign * dr);
+                if let Some(&destination) = cell_index.get(&pack(neighbor)) {
+                    adjacency.push((destination, source as i64, axis as i64));
+                }
+            }
+        }
+    }
+    adjacency.sort_unstable();
+    let mut adjacency_src = Vec::with_capacity(adjacency.len());
+    let mut adjacency_dst = Vec::with_capacity(adjacency.len());
+    let mut adjacency_axis = Vec::with_capacity(adjacency.len());
+    for (destination, source, axis) in adjacency {
+        adjacency_src.push(source);
+        adjacency_dst.push(destination);
+        adjacency_axis.push(axis);
+    }
+    Ok((
+        cell_qr,
+        cell_occupancy,
+        cell_is_legal,
+        cell_nearest,
+        radius_src,
+        radius_dst,
+        radius_orbit,
+        radius_own,
+        radius_on_axis,
+        adjacency_src,
+        adjacency_dst,
+        adjacency_axis,
+    ))
 }
 
 /// Build one live position's graph with indices local to that position.
@@ -706,6 +1022,20 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
 
     let legal: Vec<engine::HexCoord> = pos.legal_actions().map(|a| a.coord()).collect();
     let n_legal = legal.len();
+    let (
+        cell_qr,
+        cell_occupancy,
+        cell_is_legal,
+        cell_nearest,
+        radius_src,
+        radius_dst,
+        radius_orbit,
+        radius_own,
+        radius_on_axis,
+        adjacency_src,
+        adjacency_dst,
+        adjacency_axis,
+    ) = cell_node_fields(&stones, &stone_own, &legal)?;
 
     if stones.is_empty() {
         // Ply 0: every action row is an empty insert with no source window.
@@ -729,6 +1059,18 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
             inc_window: vec![],
             inc_class: vec![],
             n_legal,
+            cell_qr,
+            cell_occupancy,
+            cell_is_legal,
+            cell_nearest,
+            radius_src,
+            radius_dst,
+            radius_orbit,
+            radius_own,
+            radius_on_axis,
+            adjacency_src,
+            adjacency_dst,
+            adjacency_axis,
             dec_cell: vec![],
             dec_window: vec![],
             dec_class: vec![],
@@ -887,6 +1229,18 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
         inc_window,
         inc_class,
         n_legal,
+        cell_qr,
+        cell_occupancy,
+        cell_is_legal,
+        cell_nearest,
+        radius_src,
+        radius_dst,
+        radius_orbit,
+        radius_own,
+        radius_on_axis,
+        adjacency_src,
+        adjacency_dst,
+        adjacency_axis,
         dec_cell,
         dec_window,
         dec_class,
@@ -937,6 +1291,28 @@ pub struct RawBatch {
     pub legal_offsets: Vec<i64>,
     /// Position index for each concatenated legal cell.
     pub cell_pos: Vec<i64>,
+    /// Mover-relative occupancy of every legal cell (currently all EMPTY).
+    pub cell_occupancy: Vec<i64>,
+    /// Legality flag of every represented legal cell.
+    pub cell_is_legal: Vec<i64>,
+    /// Nearest-stone distance bucket; 9 is the stone-free opening sentinel.
+    pub cell_nearest: Vec<i64>,
+    /// Stone-to-cell radius edges and their invariant fields.
+    pub radius_src: Vec<i64>,
+    /// Legal-cell destination of each radius edge.
+    pub radius_dst: Vec<i64>,
+    /// Exact D6 displacement class of each radius edge.
+    pub radius_orbit: Vec<i64>,
+    /// Mover-relative ownership of each radius-edge source.
+    pub radius_own: Vec<i64>,
+    /// Whether each radius displacement lies on any structural axis.
+    pub radius_on_axis: Vec<i64>,
+    /// Directed legal-cell adjacency and its structural axis route.
+    pub adjacency_src: Vec<i64>,
+    /// Legal-cell destination of each directed adjacency edge.
+    pub adjacency_dst: Vec<i64>,
+    /// Structural axis of each adjacency edge.
+    pub adjacency_axis: Vec<i64>,
     /// Global legal-cell index for each decoder incidence.
     pub dec_cell: Vec<i64>,
     /// Global live-window index for each decoder incidence.
@@ -1055,6 +1431,17 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
         value_valid: vec![false; p * max_w],
         legal_offsets: Vec::with_capacity(p + 1),
         cell_pos: vec![],
+        cell_occupancy: vec![],
+        cell_is_legal: vec![],
+        cell_nearest: vec![],
+        radius_src: vec![],
+        radius_dst: vec![],
+        radius_orbit: vec![],
+        radius_own: vec![],
+        radius_on_axis: vec![],
+        adjacency_src: vec![],
+        adjacency_dst: vec![],
+        adjacency_axis: vec![],
         dec_cell: vec![],
         dec_window: vec![],
         dec_class: vec![],
@@ -1094,6 +1481,30 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
         out.legal_offsets.push(cell_off);
         out.cell_pos
             .extend(std::iter::repeat_n(i as i64, g.n_legal));
+        out.cell_occupancy.extend_from_slice(&g.cell_occupancy);
+        out.cell_is_legal.extend_from_slice(&g.cell_is_legal);
+        out.cell_nearest.extend_from_slice(&g.cell_nearest);
+        out.radius_src
+            .extend(g.radius_src.iter().map(|&source| source + stone_off));
+        out.radius_dst.extend(
+            g.radius_dst
+                .iter()
+                .map(|&destination| destination + cell_off - g.n_legal as i64),
+        );
+        out.radius_orbit.extend_from_slice(&g.radius_orbit);
+        out.radius_own.extend_from_slice(&g.radius_own);
+        out.radius_on_axis.extend_from_slice(&g.radius_on_axis);
+        out.adjacency_src.extend(
+            g.adjacency_src
+                .iter()
+                .map(|&source| source + cell_off - g.n_legal as i64),
+        );
+        out.adjacency_dst.extend(
+            g.adjacency_dst
+                .iter()
+                .map(|&destination| destination + cell_off - g.n_legal as i64),
+        );
+        out.adjacency_axis.extend_from_slice(&g.adjacency_axis);
         out.dec_cell
             .extend(g.dec_cell.iter().map(|&c| c + cell_off - g.n_legal as i64));
         out.dec_window
@@ -1574,5 +1985,149 @@ mod tests {
                     .contains(&format!("dec_class[0] has invalid feature {out_of_range}"))
             );
         }
+    }
+
+    fn oracle_images(q: i16, r: i16) -> BTreeSet<(i16, i16)> {
+        let cube = [q, r, -q - r];
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        let mut images = BTreeSet::new();
+        for permutation in permutations {
+            for sign in [-1i16, 1] {
+                images.insert((sign * cube[permutation[0]], sign * cube[permutation[1]]));
+            }
+        }
+        images
+    }
+
+    #[test]
+    fn orbit48_matches_an_independent_cube_permutation_oracle() {
+        let mut representatives = BTreeSet::new();
+        for dq in -12..=12 {
+            for dr in -12..=12 {
+                let distance = displacement_distance(dq, dr);
+                if (1..=12).contains(&distance) {
+                    let representative = *oracle_images(dq, dr).iter().min().unwrap();
+                    representatives.insert((distance, representative.0, representative.1));
+                }
+            }
+        }
+        assert_eq!(representatives.len(), ORBIT48_CLASSES);
+        let ranks: FxHashMap<_, _> = representatives
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (_distance, q, r))| ((q, r), rank as i64))
+            .collect();
+        for dq in -12..=12 {
+            for dr in -12..=12 {
+                let distance = displacement_distance(dq, dr);
+                if (1..=12).contains(&distance) {
+                    let representative = *oracle_images(dq, dr).iter().min().unwrap();
+                    assert_eq!(orbit_id(dq, dr, 12).unwrap(), ranks[&representative]);
+                }
+            }
+        }
+        assert!(orbit_id(1, 0, 13).unwrap_err().contains("1..=12"));
+    }
+
+    #[test]
+    fn cell_node_edges_match_naive_geometry_and_cover_every_legal_cell() {
+        let position = replay(&[(0, 0), (3, 0), (-2, 2), (0, 3)]);
+        let graph = build(&position).unwrap();
+        let stones: Vec<_> = position.stones().collect();
+        let legal: Vec<_> = position
+            .legal_actions()
+            .map(|action| action.coord())
+            .collect();
+        let actual: Vec<_> = (0..graph.radius_src.len())
+            .map(|edge| {
+                (
+                    graph.radius_dst[edge],
+                    graph.radius_src[edge],
+                    graph.radius_orbit[edge],
+                    graph.radius_own[edge],
+                    graph.radius_on_axis[edge],
+                )
+            })
+            .collect();
+        let mut expected = Vec::new();
+        for (destination, cell) in legal.iter().enumerate() {
+            for (source, &(stone, owner)) in stones.iter().enumerate() {
+                let dq = cell.q - stone.q;
+                let dr = cell.r - stone.r;
+                if (1..=engine::LEGAL_RADIUS as usize).contains(&displacement_distance(dq, dr)) {
+                    expected.push((
+                        destination as i64,
+                        source as i64,
+                        orbit_id(dq, dr, 12).unwrap(),
+                        i64::from(owner != position.current_player()),
+                        i64::from(structural_axis(dq, dr).is_some()),
+                    ));
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+        let destinations: BTreeSet<_> = graph.radius_dst.iter().copied().collect();
+        assert_eq!(destinations.len(), legal.len());
+
+        let mut expected_adjacency = Vec::new();
+        for (source, a) in legal.iter().enumerate() {
+            for (destination, b) in legal.iter().enumerate() {
+                let dq = b.q - a.q;
+                let dr = b.r - a.r;
+                if displacement_distance(dq, dr) == 1 {
+                    expected_adjacency.push((
+                        destination as i64,
+                        source as i64,
+                        structural_axis(dq, dr).unwrap(),
+                    ));
+                }
+            }
+        }
+        expected_adjacency.sort_unstable();
+        let actual_adjacency: Vec<_> = graph
+            .adjacency_dst
+            .iter()
+            .copied()
+            .zip(graph.adjacency_src.iter().copied())
+            .zip(graph.adjacency_axis.iter().copied())
+            .map(|((dst, src), axis)| (dst, src, axis))
+            .collect();
+        assert_eq!(actual_adjacency, expected_adjacency);
+    }
+
+    #[test]
+    fn fixture_cohort_pins_cell_node_growth() {
+        let graphs: Vec<_> = FIXTURE_GAMES
+            .iter()
+            .map(|moves| build(&replay(moves)).unwrap())
+            .collect();
+        let totals = graphs.iter().fold([0usize; 4], |mut totals, graph| {
+            totals[0] += graph.n_legal;
+            totals[1] += graph
+                .dec_cell
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len();
+            totals[2] += graph.radius_src.len();
+            totals[3] += graph.adjacency_src.len();
+            totals
+        });
+        println!(
+            "fixture positions={}, legal={}, covered={}, radius_edges={}, adjacency_edges={}",
+            graphs.len(),
+            totals[0],
+            totals[1],
+            totals[2],
+            totals[3]
+        );
+        assert_eq!(totals, [1341, 396, 5866, 7366]);
     }
 }

@@ -23,6 +23,7 @@ from torch import Tensor, nn
 
 from . import (
     cell_latents,
+    cell_nodes,
     message_passing,
     relay,
     row_encoder,
@@ -66,6 +67,10 @@ class MantisConfig:
     # window attention in the §5.1c slot.
     cell_latents: bool = False
     line_pass: bool = False
+    # Step 13: extend persistent state to every legal cell and let each block
+    # read invariant radius-8 stone context. Adjacency is a factored sub-knob.
+    cell_nodes: bool = False
+    cell_adjacency: bool = False
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
@@ -81,6 +86,12 @@ class MantisConfig:
                 "claim_reach=0 modifies the §5.1c stage, which "
                 "window_attention=False removes; the knob would be inert"
             )
+        if self.cell_adjacency and not self.cell_nodes:
+            raise ValueError("cell_adjacency requires cell_nodes=True")
+
+    @property
+    def uses_cell_state(self) -> bool:
+        return self.cell_latents or self.cell_nodes
 
     @property
     def window_vocab(self) -> int:
@@ -244,7 +255,7 @@ class _Block(nn.Module):
         # cell-latent knob on, the shared cells hold persistent typed state
         # (cells read their windows with class value rows, windows read back
         # bias-typed); off, the transient relay.
-        if cfg.cell_latents:
+        if cfg.uses_cell_state:
             self.ln_cr_c = nn.LayerNorm(h)
             self.ln_cr_w = nn.LayerNorm(h)
             self.cr_wq = nn.Linear(h, h)
@@ -260,6 +271,28 @@ class _Block(nn.Module):
             self.wr_wv = nn.Linear(h, h)
             self.wr_wo = nn.Linear(h, h)
             self.wr_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.dec_classes))
+            if cfg.cell_nodes:
+                self.ln_radius_c = nn.LayerNorm(h)
+                self.ln_radius_s = nn.LayerNorm(h)
+                self.radius_wq = nn.Linear(h, h)
+                self.radius_wk = nn.Linear(h, h, bias=False)
+                self.radius_wv = nn.Linear(h, h)
+                self.radius_wo = nn.Linear(h, h)
+                self.radius_bias = nn.Parameter(
+                    torch.zeros(cfg.heads, cell_nodes.RADIUS_CLASSES)
+                )
+                self.radius_vclass = nn.Embedding(cell_nodes.RADIUS_CLASSES, h)
+            if cfg.cell_adjacency:
+                self.ln_adj_q = nn.LayerNorm(h)
+                self.ln_adj_k = nn.LayerNorm(h)
+                self.adj_wq = nn.Linear(h, h)
+                self.adj_wk = nn.Linear(h, h, bias=False)
+                self.adj_wv = nn.Linear(h, h)
+                self.adj_wo = nn.Linear(h, h)
+                self.adj_bias = nn.Parameter(
+                    torch.zeros(cfg.heads, cell_nodes.ADJACENCY_CLASSES)
+                )
+                self.adj_vclass = nn.Embedding(cell_nodes.ADJACENCY_CLASSES, h)
         else:
             self.ln_cp_in = nn.LayerNorm(h)
             self.u_cp = nn.Linear(h, h, bias=False)
@@ -356,7 +389,13 @@ class _Block(nn.Module):
         return w + self.drop(self.mlp_cp(self.ln_cp_w(w), agg))
 
     def _cell_stage(
-        self, w: Tensor, c: Tensor, ctab: cell_latents.CellTables
+        self,
+        s: Tensor,
+        w: Tensor,
+        c: Tensor,
+        ctab: cell_latents.CellTables,
+        radius: cell_latents.CellTables | None,
+        adjacency: cell_latents.CellTables | None,
     ) -> tuple[Tensor, Tensor]:
         """§5.1b as persistent state: cells read their at most 18 containing
         windows with per-class score bias and class value rows, then windows
@@ -379,6 +418,42 @@ class _Block(nn.Module):
             ctab,
         )
         c = c + self.drop(self.cr_wo(read.reshape(n_c, cfg.h).to(zc.dtype)))
+
+        if cfg.cell_nodes:
+            if radius is None:
+                raise ValueError("cell_nodes is on but radius tables are missing")
+            zc = self.ln_radius_c(c)
+            zs = self.ln_radius_s(s)
+            read = cell_latents.cell_read(
+                self.radius_wq(zc).view(n_c, heads, hd),
+                self.radius_wk(zs).view(s.shape[0], heads, hd),
+                self.radius_wv(zs).view(s.shape[0], heads, hd),
+                self.radius_bias,
+                self.radius_vclass.weight,
+                radius,
+            )
+            c = c + self.drop(
+                self.radius_wo(read.reshape(n_c, cfg.h).to(zc.dtype))
+            )
+        elif radius is not None:
+            raise ValueError("radius tables were passed but cell_nodes is off")
+
+        if cfg.cell_adjacency:
+            if adjacency is None:
+                raise ValueError("cell_adjacency is on but adjacency tables are missing")
+            zq = self.ln_adj_q(c)
+            zk = self.ln_adj_k(c)
+            read = cell_latents.cell_read(
+                self.adj_wq(zq).view(n_c, heads, hd),
+                self.adj_wk(zk).view(n_c, heads, hd),
+                self.adj_wv(zk).view(n_c, heads, hd),
+                self.adj_bias,
+                self.adj_vclass.weight,
+                adjacency,
+            )
+            c = c + self.drop(self.adj_wo(read.reshape(n_c, cfg.h).to(zq.dtype)))
+        elif adjacency is not None:
+            raise ValueError("adjacency tables were passed but cell_adjacency is off")
 
         zw = self.ln_wr_w(w)
         zc = self.ln_wr_c(c)
@@ -498,6 +573,8 @@ class _Block(nn.Module):
         latent_layout: tuple[Tensor, Tensor, Tensor],
         lines,
         ctab: cell_latents.CellTables | None,
+        radius: cell_latents.CellTables | None,
+        adjacency: cell_latents.CellTables | None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         cfg = self.cfg
         # Sizes come from tensor shapes, not the Batch's ints: under
@@ -528,8 +605,8 @@ class _Block(nn.Module):
         ).to(agg.dtype)
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
-        if cfg.cell_latents:
-            w, c = self._cell_stage(w, c, ctab)
+        if cfg.uses_cell_state:
+            w, c = self._cell_stage(s, w, c, ctab, radius, adjacency)
         else:
             w = self._cell_pass(
                 w,
@@ -624,11 +701,15 @@ class MantisNet(nn.Module):
         self.window_table = nn.Embedding(cfg.window_vocab, h)
         self.latent_base = nn.Parameter(torch.empty(4, h))
         self.token_moves = nn.Embedding(2, h)  # moves_remaining in {1, 2}
-        if cfg.cell_latents:
+        if cfg.uses_cell_state:
             # Every covered cell starts from one learned row; identity
             # accrues through the typed reads. Legal cells no live window
             # covers keep this row at the decoder — far-ring semantics.
             self.cell_base = nn.Parameter(torch.empty(h))
+        if cfg.cell_nodes:
+            self.cell_occupancy_table = nn.Embedding(3, h)
+            self.cell_legal_table = nn.Embedding(2, h)
+            self.cell_nearest_table = nn.Embedding(cell_nodes.NEAREST_BUCKETS, h)
 
         self.blocks = nn.ModuleList(_Block(cfg) for _index in range(cfg.blocks))
         self.ln_out = nn.LayerNorm(h)  # shared final LN over S, W, g (§5)
@@ -677,7 +758,7 @@ class MantisNet(nn.Module):
             if isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
         nn.init.normal_(self.latent_base, std=0.02)
-        if self.cfg.cell_latents:
+        if self.cfg.uses_cell_state:
             nn.init.normal_(self.cell_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
         nn.init.normal_(self.act_empty_base, std=0.02)
@@ -720,7 +801,34 @@ class MantisNet(nn.Module):
                 batch.dec_class,
                 n_windows,
                 self.cfg.dec_classes,
+                batch.cell_pos.shape[0] if self.cfg.cell_nodes else -1,
             )
+        )
+
+    def _radius_tables(self, batch: Batch, n_stones: int) -> cell_latents.CellTables:
+        classes = batch.radius_orbit + cell_nodes.ORBIT48_CLASSES * (
+            batch.radius_own + 2 * batch.radius_on_axis
+        )
+        return cell_nodes.tables_from_op(
+            batch.radius_src,
+            batch.radius_dst,
+            classes,
+            n_stones,
+            batch.cell_pos.shape[0],
+            cell_nodes.RADIUS_CLASSES,
+        )
+
+    def _adjacency_tables(self, batch: Batch) -> cell_latents.CellTables:
+        # The structural axis is emitted for the future equivariant route. In
+        # the invariant Step 13 channel all three axes share one relation row.
+        classes = torch.zeros_like(batch.adjacency_axis)
+        return cell_nodes.tables_from_op(
+            batch.adjacency_src,
+            batch.adjacency_dst,
+            classes,
+            batch.cell_pos.shape[0],
+            batch.cell_pos.shape[0],
+            cell_nodes.ADJACENCY_CLASSES,
         )
 
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
@@ -749,24 +857,55 @@ class MantisNet(nn.Module):
         )
         latent_layout = (window_pos, offsets, order)
         lines = self._line_tables(batch) if cfg.line_pass else None
-        ctab = c = None
-        if cfg.cell_latents:
+        ctab = c = radius = adjacency = None
+        if cfg.uses_cell_state:
             ctab = self._cell_tables(batch, w.shape[0])
-            c = self.cell_base.expand(ctab.covered.shape[0], cfg.h)
+            if cfg.cell_nodes:
+                c = (
+                    self.cell_occupancy_table(batch.cell_occupancy)
+                    + self.cell_legal_table(batch.cell_is_legal)
+                    + self.cell_nearest_table(batch.cell_nearest)
+                )
+                c = c.clone()
+                c.index_copy_(
+                    0,
+                    ctab.covered,
+                    self.cell_base.expand(ctab.covered.shape[0], cfg.h),
+                )
+                radius = self._radius_tables(batch, s.shape[0])
+                if cfg.cell_adjacency:
+                    adjacency = self._adjacency_tables(batch)
+            else:
+                c = self.cell_base.expand(ctab.covered.shape[0], cfg.h)
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         for block in self.blocks:
             s, w, g, c = block(
-                s, w, g, c, batch, seq_lens, plan, pairs, latent_layout, lines, ctab
+                s,
+                w,
+                g,
+                c,
+                batch,
+                seq_lens,
+                plan,
+                pairs,
+                latent_layout,
+                lines,
+                ctab,
+                radius,
+                adjacency,
             )
         global_rows = self.ln_out(g).mean(dim=1)
         cells = None
-        if cfg.cell_latents:
-            cells = (
-                self.ln_out(self.cell_base)
-                .expand(batch.cell_pos.shape[0], cfg.h)
-                .clone()
-            )
-            cells.index_copy_(0, ctab.covered, self.ln_out(c).to(cells.dtype))
+        if cfg.uses_cell_state:
+            if cfg.cell_nodes:
+                cells = self.ln_out(c)
+            else:
+                cells = (
+                    self.ln_out(self.cell_base)
+                    .expand(batch.cell_pos.shape[0], cfg.h)
+                    .clone()
+                )
+                cells.index_copy_(0, ctab.covered, self.ln_out(c).to(cells.dtype))
         return self.ln_out(s), self.ln_out(w), global_rows, cells
 
     def _decoder_rows(self, w: Tensor, batch: Batch, dtype: torch.dtype) -> Tensor:
@@ -802,15 +941,15 @@ class MantisNet(nn.Module):
         latents when that knob is on, the one-shot window aggregate
         otherwise. A ``cells`` value that disagrees with the config is a
         caller wiring bug, not a fallback opportunity."""
-        if self.cfg.cell_latents:
+        if self.cfg.uses_cell_state:
             if cells is None:
                 raise ValueError(
-                    "cell_latents is on but the trunk's cell rows were not "
+                    "cell state is on but the trunk's cell rows were not "
                     "passed to the decoder"
                 )
             return cells.to(dtype)
         if cells is not None:
-            raise ValueError("cell rows were passed but cell_latents is off")
+            raise ValueError("cell rows were passed but cell state is off")
         return self._decoder_rows(w, batch, dtype)
 
     def _action_contribution(self, w: Tensor, batch: Batch) -> Tensor:

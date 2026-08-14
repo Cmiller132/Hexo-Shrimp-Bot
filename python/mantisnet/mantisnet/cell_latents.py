@@ -102,6 +102,7 @@ def cell_tables(
     dec_class: Tensor,
     n_windows: int,
     n_classes: int,
+    n_cells: int = -1,
 ) -> CellTables:
     """Sort one batch's decoder incidence into the cell-attention views.
 
@@ -125,10 +126,18 @@ def cell_tables(
     edge_window = dec_window[order]
     edge_class = dec_class[order]
     covered, counts = torch.unique_consecutive(dec_cell[order], return_counts=True)
-    cell_ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
-    edge_cell = torch.repeat_interleave(
-        torch.arange(counts.numel(), device=device), counts
-    )
+    if n_cells < 0:
+        cell_ptr = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+        edge_cell = torch.repeat_interleave(
+            torch.arange(counts.numel(), device=device), counts
+        )
+    else:
+        if dec_cell.numel() and (int(dec_cell.min()) < 0 or int(dec_cell.max()) >= n_cells):
+            raise ValueError(f"dec_cell entries must lie in [0, {n_cells})")
+        cell_ptr = torch.searchsorted(
+            dec_cell[order], torch.arange(n_cells + 1, device=device)
+        )
+        edge_cell = dec_cell[order]
 
     worder = torch.argsort(edge_window, stable=True)
     win_ptr = torch.searchsorted(
@@ -161,17 +170,24 @@ def cell_tables(
 
 @torch.library.custom_op("mantisnet::cell_tables", mutates_args=())
 def derive_cell_tables(
-    dec_cell: Tensor, dec_window: Tensor, dec_class: Tensor, n_windows: int, n_classes: int
+    dec_cell: Tensor,
+    dec_window: Tensor,
+    dec_class: Tensor,
+    n_windows: int,
+    n_classes: int,
+    n_cells: int,
 ) -> tuple[
     Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor
 ]:
     """``cell_tables`` as an opaque op: the sorts are data-dependent and would
     otherwise break the surrounding graph out of compilation."""
-    return tuple(cell_tables(dec_cell, dec_window, dec_class, n_windows, n_classes))
+    return tuple(
+        cell_tables(dec_cell, dec_window, dec_class, n_windows, n_classes, n_cells)
+    )
 
 
 @derive_cell_tables.register_fake
-def _(dec_cell, dec_window, dec_class, n_windows, n_classes):
+def _(dec_cell, dec_window, dec_class, n_windows, n_classes, n_cells):
     ctx = torch.library.get_ctx()
     n_cov = ctx.new_dynamic_size()
     e = dec_cell.shape[0]
@@ -181,7 +197,7 @@ def _(dec_cell, dec_window, dec_class, n_windows, n_classes):
 
     return (
         dec_cell.new_empty((n_cov,), dtype=torch.long),
-        dec_cell.new_empty((n_cov + 1,), dtype=torch.long),
+        dec_cell.new_empty((n_cov + 1 if n_cells < 0 else n_cells + 1,), dtype=torch.long),
         edges(),
         edges(),
         edges(),
