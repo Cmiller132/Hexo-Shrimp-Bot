@@ -70,6 +70,7 @@ class MantisConfig:
     # Step 13: extend persistent state to every legal cell and let each block
     # read invariant radius-8 stone context. Adjacency is a factored sub-knob.
     cell_nodes: bool = False
+    cell_node_scope: str = "all"
     cell_adjacency: bool = False
 
     def __post_init__(self) -> None:
@@ -88,6 +89,15 @@ class MantisConfig:
             )
         if self.cell_adjacency and not self.cell_nodes:
             raise ValueError("cell_adjacency requires cell_nodes=True")
+        if self.cell_node_scope not in cell_nodes.CELL_NODE_SCOPES:
+            raise ValueError(
+                "cell_node_scope must be one of "
+                f"{cell_nodes.CELL_NODE_SCOPES}, got {self.cell_node_scope!r}"
+            )
+        if self.cell_node_scope != "all" and not self.cell_nodes:
+            raise ValueError(
+                f"cell_node_scope={self.cell_node_scope!r} requires cell_nodes=True"
+            )
 
     @property
     def uses_cell_state(self) -> bool:
@@ -805,7 +815,9 @@ class MantisNet(nn.Module):
             )
         )
 
-    def _radius_tables(self, batch: Batch, n_stones: int) -> cell_latents.CellTables:
+    def _radius_tables(
+        self, batch: Batch, covered: Tensor, n_stones: int
+    ) -> cell_latents.CellTables:
         classes = batch.radius_orbit + cell_nodes.ORBIT48_CLASSES * (
             batch.radius_own + 2 * batch.radius_on_axis
         )
@@ -813,12 +825,16 @@ class MantisNet(nn.Module):
             batch.radius_src,
             batch.radius_dst,
             classes,
+            covered,
             n_stones,
             batch.cell_pos.shape[0],
             cell_nodes.RADIUS_CLASSES,
+            self.cfg.cell_node_scope == "uncovered",
         )
 
-    def _adjacency_tables(self, batch: Batch) -> cell_latents.CellTables:
+    def _adjacency_tables(
+        self, batch: Batch, covered: Tensor
+    ) -> cell_latents.CellTables:
         # The structural axis is emitted for the future equivariant route. In
         # the invariant Step 13 channel all three axes share one relation row.
         classes = torch.zeros_like(batch.adjacency_axis)
@@ -826,9 +842,11 @@ class MantisNet(nn.Module):
             batch.adjacency_src,
             batch.adjacency_dst,
             classes,
+            covered,
             batch.cell_pos.shape[0],
             batch.cell_pos.shape[0],
             cell_nodes.ADJACENCY_CLASSES,
+            self.cfg.cell_node_scope == "uncovered",
         )
 
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
@@ -872,9 +890,9 @@ class MantisNet(nn.Module):
                     ctab.covered,
                     self.cell_base.expand(ctab.covered.shape[0], cfg.h),
                 )
-                radius = self._radius_tables(batch, s.shape[0])
+                radius = self._radius_tables(batch, ctab.covered, s.shape[0])
                 if cfg.cell_adjacency:
-                    adjacency = self._adjacency_tables(batch)
+                    adjacency = self._adjacency_tables(batch, ctab.covered)
             else:
                 c = self.cell_base.expand(ctab.covered.shape[0], cfg.h)
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)

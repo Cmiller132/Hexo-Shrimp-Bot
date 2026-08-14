@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 
 import hexo_py
+import pytest
 import torch
 
 from mantisnet import MantisConfig, MantisNet, collate, from_position
@@ -119,7 +120,8 @@ def test_knob_off_is_byte_identical_to_the_incumbent_path():
         ).cpu().numpy().tobytes()
 
 
-def test_far_cell_alias_is_removed_by_radius_edges():
+@pytest.mark.parametrize("scope", ["all", "uncovered"])
+def test_far_cell_alias_is_removed_by_radius_edges(scope):
     batch = collate([from_position(hexo_py.Position.replay([(0, 0)]))])
     covered = set(batch.dec_cell.tolist())
     uncovered = [cell for cell in range(batch.n_cells) if cell not in covered]
@@ -127,28 +129,79 @@ def test_far_cell_alias_is_removed_by_radius_edges():
         int(dst): int(orbit)
         for dst, orbit in zip(batch.radius_dst.tolist(), batch.radius_orbit.tolist())
     }
-    pair = next(
-        (a, b)
-        for a, b in itertools.combinations(uncovered, 2)
-        if orbit_by_cell[a] != orbit_by_cell[b]
-    )
+    representatives = {}
+    for cell in uncovered:
+        representatives.setdefault(orbit_by_cell[cell], cell)
+    cells = list(representatives.values())
+    assert len(cells) > 2
 
     torch.manual_seed(7)
     off = MantisNet(_tiny(cell_latents=True)).eval()
     torch.manual_seed(7)
-    on = MantisNet(_tiny(cell_nodes=True)).eval()
+    on = MantisNet(_tiny(cell_nodes=True, cell_node_scope=scope)).eval()
     with torch.no_grad():
         off_cells = off.trunk(batch)[3]
         on_cells = on.trunk(batch)[3]
-    assert torch.equal(off_cells[pair[0]], off_cells[pair[1]])
-    assert not torch.equal(on_cells[pair[0]], on_cells[pair[1]])
+    for left, right in itertools.combinations(cells, 2):
+        assert torch.equal(off_cells[left], off_cells[right])
+        assert not torch.equal(on_cells[left], on_cells[right])
+
+
+def _table_edges(tables):
+    return set(
+        zip(
+            tables.edge_window.tolist(),
+            tables.edge_cell.tolist(),
+            tables.edge_class.tolist(),
+        )
+    )
+
+
+def test_uncovered_scope_filters_radius_and_adjacency_destinations():
+    position = hexo_py.Position.replay([(0, 0), (3, 0), (-2, 2), (0, 3)])
+    batch = collate([from_position(position)])
+    all_model = MantisNet(_tiny(cell_nodes=True, cell_adjacency=True))
+    uncovered_model = MantisNet(
+        _tiny(
+            cell_nodes=True,
+            cell_node_scope="uncovered",
+            cell_adjacency=True,
+        )
+    )
+    covered = all_model._cell_tables(batch, len(batch.window_feat)).covered
+    covered_set = set(covered.tolist())
+
+    all_radius = _table_edges(
+        all_model._radius_tables(batch, covered, len(batch.stone_own))
+    )
+    uncovered_radius = _table_edges(
+        uncovered_model._radius_tables(batch, covered, len(batch.stone_own))
+    )
+    assert uncovered_radius < all_radius
+    assert not ({destination for _, destination, _ in uncovered_radius} & covered_set)
+    assert uncovered_radius == {
+        edge for edge in all_radius if edge[1] not in covered_set
+    }
+
+    all_adjacency = _table_edges(all_model._adjacency_tables(batch, covered))
+    uncovered_adjacency = _table_edges(
+        uncovered_model._adjacency_tables(batch, covered)
+    )
+    assert uncovered_adjacency < all_adjacency
+    assert not (
+        {destination for _, destination, _ in uncovered_adjacency} & covered_set
+    )
+    assert uncovered_adjacency == {
+        edge for edge in all_adjacency if edge[1] not in covered_set
+    }
 
 
 @torch.no_grad()
-def test_cell_node_model_is_d6_invariant():
+@pytest.mark.parametrize("scope", ["all", "uncovered"])
+def test_cell_node_model_is_d6_invariant(scope):
     moves = [(0, 0), (3, 0), (-2, 2), (0, 3), (1, -2), (-1, 3)]
     torch.manual_seed(11)
-    model = MantisNet(_tiny(cell_nodes=True)).eval()
+    model = MantisNet(_tiny(cell_nodes=True, cell_node_scope=scope)).eval()
     model.mlp_p.out.weight.normal_(std=0.05)
     model.mlp_q.out.weight.normal_(std=0.05)
     base_position = hexo_py.Position.replay(moves)
@@ -166,11 +219,25 @@ def test_cell_node_model_is_d6_invariant():
         assert torch.allclose(output.value, base.value, atol=1e-5)
 
 
-def test_parameter_counts_are_pinned_for_both_cell_node_states():
+def test_parameter_counts_are_pinned_for_cell_node_states_and_scopes():
     assert sum(p.numel() for p in MantisNet(MantisConfig()).parameters()) == 4_803_813
-    assert sum(
-        p.numel() for p in MantisNet(MantisConfig(cell_nodes=True)).parameters()
-    ) == 5_462_437
+    for scope in ("all", "uncovered"):
+        assert sum(
+            p.numel()
+            for p in MantisNet(
+                MantisConfig(cell_nodes=True, cell_node_scope=scope)
+            ).parameters()
+        ) == 5_462_437
+        assert sum(
+            p.numel()
+            for p in MantisNet(
+                MantisConfig(
+                    cell_nodes=True,
+                    cell_node_scope=scope,
+                    cell_adjacency=True,
+                )
+            ).parameters()
+        ) == 5_728_693
 
 
 def test_cell_adjacency_is_a_separate_validated_subknob():
@@ -182,3 +249,17 @@ def test_cell_adjacency_is_a_separate_validated_subknob():
         raise AssertionError("an inert adjacency knob was accepted")
     model = MantisNet(MantisConfig(cell_nodes=True, cell_adjacency=True))
     assert sum(parameter.numel() for parameter in model.parameters()) == 5_728_693
+
+
+def test_cell_node_scope_is_validated():
+    assert MantisConfig().cell_node_scope == "all"
+    with pytest.raises(ValueError) as error:
+        MantisConfig(cell_node_scope="uncovered")
+    assert "cell_node_scope='uncovered' requires cell_nodes=True" in str(error.value)
+
+    with pytest.raises(ValueError) as error:
+        MantisConfig(cell_nodes=True, cell_node_scope="nearby")
+    message = str(error.value)
+    assert "cell_node_scope must be one of" in message
+    assert "'all'" in message
+    assert "'uncovered'" in message

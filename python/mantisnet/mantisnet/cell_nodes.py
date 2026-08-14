@@ -17,19 +17,24 @@ ORBIT48_CLASSES = 48
 RADIUS_CLASSES = ORBIT48_CLASSES * 2 * 2
 ADJACENCY_CLASSES = 1
 NEAREST_BUCKETS = 10
+CELL_NODE_SCOPES = ("all", "uncovered")
 
 
 def edge_tables(
     src: Tensor,
     dst: Tensor,
     cls: Tensor,
+    covered_destinations: Tensor,
     n_sources: int,
     n_destinations: int,
     n_classes: int,
+    uncovered_only: bool,
 ) -> CellTables:
     """Sort one typed edge family into the cell-attention's three views."""
     if not (src.shape == dst.shape == cls.shape) or src.ndim != 1:
         raise ValueError("src, dst, and cls must be one-dimensional and one length")
+    if covered_destinations.ndim != 1:
+        raise ValueError("covered_destinations must be one-dimensional")
     if src.numel():
         if int(src.min()) < 0 or int(src.max()) >= n_sources:
             raise ValueError(f"src entries must lie in [0, {n_sources})")
@@ -37,6 +42,18 @@ def edge_tables(
             raise ValueError(f"dst entries must lie in [0, {n_destinations})")
         if int(cls.min()) < 0 or int(cls.max()) >= n_classes:
             raise ValueError(f"cls entries must lie in [0, {n_classes})")
+    if covered_destinations.numel() and (
+        int(covered_destinations.min()) < 0
+        or int(covered_destinations.max()) >= n_destinations
+    ):
+        raise ValueError(
+            f"covered_destinations entries must lie in [0, {n_destinations})"
+        )
+    if uncovered_only:
+        keep = ~torch.isin(dst, covered_destinations)
+        src = src[keep]
+        dst = dst[keep]
+        cls = cls[keep]
     device = src.device
 
     order = torch.argsort(dst, stable=True)
@@ -82,22 +99,44 @@ def derive_edge_tables(
     src: Tensor,
     dst: Tensor,
     cls: Tensor,
+    covered_destinations: Tensor,
     n_sources: int,
     n_destinations: int,
     n_classes: int,
+    uncovered_only: bool,
 ) -> tuple[
     Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
     Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,
 ]:
     """Opaque device-side edge-table derivation for compiled forwards."""
-    return tuple(edge_tables(src, dst, cls, n_sources, n_destinations, n_classes))
+    return tuple(
+        edge_tables(
+            src,
+            dst,
+            cls,
+            covered_destinations,
+            n_sources,
+            n_destinations,
+            n_classes,
+            uncovered_only,
+        )
+    )
 
 
 @derive_edge_tables.register_fake
-def _(src, dst, cls, n_sources, n_destinations, n_classes):
+def _(
+    src,
+    dst,
+    cls,
+    covered_destinations,
+    n_sources,
+    n_destinations,
+    n_classes,
+    uncovered_only,
+):
     ctx = torch.library.get_ctx()
     n_covered = ctx.new_dynamic_size()
-    edges = src.shape[0]
+    edges = ctx.new_dynamic_size() if uncovered_only else src.shape[0]
 
     def edge_rows():
         return src.new_empty((edges,), dtype=torch.long)
@@ -117,10 +156,21 @@ def tables_from_op(
     src: Tensor,
     dst: Tensor,
     cls: Tensor,
+    covered_destinations: Tensor,
     n_sources: int,
     n_destinations: int,
     n_classes: int,
+    uncovered_only: bool,
 ) -> CellTables:
     return CellTables(
-        *derive_edge_tables(src, dst, cls, n_sources, n_destinations, n_classes)
+        *derive_edge_tables(
+            src,
+            dst,
+            cls,
+            covered_destinations,
+            n_sources,
+            n_destinations,
+            n_classes,
+            uncovered_only,
+        )
     )

@@ -34,9 +34,14 @@ With `cell_nodes=True`, uncovered legal cells initialize from occupancy,
 legality, and nearest-stone-distance embeddings, while covered cells retain
 the Step 15 learned-base initialization. In every block cells also attend to
 all stones within radius 8 through exact orbit-48, source-owner, and on-axis
-classes. `cell_adjacency=True` is a separate sub-knob adding directed
-distance-one cell messages with axis-shared weights; it is refused unless
-`cell_nodes` is enabled.
+classes. `cell_node_scope="all"` is the default and sends those radius edges
+to every legal cell; `"uncovered"` sends them only to cells with no decoder
+incidence. The scope filters edges only: every legal cell retains its latent
+and occupancy, legality, and nearest-distance features. `cell_adjacency=True`
+is a separate sub-knob adding directed distance-one cell messages with
+axis-shared weights, and its destination cells follow the same scope. Both
+`cell_adjacency=True` and the non-default scope are refused when they would be
+inert without `cell_nodes`.
 
 Three heads read the trunk output:
 
