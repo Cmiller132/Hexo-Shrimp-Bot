@@ -30,6 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from ..builder import MODEL_REPR_VERSION
 from ..model import MantisConfig, MantisNet, strip_legacy_knobs
+from ..optim import ADAM_IMPLEMENTATIONS, configure_adam, make_adam
 from .hardware import hardware_sampler
 from .selfplay import Collector, episode_samples
 from .telemetry import open_telemetry
@@ -133,7 +134,9 @@ def load_lab_cell(path: Path, model, model_kw: dict) -> None:
         raise ValueError(
             f"lab cell versions {cell['versions']} != this build {_versions()}"
         )
-    if strip_legacy_knobs(cell["model_kw"]) != strip_legacy_knobs(model_kw):
+    recorded = MantisConfig(**strip_legacy_knobs(dict(cell["model_kw"])))
+    running = MantisConfig(**strip_legacy_knobs(dict(model_kw)))
+    if recorded != running:
         raise ValueError(
             f"lab cell model_kw {cell['model_kw']} != this run's {model_kw}"
         )
@@ -382,6 +385,15 @@ def main(argv=None) -> None:
         help="legal cells per collection batch (no_grad, so larger)",
     )
     ap.add_argument("--lr", type=float, default=KlentConfig.lr)
+    ap.add_argument(
+        "--adam-impl",
+        choices=ADAM_IMPLEMENTATIONS,
+        default=KlentConfig.adam_impl,
+        help=(
+            "Adam execution policy; auto is fused on CUDA and scalar on CPU. "
+            "Fused/foreach preserve the recipe but may change last-bit reduction order"
+        ),
+    )
     ap.add_argument("--checkpoint-every", type=int, default=25)
     ap.add_argument(
         "--eval-every", type=int, default=0,
@@ -511,6 +523,7 @@ def main(argv=None) -> None:
         collect_pair_budget=args.collect_pair_budget,
         collect_cell_budget=args.collect_cell_budget,
         lr=args.lr,
+        adam_impl=args.adam_impl,
         device=args.device,
         autocast=args.device == "cuda",
         compile=args.device == "cuda" and not args.no_compile,
@@ -524,15 +537,18 @@ def main(argv=None) -> None:
     elif out.exists() and any(out.iterdir()):
         raise SystemExit(f"{out} exists and is not empty; use --resume to continue it")
 
-    # Imported here: the lab package reaches back into klent.graft at import
-    # time, so a module-level import would be circular.
     from ..lab.variants import parse_model_kw
 
     torch.manual_seed(args.seed)
     model_kw = parse_model_kw(args.model_kw)
     model_cfg = MantisConfig(**model_kw)
     model = MantisNet(model_cfg).to(cfg.device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    optimizer, adam_resolved = make_adam(
+        model.parameters(),
+        lr=cfg.lr,
+        device=cfg.device,
+        implementation=cfg.adam_impl,
+    )
     rng = np.random.default_rng(args.seed)
 
     start = 0
@@ -547,12 +563,14 @@ def main(argv=None) -> None:
             load_lab_cell(args.init_lab_cell, model, model_kw)
             print(f"initialized from lab cell {args.init_lab_cell}")
     # The invocation's --lr overrides the value stored in optimizer state.
+    configure_adam(optimizer, adam_resolved, cfg.device)
     for group in optimizer.param_groups:
         group["lr"] = cfg.lr
 
     out.mkdir(parents=True, exist_ok=True)
     config = {
         "klent": dataclasses.asdict(cfg),
+        "adam_resolved": adam_resolved,
         "model": dataclasses.asdict(model_cfg),
         "model_kw": model_kw,
         "iterations": args.iterations,

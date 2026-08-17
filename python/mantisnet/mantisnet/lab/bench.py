@@ -17,6 +17,7 @@ from ..klent import selfplay as selfplay_mod
 from ..klent.improve import improved_policy
 from ..klent.selfplay import Collector, episode_samples
 from ..klent.train import KlentConfig, fit, network_evaluate
+from ..optim import make_adam
 from .cohort import corpus_cohort, selfplay_cohort
 from .families import family_evaluate, load_checkpoint
 from .variants import build_variant
@@ -43,6 +44,7 @@ def _config(
     compile: bool,
     pair_budget: int | None = None,
     cell_budget: int | None = None,
+    adam_impl: str = "auto",
 ) -> KlentConfig:
     if pair_budget is not None and pair_budget <= 0:
         raise ValueError(f"pair_budget must be positive, got {pair_budget}")
@@ -52,6 +54,7 @@ def _config(
         device=device,
         autocast=device == "cuda",
         compile=compile,
+        adam_impl=adam_impl,
         pair_budget=(pair_budget if pair_budget is not None else KlentConfig.pair_budget),
         cell_budget=(cell_budget if cell_budget is not None else KlentConfig.cell_budget),
         collect_pair_budget=(
@@ -317,6 +320,7 @@ def _collect(
     compile: bool = False,
     pair_budget: int | None = None,
     cell_budget: int | None = None,
+    adam_impl: str = "auto",
     model_kw: dict | None = None,
     emit: bool = True,
     family: str | None = None,
@@ -325,7 +329,7 @@ def _collect(
         raise ValueError(
             f"games, envs, and cap must be positive, got {games}, {envs}, {cap}"
         )
-    cfg = _config(device, compile, pair_budget, cell_budget)
+    cfg = _config(device, compile, pair_budget, cell_budget, adam_impl)
     model, loaded = _load_or_fresh(
         checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
     )
@@ -400,11 +404,25 @@ def bench_fit(
     compile: bool = False,
     pair_budget: int | None = None,
     cell_budget: int | None = None,
+    adam_impl: str = "auto",
+    steady_warmup: int | None = None,
+    steady_measure: int | None = None,
     model_kw: dict | None = None,
     family: str | None = None,
 ) -> dict:
-    """Benchmark a production KLENT fit or one supervised corpus epoch."""
-    cfg = _config(device, compile, pair_budget, cell_budget)
+    """Benchmark a production KLENT fit or one supervised corpus epoch.
+
+    With ``steady_warmup``/``steady_measure`` set, the run is the campaign
+    speed harness of ``docs/MANTIS_GRAFT_SPEC.md`` §2.2: one epoch whose first
+    ``steady_warmup`` chunks absorb compilation and cache warm-up untimed,
+    followed by a CUDA-synchronized window of ``steady_measure`` chunks that
+    yields the reported throughput; the epoch then stops early.
+    """
+    if (steady_warmup is None) != (steady_measure is None):
+        raise ValueError(
+            "steady_warmup and steady_measure must be given together"
+        )
+    cfg = _config(device, compile, pair_budget, cell_budget, adam_impl)
     model, loaded = _load_or_fresh(
         checkpoint, device=device, model_kw=model_kw, seed=seed, family=family
     )
@@ -414,7 +432,12 @@ def bench_fit(
             f"checkpoint family {loaded.family.name!r} is scoreable but its "
             "historical fitting loss is outside the lab family contract"
         )
-    optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    optimizer, adam_resolved = make_adam(
+        model.parameters(),
+        lr=cfg.lr,
+        device=cfg.device,
+        implementation=cfg.adam_impl,
+    )
     if corpus is None:
         model, cfg, episodes, _ = _collect(
             checkpoint=checkpoint,
@@ -426,11 +449,17 @@ def bench_fit(
             compile=compile,
             pair_budget=pair_budget,
             cell_budget=cell_budget,
+            adam_impl=adam_impl,
             model_kw=model_kw,
             emit=False,
             family=family,
         )
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+        optimizer, adam_resolved = make_adam(
+            model.parameters(),
+            lr=cfg.lr,
+            device=cfg.device,
+            implementation=cfg.adam_impl,
+        )
         samples = [
             sample
             for episode in episodes
@@ -441,17 +470,18 @@ def bench_fit(
         sample_count = len(samples)
         source = "collect"
 
-        def run_epoch(epoch_seed):
+        def run_epoch(epoch_seed, steady=None):
             return fit(
                 model,
                 samples,
                 optimizer,
                 cfg,
                 np.random.default_rng(epoch_seed),
+                steady=steady,
             )
     else:
         from .corpus import load_corpus
-        from .train import fit_supervised_epoch, sample_sizes
+        from .train import TrainConfig, fit_supervised_epoch, sample_sizes
 
         frozen = load_corpus(corpus) if isinstance(corpus, (str, Path)) else corpus
         samples = frozen.split_samples(split)
@@ -460,32 +490,59 @@ def bench_fit(
         # Sizing replays the corpus once per split; production fitting reads
         # sizes from its buffer, so the replay stays outside the timed epoch.
         sizes = sample_sizes(frozen, samples)
+        # The supervised entry point takes the supervised recipe type; mirror
+        # the production budgets exactly. No train_subset cap: the bench fits
+        # the whole split it was pointed at.
+        fit_cfg = TrainConfig(
+            batch_size=cfg.batch_size,
+            pair_budget=cfg.pair_budget,
+            cell_budget=cfg.cell_budget,
+            collect_pair_budget=cfg.collect_pair_budget,
+            collect_cell_budget=cfg.collect_cell_budget,
+            lr=cfg.lr,
+            adam_impl=cfg.adam_impl,
+            device=cfg.device,
+            autocast=cfg.autocast,
+            compile=cfg.compile,
+        )
 
-        def run_epoch(epoch_seed):
+        def run_epoch(epoch_seed, steady=None):
             return fit_supervised_epoch(
                 model,
                 optimizer,
                 frozen,
                 split=split,
-                cfg=cfg,
+                cfg=fit_cfg,
                 rng=np.random.default_rng(epoch_seed),
                 sizes=sizes,
+                steady=steady,
             )
 
-    # Compilation, autotuning, and first-use allocator work happen outside
-    # the timed epoch.
-    run_epoch(seed)
-    _sync(device)
-    _vram_reset(device)
-    start = time.perf_counter()
-    metrics = run_epoch(seed + 1)
-    _sync(device)
-    seconds = time.perf_counter() - start
+    if steady_warmup is not None:
+        # §2.2 window: one epoch, warm-up absorbed by its leading chunks. The
+        # reported peak VRAM covers the whole truncated epoch, compilation
+        # included — conservative, and identical in kind across arms.
+        _vram_reset(device)
+        metrics = run_epoch(seed, steady=(steady_warmup, steady_measure))
+        window = metrics["steady"]
+        sample_count = int(window["samples"])
+        seconds = float(window["seconds"])
+    else:
+        # Compilation, autotuning, and first-use allocator work happen outside
+        # the timed epoch.
+        run_epoch(seed)
+        _sync(device)
+        _vram_reset(device)
+        start = time.perf_counter()
+        metrics = run_epoch(seed + 1)
+        _sync(device)
+        seconds = time.perf_counter() - start
     report = {
         "mode": "fit",
         **_family_fields(loaded),
         "source": source,
         "device": device,
+        "adam_impl": {"requested": adam_impl, "resolved": adam_resolved},
         "samples": sample_count,
         "seconds": seconds,
         "samples_per_s": sample_count / seconds,
@@ -561,7 +618,9 @@ def bench_sweep(
                 len(positions),
             )
             for chunk in chunks:
-                evaluate(collate_positions([positions[i] for i in chunk]))
+                evaluate(
+                    collate_positions([positions[i] for i in chunk])
+                )
             _sync(device)
             _vram_reset(device)
             collate_s = forward_s = improve_s = 0.0

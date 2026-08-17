@@ -46,7 +46,11 @@ class Sample:
 
 
 def _chunk_live(
-    positions, live: list[int], pair_budget: int, cell_budget: int, cap: int
+    positions,
+    live: list[int],
+    pair_budget: int,
+    cell_budget: int,
+    cap: int,
 ):
     """Split ``live`` into consecutive chunks under the memory budgets and
     the position-count ``cap``."""
@@ -54,7 +58,7 @@ def _chunk_live(
     chunk: list[int] = []
     max_t, cells = 0, 0
     for i in live:
-        t_pad = positions[i].stone_count + 1  # + the global token row
+        t_pad = positions[i].stone_count + 4
         c = positions[i].legal_count
         t = max(max_t, t_pad)
         if chunk and (
@@ -126,7 +130,9 @@ class Collector:
                 )
                 batches = [
                     collate_pool.submit(
-                        lambda c: collate_positions([self.positions[i] for i in c]),
+                        lambda c: collate_positions(
+                            [self.positions[i] for i in c]
+                        ),
                         chunk,
                     )
                     for chunk in chunks

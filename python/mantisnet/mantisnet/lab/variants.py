@@ -131,6 +131,11 @@ def variant_spec(name: str) -> VariantSpec:
         raise ValueError(f"unknown lab variant {name!r}; available: {available}") from exc
 
 
+def scoped_collate(name: str) -> Collate:
+    """Return the registered variant's collation callable."""
+    return variant_spec(name).collate
+
+
 def build_variant(
     name: str, overrides: Mapping[str, object] | None = None
 ) -> tuple[nn.Module, dict[str, object], VariantSpec]:

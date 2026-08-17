@@ -10,93 +10,41 @@ import hexo_py
 import numpy as np
 import pytest
 
-from mantisnet import NUM_PATTERNS, OCC_CLASSES, collate, from_position
-from mantisnet.builder import DEC_CLASSES, _CANON, _PATTERN_RANK, AXES
-
-from .conftest import (
-    JOINT_ORBITS,
-    OCC_ORBITS,
-    joint_class,
-    occ_class,
-    oracle_live_windows,
-    reverse6,
-)
+from mantisnet import collate, from_position
+from mantisnet.builder import AXES, _TERN_DEC_CLASS, _TERN_OCC_CLASS, _TERN_RANK
 
 
-def test_ninety_three_joint_decoder_classes():
-    # The 186 (nonempty-nonfull mask, empty slot) pairs fold to 186 / 2 = 93
-    # orbits: no slot is its own mirror, so the involution has no fixed point.
-    assert DEC_CLASSES == len(JOINT_ORBITS) == 93
-    pairs = [(m, s) for m in range(1, 63) for s in range(6) if not (m >> s) & 1]
-    assert len(pairs) == 186
-    # Exactly reversal-invariant, and no coarser: the two members of an orbit
-    # share a class, and members of different orbits never do.
-    assert all(joint_class(m, s) == joint_class(reverse6(m), 5 - s) for m, s in pairs)
-    assert len({joint_class(m, s) for m, s in pairs}) == 93
-    # Strictly finer than the slot class it replaces, at 18 of the 93: a
-    # (canonical mask, slot class) key merges the two ways a candidate can sit
-    # at mirrored slots of a non-palindromic window — an adjacent extension and
-    # a split one get one embedding under it and two under this.
-    merged = {}
-    for m, s in pairs:
-        merged.setdefault(
-            (min(m, reverse6(m)), min(s, 5 - s)), set()
-        ).add(joint_class(m, s))
-    assert sum(len(v) - 1 for v in merged.values()) == 18
-    assert all(len(v) <= 2 for v in merged.values())
-    assert joint_class(0b000001, 1) != joint_class(0b000001, 4)
-
-
-def test_ninety_three_joint_incidence_classes():
-    # The same fold over occupied slots: complementing the mask maps the
-    # decoder's 186 (mask, empty slot) pairs onto these bijectively and
-    # commutes with reversal, so the counts repeat — 93 orbits, and 18 more
-    # classes than the coarse (canonical mask, slot class) key realizes.
-    assert OCC_CLASSES == len(OCC_ORBITS) == 93
-    pairs = [(m, s) for m in range(1, 63) for s in range(6) if (m >> s) & 1]
-    assert len(pairs) == 186
-    assert all(occ_class(m, s) == occ_class(reverse6(m), 5 - s) for m, s in pairs)
-    assert len({occ_class(m, s) for m, s in pairs}) == 93
-    merged = {}
-    for m, s in pairs:
-        merged.setdefault(
-            (min(m, reverse6(m)), min(s, 5 - s)), set()
-        ).add(occ_class(m, s))
-    assert sum(len(v) - 1 for v in merged.values()) == 18
-    assert all(len(v) <= 2 for v in merged.values())
-    # The aliasing the joint classes remove: in 110001 the lone stone and the
-    # pair's outer stone are both "end", and the coarse class cannot say which
-    # end of the pattern a stone's own state binds to.
-    assert occ_class(0b110001, 0) != occ_class(0b110001, 5)
-    assert min(0, 5 - 0) == min(5, 5 - 5) == 0
-
-
-def test_thirty_four_canonical_patterns():
-    # 62 nonempty, nonfull 6-bit masks fold to (62 + 6 palindromes) / 2 = 34
-    # orbits under reversal.
-    assert NUM_PATTERNS == 34
-    assert (_PATTERN_RANK[_CANON[1:63]] >= 0).all()
-    assert _PATTERN_RANK[0] == -1 and _PATTERN_RANK[63] == -1
+def _oracle_windows(pos):
+    mover = pos.current_player
+    windows = {}
+    for q, r, _player in pos.stones():
+        for axis, sq, sr, m0, m1 in pos.windows_through(q, r):
+            own, opp = (m0, m1) if mover == 0 else (m1, m0)
+            pattern = sum(
+                ((own >> k & 1) + 2 * (opp >> k & 1)) * 3**k
+                for k in range(6)
+            )
+            windows[(axis, sq, sr)] = pattern
+    return windows
 
 
 def test_windows_match_engine_oracle(positions):
     for pos in positions:
         g = from_position(pos)
-        oracle = oracle_live_windows(pos)
+        oracle = _oracle_windows(pos)
 
         built = {tuple(w): None for w in g.window_id}
-        assert set(built) == set(oracle), "live-window identity sets differ"
+        assert set(built) == set(oracle), "window identity sets differ"
 
-        # Feature agreement: colour and canonical occupancy pattern.
+        # Feature agreement: reversal-canonical ternary pattern.
         for i, wid in enumerate(map(tuple, g.window_id)):
-            colour, occ = oracle[wid]
-            assert g.window_feat[i] == colour * NUM_PATTERNS + _PATTERN_RANK[_CANON[occ]]
+            assert g.window_feat[i] == _TERN_RANK[oracle[wid]]
 
 
 def test_incidence_matches_oracle(positions):
     for pos in positions:
         g = from_position(pos)
-        oracle = oracle_live_windows(pos)
+        oracle = _oracle_windows(pos)
         stones = {i: (q, r) for i, (q, r, _p) in enumerate(pos.stones())}
 
         built = {
@@ -104,13 +52,11 @@ def test_incidence_matches_oracle(positions):
             for s, w, c in zip(g.inc_stone, g.inc_window, g.inc_class)
         }
         expected = set()
-        for (axis, sq, sr), (_colour, occ) in oracle.items():
+        for (axis, sq, sr), pattern in oracle.items():
             for k in range(6):
-                if occ >> k & 1:
+                if (pattern // 3**k) % 3:
                     cell = (sq + k * int(AXES[axis, 0]), sr + k * int(AXES[axis, 1]))
-                    # The class pairs the window's occupancy — the oracle's
-                    # own, from the engine's walk — with this stone's slot.
-                    expected.add(((axis, sq, sr), cell, occ_class(occ, k)))
+                    expected.add(((axis, sq, sr), cell, int(_TERN_OCC_CLASS[pattern, k])))
         assert built == expected
 
 
@@ -123,44 +69,27 @@ def test_incidence_entries_arrive_in_window_order(positions):
     assert (batch.inc_window[1:] >= batch.inc_window[:-1]).all()
 
 
-def test_decoder_table_ordering_and_coverage(positions):
+def test_decoder_table_ordering(positions):
     for pos in positions:
         g = from_position(pos)
         legal = pos.legal_moves()
         assert g.n_legal == len(legal) == pos.legal_count
 
-        # §12.6: every legal cell is scored exactly once — window path and
-        # background path partition the index range.
-        window_cells = set(g.dec_cell.tolist())
-        bg_cells = set(g.bg_cell.tolist())
-        assert window_cells.isdisjoint(bg_cells)
-        assert window_cells | bg_cells == set(range(len(legal)))
-
         # §12.2: the table is asserted against `legal_moves[j]` itself — index
         # j's windows are exactly the live windows through the j-th legal cell.
-        oracle = oracle_live_windows(pos)
+        oracle = _oracle_windows(pos)
         live = set(oracle)
         rows_by_cell: dict[int, set] = {}
         for cell, w, c in zip(g.dec_cell, g.dec_window, g.dec_class):
             rows_by_cell.setdefault(int(cell), set()).add((tuple(g.window_id[w]), int(c)))
-        bucket_by_cell = dict(zip(g.bg_cell.tolist(), g.bg_bucket.tolist()))
         for j, (q, r) in enumerate(legal):
             expected = set()
             for axis, vec in enumerate(AXES):
                 for k in range(6):
                     wid = (axis, q - k * int(vec[0]), r - k * int(vec[1]))
                     if wid in live:
-                        # The class pairs the window's occupancy — the oracle's
-                        # own, from the engine's walk — with this cell's slot.
-                        expected.add((wid, joint_class(oracle[wid][1], k)))
+                        expected.add((wid, int(_TERN_DEC_CLASS[oracle[wid], k])))
             assert rows_by_cell.get(j, set()) == expected, f"decoder row {j} at {(q, r)}"
-            if not expected:
-                dists = [
-                    max(abs(q - sq), abs(r - sr), abs((q - sq) + (r - sr)))
-                    for sq, sr, _p in pos.stones()
-                ]
-                bucket = min(min(dists), 8) - 1 if dists else 7
-                assert bucket_by_cell[j] == bucket
 
 
 def test_decoder_entries_arrive_in_cell_order(positions):
@@ -172,11 +101,13 @@ def test_decoder_entries_arrive_in_cell_order(positions):
     assert (batch.dec_cell[1:] >= batch.dec_cell[:-1]).all()
 
 
-def test_ply_zero_builds_background_only():
+def test_ply_zero_builds_empty_action_rows():
     g = from_position(hexo_py.Position())
     assert g.n_stones == 0 and g.n_windows == 0
     assert g.n_legal == 1
-    assert g.bg_cell.tolist() == [0] and g.bg_bucket.tolist() == [7]
+    assert g.dec_cell.size == 0
+    assert g.action_window_index.shape == (1, 3, 6)
+    assert (g.action_window_index == -1).all()
     assert g.moves_remaining == 1
 
 

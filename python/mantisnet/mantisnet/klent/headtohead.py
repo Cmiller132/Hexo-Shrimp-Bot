@@ -90,10 +90,7 @@ def _refuse_incomparable(a: dict, b: dict) -> None:
         raise ValueError(
             f"MODEL_REPR_VERSION is {va.get('MODEL_REPR_VERSION')!r} in "
             f"{a['path']} and {vb.get('MODEL_REPR_VERSION')!r} in {b['path']}; "
-            "convert the version-1 side with `python -m mantisnet.klent.graft`, "
-            "which rewrites it into version 2 while preserving the function "
-            "exactly — that exactness is what makes a cross-representation "
-            "comparison legitimate at all"
+            "cross-representation comparison is invalid"
         )
 
 

@@ -11,11 +11,29 @@ backend) execution.
 ### Position encoder (`encoder`)
 
 Converts an `engine::Position` into the graph representation MantisNet consumes.
-Each position becomes a `Graph` of stones, live windows, stone-to-window
-incidence edges, a decoder table mapping legal cells back to windows, and a
-background-distance table for legal cells that no live window covers. The
-encoder assigns reversal-invariant joint occupancy/slot classes to both incidence
-and decoder edges.
+Each position becomes a `Graph` of stones, windows, stone-to-window
+incidence edges, a decoder table mapping legal cells back to windows, dense
+post-placement rows for every legal action, and the Step 13 legal-cell fields.
+Those fields are mover-relative occupancy, legality, nearest-stone distance,
+stone-to-cell radius-8 edges under the generated 48-orbit D6 vocabulary, and
+directed distance-one cell adjacency with structural axis routes. Each graph
+carries the complete edge superset: the Python model's
+`cell_node_scope="all"` default consumes every destination, while
+`"uncovered"` filters radius and adjacency destinations to legal cells with
+no decoder incidence. Scope never removes a legal-cell latent or its features.
+Every nonempty candidate window is kept under the ternary slot patterns
+(MANTIS_GRAFT_SPEC Step 12, baked): the encoder assigns reversal-invariant
+joint pattern/slot classes to both incidence and decoder edges in the
+377/726/1458 ternary vocabulary, and the wire format speaks that scope under
+`MODEL_REPR_VERSION` 7.
+
+`build(position)` emits each legal action's 18 hypothetical post-placement
+windows with their 729 joint `(post, slot)` classes and pre-insert statuses.
+Collation derives the model's views from them: the kept rows
+are asserted to be the decoder incidence in the same order (`act_class`), the
+stable window-major edge permutation (`act_rev`), and per-cell EMPTY-row
+counts by slot orbit (`act_empty`). The wire format carries the dense rows and
+validates their correspondence with the decoder incidence before collation.
 
 The encoder has three output paths:
 
@@ -28,7 +46,9 @@ The encoder has three output paths:
   collates them into a `RawBatch`.
 
 `RawBatch` is the flat, globally-indexed tensor layout the forward boundary
-accepts.
+accepts. Its stone-attention table begins with four valid global rows whose
+coordinates are zero; stone slots begin at row four, and padding follows the
+last stone.
 
 ### Forward boundary (`forward`)
 

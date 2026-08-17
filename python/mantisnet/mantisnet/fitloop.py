@@ -7,6 +7,7 @@ post-step parameter check. Callers own batch construction and their loss.
 
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Callable
@@ -96,7 +97,8 @@ def fit_epoch(
     step: Callable[[object], tuple[torch.Tensor, dict[str, torch.Tensor]]],
     lock,
     progress=None,
-) -> dict[str, float | int]:
+    steady: tuple[int, int] | None = None,
+) -> dict[str, float | int | dict[str, float | int]]:
     """Fit one packed epoch and return sample-weighted statistic means.
 
     ``prepare(indices)`` must be pure; it runs on the prefetch workers, up to
@@ -108,6 +110,17 @@ def fit_epoch(
     RNG consumption is exactly two permutations: samples before packing, then
     packed chunks before grouping. ``progress(consumed, total)`` is called
     after every consumed chunk.
+
+    ``steady=(warmup, measure)`` is the benchmark window of the graft
+    campaign's speed gate (``docs/MANTIS_GRAFT_SPEC.md`` §2.2): consume
+    ``warmup`` chunks, synchronize CUDA, time the next ``measure`` chunks,
+    synchronize again, then stop the epoch early. The returned mapping gains
+    a ``"steady"`` sub-mapping with the windowed throughput and approximate
+    per-chunk latency quantiles (chunk boundaries are wall-clock stamps
+    without per-chunk synchronization, so quantiles are indicative while the
+    windowed rate is exact). Consumption order, packing, and every consumed
+    chunk's arithmetic are identical with and without the window; production
+    fitting never passes it.
     """
     model.train()
     chunks = pack_chunks(
@@ -130,9 +143,31 @@ def fit_epoch(
         groups.append((group, count))
 
     order = [k for group, _ in groups for k in group]
+    if steady is not None:
+        warmup, measure = steady
+        if warmup < 1 or measure < 1:
+            raise ValueError(
+                f"steady window needs warmup >= 1 and measure >= 1, got {steady}"
+            )
+        if warmup + measure > len(order):
+            raise ValueError(
+                f"steady window of {warmup}+{measure} chunks exceeds the "
+                f"epoch's {len(order)} packed chunks; use a larger sample"
+            )
+    device = next(model.parameters()).device
+
+    def _sync() -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
     stat_sums: dict[str, torch.Tensor] = {}
     total = 0
     fit_step = 0
+    steady_result: dict[str, float | int] | None = None
+    marks: list[float] = []
+    window_t0 = 0.0
+    window_s0 = 0
+    stop = False
     with ThreadPoolExecutor(max_workers=_PREFETCH_DEPTH) as pool:
         prepped = {
             k: pool.submit(prepare, chunks[k]) for k in order[:_PREFETCH_DEPTH]
@@ -156,12 +191,44 @@ def fit_epoch(
                             stat_sums[name] += weighted
                         else:
                             stat_sums[name] = weighted
+                total += chunk_n
+                if steady is not None:
+                    if consumed == warmup:
+                        _sync()
+                        window_t0 = time.perf_counter()
+                        window_s0 = total
+                        marks = [window_t0]
+                    elif consumed > warmup:
+                        if consumed == warmup + measure:
+                            # The closing sync drains the queued GPU work so
+                            # the window's wall time covers exactly its chunks.
+                            _sync()
+                        marks.append(time.perf_counter())
+                        if consumed == warmup + measure:
+                            seconds = marks[-1] - window_t0
+                            deltas = np.diff(np.asarray(marks)) * 1e3
+                            steady_result = {
+                                "warmup_chunks": warmup,
+                                "measure_chunks": measure,
+                                "seconds": seconds,
+                                "samples": total - window_s0,
+                                "samples_per_s": (total - window_s0) / seconds,
+                                "chunk_ms_median": float(np.median(deltas)),
+                                "chunk_ms_p95": float(np.quantile(deltas, 0.95)),
+                            }
+                            stop = True
                 if progress is not None:
                     progress(consumed, len(order))
+                if stop:
+                    break
+            if stop:
+                # The truncated group's accumulated gradients are discarded:
+                # the window has closed, and a partial optimizer step would
+                # train on a group the epoch never finished.
+                break
             optimizer.step()
             fit_step += 1
             _refuse_nonfinite_parameters(model, fit_step)
-            total += group_n
 
     if total == 0:
         # Preserve the production fit's historical empty-buffer refusal. It
@@ -172,5 +239,7 @@ def fit_epoch(
     result: dict[str, float | int] = {
         name: float(value) / total for name, value in stat_sums.items()
     }
-    result["fit_steps"] = len(groups)
+    result["fit_steps"] = fit_step if steady is not None else len(groups)
+    if steady_result is not None:
+        result["steady"] = steady_result
     return result

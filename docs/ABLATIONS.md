@@ -919,6 +919,82 @@ once in this file's preamble.
 | Disposition | `v_hat`, `kl`, and the entropy behind `norm_entropy` divide by their segment's summed $\pi'$, which is what an expectation under a normalized distribution means; the bound then holds to a few ulps at any segment width. Retained on every configuration. The range check keeps a 1e-4 slack. |
 | Detection history | The check first refused a legitimate corpus at `brm-939` iteration 0 under an exact bound, then again at `tail-939` iteration 56 under the 1e-4 slack. Its message named neither the value nor which of its two conditions failed, and two manager hypotheses — a non-finite value from bf16 or `torch.compile`, and a slack too small for the sample size — were measured and contradicted before the third measurement located the cause. Both refusals now name the entry, its value, and the count of each condition, and every optimizer step is followed by a fused finiteness check over the parameters. |
 
+## Graft campaign
+
+Per-step records of `docs/MANTIS_GRAFT_SPEC.md`. Speed harness: WSL ext4
+clone, `bench fit --corpus mnorm-late-v1 --split val --device cuda --compile
+--seed 7 --steady-warmup 20 --steady-measure 50`, default budgets; the
+campaign corpus is `mnorm-late-v1` (SHA-256 `cd5f5d0a…`, 1M/100k/100k
+realized). The corpus-mode fit number is a gate metric over the frozen
+distribution, not production throughput. Baseline at Step 0:
+205.45 samples/s median (six runs across two Adam arms, spread ±0.2%),
+peak 10.06 GiB.
+
+### Step 0 — `perf-foundation`
+
+| Field | Record |
+| --- | --- |
+| Commits | `5bab833` (ports), `b4d09cf` (§2.2 steady-window instrument) |
+| Content | fused-Adam execution policy (`mantisnet.optim`, recorded and reapplied after checkpoint loads); fit batches pinned on the KLENT prefetch worker; `bbe64ca` not ported (production has no `torch.segment_reduce`) |
+| Speed | fused 205.45 samples/s median (3 reps) vs foreach — the pre-port corpus-path equivalent — 205.42 (2 reps); spread ±0.2%; VRAM 10.057 GiB in all six. Fused-vs-foreach is a null at production's tensor layout; the donor's gain was ACT-layout-specific. The klent-path prefetch pin is mechanism-documented, not campaign-measured (owner ruling 2026-08-10: accepted without a pre-tree A/B). |
+| Verification | full pytest and `cargo xtask verify` green at each commit |
+| Disposition | **Baked** (owner, 2026-08-10). Windows-native measurement disqualified during calibration (same-arm 188→114 samples/s swings at 10.06 GiB under WDDM); harness pinned to the WSL environment and the VRAM ceiling amended to 10.25 GiB in the same ruling. |
+
+### Step 1 — `dead-key-bias`
+
+| Field | Record |
+| --- | --- |
+| Commit | `d2bab78` |
+| Content | `wk.bias` and `wk_wa.bias` removed from every block (8 tensors, 1,024 scalars): a constant key bias shifts each query's score row uniformly and cancels in the softmax, so the parameters were gradient-dead. Census test refuses any softmax key bias by name; theorem test asserts bias-shifted keys leave both CPU attention reference paths unchanged; the lab family loader drops the two keys from historical checkpoints (exact), ordinary KLENT loading stays strict. |
+| Gate | parity in place of a screen (functionally exact change); speed pro forma. Parameter count 1,944,165 → 1,943,141. The fp32 open-interval assertion on composed Q in `test_model.py` was corrected to closed-interval (strict bound retained on the float64 composition): fp32 softmax legitimately reaches ±1.0 past a ~17 logit gap, exposed by the shifted init stream. |
+| Verification | full pytest (376) and `cargo xtask verify` green |
+| Disposition | **Baked** (owner, 2026-08-10). |
+
+### Step 12 — `mixed-windows`
+
+| Field | Record |
+| --- | --- |
+| Commits | `9168639` (knob, both builders), `f92f500` (run-reduced mixed class/decoder sums), `ddcd2e5` (bake: ternary-only scope, `MODEL_REPR_VERSION` 4) |
+| Screen | owner-amended 2×2 factorial × 3 seeds (A baseline / B mixed / C mixed+waOff / D waOff), 400k-sample cells on `mnorm-late-v1`, uniform matrix budgets (fit pair 4M / cell 250k, collect 12M / 1.2M). B s2 ran on `f92f500` at halved budgets (2M/125k, 6M/600k) after WDDM paging — budgets are chunking-only and recipe-recorded, gradients identical. |
+| Primaries (paired vs A) | B top-1 +0.553 ±1.438 pp [2+/1−], critic sign +1.334 ±8.355 pp; top-3 +0.941 ±1.210 pp [3+/0−]. Horizon top-1 (intervals excluding zero, all [3+/0−]): moves 33–48 +0.482 ±0.465 pp, 49–64 +2.019 ±1.939 pp, 65+ +1.294 ±0.772 pp — the late-horizon gains carried the verdict. C top-1 −0.120; D −0.760 [0+/3−]. |
+| Speed | matrix-budget steady window: A 3186.0 samples/s / 3.32 GiB; B 1068.1 / 9.17; C 390.3 / 2.42 (CPU-collate prefetch starvation, not attention cost); D 2388.5 / 2.42. Lean-budget B on `f92f500`: 1045.8 / 4.63 — ~2% under uniform-budget B with the §5.1c pair-density cliff gone. Node bill (`edbf760`): windows 2.22×, incidence 4.31×, decoder 1.69×. |
+| Verification | full pytest (397, 3 skipped) and `cargo xtask verify` green at `ddcd2e5`; the arm-B matrix checkpoints are the reference state-dict shape and load unchanged |
+| Disposition | **ACCEPTED and baked** (owner, 2026-08-11). Binary path deleted across Rust and Python; `mixed_windows: True` recorded in `LEGACY_BAKED_KNOBS`; binary-scope families are cleanly rejected by the registry; `window_attention` stays a live knob for Step 3. |
+
+### §5.1c cell-mediated attention — measured negative (Step 12 in-step work)
+
+| Field | Record |
+| --- | --- |
+| Commits | `b482346..2b5aec4` (claims-CSR derivation, three fused kernels, tunings), reverted at `ab3c3ae` |
+| Content | §5.1c without the materialized pair edge list: crossing pairs enumerated through claimed cells at attention time. VRAM dramatically better — B lean 3.43 vs 4.63 GiB, A 3.17 vs 3.32, and the pair-density scaling cliff gone entirely. |
+| Speed | 2.4–2.5× slower on both scopes (B lean 415.8 vs 1045.8 samples/s; A uniform 1355.4 vs 3186.0): the kernels sit at the random-gather bandwidth floor, so the cost belongs to the pair function, not the kernels. A line-blocked variant (claimant tiles serving 16 lanes) lost a further 1.8× to 41% lane occupancy, the fp32-parity ban on tf32/bf16 dots, and register pressure. |
+| Disposition | **Reverted** (owner, 2026-08-11): the edge-list §5.1c is restored; lean budgets are the sanctioned VRAM lever (chunking-only, ~2% cost). The result motivates spec Step 15 (`cell-latents`), which changes the function instead of the kernels. |
+
+### Step 4 — `action-rows`
+
+| Field | Record |
+| --- | --- |
+| Commits | `7d62232` (screen flake fix), `adb5e8d` (knob: ternary-native 729 post-placement action classes end to end — both builders emit the per-action window rows, collation adds `act_class`/`act_rev`/`act_empty`, the row encoder folds into `act_proj`/`act_table`/`act_empty_base` plus bias-free `p_act`/`q_act`, Triton fused forward and backward, §33 alias diagnostic as a lab command), `403354b` (spec: §2.2 fit-regression bound owner-amended to 10%), `3fec94b` (collation perf), `22e7844` (bake: `MODEL_REPR_VERSION` 5) |
+| Screen | 5 seeds × arms A (bg nearest-bucket) / B (action rows), 1-epoch lean recipe on `mnorm-late-v1`; plus an owner-ordered 4-epoch diagnostic pair at seed 5 (B then A) after the critic bistability surfaced. |
+| Primaries (paired vs A) | top-1 +0.647 ±2.401 pp [3+/2−]; top-3 +0.841 ±2.200 pp [4+/1−]. Horizon top-1: every bucket's mean positive; moves 1–4 +1.408 ±1.214 pp [5+/0−] is the only interval excluding zero, 5–8 +0.747 ±0.888 pp [4+/1−] — the tactical band is where the hypothetical windows apply. Critic sign overall −0.253 ±2.512 pp: uninterpretable at one epoch (next row). |
+| Critic bistability (finding) | The 1-epoch recipe gives the critic 95 optimizer steps; cells land **arm-independently** in an "optimist" basin (every v̂ positive — the tempo prior; signature \|mean_prediction\|/mean_abs_prediction > 0.97 at moves 1–4) or a discriminating one, on init/order luck. Screen split 5/10 optimist (A s1 s2; B s0 s2 s4); train CE separates the basins only in the third decimal (0.7048 vs 0.7035). Step 12's matrix retroactively shows 6/12 optimist cells, unnoticed at the time. 380 steps (4 epochs) escape decisively. Any future 1-epoch screen must basin-classify cells before reading a critic row. |
+| 4-epoch pair (seed 5) | B wins critic sign at every decidable bucket (+1.5 to +4.3 pp through moves 25–32; moves 1–4 error 2.3% → 0.8%, sign 0.9924 vs 0.9773) and state-value sign everywhere (+0.5 to +5.3 pp — the 1-epoch state dip inverted); tactical top-1 +1.4/+0.9 pp at 1–4/5–8 with overall top-1 tied (0.4577 vs 0.4570). B's near-terminal v̂ magnitudes are conservative (moves 1–4 MAE +0.117). This pair carried the critic verdict. |
+| Aliasing (§33) | 2,000 val positions, 1,199,458 legal actions: aliased actions 910,491 → 910,925 (+0.05%); distinct signatures 346,226 → 334,653; signature groups containing a bg-path action 13,115 → 1,976; largest group 213 → 1,185 — the designed far-ring merge: legal cells with no stone within 5 steps have all-18-EMPTY windows and share one row, where bg buckets gave a 1-D distance gradient. |
+| Speed | lean-budget steady window (3 reps): fit 1045.5 vs 1063.8 samples/s (−1.72%), chunk p95 +1.4%, VRAM 4.636 vs 4.629 GiB (+0.15%); collect 162.4 vs 185.2 samples/s (−12.29%) — **owner-accepted** (2026-08-11), all remaining cost in collation (busy 15.0 → 25.8 s; an O(E) counting sort for the `act_rev` argsort was identified, not pursued). Production budgets (fit pair 8M / cell 400k) are off-card at this scope since Step 12's window growth, independent of Step 4: arm A demands 15.59 GiB against the 12 GiB card and pages to 17.5/14.1 samples/s across reps; arm B's pinned prefetch buffers additionally exceed the WSL pinned-host cap and refuse before the first step. Lean budgets remain the sanctioned lever (Step 12 disposition). A paired point at the largest on-card budgets (4M/250k) was attempted twice and is **not measurable with the pinned instrument**: the harness's 17.5k-sample draw packs into ~5 chunks at those budgets, below the 20+50 steady window, so the report degrades to compile-dominated whole-run time (A 26.3–26.5, B 20.0 samples/s at 9.17 GiB torch peak — reproduced identically on a clean card; these are not throughputs). |
+| Verification | full pytest **398 passed, 3 skipped** and `cargo xtask verify` all gates green at `22e7844`; parameter pin 4,007,269 (`test_action_rows.py`; +140,672 over Step 12's 3,866,597 — the 729×h table plus projections, minus the bg embeddings); the 729-class encoding is checked against an engine-grounded successor-board oracle, including opponent digits. Knob-era arm-B checkpoints are the baked state-dict shape and load unchanged; pre-Step-4 dicts refuse loudly via `LEGACY_BAKED_KNOBS`. |
+| Disposition | **ACCEPTED and baked** (owner, 2026-08-11: collect accepted at −12.29% mid-gate; approval on the third seed group). The bg nearest-bucket path (`e_bg`/`e_qbg`) is deleted in both languages; `action_rows: True` joins `LEGACY_BAKED_KNOBS`; `MODEL_REPR_VERSION` 5. `klent.graft` (the repr v1→v2 converter, three generations stale) retired with its tests; its probe helper is inlined into `trigraft`. |
+
+### Window-attention removal — measured negative (Step 3 preview at Step 2 scope)
+
+| Field | Record |
+| --- | --- |
+| Code | No model change: screen arms compose the two live knobs (C `state_latents: 4, window_attention: False`; D `window_attention: False`) at `0875eb0` — §5.1c and the window-latent cycle are independently gated. Parameter cross-check: C 4,538,341 = D 3,741,797 + 796,544 (the latent stack); A − D = 265,472 (per-block wa projections + `wa_bias`). |
+| Screen | Owner-posed hypothesis (2026-08-12): the Step 2 latents' window read/broadcast might subsume §5.1c window attention. Arms C/D × seeds 0–4, 4 epochs, Step 2 lean recipe on `mnorm-late-v1`, same sweep as the completed A/B cells (`runs/lab/step2-epochs4`) → a wattn × latents 2×2 factorial with 5 paired seeds per contrast. C/D cells ran at `0875eb0`; model math is identical to the A/B rev (the ragged rewrite was reverted before launch). |
+| Primaries | D−A (removal alone): top-1 −1.927 ±0.834 pp [0+/5−] and top-3 −1.688 ±1.115 pp [0+/5−] — the factorial's only intervals excluding zero; state MAE +1.224 ±1.369 e−2 [5+/0−]. C−B (removal given latents): critic sign −1.279 ±1.470 pp [1+/4−]; state MAE +0.714 ±1.682 e−2 [4+/1−] — Step 2's calibration gain largely erased; top-1 −1.221 ±3.272 pp on a 4.39 pp seed range. C−D: state MAE −1.905 ±2.113 e−2 [0+/5−] — the latents' own calibration contribution survives without wattn. The two mechanisms are complementary, not redundant. |
+| Horizon | The damage concentrates near-terminal: D−A v̂ sign at moves 1–4 mean −9.31 pp (seed 4 −39.0); D−A state MAE at 1–4 +6.27 e−2; C−B state MAE at 1–4 +5.75 e−2. No optimist-basin cell (4-epoch screen), but all five D cells sit at mean_pred/mean_abs +0.4–0.6 — a uniform optimism tilt absent in A and B. |
+| Stability | wattn also stabilizes policy training: per-arm top-1 seed ranges A 0.67 / B 1.36 / D 1.63 / C 4.39 pp. |
+| Disposition | **wattn stays**; the latents-subsume-wattn hypothesis is rejected. **Step 3 RULED REJECTED on this record (owner, 2026-08-12)** — the factorial is Step 3's screen shape at 5 paired seeds and the removal is measured negative, so the trial does not run separately. Per the reject clause §5.1c returns to baked-in, with one deliberate exception: the `window_attention` knob stays live until Step 15's matrix completes (its arms B/C/D run §5.1c off), and the knob deletion executes at Step 15's bake whichever way that verdict goes. |
+
 ## Provenance
 
 | Source | Use in this record |

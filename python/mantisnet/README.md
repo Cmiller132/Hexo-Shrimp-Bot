@@ -8,26 +8,47 @@ supervised laboratory harness, and the Shrimp Control Deck telemetry dashboard. 
 
 ## The model: MantisNet
 
-MantisNet is a graph network whose nodes are stones, live win windows, and one
-global token. It has no cell grid, no coordinate inputs, and no empty-cell
-nodes.
+MantisNet is a graph network whose incumbent nodes are stones, nonempty win
+windows, and four invariant state latents. The transient `cell_nodes` Step 13
+knob extends the Step 15 persistent-cell path to every legal cell. It consumes
+only mover-relative cell fields and D6-canonical relative geometry; absolute
+cell coordinates never enter the model.
 
-A **window** is six consecutive cells along one hex axis. A window is **live**
-when it contains at least one stone and stones of only one colour; mixed
-windows are excluded. The input representation is D6-invariant by
-construction: every input -- stone colour (own/opponent relative to the side to
-move), window occupancy pattern, joint slot classes, hex-distance buckets, and
+A **window** is six consecutive cells along one hex axis. Every nonempty
+candidate window is represented under ternary slot patterns
+(empty/own/opponent, 377 canonical classes), with 726 decoder classes and
+1458 incidence classes. The input representation is D6-invariant by
+construction: every input -- stone colour (own/opponent relative to the
+side to move), window pattern, joint slot classes, hex-distance buckets, and
 `moves_remaining` -- is invariant under the twelve board symmetries.
 
 The **trunk** interleaves bipartite message passing (stones to/from windows)
 with self-attention over the stone set biased by hex distance. A cell-pass
-relay lets windows exchange state through shared empty cells, and an optional
-window-attention layer types window pairs by colinear/crossing relations.
+relay lets windows exchange state through shared empty cells, and a
+window-attention layer (the live `window_attention` knob, on by default)
+types window pairs by colinear/crossing relations. In every block the four
+latents read the real windows, self-mix, and broadcast back to those windows;
+their final normalized mean is the global context consumed by the heads.
+
+With `cell_nodes=True`, uncovered legal cells initialize from occupancy,
+legality, and nearest-stone-distance embeddings, while covered cells retain
+the Step 15 learned-base initialization. In every block cells also attend to
+all stones within radius 8 through exact orbit-48, source-owner, and on-axis
+classes. `cell_node_scope="all"` is the default and sends those radius edges
+to every legal cell; `"uncovered"` sends them only to cells with no decoder
+incidence. The scope filters edges only: every legal cell retains its latent
+and occupancy, legality, and nearest-distance features. `cell_adjacency=True`
+is a separate sub-knob adding directed distance-one cell messages with
+axis-shared weights, and its destination cells follow the same scope. Both
+`cell_adjacency=True` and the non-default scope are refused when they would be
+inert without `cell_nodes`.
 
 Three heads read the trunk output:
 
-- **Policy decoder**: one raw logit per legal cell, routed through live windows
-  or a background nearest-stone path.
+- **Policy decoder**: one raw logit per legal cell. Each action's 18
+  post-placement windows are gathered, typed by 729 joint `(post, slot)`
+  classes, ReLU'd through a shared first layer, summed per cell in fp32, and
+  read through a policy-specific extension matrix.
 - **Action-value decoder**: three categorical logits per legal cell (positive,
   negative, zero return), composed into Q in (-1, 1) and committed mass M.
   Acting ranks by the mass-normalized score Q-tilde.
@@ -57,13 +78,15 @@ heads produce outputs in engine legal-move order.
 Positions batch by concatenation with per-position index offsets. Message
 passing never crosses positions; attention is masked block-diagonal. The
 builder emits stone tables, window tables with identities, incidence lists with
-joint slot classes, legal-cell decoder tables, and `moves_remaining`. All index
-tensors are precomputed; the forward contains no data-dependent index
-discovery.
+joint slot classes, legal-cell decoder tables, action-row classes and reverse
+views, cell invariant fields, radius edges, adjacency edges, and
+`moves_remaining`. All index tensors are mandatory. Device-side CSR views are
+derived once per forward through opaque operations so compiled execution has
+no graph break.
 
 ### Versioning
 
-`MODEL_REPR_VERSION` (model-owned, currently 3) covers the builder and every
+`MODEL_REPR_VERSION` (model-owned, currently 7) covers the builder and every
 feature encoding. `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing. Either bump invalidates checkpoints.
 
@@ -207,10 +230,11 @@ against a named baseline arm.
 
 The family registry identifies a checkpoint structurally from its model key
 set, native critic-readout width, and decoder-table row count. Configuration
-is inferred from state-dict tensor shapes. Shipped scoreable families:
-`trinomial-joint`, `bipolar-joint`, `scalar-joint`, `scalar-slot`,
-`bipolar-slot`, and `factored-slot`. Slot-class decoder tables are expanded to
-93 joint classes at load time.
+is inferred from state-dict tensor shapes, including the live
+`window_attention` knob from the presence of §5.1c tensors. The latent base,
+per-block latent cycle, and row encoder are required. Shipped scoreable families
+are `trinomial-joint`,
+`bipolar-joint`, and `scalar-joint`; older representation families are rejected.
 
 ### Measurement commands
 
@@ -230,6 +254,7 @@ is inferred from state-dict tensor shapes. Shipped scoreable families:
 | `profile fit` | Profile optimizer steps and bucket kernel self-time |
 | `mass` | Measure committed mass, Q/M behavior, and acting-floor sensitivity |
 | `check` | Run D6, batch-parity, decoder-coverage, and builder contracts |
+| `alias` | Report structural alias groups before/after the Step 4 row inputs |
 | `smoke` | Tiny end-to-end freeze, CPU cell, evaluation, and report |
 
 ## Control deck
@@ -296,7 +321,7 @@ The top-level `mantisnet` package exports:
 | `collate_positions`, `collate_prefixes` | Shared Rust encoder path |
 | `policy_loss`, `value_loss`, `value_target` | Training losses and targets |
 | `param_groups` | Decay/no-decay optimizer groups |
-| `MODEL_REPR_VERSION`, `NUM_PATTERNS`, `DEC_CLASSES` | Representation constants |
+| `MODEL_REPR_VERSION`, `TERN_PATTERNS`, `TERN_DEC_CLASSES`, `TERN_OCC_CLASSES` | Representation constants |
 
 ## Run / test
 
@@ -361,6 +386,8 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `__init__.py` | Public exports: model, builder, losses, representation constants |
 | `model.py` | `MantisConfig`, `MantisNet` trunk, policy/action-value/state-value heads, `ModelOutput` |
 | `builder.py` | Position-to-graph representation, Rust batch conversion, collation, version constants |
+| `cell_latents.py` | Step 15 typed legal-cell/window attention and whole-line table derivation |
+| `cell_nodes.py` | Step 13 radius/adjacency edge plans on the typed cell-attention kernels |
 | `attention.py` | Fused coordinate-biased multi-head attention with Triton kernel and reference path |
 | `decoder.py` | Shared legal-cell incidence aggregation for policy and action-value heads |
 | `message_passing.py` | Fused incidence aggregation for the two trunk message-passing directions |
@@ -405,7 +432,7 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `evaluate.py` | Packed imitation and outcome-horizon evaluation for lab and KLENT checkpoints |
 | `report.py` | Cross-seed score aggregation with optional paired-difference baselines |
 | `variants.py` | Variant registry: MantisNet presets with typed config overrides |
-| `families.py` | Structural checkpoint-family registry, config inference, slot-table expansion |
+| `families.py` | Structural checkpoint-family registry and config inference |
 | `bench.py` | Benchmarks for building, collection, and fitting |
 | `check.py` | D6 invariance, batch parity, decoder coverage, and builder contract checks |
 | `cohort.py` | Production-shaped position cohorts from real collection or corpus replay |

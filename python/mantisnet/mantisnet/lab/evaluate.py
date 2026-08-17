@@ -22,8 +22,9 @@ from .train import (
     current_versions,
     pack_inference_indices,
     sample_sizes,
+    scoped_attention_lengths,
 )
-from .variants import build_variant, count_parameters, variant_spec
+from .variants import build_variant, count_parameters, scoped_collate
 
 
 # (label, inclusive lower bound, inclusive upper bound or None).
@@ -108,8 +109,8 @@ def _horizon_block(
 
 
 def _evaluation_heads(model, batch, include_state_value: bool):
-    _stones, windows, token = model.trunk(batch)
-    policy, critic = model.cell_head_logits(windows, token, batch)
+    _stones, windows, token, cells = model.trunk(batch)
+    policy, critic = model.cell_head_logits(windows, token, cells, batch)
     value = model.value_head(windows, token, batch)[0] if include_state_value else None
     return policy, critic, value
 
@@ -143,13 +144,14 @@ def evaluate_model(
     if not len(samples):
         raise ValueError(f"corpus split {split!r} is empty")
     lengths, cells = sample_sizes(frozen, samples)
+    lengths = scoped_attention_lengths(lengths)
     chunks = pack_inference_indices(
         lengths,
         cells,
         pair_budget=pair_budget,
         cell_budget=cell_budget,
     )
-    collate = variant_spec(variant).collate
+    collate = scoped_collate(variant)
     device_type = torch.device(device).type
     expected_autocast = device_type == "cuda"
     if autocast is not None and autocast is not expected_autocast:
@@ -298,6 +300,8 @@ def evaluate_cell(
     tau: float = 0.1,
     lam: float = 0.01,
     mass_floor: float = 0.2,
+    pair_budget: int = KlentConfig.collect_pair_budget,
+    cell_budget: int = KlentConfig.collect_cell_budget,
 ) -> dict[str, object]:
     """Load a lab cell, score it, and replace its matching scores file."""
 
@@ -357,6 +361,8 @@ def evaluate_cell(
         tau=tau,
         lam=lam,
         mass_floor=mass_floor,
+        pair_budget=pair_budget,
+        cell_budget=cell_budget,
     )
     scores = {
         "scores_format": 1,

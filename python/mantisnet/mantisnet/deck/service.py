@@ -350,8 +350,7 @@ def _config_from_checkpoint(raw: dict) -> MantisConfig:
     if critic_width != CRITIC_LOGITS:
         raise ValueError(
             f"unsupported critic readout width {critic_width}; this build loads "
-            f"the {CRITIC_LOGITS}-row categorical critic, and a narrower "
-            "readout must be converted by mantisnet.klent.graft"
+            f"only the {CRITIC_LOGITS}-row categorical critic"
         )
     if "model_config" in raw:
         return MantisConfig(**strip_legacy_knobs(raw["model_config"]))

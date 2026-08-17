@@ -55,8 +55,8 @@ def test_fit_packing_respects_budgets_and_loses_nothing():
     assert sorted(i for c in chunks for i in c) == list(range(len(samples)))
     for chunk in chunks:
         assert len(chunk) <= cfg.batch_size
-        t_pad = max(samples[i].t for i in chunk) + 1
-        assert t_pad == samples[chunk[0]].t + 1  # descending: first is widest
+        t_pad = max(samples[i].t for i in chunk) + 4
+        assert t_pad == samples[chunk[0]].t + 4  # descending: first is widest
         if len(chunk) > 1:  # a lone oversized sample is kept, never dropped
             assert len(chunk) * t_pad * t_pad <= cfg.pair_budget
             assert sum(len(samples[i].improved) for i in chunk) <= cfg.cell_budget

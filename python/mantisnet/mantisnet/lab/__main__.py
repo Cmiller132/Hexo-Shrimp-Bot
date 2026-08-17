@@ -14,6 +14,21 @@ def _device(parser: argparse.ArgumentParser) -> None:
     )
 
 
+_ADAM_IMPLEMENTATIONS = ("auto", "fused", "foreach", "scalar")
+
+
+def _adam_impl(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--adam-impl",
+        choices=_ADAM_IMPLEMENTATIONS,
+        default="auto",
+        help=(
+            "Adam execution policy; auto is fused on CUDA and scalar on CPU. "
+            "Fused/foreach may differ only in last-bit reduction order"
+        ),
+    )
+
+
 def _model_kw(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model-kw",
@@ -78,10 +93,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--lr-schedule", choices=("constant", "cosine"), default="constant"
     )
     train.add_argument("--ema-decay", type=float, default=0.0)
+    _adam_impl(train)
     train.add_argument(
         "--cell-budget",
         type=int,
         help="cap accumulation micro-chunks (memory knob; optimizer batch unchanged)",
+    )
+    train.add_argument(
+        "--train-subset",
+        type=int,
+        help="fit one deterministic N-sample train subset (identical across arms and seeds)",
+    )
+    train.add_argument(
+        "--train-subset-seed",
+        type=int,
+        help="selection seed of the train subset (default 0; recorded in the recipe)",
     )
     train.add_argument("--param-budget", type=int)
     train.add_argument("--param-tol", type=float, default=0.02)
@@ -144,6 +170,15 @@ def build_parser() -> argparse.ArgumentParser:
     fit.add_argument("--seed", type=int, default=7)
     fit.add_argument("--pair-budget", type=int)
     fit.add_argument("--cell-budget", type=int)
+    fit.add_argument(
+        "--steady-warmup", type=int,
+        help="untimed leading chunks of the MANTIS_GRAFT_SPEC §2.2 window",
+    )
+    fit.add_argument(
+        "--steady-measure", type=int,
+        help="timed chunks of the §2.2 window; the epoch stops when it closes",
+    )
+    _adam_impl(fit)
     _model_kw(fit)
     _device(fit)
 
@@ -179,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     fit_profile.add_argument("--seed", type=int, default=7)
     fit_profile.add_argument("--pair-budget", type=int)
     fit_profile.add_argument("--cell-budget", type=int)
+    _adam_impl(fit_profile)
     _model_kw(fit_profile)
     _device(fit_profile)
 
@@ -199,6 +235,15 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--steps", type=int, default=12)
     check.add_argument("--seed", type=int, default=0)
     _device(check)
+
+    alias = commands.add_parser(
+        "alias", help="structural alias diagnostic over corpus positions"
+    )
+    alias.add_argument("--corpus", required=True, help="frozen corpus path or name")
+    alias.add_argument("--split", choices=("train", "val", "test"), default="val")
+    alias.add_argument("--sample", type=int, default=2_000)
+    alias.add_argument("--seed", type=int, default=0)
+    alias.add_argument("--examples", type=int, default=8)
 
     smoke = commands.add_parser("smoke", help="tiny CPU freeze/train/evaluate/report")
     smoke.add_argument(
@@ -272,9 +317,12 @@ def main(argv=None) -> None:
                 epochs=args.epochs,
                 lr_schedule=args.lr_schedule,
                 ema_decay=args.ema_decay,
+                adam_impl=args.adam_impl,
                 device=args.device,
                 compile=args.compile,
                 cell_budget=args.cell_budget,
+                train_subset=args.train_subset,
+                train_subset_seed=args.train_subset_seed,
                 param_budget=args.param_budget,
                 param_tol=args.param_tol,
             )
@@ -377,6 +425,20 @@ def main(argv=None) -> None:
         if values.get("corpus"):
             values["corpus"] = _named_path(values["corpus"], Path("runs/corpora"))
         run_check(**values)
+        return
+
+    if args.command == "alias":
+        from .alias import corpus_alias_report
+
+        _json(
+            corpus_alias_report(
+                _named_path(args.corpus, Path("runs/corpora")),
+                split=args.split,
+                sample=args.sample,
+                seed=args.seed,
+                example_cap=args.examples,
+            )
+        )
         return
 
     if args.command == "smoke":

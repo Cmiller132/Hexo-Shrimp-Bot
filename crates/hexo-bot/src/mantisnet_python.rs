@@ -275,17 +275,25 @@ fn build_batch<'py>(
         py,
         torch,
         &kwargs,
-        "bg_cell",
-        &batch.bg_cell,
-        &[batch.bg_cell.len()],
+        "act_class",
+        &batch.act_class,
+        &[batch.act_class.len()],
     )?;
     set_tensor(
         py,
         torch,
         &kwargs,
-        "bg_bucket",
-        &batch.bg_bucket,
-        &[batch.bg_bucket.len()],
+        "act_rev",
+        &batch.act_rev,
+        &[batch.act_rev.len()],
+    )?;
+    set_tensor(
+        py,
+        torch,
+        &kwargs,
+        "act_empty",
+        &batch.act_empty,
+        &[batch.cell_pos.len(), 3],
     )?;
 
     batch_type.call((), Some(&kwargs))

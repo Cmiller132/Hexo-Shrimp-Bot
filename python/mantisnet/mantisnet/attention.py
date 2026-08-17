@@ -74,6 +74,7 @@ if triton is not None:
         n_heads,
         n_ctx,
         sm_scale,
+        global_rows,
         D_MAX: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -184,7 +185,8 @@ if triton is not None:
                     bucket,
                 )
                 bucket = tl.where(
-                    (offs_m[:, None] == 0) | (offs_n[None, :] == 0),
+                    (offs_m[:, None] < global_rows)
+                    | (offs_n[None, :] < global_rows),
                     D_MAX + 1,
                     bucket,
                 )
@@ -325,6 +327,7 @@ if triton is not None:
         n_heads,
         n_ctx,
         sm_scale,
+        global_rows,
         D_MAX: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -458,7 +461,8 @@ if triton is not None:
                     bucket,
                 )
                 bucket = tl.where(
-                    (offs_m[:, None] == 0) | (offs_n[None, :] == 0),
+                    (offs_m[:, None] < global_rows)
+                    | (offs_n[None, :] < global_rows),
                     D_MAX + 1,
                     bucket,
                 )
@@ -548,6 +552,7 @@ if triton is not None:
         n_heads,
         n_ctx,
         sm_scale,
+        global_rows,
         D_MAX: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
@@ -685,7 +690,8 @@ if triton is not None:
                     bucket,
                 )
                 bucket = tl.where(
-                    (offs_m[:, None] == 0) | (offs_n[None, :] == 0),
+                    (offs_m[:, None] < global_rows)
+                    | (offs_n[None, :] < global_rows),
                     D_MAX + 1,
                     bucket,
                 )
@@ -739,6 +745,7 @@ def _bucket_index(
     seq_lens: Tensor,
     t: int,
     d_max: int,
+    global_rows: int = 1,
 ):
     """The (P, T, T) bias-bucket index and (P, T) key validity."""
     dq = coords[:, :, None, 0] - coords[:, None, :, 0]
@@ -750,7 +757,7 @@ def _bucket_index(
 
     rows = torch.arange(t, device=coords.device)
     bucket = torch.where(rows[:, None] == rows[None, :], d_max, bucket)
-    token = (rows[:, None] == 0) | (rows[None, :] == 0)
+    token = (rows[:, None] < global_rows) | (rows[None, :] < global_rows)
     bucket = torch.where(token, d_max + 1, bucket)
     valid = rows[None, :] < seq_lens[:, None]
     bucket = torch.where(valid[:, None, :], bucket, d_max + 2)
@@ -776,6 +783,7 @@ def _attention_reference_table(
     seq_lens: Tensor,
     table: Tensor,
     d_max: int,
+    global_rows: int,
 ) -> Tensor:
     """The dense formulation used by CPU, failed launches, and recompute."""
     _, _, t, _ = q.shape
@@ -783,7 +791,7 @@ def _attention_reference_table(
         raise ValueError(
             f"bias table width {table.shape[1]} != 2*d_max+3 = {2 * d_max + 3}"
         )
-    bucket, valid = _bucket_index(coords, seq_lens, t, d_max)
+    bucket, valid = _bucket_index(coords, seq_lens, t, d_max, global_rows)
     mask = table[:, bucket.long()].permute(1, 0, 2, 3)
     return _apply_reference(q, k, v, mask, valid)
 
@@ -796,6 +804,7 @@ def _attention_reference(
     seq_lens: Tensor,
     dist_bias: Tensor,
     axis_bias: Tensor,
+    global_rows: int = 1,
 ) -> Tensor:
     """Reference attention with the checkpoint-compatible bias parameter."""
     d_max = dist_bias.shape[1] - 2
@@ -807,6 +816,7 @@ def _attention_reference(
         seq_lens,
         _bias_table(q, dist_bias, axis_bias),
         d_max,
+        global_rows,
     )
 
 
@@ -818,6 +828,7 @@ def _shape_key(
     seq_lens: Tensor,
     table: Tensor,
     d_max: int,
+    global_rows: int,
 ) -> tuple[object, ...]:
     return (
         q.device.type,
@@ -832,6 +843,7 @@ def _shape_key(
         tuple(table.shape),
         tuple(table.stride()),
         d_max,
+        global_rows,
     )
 
 
@@ -843,6 +855,7 @@ def _validate_inputs(
     seq_lens: Tensor,
     table: Tensor,
     d_max: int,
+    global_rows: int,
 ) -> None:
     if q.ndim != 4 or q.shape != k.shape or q.shape != v.shape:
         raise ValueError("q, k, and v must have the same (P, A, T, D) shape")
@@ -853,6 +866,10 @@ def _validate_inputs(
         raise ValueError("seq_lens must be int32 with shape (P,)")
     if d_max < 1:
         raise ValueError("d_max must be at least 1")
+    if global_rows < 1 or global_rows > t:
+        raise ValueError(
+            f"global_rows must be in [1, {t}], got {global_rows}"
+        )
     table_widths = (d_max + 3, 2 * d_max + 3, 3 * d_max + 3)
     if (
         table.ndim != 2
@@ -878,6 +895,7 @@ def _launch_triton(
     seq_lens: Tensor,
     table: Tensor,
     d_max: int,
+    global_rows: int,
 ) -> tuple[Tensor, Tensor]:
     p, heads, t, head_dim = q.shape
     out = torch.empty_like(q)
@@ -903,6 +921,7 @@ def _launch_triton(
         heads,
         t,
         1.0 / math.sqrt(head_dim),
+        global_rows,
         D_MAX=d_max,
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
@@ -924,6 +943,7 @@ def _launch_triton_backward(
     lse: Tensor,
     grad_out: Tensor,
     d_max: int,
+    global_rows: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     p, heads, t, head_dim = q.shape
     delta = torch.empty((p, heads, t), dtype=torch.float32, device=q.device)
@@ -976,6 +996,7 @@ def _launch_triton_backward(
         heads,
         t,
         1.0 / math.sqrt(head_dim),
+        global_rows,
         D_MAX=d_max,
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
@@ -1011,6 +1032,7 @@ def _launch_triton_backward(
         heads,
         t,
         1.0 / math.sqrt(head_dim),
+        global_rows,
         D_MAX=d_max,
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
@@ -1030,8 +1052,9 @@ def _fused_attention_op(
     seq_lens: Tensor,
     table: Tensor,
     d_max: int,
+    global_rows: int,
 ) -> tuple[Tensor, Tensor]:
-    _validate_inputs(q, k, v, coords, seq_lens, table, d_max)
+    _validate_inputs(q, k, v, coords, seq_lens, table, d_max, global_rows)
     supported = (
         triton is not None
         and q.is_cuda
@@ -1040,18 +1063,20 @@ def _fused_attention_op(
     )
     if not supported:
         out = _attention_reference_table(
-            q, k, v, coords, seq_lens, table, d_max
+            q, k, v, coords, seq_lens, table, d_max, global_rows
         )
         return out, torch.empty(0, dtype=torch.float32, device=q.device)
 
-    key = _shape_key(q, k, v, coords, seq_lens, table, d_max)
+    key = _shape_key(q, k, v, coords, seq_lens, table, d_max, global_rows)
     if key in _FAILED_SHAPES:
         out = _attention_reference_table(
-            q, k, v, coords, seq_lens, table, d_max
+            q, k, v, coords, seq_lens, table, d_max, global_rows
         )
         return out, torch.empty(0, dtype=torch.float32, device=q.device)
     try:
-        return _launch_triton(q, k, v, coords, seq_lens, table, d_max)
+        return _launch_triton(
+            q, k, v, coords, seq_lens, table, d_max, global_rows
+        )
     except Exception as exc:
         _FAILED_SHAPES[key] = f"{type(exc).__name__}: {exc}"
         warnings.warn(
@@ -1062,7 +1087,7 @@ def _fused_attention_op(
             stacklevel=2,
         )
         out = _attention_reference_table(
-            q, k, v, coords, seq_lens, table, d_max
+            q, k, v, coords, seq_lens, table, d_max, global_rows
         )
         return out, torch.empty(0, dtype=torch.float32, device=q.device)
 
@@ -1076,6 +1101,7 @@ def _(
     seq_lens: Tensor,
     table: Tensor,
     d_max: int,
+    global_rows: int,
 ) -> tuple[Tensor, Tensor]:
     supported = (
         triton is not None
@@ -1091,10 +1117,11 @@ def _(
 
 
 def _setup_context(ctx, inputs, output) -> None:
-    q, k, v, coords, seq_lens, table, d_max = inputs
+    q, k, v, coords, seq_lens, table, d_max, global_rows = inputs
     out, lse = output
     ctx.save_for_backward(q, k, v, coords, seq_lens, table, out, lse)
     ctx.d_max = d_max
+    ctx.global_rows = global_rows
     ctx.mark_non_differentiable(lse)
 
 
@@ -1102,7 +1129,8 @@ def _backward(ctx, grad_out: Tensor):
     q, k, v, coords, seq_lens, table = ctx.saved_tensors
     t = q.shape[2]
     d_max = ctx.d_max
-    bucket, valid = _bucket_index(coords, seq_lens, t, d_max)
+    global_rows = ctx.global_rows
+    bucket, valid = _bucket_index(coords, seq_lens, t, d_max, global_rows)
     with torch.enable_grad():
         q_ = q.detach().requires_grad_(True)
         k_ = k.detach().requires_grad_(True)
@@ -1126,22 +1154,30 @@ def _backward(ctx, grad_out: Tensor):
         ],
         dim=1,
     ).to(table.dtype)
-    return dq, dk, dv, None, None, dtable, None
+    return dq, dk, dv, None, None, dtable, None, None
 
 
 class _DenseBackwardContext:
-    def __init__(self, saved_tensors: tuple[Tensor, ...], d_max: int) -> None:
+    def __init__(
+        self, saved_tensors: tuple[Tensor, ...], d_max: int, global_rows: int
+    ) -> None:
         self.saved_tensors = saved_tensors
         self.d_max = d_max
+        self.global_rows = global_rows
 
 
 def _dense_backward_below_autograd(
-    saved_tensors: tuple[Tensor, ...], d_max: int, grad_out: Tensor
+    saved_tensors: tuple[Tensor, ...],
+    d_max: int,
+    global_rows: int,
+    grad_out: Tensor,
 ):
     with torch._C._ForceDispatchKeyGuard(
         _DENSE_BACKWARD_INCLUDE_KEYS, _DENSE_BACKWARD_EXCLUDE_KEYS
     ):
-        return _backward(_DenseBackwardContext(saved_tensors, d_max), grad_out)
+        return _backward(
+            _DenseBackwardContext(saved_tensors, d_max, global_rows), grad_out
+        )
 
 
 def _backward_shape_key(
@@ -1153,8 +1189,11 @@ def _backward_shape_key(
     table: Tensor,
     grad_out: Tensor,
     d_max: int,
+    global_rows: int,
 ) -> tuple[object, ...]:
-    return _shape_key(q, k, v, coords, seq_lens, table, d_max) + (
+    return _shape_key(
+        q, k, v, coords, seq_lens, table, d_max, global_rows
+    ) + (
         grad_out.dtype,
         tuple(grad_out.stride()),
     )
@@ -1172,30 +1211,41 @@ def _fused_attention_backward_op(
     lse: Tensor,
     grad_out: Tensor,
     d_max: int,
+    global_rows: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
-    _validate_inputs(q, k, v, coords, seq_lens, table, d_max)
+    _validate_inputs(q, k, v, coords, seq_lens, table, d_max, global_rows)
     saved = (q, k, v, coords, seq_lens, table)
     # The outer autograd formula handles this branch in eager mode. Keep the
     # sentinel check inside the opaque op as well: a compiled graph may have
     # been traced for Triton before a runtime forward launch marks the shape
     # failed and returns the dense sentinel.
     if lse.numel() == 0:
-        dq, dk, dv, _, _, dtable, _ = _dense_backward_below_autograd(
-            saved, d_max, grad_out
+        dq, dk, dv, _, _, dtable, _, _ = _dense_backward_below_autograd(
+            saved, d_max, global_rows, grad_out
         )
         return dq, dk, dv, dtable
 
     key = _backward_shape_key(
-        q, k, v, coords, seq_lens, table, grad_out, d_max
+        q, k, v, coords, seq_lens, table, grad_out, d_max, global_rows
     )
     if key in _FAILED_BACKWARD_SHAPES:
-        dq, dk, dv, _, _, dtable, _ = _dense_backward_below_autograd(
-            saved, d_max, grad_out
+        dq, dk, dv, _, _, dtable, _, _ = _dense_backward_below_autograd(
+            saved, d_max, global_rows, grad_out
         )
         return dq, dk, dv, dtable
     try:
         return _launch_triton_backward(
-            q, k, v, coords, seq_lens, table, out, lse, grad_out, d_max
+            q,
+            k,
+            v,
+            coords,
+            seq_lens,
+            table,
+            out,
+            lse,
+            grad_out,
+            d_max,
+            global_rows,
         )
     except Exception as exc:
         _FAILED_BACKWARD_SHAPES[key] = f"{type(exc).__name__}: {exc}"
@@ -1206,8 +1256,8 @@ def _fused_attention_backward_op(
             RuntimeWarning,
             stacklevel=2,
         )
-        dq, dk, dv, _, _, dtable, _ = _dense_backward_below_autograd(
-            saved, d_max, grad_out
+        dq, dk, dv, _, _, dtable, _, _ = _dense_backward_below_autograd(
+            saved, d_max, global_rows, grad_out
         )
         return dq, dk, dv, dtable
 
@@ -1224,6 +1274,7 @@ def _(
     lse: Tensor,
     grad_out: Tensor,
     d_max: int,
+    global_rows: int,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     return (
         torch.empty_like(q),
@@ -1236,17 +1287,18 @@ def _(
 def _dispatch_backward(ctx, grad_out: Tensor, _grad_lse: Tensor | None):
     q, k, v, coords, seq_lens, table, out, lse = ctx.saved_tensors
     d_max = ctx.d_max
+    global_rows = ctx.global_rows
     if lse.numel() == 0:
         return _backward(
             _DenseBackwardContext(
-                (q, k, v, coords, seq_lens, table), d_max
+                (q, k, v, coords, seq_lens, table), d_max, global_rows
             ),
             grad_out,
         )
     dq, dk, dv, dtable = _fused_attention_backward_op(
-        q, k, v, coords, seq_lens, table, out, lse, grad_out, d_max
+        q, k, v, coords, seq_lens, table, out, lse, grad_out, d_max, global_rows
     )
-    return dq, dk, dv, None, None, dtable, None
+    return dq, dk, dv, None, None, dtable, None, None
 
 
 _fused_attention_op.register_autograd(
@@ -1262,6 +1314,7 @@ def fused_attention(
     seq_lens: Tensor,
     dist_bias: Tensor,
     axis_bias: Tensor,
+    global_rows: int = 1,
 ) -> Tensor:
     """Apply fused attention while retaining the checkpoint bias layout."""
     d_max = dist_bias.shape[1] - 2
@@ -1273,5 +1326,6 @@ def fused_attention(
         seq_lens,
         _bias_table(q, dist_bias, axis_bias),
         d_max,
+        global_rows,
     )
     return out

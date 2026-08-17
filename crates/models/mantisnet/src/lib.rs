@@ -18,7 +18,7 @@ pub use package::{MantisPackage, WEIGHTS_FILE};
 ///
 /// Bumped whenever the bytes or index tables produced by [`encoder`] change
 /// meaning. Checkpoints are not compatible across versions.
-pub const MODEL_REPR_VERSION: u32 = 3;
+pub const MODEL_REPR_VERSION: u32 = 7;
 
 /// Version of MantisNet package semantics outside the representation.
 ///

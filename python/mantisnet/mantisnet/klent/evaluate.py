@@ -19,8 +19,8 @@ def argmax_choose(model, device: str = "cpu"):
     def choose(positions, _rng):
         batch = collate_positions(positions).to(device)
         with torch.no_grad():
-            _s, w, g = model.trunk(batch)
-            logits = model.policy_head(w, g, batch).cpu()
+            _s, w, g, cells = model.trunk(batch)
+            logits = model.policy_head(w, g, cells, batch).cpu()
         offsets = batch.legal_offsets.tolist()
         return [
             pos.nth_legal(int(logits[offsets[k] : offsets[k + 1]].argmax()))

@@ -192,6 +192,7 @@ fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'
     let (p, max_t, max_w) = (raw.n_pos, raw.max_t, raw.max_w);
     let d = PyDict::new(py);
     let n_w = raw.window_feat.len();
+    let n_cells = raw.cell_pos.len();
     d.set_item("stone_own", PyArray1::from_vec(py, raw.stone_own))?;
     d.set_item("window_feat", PyArray1::from_vec(py, raw.window_feat))?;
     d.set_item(
@@ -218,11 +219,44 @@ fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'
     )?;
     d.set_item("legal_offsets", PyArray1::from_vec(py, raw.legal_offsets))?;
     d.set_item("cell_pos", PyArray1::from_vec(py, raw.cell_pos))?;
+    d.set_item(
+        "cell_occupancy",
+        PyArray1::from_vec(py, raw.cell_occupancy),
+    )?;
+    d.set_item(
+        "cell_is_legal",
+        PyArray1::from_vec(py, raw.cell_is_legal),
+    )?;
+    d.set_item("cell_nearest", PyArray1::from_vec(py, raw.cell_nearest))?;
+    d.set_item("radius_src", PyArray1::from_vec(py, raw.radius_src))?;
+    d.set_item("radius_dst", PyArray1::from_vec(py, raw.radius_dst))?;
+    d.set_item("radius_orbit", PyArray1::from_vec(py, raw.radius_orbit))?;
+    d.set_item("radius_own", PyArray1::from_vec(py, raw.radius_own))?;
+    d.set_item(
+        "radius_on_axis",
+        PyArray1::from_vec(py, raw.radius_on_axis),
+    )?;
+    d.set_item(
+        "adjacency_src",
+        PyArray1::from_vec(py, raw.adjacency_src),
+    )?;
+    d.set_item(
+        "adjacency_dst",
+        PyArray1::from_vec(py, raw.adjacency_dst),
+    )?;
+    d.set_item(
+        "adjacency_axis",
+        PyArray1::from_vec(py, raw.adjacency_axis),
+    )?;
     d.set_item("dec_cell", PyArray1::from_vec(py, raw.dec_cell))?;
     d.set_item("dec_window", PyArray1::from_vec(py, raw.dec_window))?;
     d.set_item("dec_class", PyArray1::from_vec(py, raw.dec_class))?;
-    d.set_item("bg_cell", PyArray1::from_vec(py, raw.bg_cell))?;
-    d.set_item("bg_bucket", PyArray1::from_vec(py, raw.bg_bucket))?;
+    d.set_item("act_class", PyArray1::from_vec(py, raw.act_class))?;
+    d.set_item("act_rev", PyArray1::from_vec(py, raw.act_rev))?;
+    d.set_item(
+        "act_empty",
+        PyArray1::from_vec(py, raw.act_empty).reshape([n_cells, 3])?,
+    )?;
     Ok(d)
 }
 
@@ -230,7 +264,8 @@ fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'
 ///
 /// The production twin of `mantisnet.builder`'s Python path, held equal to it
 /// field for field by that package's parity tests. Raises `ValueError` on a
-/// terminal position.
+/// terminal position. Every nonempty window is represented under the ternary
+/// tables.
 #[pyfunction]
 fn build_batch<'py>(
     py: Python<'py>,
