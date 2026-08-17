@@ -65,20 +65,24 @@ runs every gate CI runs; `cargo xtask` lists them.
 
 ### `scripts/`
 
-Utility scripts for the development environment.
+Utility scripts for the development environment, including the exact launch
+and resume recipes of the production training run
+(`launch_cellnodes.sh` / `resume_cellnodes.sh`).
 
 ### `docs/`
 
-The project's document set. [docs/README.md](docs/README.md) is the full
-index. Normative specifications:
+The project's document set. Normative specifications:
 
 | Document | Governs |
 | --- | --- |
+| [MODEL_SPEC.md](docs/MODEL_SPEC.md) | The MantisNet model, described end to end for readers outside the project |
 | [CONTAINER_SPEC.md](docs/CONTAINER_SPEC.md) | Container crates: packaging, deployment, lifecycle |
 | [KLENT_FOR_HEXO.md](docs/KLENT_FOR_HEXO.md) | KLENT training path for Hexo |
+| [MANTIS_GRAFT_SPEC.md](docs/MANTIS_GRAFT_SPEC.md) | The stepwise architecture campaign: gates, screens, and owner-verdict protocol |
 
 Reference documents: [KLENT_PAPER.md](docs/KLENT_PAPER.md) (the source
-algorithm) and [ABLATIONS.md](docs/ABLATIONS.md) (experimental record).
+algorithm) and [ABLATIONS.md](docs/ABLATIONS.md) (the measured experimental
+record, including each campaign step's disposition).
 
 ### `.github/workflows/`
 
