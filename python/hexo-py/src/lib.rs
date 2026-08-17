@@ -257,6 +257,11 @@ fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'
         "act_empty",
         PyArray1::from_vec(py, raw.act_empty).reshape([n_cells, 3])?,
     )?;
+    d.set_item(
+        "act_tactical",
+        PyArray1::from_vec(py, raw.act_tactical)
+            .reshape([n_cells, encoder::TACTICAL_FEATURES])?,
+    )?;
     Ok(d)
 }
 

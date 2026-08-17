@@ -307,12 +307,35 @@ const ACTION_EMPTY: i64 = 2;
 const ACTION_MIXED: i64 = 3;
 const ACTION_EMPTY_ORBITS: usize = 3;
 
+/// Step 5: deterministic tactical scalars per legal action — ACT §19.3 minus
+/// its mixed-created column. Order:
+///
+/// ```text
+/// 0 immediate_win                     1 max own count after / 6
+/// 2 max opponent count before / 6     3 own five-window count after / 18
+/// 4 own four-window count after / 18  5 opponent five-windows hit / 18
+/// 6 opponent four-windows hit / 18    7 opponent five-windows remaining, capped
+/// 8 opponent four-windows remaining, capped
+/// 9 blocks-all-immediate-threats flag
+/// 10 nonempty post-windows / 18
+/// ```
+///
+/// A threat window is opponent-only: it holds no mover stone. Every value is
+/// deterministic, D6-invariant, and in `[0, 1]`.
+pub const TACTICAL_FEATURES: usize = 11;
+/// Global opponent-threat counts saturate at this cap before normalization.
+const GLOBAL_THREAT_CAP: usize = 8;
+
 fn pack(c: engine::HexCoord) -> i64 {
     c.q as i64 * QSHIFT + c.r as i64
 }
 
+fn fraction(count: usize, total: usize) -> f32 {
+    count as f32 / total as f32
+}
+
 /// One position's graph, indices local to the position.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct Graph {
     stone_own: Vec<i64>,
     stone_qr: Vec<[i32; 2]>,
@@ -341,6 +364,7 @@ pub struct Graph {
     action_window_index: Vec<i64>,
     action_post1_class: Vec<i64>,
     action_pre_status: Vec<i64>,
+    action_tactical: Vec<f32>,
 }
 
 #[derive(Default)]
@@ -348,6 +372,7 @@ struct ActionTables {
     window_index: Vec<i64>,
     post1_class: Vec<i64>,
     pre_status: Vec<i64>,
+    tactical: Vec<f32>,
 }
 
 /// Error from decoding a MantisNet wire-format position item.
@@ -413,7 +438,8 @@ impl WireCounts {
         // Per-stone: 8 (own) + 8 (qr). Per-window: 32 (feat + id triple).
         // Per-incidence and decoder edge: 24 each. Cell features use 24 bytes,
         // radius edges 40, and adjacency edges 24. Each legal cell has 18
-        // action rows carrying three i64 values.
+        // action rows carrying three i64 values plus eleven f32 tactical
+        // scalars.
         self.stones
             .checked_mul(16)?
             .checked_add(self.windows.checked_mul(32)?)?
@@ -422,6 +448,7 @@ impl WireCounts {
             .checked_add(self.legal.checked_mul(24)?)?
             .checked_add(self.radius.checked_mul(40)?)?
             .checked_add(self.adjacency.checked_mul(24)?)?
+            .checked_add(self.legal.checked_mul(TACTICAL_FEATURES)?.checked_mul(4)?)?
             .checked_add(
                 self.legal
                     .checked_mul(engine::WINDOWS_PER_PLACEMENT)?
@@ -482,6 +509,10 @@ impl<'a> WireReader<'a> {
             .expect("the reader returned the requested width");
         Ok(i64::from_le_bytes(bytes))
     }
+
+    fn f32(&mut self, field: &'static str) -> Result<f32, WireError> {
+        Ok(f32::from_bits(self.u32(field)?))
+    }
 }
 
 fn count_u32(count: usize, field: &'static str) -> u32 {
@@ -498,6 +529,12 @@ fn append_i32s(out: &mut Vec<u8>, values: impl IntoIterator<Item = i32>) {
 fn append_i64s(out: &mut Vec<u8>, values: &[i64]) {
     for &value in values {
         out.extend_from_slice(&value.to_le_bytes());
+    }
+}
+
+fn append_f32s(out: &mut Vec<u8>, values: &[f32]) {
+    for &value in values {
+        out.extend_from_slice(&value.to_bits().to_le_bytes());
     }
 }
 
@@ -526,7 +563,8 @@ fn append_i64s(out: &mut Vec<u8>, values: &[i64]) {
 /// adjacency_axis[adjacency]:i64,
 /// action_window_index[legal][18]:i64,
 /// action_post1_class[legal][18]:i64,
-/// action_pre_status[legal][18]:i64
+/// action_pre_status[legal][18]:i64,
+/// action_tactical[legal][11]:f32
 /// ```
 ///
 /// Every integer is little-endian. A terminal position is a caller protocol
@@ -584,6 +622,7 @@ pub fn encode_position(position: &engine::Position, out: &mut Vec<u8>) {
     append_i64s(out, &graph.action_window_index);
     append_i64s(out, &graph.action_post1_class);
     append_i64s(out, &graph.action_pre_status);
+    append_f32s(out, &graph.action_tactical);
 }
 
 fn read_count(
@@ -855,6 +894,38 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
         )));
     }
 
+    let tactical_count = counts
+        .legal
+        .checked_mul(TACTICAL_FEATURES)
+        .ok_or_else(|| WireError::new("tactical row count overflows usize"))?;
+    let mut action_tactical = Vec::with_capacity(tactical_count);
+    for index in 0..tactical_count {
+        let value = reader.f32("action_tactical")?;
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(WireError::new(format!(
+                "action_tactical[{index}] must be a finite value in [0, 1], got {value}"
+            )));
+        }
+        action_tactical.push(value);
+    }
+    // The nonempty column is a pure function of the row statuses, which ride
+    // the same wire — recompute and demand bit equality.
+    for action in 0..counts.legal {
+        let base = action * engine::WINDOWS_PER_PLACEMENT;
+        let nonempty = action_pre_status[base..base + engine::WINDOWS_PER_PLACEMENT]
+            .iter()
+            .filter(|&&status| status != ACTION_EMPTY)
+            .count();
+        let expected = fraction(nonempty, engine::WINDOWS_PER_PLACEMENT);
+        let found = action_tactical[action * TACTICAL_FEATURES + TACTICAL_FEATURES - 1];
+        if found.to_bits() != expected.to_bits() {
+            return Err(WireError::new(format!(
+                "action_tactical[{action}] nonempty column {found} disagrees with \
+                 the row statuses' {expected}"
+            )));
+        }
+    }
+
     debug_assert_eq!(reader.cursor, bytes.len());
     Ok(Graph {
         stone_own,
@@ -884,6 +955,7 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
         action_window_index,
         action_post1_class,
         action_pre_status,
+        action_tactical,
     })
 }
 
@@ -1039,6 +1111,8 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
 
     if stones.is_empty() {
         // Ply 0: every action row is an empty insert with no source window.
+        // The tactical row is the empty-board constant: the placed stone is
+        // the only stone in every window, and no threat exists to block.
         let mut actions = ActionTables::default();
         for _ in 0..n_legal {
             for row in 0..engine::WINDOWS_PER_PLACEMENT {
@@ -1049,6 +1123,9 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
                     .push(TERN_POST1_CLASS[POW3[slot] as usize * engine::WINDOW_LEN + slot] as i64);
                 actions.pre_status.push(ACTION_EMPTY);
             }
+            actions.tactical.push(0.0);
+            actions.tactical.push(fraction(1, engine::WINDOW_LEN));
+            actions.tactical.extend_from_slice(&[0.0; 9]);
         }
         return Ok(Graph {
             stone_own,
@@ -1078,6 +1155,7 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
             action_window_index: actions.window_index,
             action_post1_class: actions.post1_class,
             action_pre_status: actions.pre_status,
+            action_tactical: actions.tactical,
         });
     }
 
@@ -1108,12 +1186,23 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
     let mut live_ref = Vec::new();
     // Sorted for binary-search lookup by the decoder.
     let mut live_keys: Vec<i64> = Vec::new();
+    // Step 5 global threat census: opponent-only windows one or two stones
+    // from six. Live windows are deduplicated, so plain counts need no set.
+    let mut opp_five_global = 0usize;
+    let mut opp_four_global = 0usize;
     for &(key, wr, m0, m1) in &candidates {
         let (own, opp) = if mover == engine::Player::P0 {
             (m0, m1)
         } else {
             (m1, m0)
         };
+        if own == 0 {
+            match opp.count_ones() {
+                5 => opp_five_global += 1,
+                4 => opp_four_global += 1,
+                _ => {}
+            }
+        }
         let occ = m0 | m1;
         let mut pattern = 0u16;
         for (k, &place) in POW3.iter().enumerate() {
@@ -1160,7 +1249,22 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
     actions.window_index.reserve(rows);
     actions.post1_class.reserve(rows);
     actions.pre_status.reserve(rows);
+    actions.tactical.reserve(
+        n_legal
+            .checked_mul(TACTICAL_FEATURES)
+            .ok_or_else(|| "tactical row count overflows usize".to_owned())?,
+    );
+    let five_global = fraction(opp_five_global.min(GLOBAL_THREAT_CAP), GLOBAL_THREAT_CAP);
+    let four_global = fraction(opp_four_global.min(GLOBAL_THREAT_CAP), GLOBAL_THREAT_CAP);
     for (j, &cell) in legal.iter().enumerate() {
+        let mut immediate_win = false;
+        let mut max_own_after = 0usize;
+        let mut max_opp_before = 0usize;
+        let mut own_five_after = 0usize;
+        let mut own_four_after = 0usize;
+        let mut opp_five_hit = 0usize;
+        let mut opp_four_hit = 0usize;
+        let mut nonempty_pre = 0usize;
         for (i, wr) in pos.windows_through(cell).into_iter().enumerate() {
             let slot = i % 6;
             let found = if wr.window.start.is_valid() {
@@ -1217,7 +1321,37 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
             actions.window_index.push(found);
             actions.post1_class.push(class);
             actions.pre_status.push(status);
+
+            let own_count = own.count_ones() as usize;
+            let opp_count = opp.count_ones() as usize;
+            immediate_win |= opp == 0 && own_count == engine::WINDOW_LEN - 1;
+            max_own_after = max_own_after.max(own_count + 1);
+            max_opp_before = max_opp_before.max(opp_count);
+            if opp == 0 {
+                own_five_after += usize::from(own_count + 1 == 5);
+                own_four_after += usize::from(own_count + 1 == 4);
+            }
+            if own == 0 && opp != 0 {
+                opp_five_hit += usize::from(opp_count == 5);
+                opp_four_hit += usize::from(opp_count == 4);
+            }
+            nonempty_pre += usize::from(own | opp != 0);
         }
+        actions.tactical.extend_from_slice(&[
+            f32::from(u8::from(immediate_win)),
+            fraction(max_own_after, engine::WINDOW_LEN),
+            fraction(max_opp_before, engine::WINDOW_LEN),
+            fraction(own_five_after, engine::WINDOWS_PER_PLACEMENT),
+            fraction(own_four_after, engine::WINDOWS_PER_PLACEMENT),
+            fraction(opp_five_hit, engine::WINDOWS_PER_PLACEMENT),
+            fraction(opp_four_hit, engine::WINDOWS_PER_PLACEMENT),
+            five_global,
+            four_global,
+            f32::from(u8::from(
+                opp_five_global > 0 && opp_five_hit == opp_five_global,
+            )),
+            fraction(nonempty_pre, engine::WINDOWS_PER_PLACEMENT),
+        ]);
     }
 
     Ok(Graph {
@@ -1248,11 +1382,12 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
         action_window_index: actions.window_index,
         action_post1_class: actions.post1_class,
         action_pre_status: actions.pre_status,
+        action_tactical: actions.tactical,
     })
 }
 
 /// Everything `mantisnet.builder.Batch` holds, as flat vectors plus shapes.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub struct RawBatch {
     /// Number of positions in the batch.
     pub n_pos: usize,
@@ -1325,6 +1460,9 @@ pub struct RawBatch {
     pub act_rev: Vec<i64>,
     /// EMPTY-row counts in `(legal cell, slot orbit)` row-major order.
     pub act_empty: Vec<i64>,
+    /// Step 5 tactical scalars in `(legal cell, TACTICAL_FEATURES)` row-major
+    /// order.
+    pub act_tactical: Vec<f32>,
 }
 
 fn collate_action_fields(graphs: &[Graph], dec_window: &[i64]) -> (Vec<i64>, Vec<i64>, Vec<i64>) {
@@ -1352,6 +1490,11 @@ fn collate_action_fields(graphs: &[Graph], dec_window: &[i64]) -> (Vec<i64>, Vec
             graph.action_pre_status.len(),
             rows,
             "action-row status table has the wrong dense row count"
+        );
+        assert_eq!(
+            graph.action_tactical.len(),
+            graph.n_legal * TACTICAL_FEATURES,
+            "action tactical table has the wrong row count"
         );
 
         let kept_flat: Vec<usize> = graph
@@ -1448,6 +1591,7 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
         act_class: vec![],
         act_rev: vec![],
         act_empty: vec![],
+        act_tactical: vec![],
     };
 
     let (mut stone_off, mut win_off, mut cell_off) = (0i64, 0i64, 0i64);
@@ -1514,6 +1658,10 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
         win_off += nw as i64;
     }
     (out.act_class, out.act_rev, out.act_empty) = collate_action_fields(graphs, &out.dec_window);
+    out.act_tactical = graphs
+        .iter()
+        .flat_map(|g| g.action_tactical.iter().copied())
+        .collect();
     out
 }
 
@@ -1731,6 +1879,186 @@ mod tests {
                 );
             }
         }
+        let mut constant = [0.0f32; TACTICAL_FEATURES];
+        constant[1] = fraction(1, engine::WINDOW_LEN);
+        assert_eq!(graph.action_tactical, constant);
+    }
+
+    // Turn order is 1-then-2: plies 0,3,4,7,8 are P0, plies 1,2,5,6,9,10 P1.
+    // First game: P1 holds an open five and P0 moves — the threat census
+    // fires. Second: one end is already blocked, so exactly one five-window
+    // remains and playing its empty cell raises the blocks-all flag.
+    const THREAT_GAMES: &[&[(i16, i16)]] = &[
+        &[
+            (0, 0),
+            (0, 2),
+            (1, 2),
+            (-3, -3),
+            (-4, -4),
+            (2, 2),
+            (3, 2),
+            (-5, -5),
+            (-6, -6),
+            (4, 2),
+            (0, 5),
+        ],
+        &[
+            (0, 0),
+            (0, 2),
+            (1, 2),
+            (-1, 2),
+            (-3, -3),
+            (2, 2),
+            (3, 2),
+            (-4, -4),
+            (-5, -5),
+            (4, 2),
+            (0, 5),
+        ],
+    ];
+
+    fn oracle_tactical(
+        position: &engine::Position,
+        cell: engine::HexCoord,
+    ) -> [f32; TACTICAL_FEATURES] {
+        let mover = position.current_player();
+        let relative = |wr: &engine::WindowRef| {
+            let m0 = wr.mask.mask(engine::Player::P0);
+            let m1 = wr.mask.mask(engine::Player::P1);
+            if mover == engine::Player::P0 {
+                (m0, m1)
+            } else {
+                (m1, m0)
+            }
+        };
+
+        let mut live: Vec<(i64, u8, u8)> = Vec::new();
+        for (stone, _player) in position.stones() {
+            for wr in position.windows_through(stone) {
+                if !wr.window.start.is_valid() {
+                    continue;
+                }
+                let key = pack(wr.window.start) * 4 + wr.window.axis.index() as i64;
+                let (own, opp) = relative(&wr);
+                live.push((key, own, opp));
+            }
+        }
+        live.sort_unstable_by_key(|&(key, ..)| key);
+        live.dedup_by_key(|&mut (key, ..)| key);
+        let census = |count: u32| {
+            live.iter()
+                .filter(|&&(_, own, opp)| own == 0 && opp.count_ones() == count)
+                .count()
+        };
+        let (five_remaining, four_remaining) = (census(5), census(4));
+
+        let mut successor = position.clone();
+        successor
+            .advance(engine::Action::new(cell))
+            .expect("selected legal action advances");
+        let mut immediate = false;
+        let mut max_own_after = 0usize;
+        let mut max_opp_before = 0usize;
+        let (mut own_five, mut own_four) = (0usize, 0usize);
+        let (mut five_hit, mut four_hit) = (0usize, 0usize);
+        let mut nonempty = 0usize;
+        for (row, wr) in successor.windows_through(cell).into_iter().enumerate() {
+            if !wr.window.start.is_valid() {
+                max_own_after = max_own_after.max(1);
+                continue;
+            }
+            let slot = row % engine::WINDOW_LEN;
+            let (own_post, opp) = relative(&wr);
+            assert_eq!(own_post >> slot & 1, 1, "the played stone is missing");
+            let own_pre = own_post & !(1 << slot);
+            let own_count = own_pre.count_ones() as usize;
+            let opp_count = opp.count_ones() as usize;
+            immediate |= opp == 0 && own_count == engine::WINDOW_LEN - 1;
+            max_own_after = max_own_after.max(own_count + 1);
+            max_opp_before = max_opp_before.max(opp_count);
+            if opp == 0 {
+                own_five += usize::from(own_count + 1 == 5);
+                own_four += usize::from(own_count + 1 == 4);
+            }
+            if own_pre == 0 && opp != 0 {
+                five_hit += usize::from(opp_count == 5);
+                four_hit += usize::from(opp_count == 4);
+            }
+            nonempty += usize::from(own_pre | opp != 0);
+        }
+        [
+            f32::from(u8::from(immediate)),
+            fraction(max_own_after, engine::WINDOW_LEN),
+            fraction(max_opp_before, engine::WINDOW_LEN),
+            fraction(own_five, engine::WINDOWS_PER_PLACEMENT),
+            fraction(own_four, engine::WINDOWS_PER_PLACEMENT),
+            fraction(five_hit, engine::WINDOWS_PER_PLACEMENT),
+            fraction(four_hit, engine::WINDOWS_PER_PLACEMENT),
+            fraction(five_remaining.min(GLOBAL_THREAT_CAP), GLOBAL_THREAT_CAP),
+            fraction(four_remaining.min(GLOBAL_THREAT_CAP), GLOBAL_THREAT_CAP),
+            f32::from(u8::from(five_remaining > 0 && five_hit == five_remaining)),
+            fraction(nonempty, engine::WINDOWS_PER_PLACEMENT),
+        ]
+    }
+
+    #[test]
+    fn tactical_features_match_the_engine_oracle() {
+        let mut rows_checked = 0usize;
+        let mut threat_rows = 0usize;
+        let mut blocks_all_rows = 0usize;
+        for (index, &moves) in FIXTURE_GAMES.iter().chain(THREAT_GAMES).enumerate() {
+            let position = replay(moves);
+            let graph = build(&position).expect("fixture graph builds");
+            let legal: Vec<_> = position
+                .legal_actions()
+                .map(|action| action.coord())
+                .collect();
+            // Threat games sweep every action: the one blocking cell must
+            // not fall between subsample strides.
+            let threat_game = index >= FIXTURE_GAMES.len();
+            let picks: Vec<_> = if threat_game || legal.len() <= 40 {
+                (0..legal.len()).collect()
+            } else {
+                (0..legal.len()).step_by(7).collect()
+            };
+            for action in picks {
+                let want = oracle_tactical(&position, legal[action]);
+                let base = action * TACTICAL_FEATURES;
+                assert_eq!(
+                    graph.action_tactical[base..base + TACTICAL_FEATURES],
+                    want,
+                    "game {moves:?} action {action}"
+                );
+                threat_rows += usize::from(want[7] > 0.0);
+                blocks_all_rows += usize::from(want[9] == 1.0);
+                rows_checked += 1;
+            }
+        }
+        assert!(rows_checked > 100);
+        // The game list must actually exercise the census and the flag.
+        assert!(threat_rows > 0);
+        assert!(blocks_all_rows > 0);
+    }
+
+    #[test]
+    fn wire_refuses_corrupt_tactical() {
+        let position = replay(FIXTURE_GAMES[3]);
+        let bytes = encoded(&position);
+        let graph = build(&position).expect("fixture graph builds");
+        let base = bytes.len() - graph.action_tactical.len() * 4;
+
+        let mut nan = bytes.clone();
+        nan[base..base + 4].copy_from_slice(&f32::NAN.to_bits().to_le_bytes());
+        let error = decode_graph(&nan).expect_err("NaN tactical must refuse");
+        assert!(error.to_string().contains("action_tactical"));
+
+        // Finite and in range, but not the value the row statuses dictate
+        // for the nonempty column.
+        let mut wrong = bytes;
+        let last = base + (TACTICAL_FEATURES - 1) * 4;
+        wrong[last..last + 4].copy_from_slice(&0.123_456f32.to_bits().to_le_bytes());
+        let error = decode_graph(&wrong).expect_err("a lying nonempty column must refuse");
+        assert!(error.to_string().contains("nonempty"));
     }
 
     #[test]

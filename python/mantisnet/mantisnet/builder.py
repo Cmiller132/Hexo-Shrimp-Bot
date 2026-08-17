@@ -32,6 +32,10 @@ WINDOW_LEN = 6
 AXES = np.array([[1, 0], [0, 1], [1, -1]], dtype=np.int64)
 ORBIT48_CLASSES = 48
 CELL_NEAREST_UNREACHED = 9
+# Step 5: deterministic tactical scalars per legal action, all in [0, 1].
+TACTICAL_FEATURES = 11
+# Global opponent-threat counts saturate here before normalization.
+_GLOBAL_THREAT_CAP = 8
 
 
 def _rotate(qr: tuple[int, int]) -> tuple[int, int]:
@@ -245,6 +249,8 @@ class PositionGraph:
     action_window_index: np.ndarray
     action_post1_class: np.ndarray
     action_pre_status: np.ndarray
+    # Step 5 tactical scalars, (n_legal, TACTICAL_FEATURES) float32 in [0, 1].
+    action_tactical: np.ndarray
 
     @property
     def n_stones(self) -> int:
@@ -261,13 +267,19 @@ def _action_tables(
     order: np.ndarray,
     stone_own: np.ndarray,
     live_key: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """The Step 4 row tables: 18 hypothetical post-placement windows per action.
 
     Each legal cell's 11-cell line per axis is read once; candidate slot ``k``
     is the window starting ``k`` steps before the cell. The emitted window
     index refers to the all-nonempty kept-window list. Agreement between status
     and index is asserted, mirroring the donor's walk-consistency check.
+
+    The fourth table is the Step 5 tactical vector: ``TACTICAL_FEATURES``
+    deterministic scalars per action, derived from the same rows. A threat
+    window is opponent-only; the global threat census deduplicates threat
+    windows over the row table, which covers every one because a threat
+    window's empty cells are always legal.
     """
     n_legal = len(legal_qr)
     offs = np.arange(-(WINDOW_LEN - 1), WINDOW_LEN, dtype=np.int64)  # (11,)
@@ -342,7 +354,46 @@ def _action_tables(
     kept = status != ACTION_EMPTY
     if ((window_index >= 0) != kept).any():
         raise ValueError("the kept-window set disagrees with the action-row walk")
-    return window_index, post1, status
+
+    # Divisions run in float32 on float32 operands so every value carries the
+    # same bits as the Rust builder's f32 arithmetic.
+    own_count = (win_digits == 1).sum(axis=-1)  # (n_legal, 3, 6)
+    opp_count = (win_digits == 2).sum(axis=-1)
+    opp_only = has_opp & ~has_own
+    five_rows = opp_only & (opp_count == 5)
+    four_rows = opp_only & (opp_count == 4)
+    five_remaining = len(np.unique(window_index[five_rows]))
+    four_remaining = len(np.unique(window_index[four_rows]))
+    row_axes = (1, 2)
+    opp_five_hit = five_rows.sum(axis=row_axes)
+
+    def _frac(counts: np.ndarray, total: int) -> np.ndarray:
+        return counts.astype(np.float32) / np.float32(total)
+
+    rows_total = 3 * WINDOW_LEN
+    capped_five = min(five_remaining, _GLOBAL_THREAT_CAP)
+    capped_four = min(four_remaining, _GLOBAL_THREAT_CAP)
+    tactical = np.stack(
+        [
+            (~has_opp & (own_count == WINDOW_LEN - 1)).any(axis=row_axes),
+            _frac(own_count.max(axis=row_axes) + 1, WINDOW_LEN),
+            _frac(opp_count.max(axis=row_axes), WINDOW_LEN),
+            _frac((~has_opp & (own_count + 1 == 5)).sum(axis=row_axes), rows_total),
+            _frac((~has_opp & (own_count + 1 == 4)).sum(axis=row_axes), rows_total),
+            _frac(opp_five_hit, rows_total),
+            _frac(four_rows.sum(axis=row_axes), rows_total),
+            np.broadcast_to(
+                np.float32(capped_five) / np.float32(_GLOBAL_THREAT_CAP), (n_legal,)
+            ),
+            np.broadcast_to(
+                np.float32(capped_four) / np.float32(_GLOBAL_THREAT_CAP), (n_legal,)
+            ),
+            (five_remaining > 0) & (opp_five_hit == five_remaining),
+            _frac(kept.sum(axis=row_axes), rows_total),
+        ],
+        axis=1,
+    ).astype(np.float32)
+    return window_index, post1, status, tactical
 
 
 def _cell_node_fields(
@@ -458,6 +509,7 @@ def build(
             action_window_index=actions[0],
             action_post1_class=actions[1],
             action_pre_status=actions[2],
+            action_tactical=actions[3],
         )
 
     stone_key = _pack(stone_qr)
@@ -562,6 +614,7 @@ def build(
         action_window_index=actions[0],
         action_post1_class=actions[1],
         action_pre_status=actions[2],
+        action_tactical=actions[3],
     )
 
 
@@ -657,6 +710,8 @@ class Batch:
     act_class: torch.Tensor  # (E_d,) long, < TERN_POST1_CLASSES
     act_rev: torch.Tensor  # (E_d,) long: window-major edge order
     act_empty: torch.Tensor  # (N_c, 3) long: EMPTY rows per orbit
+    # Step 5 deterministic tactical scalars, one row per legal cell.
+    act_tactical: torch.Tensor  # (N_c, TACTICAL_FEATURES) float32 in [0, 1]
 
     def to(self, device) -> "Batch":
         """The same batch with every tensor on ``device``."""
@@ -796,6 +851,11 @@ def _action_fields(graphs: list[PositionGraph], dec_window: torch.Tensor) -> dic
         ),
         "act_empty": torch.from_numpy(
             np.concatenate(counts).astype(np.int64).reshape(-1, ACTION_EMPTY_ORBITS)
+        ),
+        "act_tactical": torch.from_numpy(
+            np.concatenate([g.action_tactical for g in graphs])
+            .astype(np.float32)
+            .reshape(-1, TACTICAL_FEATURES)
         ),
     }
 

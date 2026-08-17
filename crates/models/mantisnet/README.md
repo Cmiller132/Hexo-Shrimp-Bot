@@ -25,7 +25,7 @@ Every nonempty candidate window is kept under the ternary slot patterns
 (MANTIS_GRAFT_SPEC Step 12, baked): the encoder assigns reversal-invariant
 joint pattern/slot classes to both incidence and decoder edges in the
 377/726/1458 ternary vocabulary, and the wire format speaks that scope under
-`MODEL_REPR_VERSION` 7.
+`MODEL_REPR_VERSION` 8.
 
 `build(position)` emits each legal action's 18 hypothetical post-placement
 windows with their 729 joint `(post, slot)` classes and pre-insert statuses.

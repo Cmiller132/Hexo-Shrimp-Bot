@@ -86,7 +86,7 @@ no graph break.
 
 ### Versioning
 
-`MODEL_REPR_VERSION` (model-owned, currently 7) covers the builder and every
+`MODEL_REPR_VERSION` (model-owned, currently 8) covers the builder and every
 feature encoding. `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing. Either bump invalidates checkpoints.
 

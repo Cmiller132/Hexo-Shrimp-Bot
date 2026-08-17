@@ -6,7 +6,7 @@
 //! opinion; it converts the package's public raw batch to CPU tensors and hands
 //! the two raw cell heads back unchanged.
 
-use hexo_model_mantisnet::encoder::RawBatch;
+use hexo_model_mantisnet::encoder::{RawBatch, TACTICAL_FEATURES};
 use hexo_model_mantisnet::{BoxError, Forward, ForwardLoader, RawOutputs};
 use pyo3::exceptions::{PyOverflowError, PyRuntimeError, PyValueError};
 use pyo3::types::{
@@ -295,6 +295,14 @@ fn build_batch<'py>(
         &batch.act_empty,
         &[batch.cell_pos.len(), 3],
     )?;
+    set_tensor(
+        py,
+        torch,
+        &kwargs,
+        "act_tactical",
+        &batch.act_tactical,
+        &[batch.cell_pos.len(), TACTICAL_FEATURES],
+    )?;
 
     batch_type.call((), Some(&kwargs))
 }
@@ -337,6 +345,14 @@ impl TensorElement for bool {
 
     fn append_bytes(self, out: &mut Vec<u8>) {
         out.push(u8::from(self));
+    }
+}
+
+impl TensorElement for f32 {
+    const DTYPE: &'static str = "float32";
+
+    fn append_bytes(self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_ne_bytes());
     }
 }
 

@@ -65,12 +65,14 @@ Architecture knobs (validated jointly at construction):
 | `cell_nodes` | `False` | extends persistent cell state to every legal cell, with radius edges |
 | `cell_node_scope` | `"all"` | radius/adjacency edge destinations: `all` or `uncovered` |
 | `cell_adjacency` | `False` | directed distance-one cell↔cell messages (requires `cell_nodes`) |
+| `action_tactical` | `False` | encodes the §4.4 tactical scalars into the action row through a small MLP |
+| `action_latents` | `False` | two invariant latents read/mix/broadcast over each legal set (§6) |
 
 The production training configuration at this writing is `cell_latents=True,
 cell_nodes=True, cell_node_scope="all", window_attention=False`; the default
 configuration keeps window attention on and cell state off. Parameter count
-is 4,803,813 at defaults and 5,196,965 at the production configuration (both
-pinned by tests).
+is 4,803,813 at defaults (pinned by tests) and 5,196,965 at the production
+configuration.
 
 ## 3. Input entities
 
@@ -190,6 +192,16 @@ which is the intended semantics. The encoder is shared by both decoders
 (§6): one projection and class table feed a ReLU, the summed hidden rows
 pass through a per-head extension matrix.
 
+The builder also emits eleven deterministic **tactical scalars** per legal
+action, derived from the same 18 rows and a global census of opponent-only
+threat windows: immediate win; max own count after and max opponent count
+before (each /6); own five- and four-window counts after, opponent five- and
+four-windows hit (each /18); opponent five- and four-windows remaining
+globally (capped at 8); a blocks-all-immediate-threats flag; and the
+nonempty-row fraction. All values are D6-invariant and in [0, 1]. They ride
+the wire as fp32 and enter the model only under the `action_tactical` knob,
+through one small zero-initialized MLP added to the action row.
+
 ## 5. Trunk
 
 Embeddings (§3) enter B identical pre-norm residual blocks. One block runs,
@@ -236,6 +248,13 @@ Both cell heads read the same per-cell input rows:
 - otherwise, a one-shot parameter-free aggregation over the decoder
   incidence: each covered cell sums its windows' rows; uncovered cells read
   zero.
+
+With `action_latents` on, the shared action-row encoding first passes a
+read/mix/broadcast cycle: two invariant latents per position read the
+position's rows under an fp32 segment softmax, self-mix densely, and
+broadcast back — permutation-invariant context about the alternatives,
+without quadratic action attention. Keys are bias-free and the broadcast
+output is zero-initialized, so the cycle starts as the identity.
 
 Each head then forms, per legal cell, `lin(rows) + class_row_sum(e_head) +
 extension(action_rows)` — its own projection of the shared input, its own
@@ -313,7 +332,7 @@ One forward answers every head:
 | `value_dist` | (P, K) | softmax over bins |
 | `value_logits` | (P, K) | raw bin logits — what the value loss trains |
 
-`MODEL_REPR_VERSION` (currently **7**) covers the builder and every feature
+`MODEL_REPR_VERSION` (currently **8**) covers the builder and every feature
 encoding; `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing; either bump invalidates checkpoints, and loaders refuse
 mismatches rather than adapt. Checkpoints record their `model_config`;

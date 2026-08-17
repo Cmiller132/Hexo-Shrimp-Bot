@@ -46,6 +46,7 @@ _TENSOR_FIELDS = [
     "act_class",
     "act_rev",
     "act_empty",
+    "act_tactical",
 ]
 
 

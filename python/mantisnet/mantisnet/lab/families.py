@@ -15,6 +15,7 @@ import torch
 from torch import Tensor, nn
 
 from ..builder import (
+    TACTICAL_FEATURES,
     TERN_DEC_CLASSES,
     TERN_OCC_CLASSES,
     TERN_PATTERNS,
@@ -23,7 +24,13 @@ from ..builder import (
 from ..cell_latents import LINE_CLASSES
 from ..cell_nodes import ADJACENCY_CLASSES, NEAREST_BUCKETS, RADIUS_CLASSES
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
-from ..model import MantisConfig, MantisNet, ModelOutput, strip_legacy_knobs
+from ..model import (
+    ACTION_LATENTS,
+    MantisConfig,
+    MantisNet,
+    ModelOutput,
+    strip_legacy_knobs,
+)
 from ..segments import segment_ids, segment_max
 from ..window_pairs import WA_CLASSES
 
@@ -264,6 +271,28 @@ _LP_SUFFIXES = {
     "lp_wv.weight", "lp_wv.bias", "lp_wo.weight", "lp_wo.bias",
     "lp_bias",
 }
+# Step 5/6 knob keys live on the model, not the blocks.
+_TACTICAL_KEYS = {
+    "tactical_a.weight", "tactical_a.bias",
+    "tactical_out.weight", "tactical_out.bias",
+}
+_ACT_LATENT_KEYS = {
+    "act_latent_base",
+    "act_ln_read_q.weight", "act_ln_read_q.bias",
+    "act_ln_read_rows.weight", "act_ln_read_rows.bias",
+    "act_wq_read.weight", "act_wq_read.bias", "act_wk_read.weight",
+    "act_wv_read.weight", "act_wv_read.bias",
+    "act_wo_read.weight", "act_wo_read.bias",
+    "act_ln_mix.weight", "act_ln_mix.bias",
+    "act_wq_mix.weight", "act_wq_mix.bias", "act_wk_mix.weight",
+    "act_wv_mix.weight", "act_wv_mix.bias",
+    "act_wo_mix.weight", "act_wo_mix.bias",
+    "act_ln_bcast_l.weight", "act_ln_bcast_l.bias",
+    "act_ln_bcast_q.weight", "act_ln_bcast_q.bias",
+    "act_wq_bcast.weight", "act_wq_bcast.bias", "act_wk_bcast.weight",
+    "act_wv_bcast.weight", "act_wv_bcast.bias",
+    "act_wo_bcast.weight", "act_wo_bcast.bias",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,6 +309,8 @@ class _Knobs:
     line_pass: bool
     cell_nodes: bool
     cell_adjacency: bool
+    action_tactical: bool
+    action_latents: bool
 
 
 def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
@@ -326,6 +357,8 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         line_pass="blocks.0.lp_bias" in state_dict,
         cell_nodes="cell_occupancy_table.weight" in state_dict,
         cell_adjacency="blocks.0.adj_bias" in state_dict,
+        action_tactical="tactical_a.weight" in state_dict,
+        action_latents="act_latent_base" in state_dict,
     )
 
 
@@ -344,6 +377,8 @@ _BAKED = _Knobs(
     line_pass=False,
     cell_nodes=False,
     cell_adjacency=False,
+    action_tactical=False,
+    action_latents=False,
 )
 
 
@@ -363,6 +398,10 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
             "cell_nearest_table.weight",
         }
     keys |= _ACT_KEYS
+    if knobs.action_tactical:
+        keys |= _TACTICAL_KEYS
+    if knobs.action_latents:
+        keys |= _ACT_LATENT_KEYS
     for index in range(blocks):
         prefix = f"blocks.{index}."
         if knobs.axis_bias:
@@ -469,6 +508,30 @@ def _expected_shapes(
         shapes["cell_occupancy_table.weight"] = (3, h)
         shapes["cell_legal_table.weight"] = (2, h)
         shapes["cell_nearest_table.weight"] = (NEAREST_BUCKETS, h)
+    if cfg.action_tactical:
+        shapes.update({
+            "tactical_a.weight": (h, TACTICAL_FEATURES),
+            "tactical_a.bias": (h,),
+            "tactical_out.weight": (h, h),
+            "tactical_out.bias": (h,),
+        })
+    if cfg.action_latents:
+        shapes["act_latent_base"] = (ACTION_LATENTS, h)
+        for name in (
+            "act_ln_read_q", "act_ln_read_rows", "act_ln_mix",
+            "act_ln_bcast_l", "act_ln_bcast_q",
+        ):
+            shapes[name + ".weight"] = (h,)
+            shapes[name + ".bias"] = (h,)
+        for name in (
+            "act_wq_read", "act_wv_read", "act_wo_read",
+            "act_wq_mix", "act_wv_mix", "act_wo_mix",
+            "act_wq_bcast", "act_wv_bcast", "act_wo_bcast",
+        ):
+            shapes[name + ".weight"] = (h, h)
+            shapes[name + ".bias"] = (h,)
+        for name in ("act_wk_read", "act_wk_mix", "act_wk_bcast"):
+            shapes[name + ".weight"] = (h, h)
     fh = cfg.ffn_factor * h
     ln_names = ["ln_ws_s", "ln_ws_w", "ln_sw_w",
                 "ln_sw_s", "ln_attn", "ln_ffn"]
@@ -653,6 +716,8 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         cell_nodes=knobs.cell_nodes,
         cell_adjacency=knobs.cell_adjacency,
         cell_pass=not (knobs.cell_latents or knobs.cell_nodes),
+        action_tactical=knobs.action_tactical,
+        action_latents=knobs.action_latents,
     )
     if knobs != expected:
         raise _baked_profile_error(knobs)
@@ -672,6 +737,8 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         line_pass=knobs.line_pass,
         cell_nodes=knobs.cell_nodes,
         cell_adjacency=knobs.cell_adjacency,
+        action_tactical=knobs.action_tactical,
+        action_latents=knobs.action_latents,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")

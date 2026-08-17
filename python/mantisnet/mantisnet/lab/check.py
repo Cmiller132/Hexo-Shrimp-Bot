@@ -38,6 +38,7 @@ _BATCH_TENSORS = (
     "act_class",
     "act_rev",
     "act_empty",
+    "act_tactical",
 )
 
 

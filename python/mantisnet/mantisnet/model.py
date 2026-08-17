@@ -33,6 +33,7 @@ from . import (
 from .attention import fused_attention
 from .builder import (
     ACTION_EMPTY_CLASSES,
+    TACTICAL_FEATURES,
     TERN_DEC_CLASSES,
     TERN_OCC_CLASSES,
     TERN_PATTERNS,
@@ -72,6 +73,12 @@ class MantisConfig:
     cell_nodes: bool = False
     cell_node_scope: str = "all"
     cell_adjacency: bool = False
+    # Step 5: encode the builder's deterministic per-action tactical scalars
+    # into the action row through a small MLP (measured arm True).
+    action_tactical: bool = False
+    # Step 6: two learned action latents read the action rows, mix, and
+    # broadcast context about the alternatives back (measured arm True).
+    action_latents: bool = False
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
@@ -147,6 +154,8 @@ class ModelOutput:
 # Width of appendix B's categorical action-value readout: the three logits
 # [z_pos, z_neg, z_zero]. Every reader takes the checkpoint shape from here.
 CRITIC_LOGITS = 3
+# Step 6: invariant latent queries over each position's legal action set.
+ACTION_LATENTS = 2
 
 # The trunk stages were config knobs while they were ablations; checkpoints
 # written in that window record the knob fields in their model_config. These
@@ -750,6 +759,38 @@ class MantisNet(nn.Module):
             torch.tensor(ACTION_EMPTY_CLASSES, dtype=torch.long),
             persistent=False,
         )
+        if cfg.action_tactical:
+            # Step 5: the tactical scalars join the action row through one
+            # small MLP. Zero-init on its output starts the knob-on arm at
+            # exactly the incumbent function.
+            self.tactical_a = nn.Linear(TACTICAL_FEATURES, h)
+            self.tactical_out = nn.Linear(h, h)
+        if cfg.action_latents:
+            # Step 6: two invariant latents per position read the action rows
+            # (fp32 segment softmax over the legal runs), self-mix, and
+            # broadcast context about the alternatives back into the rows
+            # both heads read. Stage layout mirrors the §5.4 window-latent
+            # cycle; keys are bias-free (a constant key bias cancels in the
+            # softmax); the zero-init broadcast output starts the knob-on
+            # arm at exactly the incumbent function.
+            self.act_latent_base = nn.Parameter(torch.empty(ACTION_LATENTS, h))
+            self.act_ln_read_q = nn.LayerNorm(h)
+            self.act_ln_read_rows = nn.LayerNorm(h)
+            self.act_wq_read = nn.Linear(h, h)
+            self.act_wk_read = nn.Linear(h, h, bias=False)
+            self.act_wv_read = nn.Linear(h, h)
+            self.act_wo_read = nn.Linear(h, h)
+            self.act_ln_mix = nn.LayerNorm(h)
+            self.act_wq_mix = nn.Linear(h, h)
+            self.act_wk_mix = nn.Linear(h, h, bias=False)
+            self.act_wv_mix = nn.Linear(h, h)
+            self.act_wo_mix = nn.Linear(h, h)
+            self.act_ln_bcast_l = nn.LayerNorm(h)
+            self.act_ln_bcast_q = nn.LayerNorm(h)
+            self.act_wq_bcast = nn.Linear(h, h)
+            self.act_wk_bcast = nn.Linear(h, h, bias=False)
+            self.act_wv_bcast = nn.Linear(h, h)
+            self.act_wo_bcast = nn.Linear(h, h)
 
         # §7 value head.
         self.value_queries = nn.Parameter(torch.empty(cfg.value_queries, h))
@@ -778,6 +819,15 @@ class MantisNet(nn.Module):
         for head in (self.mlp_p, self.mlp_q):
             nn.init.zeros_(head.out.weight)
             nn.init.zeros_(head.out.bias)
+        # Knob-on arms start at the incumbent function: the added terms are
+        # exactly zero until their output layers move.
+        if self.cfg.action_tactical:
+            nn.init.zeros_(self.tactical_out.weight)
+            nn.init.zeros_(self.tactical_out.bias)
+        if self.cfg.action_latents:
+            nn.init.normal_(self.act_latent_base, std=0.02)
+            nn.init.zeros_(self.act_wo_bcast.weight)
+            nn.init.zeros_(self.act_wo_bcast.bias)
 
     def _pair_tables(self, batch: Batch):
         # §5.1c tables are born on the batch's device from the window
@@ -996,7 +1046,90 @@ class MantisNet(nn.Module):
         # to the same fp32 segment sum as the kernel's, and autocast would
         # downcast a matmul's operands.
         counts = batch.act_empty.to(torch.float32)
-        return acts + (counts.unsqueeze(-1) * empty_rows.unsqueeze(0)).sum(dim=1)
+        acts = acts + (counts.unsqueeze(-1) * empty_rows.unsqueeze(0)).sum(dim=1)
+        if self.cfg.action_tactical:
+            # Step 5: the deterministic scalars enter through one small MLP;
+            # the term joins the same fp32 accumulator as the row sums.
+            tactical = self.tactical_out(F.relu(self.tactical_a(batch.act_tactical)))
+            acts = acts + tactical.float()
+        return acts
+
+    def _action_latent_cycle(self, acts: Tensor, batch: Batch) -> Tensor:
+        """Step 6: two invariant latents per position read the legal set,
+        self-mix, and broadcast permutation-invariant context about the
+        alternatives back into the rows both heads read.
+
+        The ragged read runs on the ``segments`` machinery — position ids
+        from ``legal_offsets``, an ``amax`` reduce, and an ``index_add`` sum —
+        with the softmax in fp32 regardless of autocast, exactly the
+        discipline of the §5.4 cycle. Every position has at least one legal
+        cell, so no segment is empty. The mix is a dense two-by-two.
+        """
+        cfg = self.cfg
+        heads, head_dim = cfg.heads, cfg.h // cfg.heads
+        p = batch.legal_offsets.shape[0] - 1
+        n_cells = acts.shape[0]
+        seg = segment_ids(batch.legal_offsets)
+
+        # Read: the shared latent base queries every position's action rows.
+        rows = self.act_ln_read_rows(acts)
+        q = self.act_wq_read(self.act_ln_read_q(self.act_latent_base)).view(
+            ACTION_LATENTS, heads, head_dim
+        )
+        k = self.act_wk_read(rows).view(n_cells, heads, head_dim)
+        v = self.act_wv_read(rows).view(n_cells, heads, head_dim)
+        scores = (
+            torch.einsum("nad,lad->nla", k, q.to(k.dtype)) / math.sqrt(head_dim)
+        ).float()
+        flat = scores.reshape(n_cells, ACTION_LATENTS * heads)
+        peak = flat.new_full(
+            (p, ACTION_LATENTS * heads), torch.finfo(torch.float32).min
+        )
+        peak.index_reduce_(0, seg, flat, "amax", include_self=True)
+        exp = (flat - peak.index_select(0, seg)).exp()
+        denom = flat.new_zeros(p, ACTION_LATENTS * heads).index_add_(0, seg, exp)
+        weights = (exp / denom.index_select(0, seg)).view(
+            n_cells, ACTION_LATENTS, heads
+        )
+        contrib = weights.unsqueeze(-1) * v.float().unsqueeze(1)
+        read = acts.new_zeros(p, ACTION_LATENTS, heads, head_dim).index_add_(
+            0, seg, contrib
+        )
+        g_act = self.act_latent_base.to(acts.dtype).unsqueeze(0) + self.act_wo_read(
+            read.reshape(p, ACTION_LATENTS, cfg.h).to(acts.dtype)
+        )
+
+        # Mix: both slots are live, dense softmax fp32 independent of autocast.
+        z = self.act_ln_mix(g_act)
+        q = self.act_wq_mix(z).view(p, ACTION_LATENTS, heads, head_dim)
+        k = self.act_wk_mix(z).view(p, ACTION_LATENTS, heads, head_dim)
+        v = self.act_wv_mix(z).view(p, ACTION_LATENTS, heads, head_dim)
+        mix_scores = torch.einsum("pqhd,pkhd->phqk", q, k) / math.sqrt(head_dim)
+        mixed = torch.einsum(
+            "phqk,pkhd->pqhd", mix_scores.float().softmax(dim=-1), v.float()
+        )
+        g_act = g_act + self.act_wo_mix(
+            mixed.reshape(p, ACTION_LATENTS, cfg.h).to(g_act.dtype)
+        )
+
+        # Broadcast: each row attends over its position's two latents.
+        latent_rows = self.act_ln_bcast_l(g_act)
+        q = self.act_wq_bcast(self.act_ln_bcast_q(acts)).view(
+            n_cells, heads, head_dim
+        )
+        k = self.act_wk_bcast(latent_rows).view(p, ACTION_LATENTS, heads, head_dim)
+        v = self.act_wv_bcast(latent_rows).view(p, ACTION_LATENTS, heads, head_dim)
+        bcast_scores = (
+            torch.einsum("nhd,nlhd->nlh", q, k.index_select(0, seg).to(q.dtype))
+            / math.sqrt(head_dim)
+        ).float()
+        bcast_weights = bcast_scores.softmax(dim=1)
+        out = (
+            bcast_weights.unsqueeze(-1)
+            * v.index_select(0, seg).float()
+        ).sum(dim=1)
+        delta = self.act_wo_bcast(out.reshape(n_cells, cfg.h).to(acts.dtype))
+        return acts + delta.float()
 
     def _cell_scores(
         self,
@@ -1037,6 +1170,8 @@ class MantisNet(nn.Module):
     ) -> Tensor:
         """§6: one raw policy logit per legal cell, engine legal order."""
         acts = self._action_contribution(w, batch)
+        if self.cfg.action_latents:
+            acts = self._action_latent_cycle(acts, batch)
         g_half = self.mlp_p.lin_b(g)
         rows = self._decoder_input(w, cells, batch, g_half.dtype)
         return self._cell_scores(
@@ -1054,6 +1189,8 @@ class MantisNet(nn.Module):
         pass answers both.
         """
         acts = self._action_contribution(w, batch)
+        if self.cfg.action_latents:
+            acts = self._action_latent_cycle(acts, batch)
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
         rows = self._decoder_input(w, cells, batch, g_p.dtype)
         return (
