@@ -155,10 +155,8 @@ compute confidence intervals and ratings.
 
 ### Checkpoint conversion
 
-`graft.py` converts a slot-class/scalar-critic checkpoint to joint-class/
-trinomial representation, applying both representation changes and remapping
-Adam moments. `trigraft.py` converts a joint-class scalar checkpoint to the
-trinomial critic without changing its decoder.
+`trigraft.py` converts a joint-class scalar checkpoint to the trinomial
+critic without changing its decoder.
 
 ### Head-to-head and crossplay
 
@@ -389,7 +387,9 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `cell_latents.py` | Step 15 typed legal-cell/window attention and whole-line table derivation |
 | `cell_nodes.py` | Step 13 radius/adjacency edge plans on the typed cell-attention kernels |
 | `attention.py` | Fused coordinate-biased multi-head attention with Triton kernel and reference path |
-| `decoder.py` | Shared legal-cell incidence aggregation for policy and action-value heads |
+| `row_encoder.py` | Action-row encoder: 729-class post-placement window rows for both decoder heads |
+| `window_latents.py` | Fused ragged window-latent read/broadcast cycle for the state latents |
+| `optim.py` | Fused-Adam execution policy, recorded and reapplied across checkpoint loads |
 | `message_passing.py` | Fused incidence aggregation for the two trunk message-passing directions |
 | `relay.py` | Cell-pass relay: windows exchange state through shared empty cells via Triton segment kernels |
 | `window_pairs.py` | Window-pair relation tables (colinear/crossing) and typed window attention |
@@ -415,7 +415,6 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `seat.py` | Strict subprocess client for independent wire-protocol seats |
 | `headtohead.py` | Paired cross-run checkpoint-vs-checkpoint match and CLI |
 | `crossplay.py` | Round-robin referee for independent subprocess seats |
-| `graft.py` | Slot-class/scalar to joint-class/trinomial checkpoint conversion |
 | `trigraft.py` | Joint-class scalar to trinomial critic checkpoint conversion |
 | `telemetry.py` | SQLite run telemetry: writes, queries, schema versioning, CLI |
 | `inspect.py` | Single-position policy/value inspection via the Rust builder |
