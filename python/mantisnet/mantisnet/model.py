@@ -20,7 +20,11 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint
+from torch.utils.checkpoint import (
+    CheckpointPolicy,
+    checkpoint,
+    create_selective_checkpoint_contexts,
+)
 
 from . import (
     cell_latents,
@@ -239,6 +243,25 @@ def compose_acting_q(
 
 def _mlp(d_in: int, d_hidden: int, d_out: int) -> nn.Sequential:
     return nn.Sequential(nn.Linear(d_in, d_hidden), nn.ReLU(), nn.Linear(d_hidden, d_out))
+
+
+def _attention_saved_policy(ctx, func, *args, **kwargs):
+    """Recompute the checkpointed stages in backward except the attention
+    sweeps: their outputs cost one output-sized save per call while sparing
+    the replay a full edge sweep per op. LayerNorms, projections, and the
+    residual arithmetic recompute."""
+    if func in (
+        torch.ops.mantisnet.cell_attention.default,
+        torch.ops.mantisnet.cell_attention_plain.default,
+        torch.ops.mantisnet.window_latent_read.default,
+        torch.ops.mantisnet.window_latent_broadcast.default,
+    ):
+        return CheckpointPolicy.MUST_SAVE
+    return CheckpointPolicy.PREFER_RECOMPUTE
+
+
+def _attention_saved_contexts():
+    return create_selective_checkpoint_contexts(_attention_saved_policy)
 
 
 class _PairMlp(nn.Module):
@@ -639,6 +662,7 @@ class _Block(nn.Module):
                 radius,
                 adjacency,
                 use_reentrant=False,
+                context_fn=_attention_saved_contexts,
             )
         else:
             w = self._cell_pass(
@@ -713,7 +737,12 @@ class _Block(nn.Module):
         # second-widest slice of the peak, while its replay is a fraction
         # of a percent of the step.
         w, g = checkpoint(
-            self._window_latent_cycle, w, g, latent_layout, use_reentrant=False
+            self._window_latent_cycle,
+            w,
+            g,
+            latent_layout,
+            use_reentrant=False,
+            context_fn=_attention_saved_contexts,
         )
 
         # FFN over the same rows — row-independent, so no padding needed.

@@ -78,7 +78,7 @@ _NUM_WARPS = 1
 # tile within register budget.
 _CLASS_SPLITS = 64
 _CLASS_BLOCK_E = 128
-_VCLS_BLOCK_E = 8
+_VCLS_BLOCK_E = 16
 
 _FAILED_SHAPES: dict[tuple[object, ...], str] = {}
 _FAILED_BACKWARD_SHAPES: dict[tuple[object, ...], str] = {}
