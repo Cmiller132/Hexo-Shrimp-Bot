@@ -29,6 +29,11 @@ Kernels follow the relay's geometry — bounded fan-in, one program per
 partials — so every reduction is deterministic. CPU and failed launches
 fall back to an eager fp32 composition that doubles as the parity
 reference.
+
+Backward saves only the projections and the edge views: the forward's
+``out``/``m``/``l`` are recomputed by rerunning the deterministic forward,
+which is bit-identical to what was returned, so the fp32 output rows never
+sit in the autograd graph across the step.
 """
 
 from __future__ import annotations
@@ -877,10 +882,14 @@ def _forward_impl(q, k, v, bias, vcls, seg_ptr, src, cls, qid):
 
 
 def _backward_impl(
-    q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, out, m, l, grad_out
+    q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, grad_out
 ):
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     go = grad_out.contiguous().float()
+    # The forward is deterministic, so rerunning it reproduces out/m/l
+    # bit-identically at the cost of one extra edge sweep — cheaper than
+    # keeping the fp32 output rows alive from forward to backward.
+    out, m, l = _forward_impl(q, k, v, bias, vcls, seg_ptr, src, cls, qid)
     # delta = sum(go * out) per (query, head) — algebraically the segment's
     # sum of alpha * dalpha, so the softmax backward needs no first sweep.
     delta = (go * out).sum(-1)
@@ -962,19 +971,16 @@ def _ca_backward_op(
     scls: Tensor,
     cptr: Tensor,
     cedge_q: Tensor,
-    out: Tensor,
-    m: Tensor,
-    l: Tensor,
     grad_out: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     dq, dk, dv, dbias, dvcls = _backward_impl(
-        q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, out, m, l, grad_out
+        q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, grad_out
     )
     return dq, dk, dv, dbias, dvcls
 
 
 @_ca_backward_op.register_fake
-def _(q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, out, m, l, grad_out):
+def _(q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, grad_out):
     return (
         torch.empty_like(q),
         torch.empty_like(k),
@@ -986,9 +992,8 @@ def _(q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, c
 
 def _ca_setup(ctx, inputs, output) -> None:
     (q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q) = inputs
-    out, m, l = output
     ctx.save_for_backward(
-        q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, out, m, l
+        q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q
     )
 
 
@@ -1046,19 +1051,16 @@ def _ca_plain_backward_op(
     scls: Tensor,
     cptr: Tensor,
     cedge_q: Tensor,
-    out: Tensor,
-    m: Tensor,
-    l: Tensor,
     grad_out: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     dq, dk, dv, dbias, _ = _backward_impl(
-        q, k, v, bias, None, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, out, m, l, grad_out
+        q, k, v, bias, None, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, grad_out
     )
     return dq, dk, dv, dbias
 
 
 @_ca_plain_backward_op.register_fake
-def _(q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, out, m, l, grad_out):
+def _(q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, grad_out):
     return (
         torch.empty_like(q),
         torch.empty_like(k),
@@ -1069,9 +1071,8 @@ def _(q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q
 
 def _ca_plain_setup(ctx, inputs, output) -> None:
     (q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q) = inputs
-    out, m, l = output
     ctx.save_for_backward(
-        q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, out, m, l
+        q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q
     )
 
 

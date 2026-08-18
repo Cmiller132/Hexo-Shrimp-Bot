@@ -4,6 +4,11 @@ The read maps each position's flat window run into its four latent queries;
 the broadcast maps every flat window query back over those four latents. CUDA
 uses Triton programs that own one complete gradient row and never use atomics.
 CPU and unsupported CUDA shapes use the literal fp32 references below.
+
+The broadcast saves only its inputs for backward and reruns the
+deterministic forward there — bit-identical out/m/l without keeping the
+fp32 window rows alive across the step. The read's output is four rows per
+position, small enough to save outright.
 """
 
 from __future__ import annotations
@@ -616,12 +621,9 @@ def _read_dispatch_backward(ctx, grad_out, _grad_m, _grad_l):
 _read_op.register_autograd(_read_dispatch_backward, setup_context=_read_setup_context)
 
 
-@torch.library.custom_op("mantisnet::window_latent_broadcast", mutates_args=())
-def _broadcast_op(
-    q: Tensor, k: Tensor, v: Tensor, window_pos: Tensor, offsets: Tensor, order: Tensor,
-) -> tuple[Tensor, Tensor, Tensor]:
-    _validate_broadcast(q, k, v, window_pos, offsets, order)
-    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+def _broadcast_forward_impl(q, k, v, window_pos):
+    """The guarded broadcast forward, shared by the op and the backward's
+    recompute so both take the same kernel-or-reference path."""
     if not _supported(q, q.shape[0]):
         return _reference_broadcast_forward(q, k, v, window_pos)
     key = _shape_key(q)
@@ -638,6 +640,15 @@ def _broadcast_op(
         return _reference_broadcast_forward(q, k, v, window_pos)
 
 
+@torch.library.custom_op("mantisnet::window_latent_broadcast", mutates_args=())
+def _broadcast_op(
+    q: Tensor, k: Tensor, v: Tensor, window_pos: Tensor, offsets: Tensor, order: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    _validate_broadcast(q, k, v, window_pos, offsets, order)
+    q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
+    return _broadcast_forward_impl(q, k, v, window_pos)
+
+
 @_broadcast_op.register_fake
 def _(q, k, v, window_pos, offsets, order):
     return (
@@ -650,9 +661,12 @@ def _(q, k, v, window_pos, offsets, order):
 @torch.library.custom_op("mantisnet::window_latent_broadcast_backward", mutates_args=())
 def _broadcast_backward_op(
     q: Tensor, k: Tensor, v: Tensor, window_pos: Tensor, offsets: Tensor,
-    order: Tensor, out: Tensor, m: Tensor, l: Tensor, grad_out: Tensor,
+    order: Tensor, grad_out: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
     q, k, v, go = q.contiguous(), k.contiguous(), v.contiguous(), grad_out.contiguous().float()
+    # Deterministic forward: the recompute reproduces out/m/l bit-identically,
+    # so the fp32 window rows never sit saved across the step.
+    out, m, l = _broadcast_forward_impl(q, k, v, window_pos)
     if not _supported(q, q.shape[0]):
         return _reference_broadcast_backward(
             q, k, v, window_pos, offsets, order, out, m, l, go
@@ -678,14 +692,13 @@ def _broadcast_backward_op(
 
 
 @_broadcast_backward_op.register_fake
-def _(q, k, v, window_pos, offsets, order, out, m, l, grad_out):
+def _(q, k, v, window_pos, offsets, order, grad_out):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
 def _broadcast_setup_context(ctx, inputs, output) -> None:
     q, k, v, window_pos, offsets, order = inputs
-    out, m, l = output
-    ctx.save_for_backward(q, k, v, window_pos, offsets, order, out, m, l)
+    ctx.save_for_backward(q, k, v, window_pos, offsets, order)
 
 
 def _broadcast_dispatch_backward(ctx, grad_out, _grad_m, _grad_l):
