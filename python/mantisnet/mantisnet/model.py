@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from . import (
     cell_latents,
@@ -531,7 +532,6 @@ class _Block(nn.Module):
         self,
         w: Tensor,
         g: Tensor,
-        batch: Batch,
         layout: tuple[Tensor, Tensor, Tensor],
     ) -> tuple[Tensor, Tensor]:
         """Latents read flat windows, self-mix, then broadcast to windows."""
@@ -625,7 +625,21 @@ class _Block(nn.Module):
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
         if cfg.uses_cell_state:
-            w, c = self._cell_stage(s, w, c, ctab, radius, adjacency)
+            # Execution policy, not architecture: the cell stage is the
+            # trunk's widest activation footprint, so its internals are
+            # recomputed in backward instead of saved. Every kernel involved
+            # is deterministic, so the replay — and therefore every gradient
+            # — is bit-identical to the saved-activations execution.
+            w, c = checkpoint(
+                self._cell_stage,
+                s,
+                w,
+                c,
+                ctab,
+                radius,
+                adjacency,
+                use_reentrant=False,
+            )
         else:
             w = self._cell_pass(
                 w,
@@ -694,7 +708,12 @@ class _Block(nn.Module):
         s = s + self.drop(out.index_select(0, batch.stone_slot))
         global_delta = out.index_select(0, global_slot)
         g = g + self.drop(global_delta.view(p, global_rows, cfg.h))
-        w, g = self._window_latent_cycle(w, g, batch, latent_layout)
+        # Same recompute-in-backward policy as the cell stage: the cycle
+        # touches every window row three times and its saves were the
+        # second-widest slice of the peak.
+        w, g = checkpoint(
+            self._window_latent_cycle, w, g, latent_layout, use_reentrant=False
+        )
 
         # FFN over the same rows — row-independent, so no padding needed.
         global_flat = g.reshape(-1, cfg.h)

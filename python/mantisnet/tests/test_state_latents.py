@@ -89,7 +89,7 @@ def test_window_read_mix_broadcast_matches_literal_fp32_reference(positions):
     window_pos = batch.window_slot // batch.max_w
     offsets, order = window_latents.window_latent_layout(window_pos, batch.n_pos)
     actual_w, actual_g = block._window_latent_cycle(
-        w, g, batch, (window_pos, offsets, order)
+        w, g, (window_pos, offsets, order)
     )
 
     # Read: each latent attends only the real windows of its own position.
