@@ -30,10 +30,11 @@ partials — so every reduction is deterministic. CPU and failed launches
 fall back to an eager fp32 composition that doubles as the parity
 reference.
 
-Backward saves only the projections and the edge views: the forward's
-``out``/``m``/``l`` are recomputed by rerunning the deterministic forward,
-which is bit-identical to what was returned, so the fp32 output rows never
-sit in the autograd graph across the step.
+Backward saves the projections, the edge views, and the softmax stats
+``m``/``l`` — never the fp32 output rows. The dq sweep recomputes every
+per-edge quantity in two register passes over the query's run (first the
+softmax-backward total, then the score gradients), so nothing output-sized
+crosses from forward to backward.
 """
 
 from __future__ import annotations
@@ -407,9 +408,12 @@ if triton is not None:
         BLOCK_HD: tl.constexpr,
         BLOCK_E: tl.constexpr,
     ):
-        # Query sweep: recompute alpha from the saved stats, emit per-edge
-        # dscore (for the bias gradient) and alpha (for the class value
-        # gradient), accumulate dq in registers. Deterministic, no atomics.
+        # Query sweep, two passes over the run. Pass one recomputes alpha
+        # from the saved stats, emits alpha and dalpha, and totals
+        # delta = sum(alpha * dalpha) — the softmax-backward constant the
+        # old path formed from the saved output rows. Pass two turns the
+        # stored dalpha into dscore and accumulates dq. Deterministic, no
+        # atomics; delta lands in a buffer for the source sweep.
         pid = tl.program_id(0)
         w = pid // HEADS
         a = pid % HEADS
@@ -421,10 +425,9 @@ if triton is not None:
         m = tl.load(m_ptr + w * HEADS + a)
         l = tl.load(l_ptr + w * HEADS + a)
         l = tl.where(l > 0, l, 1.0)
-        delta = tl.load(delta_ptr + w * HEADS + a)
         start = tl.load(seg_ptr + w)
         end = tl.load(seg_ptr + w + 1)
-        acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+        delta = 0.0
         for lo in tl.range(start, end, BLOCK_E):
             eids = lo + tl.arange(0, BLOCK_E)
             ok = eids < end
@@ -439,7 +442,7 @@ if triton is not None:
             score += tl.load(
                 bias_ptr + a * stride_bias + c_idx, mask=ok, other=0.0
             ).to(tl.float32)
-            alpha = tl.exp(score - m) / l
+            alpha = tl.where(ok, tl.exp(score - m) / l, 0.0)
             v_tile = tl.load(
                 v_ptr + (s_idx[:, None] * HEADS + a) * HD + offs[None, :],
                 mask=ok[:, None] & live[None, :],
@@ -452,11 +455,24 @@ if triton is not None:
                     other=0.0,
                 ).to(tl.float32)
             dalpha = tl.sum(go_row[None, :] * v_tile, axis=1)
+            tl.store(alpha_ptr + eids * HEADS + a, alpha, mask=ok)
+            tl.store(dscore_ptr + eids * HEADS + a, dalpha, mask=ok)
+            delta += tl.sum(alpha * dalpha, axis=0)
+        tl.store(delta_ptr + w * HEADS + a, delta)
+        acc = tl.zeros([BLOCK_HD], dtype=tl.float32)
+        for lo in tl.range(start, end, BLOCK_E):
+            eids = lo + tl.arange(0, BLOCK_E)
+            ok = eids < end
+            s_idx = tl.load(src_ptr + eids, mask=ok, other=0)
+            k_tile = tl.load(
+                k_ptr + (s_idx[:, None] * HEADS + a) * HD + offs[None, :],
+                mask=ok[:, None] & live[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            alpha = tl.load(alpha_ptr + eids * HEADS + a, mask=ok, other=0.0)
+            dalpha = tl.load(dscore_ptr + eids * HEADS + a, mask=ok, other=0.0)
             ds = tl.where(ok, alpha * (dalpha - delta), 0.0)
             tl.store(dscore_ptr + eids * HEADS + a, ds, mask=ok)
-            tl.store(
-                alpha_ptr + eids * HEADS + a, tl.where(ok, alpha, 0.0), mask=ok
-            )
             acc += tl.sum(ds[:, None] * k_tile, axis=0)
         element = dq_ptr.dtype.element_ty
         tl.store(dq_ptr + row + offs, (acc * scale).to(element), mask=live)
@@ -487,7 +503,8 @@ if triton is not None:
     ):
         # Source sweep over the source-major view: this program's k and v
         # rows are fixed; the queries' rows and stats are gathered per edge
-        # and alpha is recomputed, exactly the §5.1c dkdv discipline.
+        # and alpha is recomputed, exactly the §5.1c dkdv discipline. delta
+        # comes from the buffer the query sweep filled.
         pid = tl.program_id(0)
         s = pid // HEADS
         a = pid % HEADS
@@ -649,7 +666,7 @@ def _reference_forward(q, k, v, bias, vcls, src, cls, qid):
     return out, m, l
 
 
-def _reference_backward(q, k, v, bias, vcls, src, cls, qid, m, l, delta, go):
+def _reference_backward(q, k, v, bias, vcls, src, cls, qid, m, l, go):
     n_q, heads, hd = q.shape
     scale = 1.0 / math.sqrt(hd)
 
@@ -665,6 +682,11 @@ def _reference_backward(q, k, v, bias, vcls, src, cls, qid, m, l, delta, go):
         v_edge = v_edge + vcls.float().view(-1, heads, hd).index_select(0, cls)
     go_rows = go.index_select(0, qid)
     dalpha = (go_rows * v_edge).sum(-1)
+    # delta = sum(alpha * dalpha) per (query, head): the softmax-backward
+    # constant, formed from per-edge quantities so the output rows are
+    # never needed here.
+    delta = torch.zeros((n_q, heads), dtype=torch.float32, device=q.device)
+    delta.index_add_(0, qid, alpha * dalpha)
     dscore = alpha * (dalpha - delta.index_select(0, qid))
 
     dbias = torch.zeros(
@@ -755,13 +777,14 @@ def _launch_forward(q, k, v, bias, vcls, seg_ptr, src, cls):
 
 
 def _launch_backward(
-    q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l, delta, go
+    q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l, go
 ):
     n_q, heads, hd = q.shape
     scale = 1.0 / math.sqrt(hd)
     block_hd = triton.next_power_of_2(hd)
     e = src.shape[0]
     dq = torch.empty_like(q)
+    delta = torch.empty((n_q, heads), dtype=torch.float32, device=q.device)
     dscore = torch.empty((e, heads), dtype=torch.float32, device=q.device)
     alpha = torch.empty((e, heads), dtype=torch.float32, device=q.device)
     vcls_arg = vcls if vcls is not None else q
@@ -882,29 +905,18 @@ def _forward_impl(q, k, v, bias, vcls, seg_ptr, src, cls, qid):
 
 
 def _backward_impl(
-    q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, grad_out
+    q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l, grad_out
 ):
     q, k, v = q.contiguous(), k.contiguous(), v.contiguous()
     go = grad_out.contiguous().float()
-    # The forward is deterministic, so rerunning it reproduces out/m/l
-    # bit-identically at the cost of one extra edge sweep — cheaper than
-    # keeping the fp32 output rows alive from forward to backward.
-    out, m, l = _forward_impl(q, k, v, bias, vcls, seg_ptr, src, cls, qid)
-    # delta = sum(go * out) per (query, head) — algebraically the segment's
-    # sum of alpha * dalpha, so the softmax backward needs no first sweep.
-    delta = (go * out).sum(-1)
     if not _supported(q, src):
-        return _reference_backward(
-            q, k, v, bias, vcls, src, cls, qid, m, l, delta, go
-        )
+        return _reference_backward(q, k, v, bias, vcls, src, cls, qid, m, l, go)
     key = _shape_key(q) + (vcls is not None, grad_out.dtype)
     if key in _FAILED_BACKWARD_SHAPES:
-        return _reference_backward(
-            q, k, v, bias, vcls, src, cls, qid, m, l, delta, go
-        )
+        return _reference_backward(q, k, v, bias, vcls, src, cls, qid, m, l, go)
     try:
         return _launch_backward(
-            q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l, delta, go
+            q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l, go
         )
     except Exception as exc:
         _FAILED_BACKWARD_SHAPES[key] = f"{type(exc).__name__}: {exc}"
@@ -915,9 +927,7 @@ def _backward_impl(
             RuntimeWarning,
             stacklevel=2,
         )
-        return _reference_backward(
-            q, k, v, bias, vcls, src, cls, qid, m, l, delta, go
-        )
+        return _reference_backward(q, k, v, bias, vcls, src, cls, qid, m, l, go)
 
 
 @torch.library.custom_op("mantisnet::cell_attention", mutates_args=())
@@ -971,16 +981,18 @@ def _ca_backward_op(
     scls: Tensor,
     cptr: Tensor,
     cedge_q: Tensor,
+    m: Tensor,
+    l: Tensor,
     grad_out: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     dq, dk, dv, dbias, dvcls = _backward_impl(
-        q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, grad_out
+        q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l, grad_out
     )
     return dq, dk, dv, dbias, dvcls
 
 
 @_ca_backward_op.register_fake
-def _(q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, grad_out):
+def _(q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l, grad_out):
     return (
         torch.empty_like(q),
         torch.empty_like(k),
@@ -992,8 +1004,9 @@ def _(q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, c
 
 def _ca_setup(ctx, inputs, output) -> None:
     (q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q) = inputs
+    _out, m, l = output
     ctx.save_for_backward(
-        q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q
+        q, k, v, bias, vcls, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l
     )
 
 
@@ -1051,16 +1064,18 @@ def _ca_plain_backward_op(
     scls: Tensor,
     cptr: Tensor,
     cedge_q: Tensor,
+    m: Tensor,
+    l: Tensor,
     grad_out: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     dq, dk, dv, dbias, _ = _backward_impl(
-        q, k, v, bias, None, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, grad_out
+        q, k, v, bias, None, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l, grad_out
     )
     return dq, dk, dv, dbias
 
 
 @_ca_plain_backward_op.register_fake
-def _(q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, grad_out):
+def _(q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l, grad_out):
     return (
         torch.empty_like(q),
         torch.empty_like(k),
@@ -1071,8 +1086,9 @@ def _(q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q
 
 def _ca_plain_setup(ctx, inputs, output) -> None:
     (q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q) = inputs
+    _out, m, l = output
     ctx.save_for_backward(
-        q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q
+        q, k, v, bias, seg_ptr, src, cls, qid, sseg_ptr, sqid, scls, cptr, cedge_q, m, l
     )
 
 

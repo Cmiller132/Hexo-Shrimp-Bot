@@ -5,10 +5,10 @@ the broadcast maps every flat window query back over those four latents. CUDA
 uses Triton programs that own one complete gradient row and never use atomics.
 CPU and unsupported CUDA shapes use the literal fp32 references below.
 
-The broadcast saves only its inputs for backward and reruns the
-deterministic forward there — bit-identical out/m/l without keeping the
-fp32 window rows alive across the step. The read's output is four rows per
-position, small enough to save outright.
+The broadcast saves its inputs and the softmax stats — never the fp32
+window rows: backward rebuilds every per-edge quantity in registers from
+the four slots of its tile. The read's output is four rows per position,
+small enough to save outright.
 """
 
 from __future__ import annotations
@@ -188,7 +188,7 @@ def _reference_broadcast_forward(q, k, v, window_pos):
     return out, m, l
 
 
-def _reference_broadcast_backward(q, k, v, window_pos, offsets, order, out, m, l, grad_out):
+def _reference_broadcast_backward(q, k, v, window_pos, offsets, order, m, l, grad_out):
     """Literal broadcast backward, recomputing all four edges per window."""
     windows, heads, hd = q.shape
     positions, slots = k.shape[:2]
@@ -206,8 +206,10 @@ def _reference_broadcast_backward(q, k, v, window_pos, offsets, order, out, m, l
                 ).sum(-1) * scale
                 alpha = (scores - m[window, head]).exp() / l[window, head]
                 upstream = go[window, head]
-                delta = (upstream * out[window, head]).sum()
                 dalpha = (upstream[None, :] * v[position, :, head].float()).sum(-1)
+                # delta = sum(alpha * dalpha): the softmax-backward constant,
+                # formed per edge so the output rows are never needed here.
+                delta = (alpha * dalpha).sum()
                 dscore = alpha * (dalpha - delta)
                 dq[window, head] = (
                     dscore[:, None] * k[position, :, head].float()
@@ -380,10 +382,14 @@ if triton is not None:
 
     @triton.jit
     def _broadcast_dq_kernel(
-        q_ptr, k_ptr, v_ptr, window_pos_ptr, out_ptr, m_ptr, l_ptr, go_ptr,
-        dq_ptr, scale, SLOTS: tl.constexpr, HEADS: tl.constexpr,
+        q_ptr, k_ptr, v_ptr, window_pos_ptr, m_ptr, l_ptr, go_ptr,
+        dq_ptr, delta_ptr, scale, SLOTS: tl.constexpr, HEADS: tl.constexpr,
         HD: tl.constexpr, BLOCK_HD: tl.constexpr,
     ):
+        # All four slots sit in one tile, so alpha and dalpha rebuild in
+        # registers and delta = sum(alpha * dalpha) — the softmax-backward
+        # constant the old path formed from the saved output rows — lands in
+        # a buffer for the latent-side sweep.
         pid = tl.program_id(0)
         window = pid // HEADS
         head = pid % HEADS
@@ -393,8 +399,6 @@ if triton is not None:
         q_row = (window * HEADS + head) * HD
         query = tl.load(q_ptr + q_row + dims, mask=live, other=0.0).to(tl.float32)
         upstream = tl.load(go_ptr + q_row + dims, mask=live, other=0.0).to(tl.float32)
-        output = tl.load(out_ptr + q_row + dims, mask=live, other=0.0)
-        delta = tl.sum(upstream * output, axis=0)
         slots = tl.arange(0, SLOTS)
         latent_rows = ((position * SLOTS + slots) * HEADS + head) * HD
         keys = tl.load(
@@ -410,6 +414,8 @@ if triton is not None:
         denom = tl.load(l_ptr + window * HEADS + head)
         alpha = tl.exp(scores - row_max) / denom
         dalpha = tl.sum(upstream[None, :] * values, axis=1)
+        delta = tl.sum(alpha * dalpha, axis=0)
+        tl.store(delta_ptr + window * HEADS + head, delta)
         dscore = alpha * (dalpha - delta)
         grad = tl.sum(dscore[:, None] * keys, axis=0) * scale
         element = dq_ptr.dtype.element_ty
@@ -417,8 +423,8 @@ if triton is not None:
 
     @triton.jit
     def _broadcast_dkdv_kernel(
-        q_ptr, k_ptr, v_ptr, offsets_ptr, order_ptr, out_ptr, m_ptr, l_ptr,
-        go_ptr, dk_ptr, dv_ptr, scale, SLOTS: tl.constexpr,
+        q_ptr, k_ptr, v_ptr, offsets_ptr, order_ptr, m_ptr, l_ptr,
+        go_ptr, delta_ptr, dk_ptr, dv_ptr, scale, SLOTS: tl.constexpr,
         HEADS: tl.constexpr, HD: tl.constexpr, BLOCK_HD: tl.constexpr,
         BLOCK_W: tl.constexpr,
     ):
@@ -447,18 +453,17 @@ if triton is not None:
             upstream = tl.load(
                 go_ptr + q_rows, mask=inside[:, None] & live[None, :], other=0.0
             ).to(tl.float32)
-            outputs = tl.load(
-                out_ptr + q_rows, mask=inside[:, None] & live[None, :], other=0.0
-            )
             row_max = tl.load(
                 m_ptr + windows * HEADS + head, mask=inside, other=0.0
             )
             denom = tl.load(
                 l_ptr + windows * HEADS + head, mask=inside, other=1.0
             )
+            delta = tl.load(
+                delta_ptr + windows * HEADS + head, mask=inside, other=0.0
+            )
             scores = tl.sum(queries * key[None, :], axis=1) * scale
             alpha = tl.where(inside, tl.exp(scores - row_max) / denom, 0.0)
-            delta = tl.sum(upstream * outputs, axis=1)
             dalpha = tl.sum(upstream * value[None, :], axis=1)
             dscore = alpha * (dalpha - delta)
             acc_k += tl.sum(dscore[:, None] * queries, axis=0)
@@ -526,18 +531,19 @@ def _launch_broadcast_forward(q, k, v, window_pos):
     return out, m, l
 
 
-def _launch_broadcast_backward(q, k, v, window_pos, offsets, order, out, m, l, go):
+def _launch_broadcast_backward(q, k, v, window_pos, offsets, order, m, l, go):
     windows, heads, hd = q.shape
     positions, slots = k.shape[:2]
     block_hd = triton.next_power_of_2(hd)
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+    delta = torch.empty((windows, heads), dtype=torch.float32, device=q.device)
     _broadcast_dq_kernel[(windows * heads,)](
-        q, k, v, window_pos, out, m, l, go, dq, 1.0 / math.sqrt(hd),
+        q, k, v, window_pos, m, l, go, dq, delta, 1.0 / math.sqrt(hd),
         SLOTS=slots, HEADS=heads, HD=hd, BLOCK_HD=block_hd,
         num_warps=_NUM_WARPS,
     )
     _broadcast_dkdv_kernel[(positions * slots * heads,)](
-        q, k, v, offsets, order, out, m, l, go, dk, dv, 1.0 / math.sqrt(hd),
+        q, k, v, offsets, order, m, l, go, delta, dk, dv, 1.0 / math.sqrt(hd),
         SLOTS=slots, HEADS=heads, HD=hd, BLOCK_HD=block_hd, BLOCK_W=_BLOCK_W,
         num_warps=_NUM_WARPS,
     )
@@ -622,8 +628,7 @@ _read_op.register_autograd(_read_dispatch_backward, setup_context=_read_setup_co
 
 
 def _broadcast_forward_impl(q, k, v, window_pos):
-    """The guarded broadcast forward, shared by the op and the backward's
-    recompute so both take the same kernel-or-reference path."""
+    """The guarded kernel-or-reference broadcast forward."""
     if not _supported(q, q.shape[0]):
         return _reference_broadcast_forward(q, k, v, window_pos)
     key = _shape_key(q)
@@ -661,24 +666,21 @@ def _(q, k, v, window_pos, offsets, order):
 @torch.library.custom_op("mantisnet::window_latent_broadcast_backward", mutates_args=())
 def _broadcast_backward_op(
     q: Tensor, k: Tensor, v: Tensor, window_pos: Tensor, offsets: Tensor,
-    order: Tensor, grad_out: Tensor,
+    order: Tensor, m: Tensor, l: Tensor, grad_out: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor]:
     q, k, v, go = q.contiguous(), k.contiguous(), v.contiguous(), grad_out.contiguous().float()
-    # Deterministic forward: the recompute reproduces out/m/l bit-identically,
-    # so the fp32 window rows never sit saved across the step.
-    out, m, l = _broadcast_forward_impl(q, k, v, window_pos)
     if not _supported(q, q.shape[0]):
         return _reference_broadcast_backward(
-            q, k, v, window_pos, offsets, order, out, m, l, go
+            q, k, v, window_pos, offsets, order, m, l, go
         )
     key = _shape_key(q) + (grad_out.dtype,)
     if key in _FAILED_BROADCAST_BACKWARD_SHAPES:
         return _reference_broadcast_backward(
-            q, k, v, window_pos, offsets, order, out, m, l, go
+            q, k, v, window_pos, offsets, order, m, l, go
         )
     try:
         return _launch_broadcast_backward(
-            q, k, v, window_pos, offsets, order, out, m, l, go
+            q, k, v, window_pos, offsets, order, m, l, go
         )
     except Exception as exc:
         _FAILED_BROADCAST_BACKWARD_SHAPES[key] = f"{type(exc).__name__}: {exc}"
@@ -687,18 +689,19 @@ def _broadcast_backward_op(
             f"{_FAILED_BROADCAST_BACKWARD_SHAPES[key]}", RuntimeWarning, stacklevel=2,
         )
         return _reference_broadcast_backward(
-            q, k, v, window_pos, offsets, order, out, m, l, go
+            q, k, v, window_pos, offsets, order, m, l, go
         )
 
 
 @_broadcast_backward_op.register_fake
-def _(q, k, v, window_pos, offsets, order, grad_out):
+def _(q, k, v, window_pos, offsets, order, m, l, grad_out):
     return torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
 
 
 def _broadcast_setup_context(ctx, inputs, output) -> None:
     q, k, v, window_pos, offsets, order = inputs
-    ctx.save_for_backward(q, k, v, window_pos, offsets, order)
+    _out, m, l = output
+    ctx.save_for_backward(q, k, v, window_pos, offsets, order, m, l)
 
 
 def _broadcast_dispatch_backward(ctx, grad_out, _grad_m, _grad_l):

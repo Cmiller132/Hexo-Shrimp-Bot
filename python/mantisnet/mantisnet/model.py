@@ -710,7 +710,8 @@ class _Block(nn.Module):
         g = g + self.drop(global_delta.view(p, global_rows, cfg.h))
         # Same recompute-in-backward policy as the cell stage: the cycle
         # touches every window row three times and its saves were the
-        # second-widest slice of the peak.
+        # second-widest slice of the peak, while its replay is a fraction
+        # of a percent of the step.
         w, g = checkpoint(
             self._window_latent_cycle, w, g, latent_layout, use_reentrant=False
         )
