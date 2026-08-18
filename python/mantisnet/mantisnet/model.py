@@ -240,6 +240,19 @@ def _mlp(d_in: int, d_hidden: int, d_out: int) -> nn.Sequential:
     return nn.Sequential(nn.Linear(d_in, d_hidden), nn.ReLU(), nn.Linear(d_hidden, d_out))
 
 
+def _gemm_dtype(t: Tensor) -> torch.dtype:
+    """The dtype autocast will run GEMMs in, or the tensor's own outside it.
+
+    LayerNorm runs fp32 under autocast while its consumers' GEMMs cast to
+    bf16 internally. Casting the normed rows once, explicitly, is the same
+    arithmetic — but it hands autograd one half-width tensor to save instead
+    of the fp32 rows, which is where the trunk's peak VRAM lived.
+    """
+    if torch.is_autocast_enabled(t.device.type):
+        return torch.get_autocast_dtype(t.device.type)
+    return t.dtype
+
+
 class _PairMlp(nn.Module):
     """``MLP([a; b])`` with the concatenation folded away.
 
@@ -426,8 +439,8 @@ class _Block(nn.Module):
         heads, hd = cfg.heads, cfg.h // cfg.heads
         n_c, n_w = c.shape[0], w.shape[0]
 
-        zc = self.ln_cr_c(c)
-        zw = self.ln_cr_w(w)
+        zc = self.ln_cr_c(c).to(_gemm_dtype(c))
+        zw = self.ln_cr_w(w).to(_gemm_dtype(w))
         read = cell_latents.cell_read(
             self.cr_wq(zc).view(n_c, heads, hd),
             self.cr_wk(zw).view(n_w, heads, hd),
@@ -441,8 +454,8 @@ class _Block(nn.Module):
         if cfg.cell_nodes:
             if radius is None:
                 raise ValueError("cell_nodes is on but radius tables are missing")
-            zc = self.ln_radius_c(c)
-            zs = self.ln_radius_s(s)
+            zc = self.ln_radius_c(c).to(_gemm_dtype(c))
+            zs = self.ln_radius_s(s).to(_gemm_dtype(s))
             read = cell_latents.cell_read(
                 self.radius_wq(zc).view(n_c, heads, hd),
                 self.radius_wk(zs).view(s.shape[0], heads, hd),
@@ -460,8 +473,8 @@ class _Block(nn.Module):
         if cfg.cell_adjacency:
             if adjacency is None:
                 raise ValueError("cell_adjacency is on but adjacency tables are missing")
-            zq = self.ln_adj_q(c)
-            zk = self.ln_adj_k(c)
+            zq = self.ln_adj_q(c).to(_gemm_dtype(c))
+            zk = self.ln_adj_k(c).to(_gemm_dtype(c))
             read = cell_latents.cell_read(
                 self.adj_wq(zq).view(n_c, heads, hd),
                 self.adj_wk(zk).view(n_c, heads, hd),
@@ -474,8 +487,8 @@ class _Block(nn.Module):
         elif adjacency is not None:
             raise ValueError("adjacency tables were passed but cell_adjacency is off")
 
-        zw = self.ln_wr_w(w)
-        zc = self.ln_wr_c(c)
+        zw = self.ln_wr_w(w).to(_gemm_dtype(w))
+        zc = self.ln_wr_c(c).to(_gemm_dtype(c))
         back = cell_latents.window_read(
             self.wr_wq(zw).view(n_w, heads, hd),
             self.wr_wk(zc).view(n_c, heads, hd),
@@ -545,7 +558,7 @@ class _Block(nn.Module):
         q = self.latent_wq_read(self.latent_ln_read_q(g)).view(
             p, slots, heads, head_dim
         )
-        window_rows = self.latent_ln_read_w(w)
+        window_rows = self.latent_ln_read_w(w).to(_gemm_dtype(w))
         k = self.latent_wk_read(window_rows).view(-1, heads, head_dim)
         v = self.latent_wv_read(window_rows).view(-1, heads, head_dim)
         read = window_latents.read_attention(q, k, v, window_pos, offsets, order)
@@ -567,9 +580,9 @@ class _Block(nn.Module):
         # K is fixed at four, so the fused op uses multiply-sum reductions
         # rather than a small-dimension dot and returns flat window rows.
         latent_rows = self.latent_ln_bcast_l(g)
-        q = self.latent_wq_bcast(self.latent_ln_bcast_q(w)).view(
-            -1, heads, head_dim
-        )
+        q = self.latent_wq_bcast(
+            self.latent_ln_bcast_q(w).to(_gemm_dtype(w))
+        ).view(-1, heads, head_dim)
         k = self.latent_wk_bcast(latent_rows).view(p, slots, heads, head_dim)
         v = self.latent_wv_bcast(latent_rows).view(p, slots, heads, head_dim)
         broadcast = window_latents.broadcast_attention(
