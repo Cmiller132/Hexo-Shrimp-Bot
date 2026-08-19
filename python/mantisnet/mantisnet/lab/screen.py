@@ -32,6 +32,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+import torch
+
 from .evaluate import SCORES_FORMAT, scores_filename
 from .train import TrainConfig
 
@@ -430,9 +432,19 @@ def main(argv: Iterable[str] | None = None) -> None:
         from .evaluate import evaluate_cell
 
         written = []
+        compile_model = torch.device(args.device).type == "cuda"
         for split in ("val", "test"):
             for ema in (False, True):
-                evaluate_cell(args.cell, args.corpus, split=split, ema=ema, device=args.device)
+                evaluate_cell(
+                    args.cell,
+                    args.corpus,
+                    split=split,
+                    ema=ema,
+                    device=args.device,
+                    compile=compile_model,
+                    pair_budget=RECIPE.collect_pair_budget,
+                    cell_budget=RECIPE.collect_cell_budget,
+                )
                 written.append(scores_filename(split, ema))
         print(json.dumps({"cell": args.cell, "scores": written}))
         return
