@@ -3,18 +3,34 @@
 Every query-key pair is typed by the D6 orbit of its displacement: the frozen
 48-class vocabulary of §4.2 within hex radius 12, then FAR beyond it, SELF on
 the diagonal, TOKEN for any pair touching a latent row, and a finite PAD
-sentinel for keys past the live prefix. The learned table holds the 51
-orbit/FAR/SELF/TOKEN rows per head; PAD is appended at compute time.
+sentinel for keys past the live prefix. PAD is appended at compute time.
+
+The bias the kernels read comes in two widths, selected by the model's
+``orbit_vectors`` knob and told apart by rank at the seam:
+
+* ``(A, BIAS_ROWS)`` — the static table of 51 orbit/FAR/SELF/TOKEN rows per
+  head (:func:`compose_bias_table`), one opinion of a displacement per head;
+* ``(P, A, T, BIAS_ROWS)`` — the same rows plus a content term the querying
+  row projects out of a learned per-orbit vector
+  (:func:`compose_row_bias_table`), so what a head makes of a displacement
+  depends on the stone that is asking.
+
+Each width has its own kernel specialization: the static one broadcasts its
+row over the query tile and reduces its gradient with an atomic, the per-row
+one gathers and stores by query row. The seam knows only "a table indexed by
+(row, bucket)"; the parametrisation is the model's.
 """
 
 from __future__ import annotations
 
+import contextlib
 import math
 import warnings
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from .builder import orbit48_id
 
@@ -149,6 +165,42 @@ def compose_bias_table(axis_bias: Tensor, orbit_bias: Tensor, index: Tensor) -> 
     coarse = axis_bias.index_select(1, index)
     return torch.cat((coarse[:, :ORBIT_CLASSES] + orbit_bias, coarse[:, ORBIT_CLASSES:]), dim=1)
 
+
+def compose_row_bias_table(bias_table: Tensor, orbit_vec: Tensor, q: Tensor) -> Tensor:
+    """The ``(P, A, T, BIAS_ROWS)`` per-query-row table of the
+    ``orbit_vectors`` knob.
+
+    Row ``m`` of head ``h`` is the static row ``bias_table[h]`` plus
+    ``q[m] @ orbit_vec[h]^T``, so a head's opinion about a displacement is a
+    function of the querying stone rather than a constant of the geometry.
+    Only the query enters: the key's content already reaches the score through
+    ``q·k``. The content term carries no scale factor — ``orbit_vec`` is
+    learned and zero-initialised, so training starts exactly at the static
+    table and the vectors set their own magnitude from there.
+
+    Composed here rather than inside the kernel because the kernel seam is "a
+    table indexed by (row, bucket)": autograd routes the table's gradient back
+    to ``orbit_vec``, to the static parts, and to ``q`` with no kernel of its
+    own.
+    """
+    if bias_table.ndim != 2 or bias_table.shape[1] != BIAS_ROWS:
+        raise ValueError(
+            f"bias_table must have shape (A, {BIAS_ROWS}), got {tuple(bias_table.shape)}"
+        )
+    heads = bias_table.shape[0]
+    if q.ndim != 4 or q.shape[1] != heads:
+        raise ValueError(
+            f"q must have shape (P, {heads}, T, D), got {tuple(q.shape)}"
+        )
+    if orbit_vec.shape != (heads, BIAS_ROWS, q.shape[3]):
+        raise ValueError(
+            f"orbit_vec must have shape ({heads}, {BIAS_ROWS}, {q.shape[3]}), "
+            f"got {tuple(orbit_vec.shape)}"
+        )
+    content = torch.matmul(q, orbit_vec.to(q.dtype).transpose(-2, -1))
+    return bias_table.to(q.dtype)[None, :, None, :] + content
+
+
 # Fixed launch geometry keeps symbolic shape changes out of Triton's tuning cache.
 _BLOCK_M = 64
 _BLOCK_N = 64
@@ -204,6 +256,30 @@ if triton is not None:
         return tl.where(k_live[None, :], bucket, PAD)
 
     @triton.jit
+    def _bias_tile(
+        table_base,
+        bucket,
+        offs_m,
+        q_live,
+        stride_tm,
+        stride_tb,
+        ROW_TABLE: tl.constexpr,
+    ):
+        # The (BLOCK_M, BLOCK_N) bias tile, one load per pair either way.
+        # ROW_TABLE roots each pair's gather at its own query row; without it
+        # the head's single row broadcasts over the tile. Dead query rows read
+        # nothing under ROW_TABLE: their table rows may sit past the tensor,
+        # and their output is zeroed regardless.
+        if ROW_TABLE:
+            return tl.load(
+                table_base + offs_m[:, None] * stride_tm + bucket * stride_tb,
+                mask=q_live[:, None],
+                other=0.0,
+                cache_modifier=".ca",
+            )
+        return tl.load(table_base + bucket * stride_tb, cache_modifier=".ca")
+
+    @triton.jit
     def _fused_attention_kernel(
         q_ptr,
         k_ptr,
@@ -230,7 +306,9 @@ if triton is not None:
         stride_ct,
         stride_cc,
         stride_lp,
+        stride_tp,
         stride_th,
+        stride_tm,
         stride_tb,
         stride_op,
         stride_oh,
@@ -249,6 +327,7 @@ if triton is not None:
         SELF: tl.constexpr,
         TOKEN: tl.constexpr,
         PAD: tl.constexpr,
+        ROW_TABLE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -293,6 +372,7 @@ if triton is not None:
             q_live = offs_m < live_len
             q = tl.load(q_ptrs, mask=q_live[:, None], other=0.0)
 
+            table_base = table_ptr + off_p * stride_tp + off_h * stride_th
             coords_base = coords_ptr + off_p * stride_cp
             q_q = tl.load(
                 coords_base + offs_m * stride_ct,
@@ -347,9 +427,9 @@ if triton is not None:
                     q_q, q_r, k_q, k_r, offs_m, offs_n, k_live, global_rows,
                     lut_ptr, RADIUS, SIDE, FAR, SELF, TOKEN, PAD,
                 )
-                bias = tl.load(
-                    table_ptr + off_h * stride_th + bucket * stride_tb,
-                    cache_modifier=".ca",
+                bias = _bias_tile(
+                    table_base, bucket, offs_m, q_live, stride_tm, stride_tb,
+                    ROW_TABLE,
                 )
 
                 scores = tl.dot(q, tl.trans(k)) * sm_scale + bias
@@ -463,7 +543,9 @@ if triton is not None:
         stride_ct,
         stride_cc,
         stride_lp,
+        stride_tp,
         stride_th,
+        stride_tm,
         stride_tb,
         stride_lsep,
         stride_lseh,
@@ -479,7 +561,9 @@ if triton is not None:
         stride_dqh,
         stride_dqt,
         stride_dqd,
+        stride_dtp,
         stride_dth,
+        stride_dtm,
         stride_dtb,
         n_heads,
         n_ctx,
@@ -491,6 +575,7 @@ if triton is not None:
         SELF: tl.constexpr,
         TOKEN: tl.constexpr,
         PAD: tl.constexpr,
+        ROW_TABLE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -504,6 +589,7 @@ if triton is not None:
 
         offs_m = start_m + tl.arange(0, BLOCK_M)
         offs_d = tl.arange(0, HEAD_DIM)
+        offs_b = tl.arange(0, BLOCK_BUCKETS)
         live_len = tl.load(seq_lens_ptr + off_p * stride_lp)
         live_len = tl.minimum(tl.maximum(live_len, 0), n_ctx)
         q_live = offs_m < live_len
@@ -514,10 +600,28 @@ if triton is not None:
             + offs_m[:, None] * stride_dqt
             + offs_d[None, :] * stride_dqd
         )
+        if ROW_TABLE:
+            # This program owns every table row of its query tile, so the row
+            # histogram is a plain store — no atomics, and the result is
+            # independent of block scheduling.
+            dtable_ptrs = (
+                dtable_ptr
+                + off_p * stride_dtp
+                + off_h * stride_dth
+                + offs_m[:, None] * stride_dtm
+                + offs_b[None, :] * stride_dtb
+            )
+            dtable_mask = (offs_m[:, None] < n_ctx) & (offs_b[None, :] < TABLE_COLS)
 
         if start_m >= live_len:
             zeros = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
             tl.store(dq_ptrs, zeros, mask=offs_m[:, None] < n_ctx)
+            if ROW_TABLE:
+                tl.store(
+                    dtable_ptrs,
+                    tl.zeros([BLOCK_M, BLOCK_BUCKETS], dtype=tl.float32),
+                    mask=dtable_mask,
+                )
         else:
             q = tl.load(
                 q_ptr
@@ -566,9 +670,12 @@ if triton is not None:
                 other=0,
             )
 
+            table_base = table_ptr + off_p * stride_tp + off_h * stride_th
             dq_acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-            offs_b = tl.arange(0, BLOCK_BUCKETS)
-            dtable_acc = tl.zeros([BLOCK_BUCKETS], dtype=tl.float32)
+            if ROW_TABLE:
+                dtable_acc = tl.zeros([BLOCK_M, BLOCK_BUCKETS], dtype=tl.float32)
+            else:
+                dtable_acc = tl.zeros([BLOCK_BUCKETS], dtype=tl.float32)
 
             for start_n in tl.range(0, live_len, BLOCK_N):
                 start_n = tl.multiple_of(start_n, BLOCK_N)
@@ -608,9 +715,9 @@ if triton is not None:
                     q_q, q_r, k_q, k_r, offs_m, offs_n, k_live, global_rows,
                     lut_ptr, RADIUS, SIDE, FAR, SELF, TOKEN, PAD,
                 )
-                bias = tl.load(
-                    table_ptr + off_h * stride_th + bucket * stride_tb,
-                    cache_modifier=".ca",
+                bias = _bias_tile(
+                    table_base, bucket, offs_m, q_live, stride_tm, stride_tb,
+                    ROW_TABLE,
                 )
 
                 scores = tl.dot(q, tl.trans(k)) * sm_scale + bias
@@ -623,22 +730,36 @@ if triton is not None:
                 ds = p * (dp - delta[:, None])
                 dq_acc += tl.dot(ds.to(k_ptr.dtype.element_ty), k) * sm_scale
 
-                for b in tl.static_range(0, TABLE_COLS):
-                    bucket_grad = tl.sum(
-                        tl.sum(tl.where(bucket == b, ds, 0.0), axis=1),
-                        axis=0,
-                    )
-                    dtable_acc += tl.where(offs_b == b, bucket_grad, 0.0)
+                # The table enters each score additively through one gather, so
+                # its gradient is the score gradient's bucket histogram — kept
+                # per query row when each row owns a table row, pooled over the
+                # tile when they all share one.
+                if ROW_TABLE:
+                    for b in tl.static_range(0, TABLE_COLS):
+                        bucket_grad = tl.sum(tl.where(bucket == b, ds, 0.0), axis=1)
+                        dtable_acc += tl.where(
+                            offs_b[None, :] == b, bucket_grad[:, None], 0.0
+                        )
+                else:
+                    for b in tl.static_range(0, TABLE_COLS):
+                        bucket_grad = tl.sum(
+                            tl.sum(tl.where(bucket == b, ds, 0.0), axis=1),
+                            axis=0,
+                        )
+                        dtable_acc += tl.where(offs_b == b, bucket_grad, 0.0)
 
             dq_acc = tl.where(q_live[:, None], dq_acc, 0.0)
             tl.store(dq_ptrs, dq_acc, mask=offs_m[:, None] < n_ctx)
-            tl.atomic_add(
-                dtable_ptr
-                + off_h * stride_dth
-                + offs_b * stride_dtb,
-                dtable_acc,
-                mask=offs_b < TABLE_COLS,
-            )
+            if ROW_TABLE:
+                tl.store(dtable_ptrs, dtable_acc, mask=dtable_mask)
+            else:
+                tl.atomic_add(
+                    dtable_ptr
+                    + off_h * stride_dth
+                    + offs_b * stride_dtb,
+                    dtable_acc,
+                    mask=offs_b < TABLE_COLS,
+                )
 
 
     @triton.jit
@@ -671,7 +792,9 @@ if triton is not None:
         stride_ct,
         stride_cc,
         stride_lp,
+        stride_tp,
         stride_th,
+        stride_tm,
         stride_tb,
         stride_lsep,
         stride_lseh,
@@ -701,6 +824,7 @@ if triton is not None:
         SELF: tl.constexpr,
         TOKEN: tl.constexpr,
         PAD: tl.constexpr,
+        ROW_TABLE: tl.constexpr,
         HEAD_DIM: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
@@ -753,6 +877,7 @@ if triton is not None:
                 mask=k_live[:, None],
                 other=0.0,
             )
+            table_base = table_ptr + off_p * stride_tp + off_h * stride_th
             coords_base = coords_ptr + off_p * stride_cp
             k_q = tl.load(
                 coords_base + offs_n * stride_ct,
@@ -822,9 +947,9 @@ if triton is not None:
                     q_q, q_r, k_q, k_r, offs_m, offs_n, k_live, global_rows,
                     lut_ptr, RADIUS, SIDE, FAR, SELF, TOKEN, PAD,
                 )
-                bias = tl.load(
-                    table_ptr + off_h * stride_th + bucket * stride_tb,
-                    cache_modifier=".ca",
+                bias = _bias_tile(
+                    table_base, bucket, offs_m, q_live, stride_tm, stride_tb,
+                    ROW_TABLE,
                 )
 
                 scores = tl.dot(q, tl.trans(k)) * sm_scale + bias
@@ -851,17 +976,20 @@ if triton is not None:
 
 
 def _bias_table(q: Tensor, bias_table: Tensor) -> Tensor:
-    """Cast the learned rows once and append the finite PAD sentinel.
+    """Cast the learned rows once and append the finite PAD sentinel column.
 
-    Layout: orbits 0..47, FAR, SELF, TOKEN, then PAD — ``TABLE_WIDTH`` wide.
+    Layout of the last axis: orbits 0..47, FAR, SELF, TOKEN, then PAD —
+    ``TABLE_WIDTH`` wide. Rank tells the two biases apart: ``(A, BIAS_ROWS)``
+    is the static table, ``(P, A, T, BIAS_ROWS)`` the per-query-row one.
     """
-    if bias_table.ndim != 2 or bias_table.shape[1] != BIAS_ROWS:
+    if bias_table.ndim not in (2, 4) or bias_table.shape[-1] != BIAS_ROWS:
         raise ValueError(
-            f"bias_table must have shape (A, {BIAS_ROWS}), got {tuple(bias_table.shape)}"
+            f"bias_table must have shape (A, {BIAS_ROWS}) or "
+            f"(P, A, T, {BIAS_ROWS}), got {tuple(bias_table.shape)}"
         )
     table = bias_table.to(q.dtype)
-    pad = table.new_full((table.shape[0], 1), _PAD_BIAS)
-    return torch.cat((table, pad), dim=1)
+    pad = table.new_full(table.shape[:-1] + (1,), _PAD_BIAS)
+    return torch.cat((table, pad), dim=-1)
 
 
 def _bucket_index(
@@ -901,6 +1029,15 @@ def _apply_reference(q: Tensor, k: Tensor, v: Tensor, mask: Tensor, valid: Tenso
     return out
 
 
+def _table_mask(table: Tensor, bucket: Tensor) -> Tensor:
+    """The dense ``(P, A, T, T)`` bias: each pair reads its bucket, from the
+    head's one row or — for a per-row table — from its own query row."""
+    if table.ndim == 2:
+        return table[:, bucket].permute(1, 0, 2, 3)
+    heads = table.shape[1]
+    return torch.gather(table, 3, bucket.unsqueeze(1).expand(-1, heads, -1, -1))
+
+
 def _attention_reference_table(
     q: Tensor,
     k: Tensor,
@@ -913,11 +1050,10 @@ def _attention_reference_table(
 ) -> Tensor:
     """The dense formulation used by CPU, failed launches, and recompute."""
     _, _, t, _ = q.shape
-    if table.shape[1] != TABLE_WIDTH:
-        raise ValueError(f"bias table width {table.shape[1]} != {TABLE_WIDTH}")
+    if table.shape[-1] != TABLE_WIDTH:
+        raise ValueError(f"bias table width {table.shape[-1]} != {TABLE_WIDTH}")
     bucket, valid = _bucket_index(coords, seq_lens, t, lut, global_rows)
-    mask = table[:, bucket].permute(1, 0, 2, 3)
-    return _apply_reference(q, k, v, mask, valid)
+    return _apply_reference(q, k, v, _table_mask(table, bucket), valid)
 
 
 def _attention_reference(
@@ -930,7 +1066,8 @@ def _attention_reference(
     lut: Tensor,
     global_rows: int = 1,
 ) -> Tensor:
-    """Reference attention over the learned ``bias_table`` rows."""
+    """Reference attention over either bias width — the static ``(A,
+    BIAS_ROWS)`` rows or the per-query-row ``(P, A, T, BIAS_ROWS)`` table."""
     return _attention_reference_table(
         q, k, v, coords, seq_lens, _bias_table(q, bias_table), lut, global_rows
     )
@@ -982,8 +1119,11 @@ def _validate_inputs(
         raise ValueError(
             f"global_rows must be in [1, {t}], got {global_rows}"
         )
-    if table.ndim != 2 or table.shape[0] != heads or table.shape[1] != TABLE_WIDTH:
-        raise ValueError(f"bias table must have shape (A, {TABLE_WIDTH})")
+    if table.shape not in ((heads, TABLE_WIDTH), (p, heads, t, TABLE_WIDTH)):
+        raise ValueError(
+            f"bias table must have shape ({heads}, {TABLE_WIDTH}) or "
+            f"({p}, {heads}, {t}, {TABLE_WIDTH}), got {tuple(table.shape)}"
+        )
     if lut.shape != (_LUT_SIDE * _LUT_SIDE,) or lut.dtype != torch.int32:
         raise ValueError(
             f"orbit lut must be int32 with shape ({_LUT_SIDE * _LUT_SIDE},)"
@@ -995,7 +1135,7 @@ def _validate_inputs(
         raise ValueError("q, k, v, and the bias table must have one dtype")
 
 
-def _orbit_constexprs() -> dict:
+def _orbit_constexprs(table: Tensor) -> dict:
     return dict(
         RADIUS=ORBIT_RADIUS,
         SIDE=_LUT_SIDE,
@@ -1003,7 +1143,17 @@ def _orbit_constexprs() -> dict:
         SELF=SELF_BUCKET,
         TOKEN=TOKEN_BUCKET,
         PAD=PAD_BUCKET,
+        ROW_TABLE=table.ndim == 4,
     )
+
+
+def _table_strides(table: Tensor) -> tuple[int, ...]:
+    """``(P, A, T, R)`` strides for either table rank. The static table is one
+    row per head, broadcast over positions and query rows, so those two
+    strides are zero — and ``ROW_TABLE=False`` compiles their loads away."""
+    if table.ndim == 2:
+        return (0, table.stride(0), 0, table.stride(1))
+    return tuple(table.stride())
 
 
 def _launch_triton(
@@ -1035,14 +1185,14 @@ def _launch_triton(
         *v.stride(),
         *coords.stride(),
         *seq_lens.stride(),
-        *table.stride(),
+        *_table_strides(table),
         *out.stride(),
         *lse.stride(),
         heads,
         t,
         1.0 / math.sqrt(head_dim),
         global_rows,
-        **_orbit_constexprs(),
+        **_orbit_constexprs(table),
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
@@ -1070,7 +1220,12 @@ def _launch_triton_backward(
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    dtable = torch.zeros(table.shape, dtype=torch.float32, device=table.device)
+    if table.ndim == 4:
+        # Every entry is written by the one dq program that owns its query row.
+        dtable = torch.empty(table.shape, dtype=table.dtype, device=table.device)
+    else:
+        # Every dq program adds its tile's histogram into the head's one row.
+        dtable = torch.zeros(table.shape, dtype=torch.float32, device=table.device)
     row_grid = (triton.cdiv(t, _BLOCK_M), p * heads)
     key_grid = (triton.cdiv(t, _BLOCK_N), p * heads)
 
@@ -1108,22 +1263,22 @@ def _launch_triton_backward(
         *v.stride(),
         *coords.stride(),
         *seq_lens.stride(),
-        *table.stride(),
+        *_table_strides(table),
         *lse.stride(),
         *delta.stride(),
         *grad_out.stride(),
         *dq.stride(),
-        *dtable.stride(),
+        *_table_strides(dtable),
         heads,
         t,
         1.0 / math.sqrt(head_dim),
         global_rows,
-        **_orbit_constexprs(),
+        **_orbit_constexprs(table),
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
-        BLOCK_BUCKETS=triton.next_power_of_2(table.shape[1]),
-        TABLE_COLS=table.shape[1],
+        BLOCK_BUCKETS=triton.next_power_of_2(table.shape[-1]),
+        TABLE_COLS=table.shape[-1],
         num_warps=_NUM_WARPS,
         num_stages=_NUM_STAGES,
     )
@@ -1145,7 +1300,7 @@ def _launch_triton_backward(
         *v.stride(),
         *coords.stride(),
         *seq_lens.stride(),
-        *table.stride(),
+        *_table_strides(table),
         *lse.stride(),
         *delta.stride(),
         *grad_out.stride(),
@@ -1155,7 +1310,7 @@ def _launch_triton_backward(
         t,
         1.0 / math.sqrt(head_dim),
         global_rows,
-        **_orbit_constexprs(),
+        **_orbit_constexprs(table),
         HEAD_DIM=head_dim,
         BLOCK_M=_BLOCK_M,
         BLOCK_N=_BLOCK_N,
@@ -1248,23 +1403,40 @@ def _backward(ctx, grad_out: Tensor):
     q, k, v, coords, seq_lens, table, lut = ctx.saved_tensors
     t = q.shape[2]
     global_rows = ctx.global_rows
+    row_table = table.ndim == 4
     bucket, valid = _bucket_index(coords, seq_lens, t, lut, global_rows)
     with torch.enable_grad():
         q_ = q.detach().requires_grad_(True)
         k_ = k.detach().requires_grad_(True)
         v_ = v.detach().requires_grad_(True)
-        # The dense bias enters the scores additively, so its gradient is the
-        # per-pair score gradient. Differentiating the mask directly (instead
-        # of the table gather) keeps the scatter out of autograd: reducing
-        # P*A*T*T gradients into a table this small serializes on atomics.
-        mask = table.detach()[:, bucket].permute(1, 0, 2, 3).requires_grad_(True)
-        out = _apply_reference(q_, k_, v_, mask, valid)
-        dq, dk, dv, dmask = torch.autograd.grad(
-            out,
-            (q_, k_, v_, mask),
-            grad_out,
-        )
-    grads = dmask.float()
+        if row_table:
+            # Over a table this wide the gather's scatter is per query row and
+            # no longer serializes, so differentiating the gather itself *is*
+            # the per-row bucket histogram the Triton path accumulates.
+            # Gathering out of an fp32 copy keeps a long key run from rounding
+            # away in the compute dtype.
+            wrt = table.detach().float().requires_grad_(True)
+            mask = _table_mask(wrt, bucket).to(q.dtype)
+        else:
+            # The dense bias enters the scores additively, so its gradient is
+            # the per-pair score gradient. Differentiating the mask directly
+            # (instead of the table gather) keeps the scatter out of autograd:
+            # reducing P*A*T*T gradients into a table this small serializes on
+            # atomics.
+            wrt = _table_mask(table.detach(), bucket).requires_grad_(True)
+            mask = wrt
+        # The per-row gather leaves the mask contiguous, which sends SDPA's
+        # heuristics to the memory-efficient backend — whose backward refuses
+        # to differentiate a dense bias at some sequence lengths. Pin the row
+        # case to the math backend, the formula itself; a fallback must not
+        # rest on an accident of the mask's strides. The static case keeps the
+        # dispatch it has always had, so its gradients are unchanged.
+        with sdpa_kernel(SDPBackend.MATH) if row_table else contextlib.nullcontext():
+            out = _apply_reference(q_, k_, v_, mask, valid)
+            dq, dk, dv, dwrt = torch.autograd.grad(out, (q_, k_, v_, wrt), grad_out)
+    if row_table:
+        return dq, dk, dv, None, None, dwrt.to(table.dtype), None, None
+    grads = dwrt.float()
     dtable = torch.stack(
         [
             (grads * (bucket == b).unsqueeze(1)).sum(dim=(0, 2, 3))
@@ -1412,8 +1584,10 @@ def fused_attention(
 ) -> Tensor:
     """Orbit-biased attention over ``[latent rows; stones]`` per position.
 
-    ``bias_table`` is the ``(A, BIAS_ROWS)`` table of per-head bias rows (the
-    model composes it with :func:`compose_bias_table`); ``lut`` the
+    ``bias_table`` is either the ``(A, BIAS_ROWS)`` table of per-head bias
+    rows (:func:`compose_bias_table`) or, with the model's ``orbit_vectors``
+    knob on, the ``(P, A, T, BIAS_ROWS)`` table of each query row
+    (:func:`compose_row_bias_table`). Rank selects the kernel; ``lut`` is the
     device-resident displacement table from :func:`orbit_lut`.
     """
     out, _ = _fused_attention_op(

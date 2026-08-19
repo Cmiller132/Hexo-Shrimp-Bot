@@ -21,7 +21,7 @@ from ..builder import (
     TERN_PATTERNS,
     TERN_POST1_CLASSES,
 )
-from ..attention import AXIS_ROWS, ORBIT_CLASSES
+from ..attention import AXIS_ROWS, BIAS_ROWS, ORBIT_CLASSES
 from ..cell_latents import LINE_CLASSES
 from ..cell_nodes import ADJACENCY_CLASSES, NEAREST_BUCKETS, RADIUS_CLASSES
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
@@ -272,6 +272,7 @@ _LP_SUFFIXES = {
     "lp_wv.weight", "lp_wv.bias", "lp_wo.weight", "lp_wo.bias",
     "lp_bias",
 }
+_ORBIT_VEC_SUFFIXES = {"orbit_vec"}
 # Step 5/6 knob keys live on the model, not the blocks.
 _TACTICAL_KEYS = {
     "tactical_a.weight", "tactical_a.bias",
@@ -315,6 +316,7 @@ class _Knobs:
     action_tactical: bool
     action_latents: bool
     global_magnitude: bool
+    orbit_vectors: bool
 
 
 def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
@@ -362,6 +364,7 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         action_tactical="tactical_a.weight" in state_dict,
         action_latents="act_latent_base" in state_dict,
         global_magnitude="magnitude_pattern" in state_dict,
+        orbit_vectors="blocks.0.orbit_vec" in state_dict,
     )
 
 
@@ -381,6 +384,7 @@ _BAKED = _Knobs(
     action_tactical=False,
     action_latents=False,
     global_magnitude=False,
+    orbit_vectors=False,
 )
 
 
@@ -408,6 +412,8 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
             keys |= {prefix + suffix for suffix in _WA_SUFFIXES}
         if knobs.line_pass:
             keys |= {prefix + suffix for suffix in _LP_SUFFIXES}
+        if knobs.orbit_vectors:
+            keys |= {prefix + suffix for suffix in _ORBIT_VEC_SUFFIXES}
         keys |= {prefix + suffix for suffix in _LATENT_SUFFIXES}
         if knobs.cell_latents or knobs.cell_nodes:
             keys |= {prefix + suffix for suffix in _CELL_SUFFIXES}
@@ -610,6 +616,8 @@ def _expected_shapes(
             shapes[prefix + "lp_bias"] = (cfg.heads, LINE_CLASSES)
         shapes[prefix + "axis_bias"] = (cfg.heads, AXIS_ROWS)
         shapes[prefix + "orbit_bias"] = (cfg.heads, ORBIT_CLASSES)
+        if cfg.orbit_vectors:
+            shapes[prefix + "orbit_vec"] = (cfg.heads, BIAS_ROWS, h // cfg.heads)
         shapes[prefix + "ffn.0.weight"] = (fh, h)
         shapes[prefix + "ffn.0.bias"] = (fh,)
         shapes[prefix + "ffn.2.weight"] = (h, fh)
@@ -718,6 +726,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         action_tactical=knobs.action_tactical,
         action_latents=knobs.action_latents,
         global_magnitude=knobs.global_magnitude,
+        orbit_vectors=knobs.orbit_vectors,
     )
     if knobs != expected:
         raise _baked_profile_error(knobs)
@@ -739,6 +748,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         action_tactical=knobs.action_tactical,
         action_latents=knobs.action_latents,
         global_magnitude=knobs.global_magnitude,
+        orbit_vectors=knobs.orbit_vectors,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")
