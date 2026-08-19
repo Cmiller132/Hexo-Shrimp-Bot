@@ -1,13 +1,17 @@
-"""Step 11 orbit48 single-seed cell: one (seed) per invocation.
+"""Step 11 single-seed cell: one (sweep, seed) per invocation.
 
 The exact Step 5/6 arm-B recipe (production architecture: cell latents +
 cell nodes at scope all, window attention off, tactical scalars on) on the
 same corpus, subset, budgets, and epochs, so the cell pairs directly with
 ``runs/lab/step56-epochs4/armB/s<seed>`` — the only difference between the
-two is the tree: this one carries the orbit-48 stone-attention bias.
+two is the tree this driver runs on. The sweep name records which:
+``step11-orbit48`` (be1dda8, plain orbit rows), ``step11b-residual``
+(ab6de77, coarse table + orbit residual), ``step11b-control`` (the residual
+tree with the residual frozen at zero — the old vocabulary on the new
+kernel path).
 
-    python step11_driver.py train <seed> [epochs]
-    python step11_driver.py evaluate <seed> [epochs]
+    python step11_driver.py train <sweep> <seed> [epochs]
+    python step11_driver.py evaluate <sweep> <seed> [epochs]
 """
 
 import json
@@ -23,7 +27,8 @@ MODEL_KW = dict(
     action_latents=False,
 )
 CORPUS = Path("runs/corpora/cn1-late-v1")
-SWEEPS = ("step11-orbit48", "step11b-residual")
+SWEEPS = ("step11-orbit48", "step11b-residual", "step11b-control")
+FREEZE = {"step11b-control": ("orbit_bias",)}
 
 CELL_BUDGET = 125_000
 PAIR_BUDGET = 2_000_000
@@ -52,6 +57,7 @@ def main() -> None:
             collect_cell_budget=COLLECT_CELL_BUDGET,
             collect_pair_budget=COLLECT_PAIR_BUDGET,
             train_subset=TRAIN_SUBSET,
+            freeze=FREEZE.get(sweep, ()),
         )
         result = train_cell(
             CORPUS,

@@ -51,6 +51,9 @@ class TrainConfig:
     # seed) so every arm and seed of a paired screen fits identical samples.
     train_subset: int = 0
     train_subset_seed: int = 0
+    # Ablation-by-freezing control: parameter-name suffixes held at their
+    # initial value (left out of the optimizer). Empty = train everything.
+    freeze: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         resolve_adam_implementation(self.adam_impl, self.device)
@@ -532,8 +535,18 @@ def train_cell(
     destination.mkdir(parents=True, exist_ok=True)
 
     model = model.to(cfg.device)
+    if cfg.freeze:
+        frozen_names = [
+            name for name, parameter in model.named_parameters()
+            if name.endswith(tuple(cfg.freeze))
+        ]
+        if not frozen_names:
+            raise ValueError(f"freeze suffixes {cfg.freeze} match no parameter")
+        for name, parameter in model.named_parameters():
+            if name in frozen_names:
+                parameter.requires_grad_(False)
     optimizer, adam_resolved = make_adam(
-        model.parameters(),
+        [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=cfg.lr,
         device=cfg.device,
         implementation=cfg.adam_impl,
