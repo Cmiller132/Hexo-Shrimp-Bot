@@ -64,6 +64,7 @@ Architecture knobs (validated jointly at construction):
 | `cell_nodes` | `False` | extends persistent cell state to every legal cell, with radius edges |
 | `cell_node_scope` | `"all"` | radius/adjacency edge destinations: `all` or `uncovered` |
 | `cell_adjacency` | `False` | directed distance-one cell↔cell messages (requires `cell_nodes`) |
+| `cell_structure` | `False` | structured covered-cell init and a nonlinear cell update (requires `cell_latents`) |
 | `action_tactical` | `False` | encodes the §4.4 tactical scalars into the action row through a small MLP |
 | `action_latents` | `False` | two invariant latents read/mix/broadcast over each legal set (§6) |
 | `global_magnitude` | `False` | feeds three whole-position magnitude features into the §3.3 latent init |
@@ -75,6 +76,9 @@ configuration keeps window attention on and cell state off. Parameter count
 is 4,804,581 at defaults (pinned by tests) and 5,197,093 at the production
 configuration. `orbit_vectors` adds `B × A × 51 × H/A` parameters on top of
 whatever else is on — 26,112 at either of those shapes.
+configuration. `cell_structure` adds 726·H + 8·H for its two static tables
+and B·(2H + 3H² + 2H) for the per-block update MLP — 292,608 at the default
+widths and four blocks.
 
 ## 3. Input entities
 
@@ -140,6 +144,15 @@ learned-base initialization, and all cells additionally read radius-edge
 context from stones (§5.1b). The `cell_node_scope` knob restricts which cells
 receive radius/adjacency edges (`all`, or only `uncovered` ones); every legal
 cell keeps its latent and features regardless of scope.
+
+With `cell_structure` on, a covered cell no longer starts from the bare
+shared row: `cell_base` stays as the bias every covered cell gets, and three
+invariant static encodings of the cell's own coverage join it — the sum over
+its containing live windows of a learned row per 726-class decoder incidence
+class (§4.3), its nearest-stone bucket (the same 10-bucket table uncovered
+cells initialize from, §4.2), and a bucketed count of how many live windows
+contain it (§4.2). Uncovered cells are unchanged. The knob requires
+`cell_latents`.
 
 ### 3.5 Excluded inputs
 
@@ -217,6 +230,13 @@ neighbours share one relation row (the per-axis split is emitted by the
 builder for a future equivariant route but collapsed here). Nearest-stone
 distance for cell features uses 10 buckets.
 
+`cell_structure` adds one more invariant cell feature: **coverage count**,
+the number of live windows containing the cell, 1..18 (six per axis), folded
+into **8 buckets** — 1, 2, 3, 4, 5-6, 7-9, 10-13, 14-18. Resolution where it
+separates a barely-touched cell from a contested one, coarse in the crowded
+tail where one more window changes little. The count is the cell's decoder
+incidence degree, so it needs nothing new on the wire.
+
 ### 4.3 Ternary window classes and the incidence fold
 
 Windows relate to the stones and cells they contain through **incidence
@@ -274,9 +294,19 @@ in order:
    and class value rows; with `cell_nodes`, cells then read stones through
    the 192-class radius edges (and optionally distance-one neighbours);
    finally windows read back from their (at most 5) empty candidate cells,
-   bias-typed. A full window has no empty cells and reads zero. With cell
-   state off, a parameter-tied transient relay lets windows exchange state
-   through shared empty cells instead.
+   bias-typed. A full window has no empty cells and reads zero. Each cell
+   read applies as its own additive residual, so the stone read sees the
+   cell state the window read already updated. `cell_structure` leaves that
+   additive path exactly as it is and adds a second, nonlinear residual
+   after it — `c += MLP_c([LN(c₀); W_o·read_win + R_o·read_stone])`, a 2H→H
+   layer, the trunk's ReLU, then H→H — where `c₀` is the block's incoming
+   cell state and the second input sums the same read outputs the additive
+   path applied. The knob strictly nests the incumbent, recovering it
+   exactly at zero output weights. Without `cell_nodes` there is no stone
+   read and the second input is the window read alone. The window read-back
+   and the adjacency pass are unaffected. With cell state off, a
+   parameter-tied transient relay lets windows exchange state through shared
+   empty cells instead.
 3. **§5.1c window attention** — multi-head attention over each window's
    typed pair relations (48 classes), when `window_attention` is on; the
    whole-line pass (13 classes) runs in the same slot when `line_pass` is
@@ -379,6 +409,15 @@ each query row owns a table row, the reduction becomes a plain store, and
 that exception disappears. Embeddings, the latent and cell bases, and the
 value queries initialize N(0, 0.02); decoder output layers initialize to zero;
 attention key projections and the spec's bare matrices are bias-free (a
+backward passes — no atomics — and CPU reference paths asserted equal at
+tolerance on CUDA. Embeddings, the latent and cell bases, and the value
+queries initialize N(0, 0.02); decoder output layers initialize to zero, as
+do the output layers and static tables a knob adds, so every knob-on arm
+starts at exactly the incumbent function — for `cell_structure` that is both
+static tables and the cell-update MLP's output layer, its one remaining
+init-time difference being the nearest-stone row covered cells newly read
+off a table that is not new; attention key projections and the spec's bare
+matrices are bias-free (a
 shared key bias cancels in softmax), while FFN, MLP, and the remaining
 attention linears keep the framework-default bias.
 

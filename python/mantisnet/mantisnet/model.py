@@ -90,6 +90,10 @@ class MantisConfig:
     # head makes of a displacement depends on the querying stone rather than
     # on the geometry alone. Zero-initialised, hence a no-op at init.
     orbit_vectors: bool = False
+    # Step S1: covered cells start from invariant structure rather than one
+    # shared row, and a block's cell reads gain a nonlinear residual on top
+    # of the additive path they already take.
+    cell_structure: bool = False
     # Step 5: encode the builder's deterministic per-action tactical scalars
     # into the action row through a small MLP (measured arm True).
     action_tactical: bool = False
@@ -125,6 +129,8 @@ class MantisConfig:
             raise ValueError(
                 f"cell_node_scope={self.cell_node_scope!r} requires cell_nodes=True"
             )
+        if self.cell_structure and not self.cell_latents:
+            raise ValueError("cell_structure requires cell_latents=True")
 
     @property
     def uses_cell_state(self) -> bool:
@@ -162,6 +168,17 @@ CRITIC_LOGITS = 3
 ACTION_LATENTS = 2
 # S2: the two whole-position count scalars, log stones and log legal cells.
 MAGNITUDE_COUNTS = 2
+
+# Step S1 coverage vocabulary: how many live windows contain a covered cell,
+# 1..18, folded into eight buckets — 1, 2, 3, 4, 5-6, 7-9, 10-13, 14-18.
+# Resolution where it separates a barely-touched cell from a contested one,
+# coarse in the crowded tail where one more window changes little.
+COVERAGE_BUCKETS = 8
+# Bucket of each degree 0..18. Entry 0 is unreachable: a cell is covered
+# exactly when it has decoder incidence, so every row this table indexes has
+# degree at least one. A degree above 18 is impossible (six windows per axis)
+# and indexes out of the table rather than folding into the last bucket.
+COVERAGE_BUCKET_OF = (0, 0, 1, 2, 3, 4, 4, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 7)
 
 # The trunk stages were config knobs while they were ablations; checkpoints
 # written in that window record the knob fields in their model_config. These
@@ -365,6 +382,12 @@ class _Block(nn.Module):
                     torch.zeros(cfg.heads, cell_nodes.ADJACENCY_CLASSES)
                 )
                 self.adj_vclass = nn.Embedding(cell_nodes.ADJACENCY_CLASSES, h)
+            if cfg.cell_structure:
+                # Step S1: one more residual, an MLP over the block's
+                # incoming normalized cell state and the summed read
+                # outputs, after the two additive read residuals.
+                self.ln_c = nn.LayerNorm(h)
+                self.mlp_c = _PairMlp(h, h, h)
         else:
             self.ln_cp_in = nn.LayerNorm(h)
             self.u_cp = nn.Linear(h, h, bias=False)
@@ -499,10 +522,19 @@ class _Block(nn.Module):
         read back from their at most 5 empty cells bias-typed. A full window
         has no empty cells and reads zero. Both ops run their scores,
         softmax, and weighted sums in fp32 whatever autocast chose for the
-        projections."""
+        projections.
+
+        ``cell_structure`` adds a second, nonlinear residual on top of that
+        additive path rather than replacing it: one MLP over the block's
+        incoming cell state and the same read outputs the additive path
+        applied. Its zero-init output layer makes the knob-on arm start at
+        exactly the incumbent function."""
         cfg = self.cfg
         heads, hd = cfg.heads, cfg.h // cfg.heads
         n_c, n_w = c.shape[0], w.shape[0]
+        # The incoming state, which the knob's MLP reads; the additive path
+        # below advances ``c`` exactly as it does off the knob.
+        state = c
 
         zc = self.ln_cr_c(c)
         zw = self.ln_cr_w(w)
@@ -514,7 +546,8 @@ class _Block(nn.Module):
             self.cr_vclass.weight,
             ctab,
         )
-        c = c + self.drop(self.cr_wo(read.reshape(n_c, cfg.h).to(zc.dtype)))
+        reads = self.cr_wo(read.reshape(n_c, cfg.h).to(zc.dtype))
+        c = c + self.drop(reads)
 
         if cfg.cell_nodes:
             if radius is None:
@@ -529,11 +562,17 @@ class _Block(nn.Module):
                 self.radius_vclass.weight,
                 radius,
             )
-            c = c + self.drop(
-                self.radius_wo(read.reshape(n_c, cfg.h).to(zc.dtype))
-            )
+            stone = self.radius_wo(read.reshape(n_c, cfg.h).to(zc.dtype))
+            c = c + self.drop(stone)
+            if cfg.cell_structure:
+                reads = reads + stone
         elif radius is not None:
             raise ValueError("radius tables were passed but cell_nodes is off")
+
+        if cfg.cell_structure:
+            # Without cell_nodes there is no stone read and ``reads`` is the
+            # window read alone.
+            c = c + self.drop(self.mlp_c(self.ln_c(state), reads))
 
         if cfg.cell_adjacency:
             if adjacency is None:
@@ -835,12 +874,26 @@ class MantisNet(nn.Module):
             self.magnitude_pattern = nn.Parameter(torch.empty(cfg.window_vocab, h))
             self.magnitude_counts = nn.Linear(MAGNITUDE_COUNTS, h)
         if cfg.uses_cell_state:
-            # Every covered cell starts from one learned row; identity
-            # accrues through the typed reads. Legal cells no live window
+            # The shared covered-cell row; identity accrues through the typed
+            # reads, and under `cell_structure` also from the static
+            # encodings this row then biases. Legal cells no live window
             # covers keep this row at the decoder — far-ring semantics.
             self.cell_base = nn.Parameter(torch.empty(h))
-        if cfg.cell_nodes:
+        if cfg.cell_nodes or cfg.cell_structure:
             self.cell_nearest_table = nn.Embedding(cell_nodes.NEAREST_BUCKETS, h)
+        if cfg.cell_structure:
+            # Step S1: a covered cell's static identity — the 726-class
+            # decoder incidence it sits in, its nearest-stone bucket (the
+            # same table uncovered cells initialize from), and how many live
+            # windows cover it. Both tables are zero at init, so the knob
+            # starts at the incumbent function on these two terms.
+            self.cell_class_table = nn.Embedding(cfg.dec_classes, h)
+            self.cell_coverage_table = nn.Embedding(COVERAGE_BUCKETS, h)
+            self.register_buffer(
+                "coverage_bucket",
+                torch.tensor(COVERAGE_BUCKET_OF, dtype=torch.long),
+                persistent=False,
+            )
 
         self.blocks = nn.ModuleList(_Block(cfg) for _index in range(cfg.blocks))
         # The §4.1 displacement → orbit table the stone attention gathers
@@ -948,6 +1001,12 @@ class MantisNet(nn.Module):
             nn.init.zeros_(self.magnitude_pattern)
             nn.init.zeros_(self.magnitude_counts.weight)
             nn.init.zeros_(self.magnitude_counts.bias)
+        if self.cfg.cell_structure:
+            nn.init.zeros_(self.cell_class_table.weight)
+            nn.init.zeros_(self.cell_coverage_table.weight)
+            for block in self.blocks:
+                nn.init.zeros_(block.mlp_c.out.weight)
+                nn.init.zeros_(block.mlp_c.out.bias)
 
     def _pair_tables(self, batch: Batch):
         # §5.1c tables are born on the batch's device from the window
@@ -984,6 +1043,43 @@ class MantisNet(nn.Module):
                 batch.cell_pos.shape[0] if self.cfg.cell_nodes else -1,
             )
         )
+
+    def _covered_init(
+        self, batch: Batch, ctab: cell_latents.CellTables
+    ) -> Tensor:
+        """The initial state of the covered legal cells, ``(N_cov, H)``.
+
+        Off ``cell_structure`` that is the one shared learned row, identical
+        for every covered cell. On it the shared row stays as the bias and
+        three invariant static encodings of the cell's own coverage join it:
+        the sum of its decoder incidence classes, its nearest-stone bucket —
+        the same table uncovered cells initialize from — and the bucketed
+        number of live windows that contain it.
+        """
+        cfg = self.cfg
+        base = self.cell_base.expand(ctab.covered.shape[0], cfg.h)
+        if not cfg.cell_structure:
+            return base
+        n_cells = batch.cell_pos.shape[0]
+        classes = message_passing.class_row_sum(
+            self.cell_class_table.weight,
+            batch.dec_class,
+            batch.dec_cell,
+            n_cells,
+            message_passing.STONE_RUN,
+        ).index_select(0, ctab.covered)
+        # Coverage count is the cell's decoder-incidence degree; a covered
+        # cell has at least one entry by definition.
+        degree = torch.zeros(
+            n_cells, dtype=torch.long, device=batch.dec_cell.device
+        ).index_add_(0, batch.dec_cell, torch.ones_like(batch.dec_cell))
+        coverage = self.cell_coverage_table(
+            self.coverage_bucket.index_select(0, degree.index_select(0, ctab.covered))
+        )
+        nearest = self.cell_nearest_table(
+            batch.cell_nearest.index_select(0, ctab.covered)
+        )
+        return base + classes.to(base.dtype) + nearest + coverage
 
     def _radius_tables(
         self, batch: Batch, covered: Tensor, n_stones: int
@@ -1066,18 +1162,15 @@ class MantisNet(nn.Module):
         ctab = c = radius = adjacency = None
         if cfg.uses_cell_state:
             ctab = self._cell_tables(batch, w.shape[0])
+            covered_init = self._covered_init(batch, ctab)
             if cfg.cell_nodes:
                 c = self.cell_nearest_table(batch.cell_nearest).clone()
-                c.index_copy_(
-                    0,
-                    ctab.covered,
-                    self.cell_base.expand(ctab.covered.shape[0], cfg.h),
-                )
+                c.index_copy_(0, ctab.covered, covered_init)
                 radius = self._radius_tables(batch, ctab.covered, s.shape[0])
                 if cfg.cell_adjacency:
                     adjacency = self._adjacency_tables(batch, ctab.covered)
             else:
-                c = self.cell_base.expand(ctab.covered.shape[0], cfg.h)
+                c = covered_init
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         for block in self.blocks:
             s, w, g, c = block(

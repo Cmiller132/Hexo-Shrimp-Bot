@@ -28,6 +28,7 @@ from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
 from ..model import (
     ACTION_LATENTS,
     MAGNITUDE_COUNTS,
+    COVERAGE_BUCKETS,
     MantisConfig,
     MantisNet,
     ModelOutput,
@@ -266,6 +267,11 @@ _ADJACENCY_SUFFIXES = {
     "adj_wv.weight", "adj_wv.bias", "adj_wo.weight", "adj_wo.bias",
     "adj_bias", "adj_vclass.weight",
 }
+_CELL_STRUCTURE_SUFFIXES = {
+    "ln_c.weight", "ln_c.bias",
+    "mlp_c.lin_a.weight", "mlp_c.lin_a.bias", "mlp_c.lin_b.weight",
+    "mlp_c.out.weight", "mlp_c.out.bias",
+}
 _LP_SUFFIXES = {
     "ln_lp.weight", "ln_lp.bias",
     "lp_wq.weight", "lp_wq.bias", "lp_wk.weight",
@@ -313,6 +319,7 @@ class _Knobs:
     line_pass: bool
     cell_nodes: bool
     cell_adjacency: bool
+    cell_structure: bool
     action_tactical: bool
     action_latents: bool
     global_magnitude: bool
@@ -339,6 +346,10 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
     )
     e_ws = state_dict.get("blocks.0.e_ws.weight")
     latent_base = state_dict.get("latent_base")
+    # The all-cell stage is identified by its radius tensors, not by the
+    # nearest-distance table, which `cell_structure` also brings in.
+    nodes = "blocks.0.radius_bias" in state_dict
+    structure = "cell_class_table.weight" in state_dict
     return _Knobs(
         cell_pass=bool(relayed),
         cell_pass_from=relayed[0] if relayed else 0,
@@ -355,12 +366,14 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
             if isinstance(latent_base, Tensor) and latent_base.ndim == 2
             else 0
         ),
-        cell_latents=(
-            "cell_base" in state_dict and "cell_nearest_table.weight" not in state_dict
-        ),
+        # Cell state is one stage and `cell_nodes` subsumes `cell_latents`,
+        # so an all-cell profile names only `cell_nodes` — except under
+        # `cell_structure`, which requires `cell_latents=True`.
+        cell_latents=("cell_base" in state_dict and not nodes) or structure,
         line_pass="blocks.0.lp_bias" in state_dict,
-        cell_nodes="cell_nearest_table.weight" in state_dict,
+        cell_nodes=nodes,
         cell_adjacency="blocks.0.adj_bias" in state_dict,
+        cell_structure=structure,
         action_tactical="tactical_a.weight" in state_dict,
         action_latents="act_latent_base" in state_dict,
         global_magnitude="magnitude_pattern" in state_dict,
@@ -381,6 +394,7 @@ _BAKED = _Knobs(
     line_pass=False,
     cell_nodes=False,
     cell_adjacency=False,
+    cell_structure=False,
     action_tactical=False,
     action_latents=False,
     global_magnitude=False,
@@ -397,8 +411,10 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
     keys.add("latent_base")
     if knobs.cell_latents or knobs.cell_nodes:
         keys.add("cell_base")
-    if knobs.cell_nodes:
+    if knobs.cell_nodes or knobs.cell_structure:
         keys.add("cell_nearest_table.weight")
+    if knobs.cell_structure:
+        keys |= {"cell_class_table.weight", "cell_coverage_table.weight"}
     keys |= _ACT_KEYS
     if knobs.action_tactical:
         keys |= _TACTICAL_KEYS
@@ -421,6 +437,8 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
             keys |= {prefix + suffix for suffix in _RADIUS_SUFFIXES}
         if knobs.cell_adjacency:
             keys |= {prefix + suffix for suffix in _ADJACENCY_SUFFIXES}
+        if knobs.cell_structure:
+            keys |= {prefix + suffix for suffix in _CELL_STRUCTURE_SUFFIXES}
         if knobs.cell_pass and index >= knobs.cell_pass_from:
             keys |= {prefix + suffix for suffix in _CP_SUFFIXES}
     return keys
@@ -506,8 +524,11 @@ def _expected_shapes(
     })
     if cfg.uses_cell_state:
         shapes["cell_base"] = (h,)
-    if cfg.cell_nodes:
+    if cfg.cell_nodes or cfg.cell_structure:
         shapes["cell_nearest_table.weight"] = (NEAREST_BUCKETS, h)
+    if cfg.cell_structure:
+        shapes["cell_class_table.weight"] = (cfg.dec_classes, h)
+        shapes["cell_coverage_table.weight"] = (COVERAGE_BUCKETS, h)
     if cfg.action_tactical:
         shapes.update({
             "tactical_a.weight": (h, TACTICAL_FEATURES),
@@ -555,6 +576,8 @@ def _expected_shapes(
         ln_names += ["ln_adj_q", "ln_adj_k"]
         biased += ["adj_wq", "adj_wv", "adj_wo"]
         bias_free += ["adj_wk"]
+    if cfg.cell_structure:
+        ln_names.append("ln_c")
     if cfg.window_attention:
         ln_names.append("ln_wa")
         biased += ["wq_wa", "wv_wa", "wo_wa"]
@@ -599,6 +622,8 @@ def _expected_shapes(
         if cfg.cell_adjacency:
             shapes[prefix + "adj_bias"] = (cfg.heads, ADJACENCY_CLASSES)
             shapes[prefix + "adj_vclass.weight"] = (ADJACENCY_CLASSES, h)
+        if cfg.cell_structure:
+            mlps.append("mlp_c")
         for name in mlps:
             shapes[prefix + name + ".lin_a.weight"] = (h, h)
             shapes[prefix + name + ".lin_a.bias"] = (h,)
@@ -722,6 +747,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         line_pass=knobs.line_pass,
         cell_nodes=knobs.cell_nodes,
         cell_adjacency=knobs.cell_adjacency,
+        cell_structure=knobs.cell_structure,
         cell_pass=not (knobs.cell_latents or knobs.cell_nodes),
         action_tactical=knobs.action_tactical,
         action_latents=knobs.action_latents,
@@ -745,6 +771,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         line_pass=knobs.line_pass,
         cell_nodes=knobs.cell_nodes,
         cell_adjacency=knobs.cell_adjacency,
+        cell_structure=knobs.cell_structure,
         action_tactical=knobs.action_tactical,
         action_latents=knobs.action_latents,
         global_magnitude=knobs.global_magnitude,

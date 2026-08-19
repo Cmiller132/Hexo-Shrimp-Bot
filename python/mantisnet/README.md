@@ -59,6 +59,30 @@ through a learned table, plus `log1p` of the stone and legal-cell counts
 through one linear. Every term is a count over D6-invariant inputs, and both
 parameter groups are zero-initialized, so the knob is an exact no-op at
 initialization.
+`cell_structure=True` (refused without `cell_latents`) gives covered cells a
+structured start and the cell stage a nonlinear second residual:
+
+- **Structured init.** `cell_base` stays as the bias every covered cell gets,
+  and three invariant static encodings of the cell's own coverage join it: the
+  sum over its containing live windows of a learned row per 726-class decoder
+  incidence class, its nearest-stone bucket (the same 10-row table uncovered
+  cells initialize from), and a bucketed coverage count — how many live
+  windows contain the cell, 1..18 folded into eight buckets: 1, 2, 3, 4, 5-6,
+  7-9, 10-13, 14-18. The count is the cell's decoder incidence degree, so
+  nothing new rides the wire. Uncovered cells are unchanged.
+- **Nonlinear update.** The window read and the radius read still apply as
+  two additive residuals in sequence, exactly as they do off the knob. On top
+  of them one more residual MLP runs over `[LN(c0); read]` — a 2H→H layer,
+  ReLU, then H→H — where `c0` is the block's incoming cell state and `read`
+  sums the same two projected read outputs the additive path applied. Without
+  `cell_nodes` there is no radius read and the second input is the window
+  read alone. The window read-back and the adjacency pass are untouched.
+
+The knob strictly nests the incumbent: both static tables and the MLP's
+output layer are zero at init, so a fresh knob-on model computes exactly the
+incumbent function apart from the nearest-stone row that covered cells newly
+read, off a table that is not new. Zeroing that table makes the two arms
+byte-identical, which is what the no-op-at-init test asserts.
 
 Three heads read the trunk output:
 
@@ -267,10 +291,12 @@ numbers go to `docs/ABLATIONS.md`.
 The family registry identifies a checkpoint structurally from its model key
 set, native critic-readout width, and decoder-table row count. Configuration
 is inferred from state-dict tensor shapes, including the live
-`window_attention` knob from the presence of §5.1c tensors. The latent base,
-per-block latent cycle, and row encoder are required. Shipped scoreable families
-are `trinomial-joint`,
-`bipolar-joint`, and `scalar-joint`; older representation families are rejected.
+`window_attention` knob from the presence of §5.1c tensors. Cell state is one
+stage, so an all-cell profile is named `cell_nodes` alone — except under
+`cell_structure`, whose own requirement puts `cell_latents` back on. The
+latent base, per-block latent cycle, and row encoder are required. Shipped
+scoreable families are `trinomial-joint`, `bipolar-joint`, and
+`scalar-joint`; older representation families are rejected.
 
 ### Measurement commands
 
