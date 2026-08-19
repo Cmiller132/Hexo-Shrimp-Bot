@@ -378,7 +378,7 @@ def smoke(work_dir: str | Path | None = None) -> dict:
     root.mkdir(parents=True, exist_ok=True)
     try:
         from .corpus import freeze
-        from .evaluate import evaluate_cell
+        from .evaluate import evaluate_cell, scores_filename
         from .report import build_report
         from .train import train_cell
 
@@ -416,14 +416,15 @@ def smoke(work_dir: str | Path | None = None) -> dict:
         )
         scores = evaluate_cell(cell_dir, corpus_dir, split="test", device="cpu")
         report_path = root / "report.json"
-        report = build_report([cell_dir / "scores.json"], report_path)
+        scores_path = cell_dir / scores_filename("test")
+        report = build_report([scores_path], report_path)
         required = (
             corpus_dir / "manifest.json",
             corpus_dir / "corpus.npz",
             cell_dir / "config.json",
             cell_dir / "metrics.jsonl",
             cell_dir / "checkpoint_final.pt",
-            cell_dir / "scores.json",
+            scores_path,
             report_path,
         )
         missing = [str(path) for path in required if not path.is_file()]

@@ -219,10 +219,32 @@ Configuration overrides are typed against the chosen variant's dataclass.
 ### Evaluation and reports
 
 Evaluation produces imitation top-1 and top-3 accuracy overall and per
-distance-from-end bucket, plus per-bucket sign accuracy, MAE, and mean
-prediction for the v-hat and (where present) state-value channels. Reports
-aggregate scores across seeds, with optional per-seed paired differencing
-against a named baseline arm.
+distance-from-end bucket; per-bucket sign accuracy, MAE, and mean prediction
+for the v-hat and (where present) state-value channels; and the three fit
+losses scored per sample — policy NLL of the played move, trinomial critic
+cross-entropy at the played move, and state-value cross-entropy — overall and
+per bucket. A cell's per-epoch validation row carries the same three losses.
+Scores are written beside the cell as `scores-<split>.json`
+(`scores-<split>-ema.json` for the EMA weights), so one cell can hold val and
+test scores at once; `scores_format` 2. Reports aggregate one split's scores
+across seeds (mean and sample SD per metric).
+
+### Screen protocol v2
+
+`python -m mantisnet.lab.screen` holds the current ablation screen as code:
+`train` fits one cell under the protocol's recipe (4 epochs over the whole
+realized train split, lean budgets, EMA 0.995); `evaluate` scores a cell on
+val and test with raw and EMA weights; `verdict` judges arms against the
+fixture. The fixture is the baseline configuration at six seeds, which sets
+the per-metric seed SD and the critic/policy correlation; an arm is three
+seeds. The composite `S = (2·z_critic + z_policy) / sqrt(5 + 4ρ)`, with each
+`z` the arm's mean improvement in the fit loss over the fixture divided by
+`sd·sqrt(1/3 + 1/6)`, is unit-normal under no effect. `S ≥ 2` with the policy
+no more than one SE worse is `keep`; `S ≥ 2` otherwise is `policy-regressed`;
+`S ≤ −2` is `negative`; two cells in a critic basin (optimist or agnostic at
+1–4 plies from the end) make the arm `pathology-prone` regardless. Speed and
+other benefits are decided outside the module. Per-arm rows and the fixture's
+numbers go to `docs/ABLATIONS.md`.
 
 ### Checkpoint families
 
@@ -428,8 +450,9 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `__main__.py` | Command-line interface for all lab commands |
 | `corpus.py` | Frozen corpus freeze, load, replay verification, and sample access |
 | `train.py` | Supervised lab-cell fitting through the production model and fit engine |
-| `evaluate.py` | Packed imitation and outcome-horizon evaluation for lab and KLENT checkpoints |
-| `report.py` | Cross-seed score aggregation with optional paired-difference baselines |
+| `evaluate.py` | Packed imitation, outcome-horizon, and per-sample loss evaluation for lab and KLENT checkpoints |
+| `report.py` | Cross-seed score aggregation (mean and sample SD per metric) |
+| `screen.py` | Screen protocol v2: the arm recipe, the fixture noise floor, and the composite verdict |
 | `variants.py` | Variant registry: MantisNet presets with typed config overrides |
 | `families.py` | Structural checkpoint-family registry and config inference |
 | `bench.py` | Benchmarks for building, collection, and fitting |

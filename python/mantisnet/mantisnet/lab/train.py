@@ -407,16 +407,32 @@ def validate_supervised(
     correct = 0
     sign_correct = 0
     absolute_error = 0.0
+    # Sums of the three fit losses over the split, per sample, so the
+    # per-epoch row carries the same quantities the fit minimizes.
+    policy_nll_sum = 0.0
+    critic_ce_sum = 0.0
+    state_value_ce_sum = 0.0
     model.eval()
     for indices in chunks:
-        batch, _target, ranks, z = collate_samples(frozen, samples, indices, collate)
+        batch, target, ranks, z = collate_samples(frozen, samples, indices, collate)
         batch = batch.to(cfg.device)
+        target = target.to(cfg.device)
         ranks = ranks.to(cfg.device)
         z = z.to(cfg.device)
         with _gpu_lock, torch.autocast(
             device_type, dtype=torch.bfloat16, enabled=cfg.autocast
         ):
-            policy, _critic, value, _value_logits = forward(model, batch)
+            policy, critic, value, value_logits = forward(model, batch)
+        rows = len(indices)
+        policy_nll_sum += float(policy_loss(policy.float(), batch.legal_offsets, target)) * rows
+        taken = critic.index_select(0, batch.legal_offsets[:-1] + ranks).float()
+        critic_target = torch.stack(
+            (z.clamp(min=0.0), (-z).clamp(min=0.0), 1.0 - z.abs()), dim=-1
+        )
+        critic_ce_sum += float(
+            -(critic_target * F.log_softmax(taken, dim=-1)).sum(dim=-1).sum()
+        )
+        state_value_ce_sum += float(value_loss(value_logits, z)) * rows
         # One transfer per tensor keeps validation packed on CUDA instead of
         # synchronizing separately for every position's scalar conversions.
         offsets = batch.legal_offsets.cpu().tolist()
@@ -424,7 +440,7 @@ def validate_supervised(
         policy_cpu = policy.float().cpu()
         value_cpu = value.float().cpu()
         z_cpu = z.cpu()
-        for row in range(len(indices)):
+        for row in range(rows):
             lo, hi = offsets[row], offsets[row + 1]
             correct += int(int(policy_cpu[lo:hi].argmax()) == ranks_cpu[row])
         sign_correct += int((torch.sign(value_cpu) == z_cpu).sum())
@@ -435,6 +451,9 @@ def validate_supervised(
         "imitation_top1": correct / n,
         "value_sign_accuracy": sign_correct / n,
         "value_mae": absolute_error / n,
+        "policy_nll": policy_nll_sum / n,
+        "critic_ce": critic_ce_sum / n,
+        "state_value_ce": state_value_ce_sum / n,
     }
 
 

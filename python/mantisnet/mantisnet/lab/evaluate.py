@@ -14,7 +14,9 @@ import torch
 
 from ..klent.improve import improved_policy
 from ..klent.train import KlentConfig, _gpu_lock
+from ..losses import value_target
 from ..model import compose_acting_q, compose_q
+from ..segments import segment_log_softmax
 from .families import Composition, load_checkpoint
 from .corpus import FrozenCorpus
 from .train import (
@@ -108,11 +110,37 @@ def _horizon_block(
     return block
 
 
+def _loss_block(
+    per_sample: np.ndarray, masks: Mapping[str, np.ndarray]
+) -> dict[str, object]:
+    """Mean of a per-sample loss overall and per distance-from-end bucket."""
+    if not np.isfinite(per_sample).all():
+        index = int(np.nonzero(~np.isfinite(per_sample))[0][0])
+        raise ValueError(f"non-finite per-sample loss at sample {index}: {per_sample[index]}")
+
+    def metrics(mask: np.ndarray) -> dict[str, object]:
+        n = int(mask.sum())
+        return {"n": n, "mean": float(per_sample[mask].mean()) if n else None}
+
+    return {
+        "overall": metrics(np.ones(len(per_sample), dtype=bool)),
+        "by_distance": {label: metrics(mask) for label, mask in masks.items()},
+    }
+
+
+def _critic_target(z: torch.Tensor) -> torch.Tensor:
+    """Trinomial (+, -, 0) target for an outcome in [-1, 1]; same as the fit."""
+    return torch.stack((z.clamp(min=0.0), (-z).clamp(min=0.0), 1.0 - z.abs()), dim=-1)
+
+
 def _evaluation_heads(model, batch, include_state_value: bool):
     _stones, windows, token, cells = model.trunk(batch)
     policy, critic = model.cell_head_logits(windows, token, cells, batch)
-    value = model.value_head(windows, token, batch)[0] if include_state_value else None
-    return policy, critic, value
+    if include_state_value:
+        value, _value_dist, value_logits = model.value_head(windows, token, batch)
+    else:
+        value = value_logits = None
+    return policy, critic, value, value_logits
 
 
 @torch.no_grad()
@@ -172,6 +200,12 @@ def evaluate_model(
     top3 = np.zeros(n, dtype=bool)
     v_hat_prediction = np.empty(n, dtype=np.float32)
     state_prediction = np.empty(n, dtype=np.float32) if include_state_value else None
+    # Per-sample values of the three fit losses, scored exactly as the fit
+    # computes them (policy CE over the legal cells at the played move,
+    # trinomial critic CE at the played move, two-hot state-value CE).
+    policy_nll = np.empty(n, dtype=np.float32)
+    critic_ce = np.empty(n, dtype=np.float32)
+    state_value_ce = np.empty(n, dtype=np.float32) if include_state_value else None
     model.eval()
     for indices in chunks:
         games = [frozen.moves_for(int(samples.game[index])) for index in indices]
@@ -180,6 +214,11 @@ def evaluate_model(
         ranks = torch.tensor(
             [int(samples.rank[index]) for index in indices],
             dtype=torch.long,
+            device=device,
+        )
+        z_chunk = torch.tensor(
+            [float(samples.z[index]) for index in indices],
+            dtype=torch.float32,
             device=device,
         )
         counts = batch.legal_offsets[1:] - batch.legal_offsets[:-1]
@@ -193,9 +232,27 @@ def evaluate_model(
         with _gpu_lock, torch.autocast(
             device_type, dtype=torch.bfloat16, enabled=use_autocast
         ):
-            policy, critic, state_value = forward(model, batch)
+            policy, critic, state_value, value_logits = forward(model, batch)
         policy = policy.float()
         critic = critic.float()
+        played = batch.legal_offsets[:-1] + ranks
+        sample_indices = np.asarray(indices, dtype=np.intp)
+        policy_nll[sample_indices] = (
+            -segment_log_softmax(policy, batch.legal_offsets).index_select(0, played)
+        ).cpu().numpy()
+        critic_ce[sample_indices] = (
+            -(
+                _critic_target(z_chunk)
+                * torch.log_softmax(critic.index_select(0, played), dim=-1)
+            ).sum(dim=-1)
+        ).cpu().numpy()
+        if state_value_ce is not None:
+            assert value_logits is not None
+            logits = value_logits.float()
+            state_value_ce[sample_indices] = (
+                -(value_target(z_chunk, logits.shape[-1]) * torch.log_softmax(logits, dim=-1))
+                .sum(dim=-1)
+            ).cpu().numpy()
         q_score = (
             composition.q_score(critic, batch.legal_offsets, mass_floor)
             if composition is not None
@@ -215,7 +272,6 @@ def evaluate_model(
         ranks_cpu = ranks.cpu().tolist()
         policy_cpu = policy.cpu()
         v_hat_cpu = improved.v_hat.float().cpu().numpy()
-        sample_indices = np.asarray(indices, dtype=np.intp)
         v_hat_prediction[sample_indices] = v_hat_cpu
         if state_prediction is not None:
             assert state_value is not None
@@ -232,8 +288,14 @@ def evaluate_model(
     z = np.asarray(samples.z, dtype=np.int8)
     masks = _bucket_masks(np.asarray(samples.dist, dtype=np.int64))
     horizon = {"v_hat": _horizon_block(v_hat_prediction, z, masks)}
+    loss = {
+        "policy_nll": _loss_block(policy_nll, masks),
+        "critic_ce": _loss_block(critic_ce, masks),
+    }
     if state_prediction is not None:
         horizon["state_value"] = _horizon_block(state_prediction, z, masks)
+        assert state_value_ce is not None
+        loss["state_value_ce"] = _loss_block(state_value_ce, masks)
     return {
         "flags": {
             "device": device,
@@ -258,7 +320,16 @@ def evaluate_model(
         },
         "imitation": _imitation_block(top1, top3, masks),
         "horizon": horizon,
+        "loss": loss,
     }
+
+
+SCORES_FORMAT = 2
+
+
+def scores_filename(split: str, ema: bool = False) -> str:
+    """``scores-<split>.json`` / ``scores-<split>-ema.json`` beside a cell."""
+    return f"scores-{split}{'-ema' if ema else ''}.json"
 
 
 def _write_scores(path: Path, scores: dict[str, object]) -> None:
@@ -365,7 +436,7 @@ def evaluate_cell(
         cell_budget=cell_budget,
     )
     scores = {
-        "scores_format": 1,
+        "scores_format": SCORES_FORMAT,
         **({"ema": True} if ema else {}),
         "variant": variant,
         "model_kw": model_kw,
@@ -377,7 +448,7 @@ def evaluate_cell(
         ),
         **blocks,
     }
-    _write_scores(cell / ("scores_ema.json" if ema else "scores.json"), scores)
+    _write_scores(cell / scores_filename(split, ema), scores)
     return scores
 
 
@@ -419,7 +490,7 @@ def evaluate_checkpoint(
         composition=loaded.composition,
     )
     scores = {
-        "scores_format": 1,
+        "scores_format": SCORES_FORMAT,
         "variant": "mantis",
         "model_kw": dataclasses.asdict(loaded.config),
         "family": loaded.family.name,

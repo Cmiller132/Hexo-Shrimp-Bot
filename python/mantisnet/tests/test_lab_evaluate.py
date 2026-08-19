@@ -10,7 +10,13 @@ import torch
 
 from mantisnet import MantisConfig, MantisNet
 from mantisnet.klent.run import save_checkpoint
-from mantisnet.lab.evaluate import DISTANCE_BUCKETS, evaluate_cell, evaluate_checkpoint
+from mantisnet.lab.evaluate import (
+    DISTANCE_BUCKETS,
+    SCORES_FORMAT,
+    evaluate_cell,
+    evaluate_checkpoint,
+    scores_filename,
+)
 from mantisnet.lab.train import TrainConfig, train_cell
 
 from .test_lab_train import TINY_MODEL_KW, tiny_corpus
@@ -85,18 +91,69 @@ def _assert_metric_shape(scores, expected_n: int):
                     "mean_prediction": None,
                     "mean_abs_prediction": None,
                 }
+    for metric in scores["loss"].values():
+        assert metric["overall"]["n"] == expected_n
+        assert np.isfinite(metric["overall"]["mean"]) and metric["overall"]["mean"] >= 0.0
+        assert list(metric["by_distance"]) == labels
+        assert sum(bucket["n"] for bucket in metric["by_distance"].values()) == expected_n
+        # The overall mean is the sample-weighted mean of the bucket means.
+        weighted = sum(
+            bucket["n"] * bucket["mean"]
+            for bucket in metric["by_distance"].values()
+            if bucket["n"]
+        )
+        assert weighted / expected_n == pytest.approx(metric["overall"]["mean"], rel=1e-5)
 
 
 def test_lab_cell_scores_both_value_channels_and_writes_in_place(evaluated):
     corpus, cell, scores, _production_path, _production_out, _production_scores = evaluated
-    assert (cell / "scores.json").is_file()
+    assert (cell / scores_filename("test")).is_file()
+    assert not (cell / "scores.json").exists()
+    assert scores["scores_format"] == SCORES_FORMAT
     assert "ema" not in scores
     assert scores["checkpoint"]["kind"] == "lab_cell"
     assert scores["checkpoint"]["param_count"] > 0
     assert scores["corpus"] == {"name": corpus.name, "sha256": corpus.sha256}
     assert scores["flags"]["state_value_scored"] is True
     assert set(scores["horizon"]) == {"state_value", "v_hat"}
+    assert set(scores["loss"]) == {"policy_nll", "critic_ce", "state_value_ce"}
     _assert_metric_shape(scores, len(corpus.split_samples("test")))
+
+
+def test_lab_cell_losses_match_the_fit_losses(evaluated):
+    """The scored per-sample losses are the fit's losses, sample by sample."""
+    corpus, cell, scores, *_rest = evaluated
+    from mantisnet.lab.train import validate_supervised
+    from mantisnet.lab.variants import build_variant
+
+    checkpoint = torch.load(cell / "checkpoint_final.pt", map_location="cpu", weights_only=False)
+    model, _kw, _spec = build_variant("mantis", checkpoint["model_kw"])
+    model.load_state_dict(checkpoint["model"], strict=True)
+    validation = validate_supervised(
+        model,
+        corpus,
+        "test",
+        TrainConfig(
+            device="cpu",
+            batch_size=12,
+            pair_budget=100_000,
+            cell_budget=100_000,
+            collect_pair_budget=100_000,
+            collect_cell_budget=100_000,
+        ),
+    )
+    for metric in ("policy_nll", "critic_ce", "state_value_ce"):
+        assert validation[metric] == pytest.approx(scores["loss"][metric]["overall"]["mean"], rel=1e-4)
+    assert validation["imitation_top1"] == pytest.approx(scores["imitation"]["overall"]["top1"])
+
+
+def test_scores_are_named_by_split_so_val_and_test_coexist(evaluated):
+    corpus, cell, test_scores, *_rest = evaluated
+    val_scores = evaluate_cell(cell, corpus, split="val", device="cpu")
+    assert (cell / scores_filename("val")).is_file()
+    assert (cell / scores_filename("test")).is_file()
+    assert val_scores["split"] == "val" and test_scores["split"] == "test"
+    assert val_scores["loss"]["policy_nll"]["overall"]["n"] == len(corpus.split_samples("val"))
 
 
 def test_production_checkpoint_exercises_v_hat_but_never_scores_state_value(evaluated):
@@ -106,6 +163,7 @@ def test_production_checkpoint_exercises_v_hat_but_never_scores_state_value(eval
     assert scores["checkpoint"]["sha256"] == hashlib.sha256(checkpoint.read_bytes()).hexdigest()
     assert scores["flags"]["state_value_scored"] is False
     assert set(scores["horizon"]) == {"v_hat"}
+    assert set(scores["loss"]) == {"policy_nll", "critic_ce"}
     _assert_metric_shape(scores, len(corpus.split_samples("test")))
 
     with pytest.raises(ValueError, match="--out is required"):
@@ -132,7 +190,7 @@ def test_evaluate_ema_cell_and_refuse_missing_ema(tmp_path, evaluated):
     )
     scores = evaluate_cell(ema_cell, corpus, ema=True, device="cpu")
     assert scores["ema"] is True
-    assert (ema_cell / "scores_ema.json").is_file()
+    assert (ema_cell / scores_filename("test", ema=True)).is_file()
 
     no_ema_corpus, no_ema_cell, *_rest = evaluated
     with pytest.raises(FileNotFoundError, match=r"tiny.*without ema_decay"):
