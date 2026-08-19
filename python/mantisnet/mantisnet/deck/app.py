@@ -711,7 +711,16 @@ def create_app(
                 q = captured["q"][0, :length].view(length, heads, dim).transpose(0, 1)
                 k = captured["k"][0, :length].view(length, heads, dim).transpose(0, 1)
                 logits = q.float() @ k.float().transpose(-1, -2) / math.sqrt(dim)
-                logits += block.bias_table().detach().float().cpu()[:, buckets].to(logits.device)
+                # The whole §4.1 bias, not just its static rows: with
+                # `orbit_vectors` on every query row has its own table, and the
+                # weights shown must be the ones the model attended with.
+                bias = block.attention_bias(q.unsqueeze(0)).detach().float().cpu()
+                if bias.ndim == 2:
+                    logits += bias[:, buckets].to(logits.device)
+                else:
+                    logits += torch.gather(
+                        bias[0], 2, buckets.unsqueeze(0).expand(heads, -1, -1)
+                    ).to(logits.device)
                 layers.append({
                     "block": index,
                     "heads": torch.softmax(logits, dim=-1).cpu().tolist(),

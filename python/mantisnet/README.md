@@ -23,12 +23,20 @@ side to move), window pattern, joint slot classes, displacement orbits, and
 `moves_remaining` -- is invariant under the twelve board symmetries.
 
 The **trunk** interleaves bipartite message passing (stones to/from windows)
-with self-attention over the stone set biased by hex distance. A cell-pass
-relay lets windows exchange state through shared empty cells, and a
-window-attention layer (the live `window_attention` knob, on by default)
-types window pairs by colinear/crossing relations. In every block the four
-latents read the real windows, self-mix, and broadcast back to those windows;
-their final normalized mean is the global context consumed by the heads.
+with self-attention over the stone set, biased by each displacement's orbit
+through a static per-head table. A cell-pass relay lets windows exchange
+state through shared empty cells, and a window-attention layer (the live
+`window_attention` knob, on by default) types window pairs by
+colinear/crossing relations. In every block the four latents read the real
+windows, self-mix, and broadcast back to those windows; their final
+normalized mean is the global context consumed by the heads.
+
+`orbit_vectors=True` gives that bias a content term the querying stone
+projects out of a learned per-orbit vector, so a head's opinion of a
+displacement depends on the stone that is asking. The table the kernel reads
+is then one row per query instead of one row per head, and each width has its
+own kernel specialization; the vectors are zero-initialized, so the knob is a
+no-op at init.
 
 With `cell_nodes=True`, uncovered legal cells initialize from the
 nearest-stone-distance embedding, while covered cells retain the Step 15

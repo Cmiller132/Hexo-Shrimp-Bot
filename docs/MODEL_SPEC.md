@@ -66,12 +66,14 @@ Architecture knobs (validated jointly at construction):
 | `cell_adjacency` | `False` | directed distance-one cell↔cell messages (requires `cell_nodes`) |
 | `action_tactical` | `False` | encodes the §4.4 tactical scalars into the action row through a small MLP |
 | `action_latents` | `False` | two invariant latents read/mix/broadcast over each legal set (§6) |
+| `orbit_vectors` | `False` | adds the §4.1 content term to the stone-attention bias |
 
 The production training configuration at this writing is `cell_latents=True,
 cell_nodes=True, cell_node_scope="all", window_attention=False`; the default
 configuration keeps window attention on and cell state off. Parameter count
 is 4,804,581 at defaults (pinned by tests) and 5,197,093 at the production
-configuration.
+configuration. `orbit_vectors` adds `B × A × 51 × H/A` parameters on top of
+whatever else is on — 26,112 at either of those shapes.
 
 ## 3. Input entities
 
@@ -136,18 +138,38 @@ Stone self-attention (§5.3) is biased by the D6 orbit of each query–key
 displacement: the same frozen **orbit-48** vocabulary the cell-node edges
 use (§4.2), covering every displacement of hex distance 1..12, then FAR for
 pairs beyond radius 12, SELF on the diagonal, and TOKEN for any pair that
-touches a latent row — 51 bias rows per head. The rows are learned in two
-parts: a coarse table over the 23 (distance, on-axis) classes of distances
-1..12 plus FAR, SELF and TOKEN (`axis_bias`, 26 rows), and a per-orbit
-residual (`orbit_bias`, 48 rows); an orbit's bias row is its class row plus
-its residual, and FAR/SELF/TOKEN are class rows alone. Both are
-zero-initialised, so the table starts as a (distance, on-axis) table whose
-class rows pool gradient over every displacement at a distance, and the
-residual adds orbit resolution where the data asks for it. Padding is a
-finite sentinel appended at compute time, not a learned row. The orbit is
-symmetric under negating the displacement, so the bias is symmetric in the
-pair. The kernels gather the orbit from a constant 25×25 displacement table
-generated from the orbit function, never hand-written.
+touches a latent row — 51 bias rows per head.
+
+The **static** part of the bias is learned in two pieces: a coarse table over
+the 23 (distance, on-axis) classes of distances 1..12 plus FAR, SELF and
+TOKEN (`axis_bias`, 26 rows), and a per-orbit residual (`orbit_bias`, 48
+rows); an orbit's static row is its class row plus its residual, and
+FAR/SELF/TOKEN are class rows alone. Both are zero-initialised, so the table
+starts as a (distance, on-axis) table whose class rows pool gradient over
+every displacement at a distance, and the residual adds orbit resolution
+where the data asks for it.
+
+With the `orbit_vectors` knob the bias gains a **content** part:
+
+    score[m, n] = q[m]·k[n]/√d + static[h, bucket] + q[m] · orbit_vec[h, bucket]
+
+`orbit_vec` is a learned vector per (head, bucket), 51 × H/A, that the
+querying row projects onto, so what a head makes of a displacement depends on
+the stone that is asking rather than on the geometry alone. Only the query
+enters — the key's content already reaches the score through `q·k` — and the
+term carries no scale factor of its own. It is zero-initialised, so a model
+with the knob on begins exactly at the static table.
+
+The kernel is handed the whole bias, either as the static table or, with the
+knob on, as a table **per query row** of shape (positions, heads, rows, 51)
+that the model composes before the call; the kernel knows only "a table
+indexed by (row, bucket)" and its gradient is that table's bucket histogram —
+pooled over the tile for the static width, per row for the wide one. Padding
+is a finite sentinel column appended at compute time, not a learned row. The
+orbit is symmetric under negating the displacement, so the static bias is
+symmetric in the pair; the content term is not, since only the query
+contributes it. The kernels gather the orbit from a constant 25×25
+displacement table generated from the orbit function, never hand-written.
 
 ### 4.2 Cell-node vocabularies
 
@@ -235,9 +257,9 @@ in order:
 4. **§5.2 stone ← windows** — the mirror of §5.1: stones aggregate their
    windows plus the class row sum.
 5. **§5.3 stone self-attention** — attention over `[latent rows; stones]`,
-   block-diagonal per position, biased by the §4.1 distance and axis
-   tables. The four latent rows attend as ordinary rows under the TOKEN
-   bucket.
+   block-diagonal per position, biased by the §4.1 orbit table and, with
+   `orbit_vectors`, its content vectors. The four latent rows attend as
+   ordinary rows under the TOKEN bucket.
 6. **§5.4 window-latent cycle** — the latents read the window set
    (attention over each position's real windows), mix among themselves
    (dense 4×4 attention), and broadcast back to the windows.
@@ -322,9 +344,13 @@ has no graph break.
 Weights are fp32; the forward is written to run under bf16 autocast without
 assuming it. Ragged softmaxes, segment reductions, and the categorical
 compositions run in fp32 unconditionally. Custom kernels have deterministic
-backward passes — no atomics — and CPU reference paths asserted equal at
-tolerance on CUDA. Embeddings, the latent and cell bases, and the value
-queries initialize N(0, 0.02); decoder output layers initialize to zero;
+backward passes and CPU reference paths asserted equal at tolerance on CUDA.
+The one exception is the §4.1 static bias table: every query tile reduces
+into the same 51 rows per head, so its gradient is accumulated with an
+atomic and its last bits depend on block scheduling. Under `orbit_vectors`
+each query row owns a table row, the reduction becomes a plain store, and
+that exception disappears. Embeddings, the latent and cell bases, and the
+value queries initialize N(0, 0.02); decoder output layers initialize to zero;
 attention key projections and the spec's bare matrices are bias-free (a
 shared key bias cancels in softmax), while FFN, MLP, and the remaining
 attention linears keep the framework-default bias.
