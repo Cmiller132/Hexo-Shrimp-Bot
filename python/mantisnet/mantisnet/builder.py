@@ -229,8 +229,6 @@ class PositionGraph:
     # Policy decoder table over legal cells, in engine legal order.
     n_legal: int
     cell_qr: np.ndarray  # (n_legal, 2), builder/debug only
-    cell_occupancy: np.ndarray  # EMPTY/OWN/OPP relative to mover
-    cell_is_legal: np.ndarray  # (n_legal,) bool-as-int
     cell_nearest: np.ndarray  # 1..8, or 9 at the stone-free opening
     radius_src: np.ndarray  # stone source index
     radius_dst: np.ndarray  # legal-cell destination index
@@ -400,8 +398,6 @@ def _cell_node_fields(
     stone_qr: np.ndarray, stone_own: np.ndarray, legal_qr: np.ndarray
 ) -> dict[str, np.ndarray]:
     n_legal = len(legal_qr)
-    occupancy = np.zeros(n_legal, dtype=np.int64)
-    is_legal = np.ones(n_legal, dtype=np.int64)
     if len(stone_qr):
         displacement = legal_qr[:, None, :] - stone_qr[None, :, :]
         distance = _hex_distance(displacement)
@@ -445,8 +441,6 @@ def _cell_node_fields(
         adjacency_src = adjacency_dst = adjacency_axis = np.empty(0, dtype=np.int64)
     return {
         "cell_qr": legal_qr.copy(),
-        "cell_occupancy": occupancy,
-        "cell_is_legal": is_legal,
         "cell_nearest": nearest,
         "radius_src": radius_src,
         "radius_dst": radius_dst,
@@ -674,8 +668,6 @@ class Batch:
     n_cells: int
     legal_offsets: torch.Tensor  # (P + 1,) long
     cell_pos: torch.Tensor  # (N_c,) long: position of each cell
-    cell_occupancy: torch.Tensor  # (N_c,) EMPTY/OWN/OPP relative to mover
-    cell_is_legal: torch.Tensor  # (N_c,) bool-as-long
     cell_nearest: torch.Tensor  # (N_c,) 1..8, or opening sentinel 9
     radius_src: torch.Tensor  # (E_r,) global stone source
     radius_dst: torch.Tensor  # (E_r,) global legal-cell destination
@@ -917,8 +909,6 @@ def collate(graphs: list[PositionGraph]) -> Batch:
         n_cells=int(cell_off[-1]),
         legal_offsets=torch.from_numpy(cell_off.astype(np.int64)),
         cell_pos=cat([np.full(g.n_legal, i) for i, g in enumerate(graphs)]),
-        cell_occupancy=cat([g.cell_occupancy for g in graphs]),
-        cell_is_legal=cat([g.cell_is_legal for g in graphs]),
         cell_nearest=cat([g.cell_nearest for g in graphs]),
         radius_src=cat([g.radius_src + stone_off[i] for i, g in enumerate(graphs)]),
         radius_dst=cat([g.radius_dst + cell_off[i] for i, g in enumerate(graphs)]),

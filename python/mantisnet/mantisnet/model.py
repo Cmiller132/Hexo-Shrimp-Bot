@@ -775,8 +775,6 @@ class MantisNet(nn.Module):
             # covers keep this row at the decoder — far-ring semantics.
             self.cell_base = nn.Parameter(torch.empty(h))
         if cfg.cell_nodes:
-            self.cell_occupancy_table = nn.Embedding(3, h)
-            self.cell_legal_table = nn.Embedding(2, h)
             self.cell_nearest_table = nn.Embedding(cell_nodes.NEAREST_BUCKETS, h)
 
         self.blocks = nn.ModuleList(_Block(cfg) for _index in range(cfg.blocks))
@@ -978,12 +976,7 @@ class MantisNet(nn.Module):
         if cfg.uses_cell_state:
             ctab = self._cell_tables(batch, w.shape[0])
             if cfg.cell_nodes:
-                c = (
-                    self.cell_occupancy_table(batch.cell_occupancy)
-                    + self.cell_legal_table(batch.cell_is_legal)
-                    + self.cell_nearest_table(batch.cell_nearest)
-                )
-                c = c.clone()
+                c = self.cell_nearest_table(batch.cell_nearest).clone()
                 c.index_copy_(
                     0,
                     ctab.covered,

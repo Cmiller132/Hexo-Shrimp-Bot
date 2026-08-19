@@ -352,10 +352,10 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
             else 0
         ),
         cell_latents=(
-            "cell_base" in state_dict and "cell_occupancy_table.weight" not in state_dict
+            "cell_base" in state_dict and "cell_nearest_table.weight" not in state_dict
         ),
         line_pass="blocks.0.lp_bias" in state_dict,
-        cell_nodes="cell_occupancy_table.weight" in state_dict,
+        cell_nodes="cell_nearest_table.weight" in state_dict,
         cell_adjacency="blocks.0.adj_bias" in state_dict,
         action_tactical="tactical_a.weight" in state_dict,
         action_latents="act_latent_base" in state_dict,
@@ -392,11 +392,7 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
     if knobs.cell_latents or knobs.cell_nodes:
         keys.add("cell_base")
     if knobs.cell_nodes:
-        keys |= {
-            "cell_occupancy_table.weight",
-            "cell_legal_table.weight",
-            "cell_nearest_table.weight",
-        }
+        keys.add("cell_nearest_table.weight")
     keys |= _ACT_KEYS
     if knobs.action_tactical:
         keys |= _TACTICAL_KEYS
@@ -505,8 +501,6 @@ def _expected_shapes(
     if cfg.uses_cell_state:
         shapes["cell_base"] = (h,)
     if cfg.cell_nodes:
-        shapes["cell_occupancy_table.weight"] = (3, h)
-        shapes["cell_legal_table.weight"] = (2, h)
         shapes["cell_nearest_table.weight"] = (NEAREST_BUCKETS, h)
     if cfg.action_tactical:
         shapes.update({

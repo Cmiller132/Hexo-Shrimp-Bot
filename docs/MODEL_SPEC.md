@@ -71,7 +71,7 @@ Architecture knobs (validated jointly at construction):
 The production training configuration at this writing is `cell_latents=True,
 cell_nodes=True, cell_node_scope="all", window_attention=False`; the default
 configuration keeps window attention on and cell state off. Parameter count
-is 4,803,813 at defaults (pinned by tests) and 5,196,965 at the production
+is 4,803,813 at defaults (pinned by tests) and 5,196,325 at the production
 configuration.
 
 ## 3. Input entities
@@ -116,13 +116,12 @@ five cells along any axis line).
 With `cell_latents` on, covered cells become persistent latent nodes: each
 starts from one shared learned H-row (`cell_base`) and accrues identity
 through typed reads (§5.1b). With `cell_nodes` on, *every* legal cell is a
-node: uncovered cells initialize from three invariant feature embeddings —
-occupancy (3 states), legality (2), and bucketed nearest-stone distance (10
-buckets) — while covered cells keep the learned-base initialization, and all
-cells additionally read radius-edge context from stones (§5.1b). The
-`cell_node_scope` knob restricts which cells receive radius/adjacency edges
-(`all`, or only `uncovered` ones); every legal cell keeps its latent and
-features regardless of scope.
+node: uncovered cells initialize from one invariant feature embedding — the
+bucketed nearest-stone distance (10 buckets) — while covered cells keep the
+learned-base initialization, and all cells additionally read radius-edge
+context from stones (§5.1b). The `cell_node_scope` knob restricts which cells
+receive radius/adjacency edges (`all`, or only `uncovered` ones); every legal
+cell keeps its latent and features regardless of scope.
 
 ### 3.5 Excluded inputs
 
@@ -332,7 +331,7 @@ One forward answers every head:
 | `value_dist` | (P, K) | softmax over bins |
 | `value_logits` | (P, K) | raw bin logits — what the value loss trains |
 
-`MODEL_REPR_VERSION` (currently **8**) covers the builder and every feature
+`MODEL_REPR_VERSION` (currently **9**) covers the builder and every feature
 encoding; `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing; either bump invalidates checkpoints, and loaders refuse
 mismatches rather than adapt. Checkpoints record their `model_config`;

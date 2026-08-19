@@ -219,14 +219,6 @@ fn raw_to_dict<'py>(py: Python<'py>, raw: encoder::RawBatch) -> PyResult<Bound<'
     )?;
     d.set_item("legal_offsets", PyArray1::from_vec(py, raw.legal_offsets))?;
     d.set_item("cell_pos", PyArray1::from_vec(py, raw.cell_pos))?;
-    d.set_item(
-        "cell_occupancy",
-        PyArray1::from_vec(py, raw.cell_occupancy),
-    )?;
-    d.set_item(
-        "cell_is_legal",
-        PyArray1::from_vec(py, raw.cell_is_legal),
-    )?;
     d.set_item("cell_nearest", PyArray1::from_vec(py, raw.cell_nearest))?;
     d.set_item("radius_src", PyArray1::from_vec(py, raw.radius_src))?;
     d.set_item("radius_dst", PyArray1::from_vec(py, raw.radius_dst))?;

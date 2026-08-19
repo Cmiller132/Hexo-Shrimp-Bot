@@ -346,8 +346,6 @@ pub struct Graph {
     inc_class: Vec<i64>,
     n_legal: usize,
     cell_qr: Vec<[i32; 2]>,
-    cell_occupancy: Vec<i64>,
-    cell_is_legal: Vec<i64>,
     cell_nearest: Vec<i64>,
     radius_src: Vec<i64>,
     radius_dst: Vec<i64>,
@@ -436,7 +434,7 @@ impl WireCounts {
 
     fn payload_len(self) -> Option<usize> {
         // Per-stone: 8 (own) + 8 (qr). Per-window: 32 (feat + id triple).
-        // Per-incidence and decoder edge: 24 each. Cell features use 24 bytes,
+        // Per-incidence and decoder edge: 24 each. Cell features use 8 bytes,
         // radius edges 40, and adjacency edges 24. Each legal cell has 18
         // action rows carrying three i64 values plus eleven f32 tactical
         // scalars.
@@ -445,7 +443,7 @@ impl WireCounts {
             .checked_add(self.windows.checked_mul(32)?)?
             .checked_add(self.incidences.checked_mul(24)?)?
             .checked_add(self.decoder.checked_mul(24)?)?
-            .checked_add(self.legal.checked_mul(24)?)?
+            .checked_add(self.legal.checked_mul(8)?)?
             .checked_add(self.radius.checked_mul(40)?)?
             .checked_add(self.adjacency.checked_mul(24)?)?
             .checked_add(self.legal.checked_mul(TACTICAL_FEATURES)?.checked_mul(4)?)?
@@ -555,7 +553,6 @@ fn append_f32s(out: &mut Vec<u8>, values: &[f32]) {
 /// inc_class[incidences]:i64,
 /// dec_cell[decoder]:i64, dec_window[decoder]:i64,
 /// dec_class[decoder]:i64,
-/// cell_occupancy[legal]:i64, cell_is_legal[legal]:i64,
 /// cell_nearest[legal]:i64,
 /// radius_src[radius]:i64, radius_dst[radius]:i64, radius_orbit[radius]:i64,
 /// radius_own[radius]:i64, radius_on_axis[radius]:i64,
@@ -608,8 +605,6 @@ pub fn encode_position(position: &engine::Position, out: &mut Vec<u8>) {
     append_i64s(out, &graph.dec_cell);
     append_i64s(out, &graph.dec_window);
     append_i64s(out, &graph.dec_class);
-    append_i64s(out, &graph.cell_occupancy);
-    append_i64s(out, &graph.cell_is_legal);
     append_i64s(out, &graph.cell_nearest);
     append_i64s(out, &graph.radius_src);
     append_i64s(out, &graph.radius_dst);
@@ -792,19 +787,7 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
         }
     }
 
-    let cell_occupancy = read_i64_vec(&mut reader, counts.legal, "cell_occupancy")?;
-    let cell_is_legal = read_i64_vec(&mut reader, counts.legal, "cell_is_legal")?;
     let cell_nearest = read_i64_vec(&mut reader, counts.legal, "cell_nearest")?;
-    for (index, &value) in cell_occupancy.iter().enumerate() {
-        if !(0..3).contains(&value) {
-            return Err(invalid_feature("cell_occupancy", index, value));
-        }
-    }
-    for (index, &value) in cell_is_legal.iter().enumerate() {
-        if !matches!(value, 0 | 1) {
-            return Err(invalid_feature("cell_is_legal", index, value));
-        }
-    }
     for (index, &value) in cell_nearest.iter().enumerate() {
         if !(0..=CELL_NEAREST_UNREACHED).contains(&value) {
             return Err(invalid_feature("cell_nearest", index, value));
@@ -937,8 +920,6 @@ fn decode_graph(bytes: &[u8]) -> Result<Graph, WireError> {
         inc_class,
         n_legal: counts.legal,
         cell_qr: vec![],
-        cell_occupancy,
-        cell_is_legal,
         cell_nearest,
         radius_src,
         radius_dst,
@@ -976,8 +957,6 @@ fn cell_node_fields(
         Vec<i64>,
         Vec<i64>,
         Vec<i64>,
-        Vec<i64>,
-        Vec<i64>,
     ),
     String,
 > {
@@ -985,8 +964,6 @@ fn cell_node_fields(
         .iter()
         .map(|cell| [i32::from(cell.q), i32::from(cell.r)])
         .collect();
-    let cell_occupancy = vec![0; legal.len()];
-    let cell_is_legal = vec![1; legal.len()];
     let mut cell_nearest = vec![CELL_NEAREST_UNREACHED; legal.len()];
     let mut radius_src = Vec::new();
     let mut radius_dst = Vec::new();
@@ -1050,8 +1027,6 @@ fn cell_node_fields(
     }
     Ok((
         cell_qr,
-        cell_occupancy,
-        cell_is_legal,
         cell_nearest,
         radius_src,
         radius_dst,
@@ -1096,8 +1071,6 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
     let n_legal = legal.len();
     let (
         cell_qr,
-        cell_occupancy,
-        cell_is_legal,
         cell_nearest,
         radius_src,
         radius_dst,
@@ -1137,8 +1110,6 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
             inc_class: vec![],
             n_legal,
             cell_qr,
-            cell_occupancy,
-            cell_is_legal,
             cell_nearest,
             radius_src,
             radius_dst,
@@ -1364,8 +1335,6 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
         inc_class,
         n_legal,
         cell_qr,
-        cell_occupancy,
-        cell_is_legal,
         cell_nearest,
         radius_src,
         radius_dst,
@@ -1426,10 +1395,6 @@ pub struct RawBatch {
     pub legal_offsets: Vec<i64>,
     /// Position index for each concatenated legal cell.
     pub cell_pos: Vec<i64>,
-    /// Mover-relative occupancy of every legal cell (currently all EMPTY).
-    pub cell_occupancy: Vec<i64>,
-    /// Legality flag of every represented legal cell.
-    pub cell_is_legal: Vec<i64>,
     /// Nearest-stone distance bucket; 9 is the stone-free opening sentinel.
     pub cell_nearest: Vec<i64>,
     /// Stone-to-cell radius edges and their invariant fields.
@@ -1574,8 +1539,6 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
         value_valid: vec![false; p * max_w],
         legal_offsets: Vec::with_capacity(p + 1),
         cell_pos: vec![],
-        cell_occupancy: vec![],
-        cell_is_legal: vec![],
         cell_nearest: vec![],
         radius_src: vec![],
         radius_dst: vec![],
@@ -1625,8 +1588,6 @@ pub fn collate(graphs: &[Graph]) -> RawBatch {
         out.legal_offsets.push(cell_off);
         out.cell_pos
             .extend(std::iter::repeat_n(i as i64, g.n_legal));
-        out.cell_occupancy.extend_from_slice(&g.cell_occupancy);
-        out.cell_is_legal.extend_from_slice(&g.cell_is_legal);
         out.cell_nearest.extend_from_slice(&g.cell_nearest);
         out.radius_src
             .extend(g.radius_src.iter().map(|&source| source + stone_off));

@@ -60,11 +60,7 @@ def test_new_builder_inputs_are_d6_invariant_and_only_permuted():
     moves = [(0, 0), (3, 0), (-2, 2), (0, 3), (1, -2), (-1, 3)]
     base = from_position(hexo_py.Position.replay(moves))
     base_cells = {
-        tuple(coord): (
-            int(base.cell_occupancy[i]),
-            int(base.cell_is_legal[i]),
-            int(base.cell_nearest[i]),
-        )
+        tuple(coord): int(base.cell_nearest[i])
         for i, coord in enumerate(base.cell_qr.tolist())
     }
     base_edges = _edge_rows(base)
@@ -72,11 +68,7 @@ def test_new_builder_inputs_are_d6_invariant_and_only_permuted():
     for transform in d6_transforms():
         graph = from_position(hexo_py.Position.replay([transform(move) for move in moves]))
         cells = {
-            tuple(coord): (
-                int(graph.cell_occupancy[i]),
-                int(graph.cell_is_legal[i]),
-                int(graph.cell_nearest[i]),
-            )
+            tuple(coord): int(graph.cell_nearest[i])
             for i, coord in enumerate(graph.cell_qr.tolist())
         }
         assert cells == {transform(coord): value for coord, value in base_cells.items()}
@@ -227,7 +219,7 @@ def test_parameter_counts_are_pinned_for_cell_node_states_and_scopes():
             for p in MantisNet(
                 MantisConfig(cell_nodes=True, cell_node_scope=scope)
             ).parameters()
-        ) == 5_462_437
+        ) == 5_461_797
         assert sum(
             p.numel()
             for p in MantisNet(
@@ -237,7 +229,7 @@ def test_parameter_counts_are_pinned_for_cell_node_states_and_scopes():
                     cell_adjacency=True,
                 )
             ).parameters()
-        ) == 5_728_693
+        ) == 5_728_053
 
 
 def test_cell_adjacency_is_a_separate_validated_subknob():
@@ -248,7 +240,7 @@ def test_cell_adjacency_is_a_separate_validated_subknob():
     else:
         raise AssertionError("an inert adjacency knob was accepted")
     model = MantisNet(MantisConfig(cell_nodes=True, cell_adjacency=True))
-    assert sum(parameter.numel() for parameter in model.parameters()) == 5_728_693
+    assert sum(parameter.numel() for parameter in model.parameters()) == 5_728_053
 
 
 def test_cell_node_scope_is_validated():
