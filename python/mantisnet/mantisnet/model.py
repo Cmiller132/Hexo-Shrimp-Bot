@@ -90,6 +90,9 @@ class MantisConfig:
     # Step 6: two learned action latents read the action rows, mix, and
     # broadcast context about the alternatives back (measured arm True).
     action_latents: bool = False
+    # S2: whole-position magnitude — the live-window pattern histogram and the
+    # log stone and legal-cell counts — enters the §3.3 latent init.
+    global_magnitude: bool = False
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
@@ -151,6 +154,8 @@ class ModelOutput:
 CRITIC_LOGITS = 3
 # Step 6: invariant latent queries over each position's legal action set.
 ACTION_LATENTS = 2
+# S2: the two whole-position count scalars, log stones and log legal cells.
+MAGNITUDE_COUNTS = 2
 
 # The trunk stages were config knobs while they were ablations; checkpoints
 # written in that window record the knob fields in their model_config. These
@@ -230,6 +235,33 @@ def compose_acting_q(
         min=mass_floor
     )
     return (p_pos - p_neg) / scale.index_select(0, seg)
+
+
+def magnitude_features(batch: Batch, window_pos: Tensor) -> tuple[Tensor, Tensor]:
+    """The §3.3 whole-position magnitude features, as exact int64 counts.
+
+    Returns each position's live-window histogram over the ``TERN_PATTERNS``
+    canonical ternary patterns — ``(P, TERN_PATTERNS)`` — and its ``(P, 2)``
+    stone and legal-cell counts. The histogram is a segment bincount: position
+    and pattern fold into one flat key whose integer ``index_add_`` is exact
+    in any summation order, so no float reduction order can perturb it.
+
+    Every input is D6-invariant (canonical patterns, and counts of sets the
+    symmetries permute), so a position and its transformed image produce
+    identical rows.
+    """
+    positions = batch.legal_offsets.shape[0] - 1
+    keys = window_pos * TERN_PATTERNS + batch.window_feat
+    hist = (
+        keys.new_zeros(positions * TERN_PATTERNS)
+        .index_add_(0, keys, torch.ones_like(keys))
+        .view(positions, TERN_PATTERNS)
+    )
+    stones = batch.stone_slot.new_zeros(positions).index_add_(
+        0, batch.stone_slot // batch.max_t, torch.ones_like(batch.stone_slot)
+    )
+    cells = batch.legal_offsets[1:] - batch.legal_offsets[:-1]
+    return hist, torch.stack([stones, cells], dim=1)
 
 
 def _mlp(d_in: int, d_hidden: int, d_out: int) -> nn.Sequential:
@@ -770,6 +802,16 @@ class MantisNet(nn.Module):
         self.window_table = nn.Embedding(cfg.window_vocab, h)
         self.latent_base = nn.Parameter(torch.empty(4, h))
         self.token_moves = nn.Embedding(2, h)  # moves_remaining in {1, 2}
+        if cfg.global_magnitude:
+            # S2: the §3.3 whole-position magnitude channel. The histogram
+            # reads a bare table — the dense count vector is itself the
+            # additive term, so the projection carries no bias — and the two
+            # log counts share one linear, whose two columns are their
+            # separate maps under a single additive bias. Both are
+            # zero-initialized, so a knob-on model starts at exactly the
+            # knob-off function.
+            self.magnitude_pattern = nn.Parameter(torch.empty(cfg.window_vocab, h))
+            self.magnitude_counts = nn.Linear(MAGNITUDE_COUNTS, h)
         if cfg.uses_cell_state:
             # Every covered cell starts from one learned row; identity
             # accrues through the typed reads. Legal cells no live window
@@ -880,6 +922,10 @@ class MantisNet(nn.Module):
             nn.init.normal_(self.act_latent_base, std=0.02)
             nn.init.zeros_(self.act_wo_bcast.weight)
             nn.init.zeros_(self.act_wo_bcast.bias)
+        if self.cfg.global_magnitude:
+            nn.init.zeros_(self.magnitude_pattern)
+            nn.init.zeros_(self.magnitude_counts.weight)
+            nn.init.zeros_(self.magnitude_counts.bias)
 
     def _pair_tables(self, batch: Batch):
         # §5.1c tables are born on the batch's device from the window
@@ -951,6 +997,19 @@ class MantisNet(nn.Module):
             self.cfg.cell_node_scope == "uncovered",
         )
 
+    def _magnitude_row(self, batch: Batch, window_pos: Tensor) -> Tensor:
+        """S2's one magnitude row per position, ``(P, H)``.
+
+        ``log1p`` of the pattern histogram through the learned table plus
+        ``log1p`` of the stone and legal-cell counts through the shared
+        linear. The logs compress counts that range over three orders of
+        magnitude between the opening and a crowded board.
+        """
+        hist, counts = magnitude_features(batch, window_pos)
+        return hist.float().log1p() @ self.magnitude_pattern + self.magnitude_counts(
+            counts.float().log1p()
+        )
+
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         """Embeddings through the B blocks and the shared final LN (§5).
 
@@ -963,7 +1022,13 @@ class MantisNet(nn.Module):
         s = self.stone_table(batch.stone_own)
         w = self.window_table(batch.window_feat)
         moves = self.token_moves(batch.moves_idx)
+        window_pos = batch.window_slot // batch.max_w
         g = self.latent_base[None, :, :] + moves[:, None, :]
+        if cfg.global_magnitude:
+            # S2: one shared magnitude row per position, broadcast over all
+            # four latents — the channel is whole-position, so the slots are
+            # not given separate copies of it to specialize from.
+            g = g + self._magnitude_row(batch, window_pos).to(g.dtype)[:, None, :]
 
         plan = message_passing.incidence_plan(
             batch.inc_stone,
@@ -971,7 +1036,6 @@ class MantisNet(nn.Module):
             batch.inc_class,
         )
         pairs = self._pair_tables(batch) if cfg.window_attention else None
-        window_pos = batch.window_slot // batch.max_w
         offsets, order = window_latents.window_latent_layout(
             window_pos, g.shape[0]
         )

@@ -66,6 +66,7 @@ Architecture knobs (validated jointly at construction):
 | `cell_adjacency` | `False` | directed distance-one cell↔cell messages (requires `cell_nodes`) |
 | `action_tactical` | `False` | encodes the §4.4 tactical scalars into the action row through a small MLP |
 | `action_latents` | `False` | two invariant latents read/mix/broadcast over each legal set (§6) |
+| `global_magnitude` | `False` | feeds three whole-position magnitude features into the §3.3 latent init |
 
 The production training configuration at this writing is `cell_latents=True,
 cell_nodes=True, cell_node_scope="all", window_attention=False`; the default
@@ -99,10 +100,26 @@ axis); a cell likewise.
 Four position-level latent rows replace the single "global token" of earlier
 designs. They initialize as a learned 4×H base plus an embedding of
 `moves_remaining` (1 or 2 stones left in the current turn — the only
-whole-position scalar the model consumes). Each block lets them attend with
-the stones (§5.3), read the window set, mix among themselves, and broadcast
-back to the windows (§5.4). After the final block their normalized mean is
-the global context row `g` the heads consume.
+whole-position scalar the incumbent model consumes). Each block lets them
+attend with the stones (§5.3), read the window set, mix among themselves, and
+broadcast back to the windows (§5.4). After the final block their normalized
+mean is the global context row `g` the heads consume.
+
+With `global_magnitude` on, the init carries one further term, added
+identically to all four rows — the channel is whole-position, so the slots
+are not given separate copies of it to specialize from. That row sums three
+whole-position magnitude features, read through two learned maps:
+
+- the position's **window-pattern histogram**: the count of its live windows
+  in each of the 377 canonical patterns of §3.2, under `log1p`, read through
+  a learned 377×H table (the dense count vector is the additive term, so the
+  table carries no bias);
+- `log1p` of the position's **stone count** and `log1p` of its **legal-cell
+  count**, the pair read through one learned linear.
+
+Each is a count over D6-invariant inputs, so the channel preserves §8. The
+table and the linear are zero-initialized, so a knob-on model begins at
+exactly the knob-off function.
 
 ### 3.4 Legal cells
 
@@ -125,8 +142,18 @@ cell keeps its latent and features regardless of scope.
 ### 3.5 Excluded inputs
 
 Deliberately absent: absolute coordinates, axis identity as a feature, move
-history, ply number, and any hand-crafted tactical scalars. Everything the
-model knows arrives through the entities above and the encodings of §4.
+history, and ply number. The model is also **magnitude-blind at the position
+level** — `moves_remaining` is the only whole-position quantity the latents
+start from, so nothing tells them how large the position is beyond what the
+message passing carries node by node. Everything the model knows arrives
+through the entities above and the encodings of §4.
+
+Two knobs breach that boundary on purpose, each stated where it enters:
+`action_tactical` admits the hand-crafted tactical scalars of §4.4 into the
+action row, and `global_magnitude` admits the three whole-position magnitude
+features of §3.3 into the latent init. Both are off by default, and both are
+zero-initialized so that turning one on changes nothing until training moves
+its parameters.
 
 ## 4. Feature encodings
 
