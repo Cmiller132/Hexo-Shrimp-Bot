@@ -70,9 +70,9 @@ def param_groups(model: nn.Module, weight_decay: float) -> list[dict]:
     tables, and the attention-bias tables."""
     no_decay_ids = {id(m.weight) for m in model.modules() if isinstance(m, nn.Embedding)}
     for name, p in model.named_parameters():
-        # "_bias" catches every attention-bias table (dist_bias, axis_bias,
-        # wa_bias) and no linear bias, which is ".bias" and
-        # ndim 1 besides.
+        # "_bias" catches every attention-bias table (axis_bias, orbit_bias, wa_bias,
+        # cr_bias, ...) and no linear bias, which is ".bias" and ndim 1
+        # besides.
         if p.ndim <= 1 or name.endswith("_bias"):
             no_decay_ids.add(id(p))
     params = list(model.parameters())

@@ -358,13 +358,12 @@ def _config_from_checkpoint(raw: dict) -> MantisConfig:
         [int(k.split(".")[1]) for k in state if k.startswith("blocks.")], default=-1
     )
     h = state["stone_table.weight"].shape[1]
-    heads, bias_bins = state["blocks.0.dist_bias"].shape
+    heads = state["blocks.0.orbit_bias"].shape[0]
     return MantisConfig(
         h=h,
         blocks=blocks,
         heads=heads,
         ffn_factor=state["blocks.0.ffn.0.weight"].shape[0] // h,
-        d_max=bias_bins - 2,
         value_queries=state["value_queries"].shape[0],
         value_bins=state["mlp_v.2.weight"].shape[0],
         policy_hidden=state["mlp_p.lin_a.weight"].shape[0],

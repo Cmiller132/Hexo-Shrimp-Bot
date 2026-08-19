@@ -67,7 +67,8 @@ _TRUNK_STAGES = (
 
 
 def _replicated_block(
-    block, s, w, g, batch, seq_lens, plan, pairs, latent_layout, device, timings
+    block, s, w, g, batch, seq_lens, orbit_table, plan, pairs, latent_layout,
+    device, timings,
 ):
     """Transcribe one ``_Block`` without hooks or model instrumentation."""
     cfg = block.cfg
@@ -146,7 +147,7 @@ def _replicated_block(
         k = block.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         v = block.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         out = fused_attention(
-            q, k, v, batch.coords, seq_lens, block.dist_bias, block.axis_bias, 4
+            q, k, v, batch.coords, seq_lens, block.bias_table(), orbit_table, 4
         )
         out = block.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(
             p * max_t, cfg.h
@@ -199,8 +200,8 @@ def _replicated_trunk(model, batch, device: str):
     for block in model.blocks:
         timings = {name: 0.0 for name in _TRUNK_STAGES}
         s, w, g = _replicated_block(
-            block, s, w, g, batch, seq_lens, plan, pairs, latent_layout, device,
-            timings,
+            block, s, w, g, batch, seq_lens, model.orbit_table, plan, pairs,
+            latent_layout, device, timings,
         )
         per_block.append(timings)
     return (
