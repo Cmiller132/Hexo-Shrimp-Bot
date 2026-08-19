@@ -8,7 +8,7 @@ from copy import deepcopy
 
 import pytest
 
-from mantisnet.lab.evaluate import DISTANCE_BUCKETS
+from mantisnet.lab.evaluate import DISTANCE_BUCKETS, SCORES_FORMAT, scores_filename
 from mantisnet.lab.report import build_report, discover_scores
 
 
@@ -27,8 +27,15 @@ def _scores(seed: int, *, corpus_sha: str = "a" * 64, split: str = "test") -> di
         }
         for channel in ("state_value", "v_hat")
     }
+    loss = {
+        metric: {
+            "overall": {"n": 18, "mean": base + 0.1 * seed},
+            "by_distance": {},
+        }
+        for metric, base in (("policy_nll", 2.0), ("critic_ce", 0.6), ("state_value_ce", 0.7))
+    }
     return {
-        "scores_format": 1,
+        "scores_format": SCORES_FORMAT,
         "variant": "mantis",
         "model_kw": {"h": 8},
         "seed": seed,
@@ -40,6 +47,7 @@ def _scores(seed: int, *, corpus_sha: str = "a" * 64, split: str = "test") -> di
             "by_distance": {},
         },
         "horizon": horizon,
+        "loss": loss,
     }
 
 
@@ -55,16 +63,19 @@ def _write(path, value, *, throughput=None):
 
 def test_report_aggregates_sample_sd_and_writes_plain_table(tmp_path, capsys):
     sweep = tmp_path / "sweep"
-    first = sweep / "mantis+h8" / "s0" / "scores.json"
-    second = sweep / "mantis+h8" / "s1" / "scores.json"
+    first = sweep / "mantis+h8" / "s0" / scores_filename("test")
+    second = sweep / "mantis+h8" / "s1" / scores_filename("test")
     _write(first, _scores(0), throughput=100.0)
     _write(second, _scores(1), throughput=120.0)
-    assert discover_scores(sweep) == [first, second]
+    assert discover_scores(sweep, split="test") == [first, second]
+    with pytest.raises(ValueError, match="no scores-val.json"):
+        discover_scores(sweep, split="val")
 
     out = sweep / "report.json"
     report = build_report([first, second], out)
     printed = capsys.readouterr().out
     assert "mantis+h8" in printed and "horizon sign-accuracy" in printed and "±" in printed
+    assert "policy NLL" in printed
     assert out.is_file()
     row = report["variants"]["mantis+h8"]
     assert row["seeds"] == [0, 1]
@@ -72,8 +83,19 @@ def test_report_aggregates_sample_sd_and_writes_plain_table(tmp_path, capsys):
     assert row["imitation_top1"]["mean"] == pytest.approx(0.5)
     assert row["imitation_top1"]["sample_sd"] == pytest.approx(math.sqrt(0.02))
     assert row["samples_per_second"]["mean"] == pytest.approx(110.0)
+    assert row["loss"]["policy_nll"]["mean"] == pytest.approx(2.05)
+    assert row["loss"]["critic_ce"]["sample_sd"] == pytest.approx(math.sqrt(0.005))
     first_bucket = DISTANCE_BUCKETS[0][0]
     assert row["horizon_sign_accuracy"]["v_hat"][first_bucket]["mean"] == pytest.approx(0.5)
+
+
+def test_report_refuses_old_scores_format(tmp_path):
+    old = _scores(0)
+    old["scores_format"] = 1
+    path = tmp_path / "one" / scores_filename("test")
+    _write(path, old, throughput=100.0)
+    with pytest.raises(ValueError, match="unsupported scores format 1"):
+        build_report([path], tmp_path / "report.json", emit=False)
 
 
 @pytest.mark.parametrize(

@@ -9,17 +9,22 @@ import statistics
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from .evaluate import DISTANCE_BUCKETS
+from .evaluate import DISTANCE_BUCKETS, SCORES_FORMAT, scores_filename
 from .variants import derived_cell_name, normalize_model_kw
 
+LOSS_METRICS = ("policy_nll", "critic_ce", "state_value_ce")
 
-def discover_scores(sweep: str | os.PathLike[str]) -> list[Path]:
-    """Find every cell score file below a sweep, in stable path order."""
+
+def discover_scores(
+    sweep: str | os.PathLike[str], *, split: str = "val", ema: bool = False
+) -> list[Path]:
+    """Find every cell score file of one split below a sweep, in path order."""
 
     root = Path(sweep)
-    paths = sorted(root.glob("*/s*/scores.json"))
+    name = scores_filename(split, ema)
+    paths = sorted(root.glob(f"*/s*/{name}"))
     if not paths:
-        raise ValueError(f"no scores.json artifacts found under sweep {root}")
+        raise ValueError(f"no {name} artifacts found under sweep {root}")
     return paths
 
 
@@ -51,13 +56,13 @@ def _load_scores(paths: Iterable[str | os.PathLike[str]]) -> list[tuple[Path, di
     for raw_path in paths:
         path = Path(raw_path)
         score = json.loads(path.read_text(encoding="utf-8"))
-        if score.get("scores_format") != 1:
+        if score.get("scores_format") != SCORES_FORMAT:
             raise ValueError(
                 f"unsupported scores format {score.get('scores_format')!r} in {path}"
             )
         loaded.append((path, score))
     if not loaded:
-        raise ValueError("report requires at least one scores.json path")
+        raise ValueError("report requires at least one scores path")
     return loaded
 
 
@@ -129,6 +134,18 @@ def aggregate_scores(paths: Iterable[str | os.PathLike[str]]) -> dict[str, objec
             [score["imitation"]["overall"]["top1"] for score in scores],
             f"{labels[identity]} imitation top1",
         )
+        losses = {
+            metric: _mean_sd(
+                [
+                    score["loss"][metric]["overall"]["mean"]
+                    if metric in score["loss"]
+                    else None
+                    for score in scores
+                ],
+                f"{labels[identity]} {metric}",
+            )
+            for metric in LOSS_METRICS
+        }
 
         channels = sorted(
             set().union(*(score["horizon"].keys() for score in scores))
@@ -163,14 +180,16 @@ def aggregate_scores(paths: Iterable[str | os.PathLike[str]]) -> dict[str, objec
                 throughput, f"{label} samples_per_second"
             ),
             "imitation_top1": imitation,
+            "loss": losses,
             "horizon_sign_accuracy": horizon,
         }
 
     first = loaded[0][1]
     return {
-        "report_format": 1,
+        "report_format": 2,
         "corpus": dict(first["corpus"]),
         "split": first["split"],
+        "ema": bool(first.get("ema", False)),
         "variants": variants,
     }
 
@@ -188,15 +207,16 @@ def render_report(report: dict[str, object]) -> str:
 
     lines = [
         f"corpus {report['corpus']['name']} ({report['corpus']['sha256']})  "
-        f"split {report['split']}",
-        "cell  seeds  params  samples/s  imitation top-1",
+        f"split {report['split']}{'  ema' if report.get('ema') else ''}",
+        "cell  seeds  params  samples/s  imitation top-1  policy NLL  critic CE  state-value CE",
     ]
     variants = report["variants"]
     for label, row in variants.items():
         lines.append(
             f"{label}  {len(row['seeds'])}  {row['param_count']}  "
             f"{_format_stat(row['samples_per_second'])}  "
-            f"{_format_stat(row['imitation_top1'])}"
+            f"{_format_stat(row['imitation_top1'])}  "
+            + "  ".join(_format_stat(row["loss"][metric]) for metric in LOSS_METRICS)
         )
     lines.extend(["", "horizon sign-accuracy", "cell  channel  " + "  ".join(
         label for label, _lower, _upper in DISTANCE_BUCKETS
@@ -234,9 +254,17 @@ def build_report(
 
 
 def report_sweep(
-    sweep: str | os.PathLike[str], *, emit: bool = True
+    sweep: str | os.PathLike[str],
+    *,
+    split: str = "val",
+    ema: bool = False,
+    emit: bool = True,
 ) -> dict[str, object]:
     """Convenience entry point for ``report --sweep``."""
 
     root = Path(sweep)
-    return build_report(discover_scores(root), root / "report.json", emit=emit)
+    return build_report(
+        discover_scores(root, split=split, ema=ema),
+        root / f"report-{split}{'-ema' if ema else ''}.json",
+        emit=emit,
+    )

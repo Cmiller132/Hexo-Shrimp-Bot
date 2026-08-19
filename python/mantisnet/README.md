@@ -219,10 +219,15 @@ Configuration overrides are typed against the chosen variant's dataclass.
 ### Evaluation and reports
 
 Evaluation produces imitation top-1 and top-3 accuracy overall and per
-distance-from-end bucket, plus per-bucket sign accuracy, MAE, and mean
-prediction for the v-hat and (where present) state-value channels. Reports
-aggregate scores across seeds, with optional per-seed paired differencing
-against a named baseline arm.
+distance-from-end bucket; per-bucket sign accuracy, MAE, and mean prediction
+for the v-hat and (where present) state-value channels; and the three fit
+losses scored per sample — policy NLL of the played move, trinomial critic
+cross-entropy at the played move, and state-value cross-entropy — overall and
+per bucket. A cell's per-epoch validation row carries the same three losses.
+Scores are written beside the cell as `scores-<split>.json`
+(`scores-<split>-ema.json` for the EMA weights), so one cell can hold val and
+test scores at once; `scores_format` 2. Reports aggregate one split's scores
+across seeds (mean and sample SD per metric).
 
 ### Checkpoint families
 

@@ -128,9 +128,11 @@ def build_parser() -> argparse.ArgumentParser:
     _device(evaluate)
 
     report = commands.add_parser("report", help="aggregate scores across seeds")
-    report.add_argument("scores", nargs="*", help="explicit scores.json paths")
+    report.add_argument("scores", nargs="*", help="explicit scores-<split>.json paths")
     report.add_argument("--sweep", help="sweep directory")
-    report.add_argument("--out", help="report.json destination for explicit paths")
+    report.add_argument("--split", choices=("train", "val", "test"), default="val")
+    report.add_argument("--ema", action="store_true", help="aggregate the EMA score files")
+    report.add_argument("--out", help="report json destination for explicit paths")
 
     bench = commands.add_parser("bench", help="benchmark production paths")
     bench_modes = bench.add_subparsers(dest="bench_mode", required=True)
@@ -368,7 +370,7 @@ def main(argv=None) -> None:
         if bool(args.sweep) == bool(args.scores):
             parser.error("provide exactly one of --sweep or explicit scores paths")
         if args.sweep:
-            report_sweep(args.sweep)
+            report_sweep(args.sweep, split=args.split, ema=args.ema)
         else:
             build_report(args.scores, args.out or "report.json")
         return
