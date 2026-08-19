@@ -23,7 +23,7 @@ MODEL_KW = dict(
     action_latents=False,
 )
 CORPUS = Path("runs/corpora/cn1-late-v1")
-SWEEP = Path("runs/lab/step11-orbit48")
+SWEEPS = ("step11-orbit48", "step11b-residual")
 
 CELL_BUDGET = 125_000
 PAIR_BUDGET = 2_000_000
@@ -33,9 +33,11 @@ TRAIN_SUBSET = 400_000
 
 
 def main() -> None:
-    mode, seed = sys.argv[1], int(sys.argv[2])
-    epochs = int(sys.argv[3]) if len(sys.argv) > 3 else 4
-    cell_dir = SWEEP / "armB" / f"s{seed}"
+    mode, sweep, seed = sys.argv[1], sys.argv[2], int(sys.argv[3])
+    epochs = int(sys.argv[4]) if len(sys.argv) > 4 else 4
+    if sweep not in SWEEPS:
+        raise SystemExit(f"unknown sweep {sweep!r}; expected one of {SWEEPS}")
+    cell_dir = Path("runs/lab") / sweep / "armB" / f"s{seed}"
 
     if mode == "train":
         from mantisnet.lab.train import TrainConfig, train_cell
