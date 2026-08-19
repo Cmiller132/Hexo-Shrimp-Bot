@@ -35,7 +35,7 @@ from . import (
     window_latents,
     window_pairs,
 )
-from .attention import fused_attention
+from .attention import BIAS_ROWS, fused_attention, orbit_lut
 from .builder import (
     ACTION_EMPTY_CLASSES,
     TACTICAL_FEATURES,
@@ -56,7 +56,6 @@ class MantisConfig:
     blocks: int = 4  # B
     heads: int = 4  # A
     ffn_factor: int = 2  # F
-    d_max: int = 12  # D_MAX: hex-distance clamp
     value_queries: int = 4  # Q
     value_bins: int = 65  # K
     policy_hidden: int = 128  # P_H
@@ -127,22 +126,6 @@ class MantisConfig:
     def occ_classes(self) -> int:
         return TERN_OCC_CLASSES
 
-    # Bucket indices of the attention bias table (§4.1): distances 1..D_MAX
-    # occupy 0..D_MAX-1, then SELF, then TOKEN. TOKEN wins on the token-token
-    # pair. PAD is not a parameter row: attention appends its finite sentinel
-    # after casting the learned table to the compute dtype.
-    @property
-    def self_bucket(self) -> int:
-        return self.d_max
-
-    @property
-    def token_bucket(self) -> int:
-        return self.d_max + 1
-
-    @property
-    def pad_bucket(self) -> int:
-        return self.d_max + 2
-
 
 @dataclass
 class ModelOutput:
@@ -170,6 +153,7 @@ ACTION_LATENTS = 2
 LEGACY_BAKED_KNOBS: dict[str, object] = {
     "axis_bias": True,
     "off_axis_bias": False,
+    "d_max": 12,
     "cell_pass": True,
     "cell_pass_from": 0,
     "cell_pass_rounds": 1,
@@ -391,14 +375,14 @@ class _Block(nn.Module):
         self.v = nn.Linear(h, h, bias=False)
         self.e_sw = nn.Embedding(cfg.occ_classes, h)
         self.mlp_s = _PairMlp(h, h, h)
-        # §5.3 stone self-attention + state latents
+        # §5.3 stone self-attention + state latents. The bias table is typed
+        # by the §4.1 orbit vocabulary: 48 orbits, FAR, SELF, TOKEN per head.
         self.ln_attn = nn.LayerNorm(h)
         self.wq = nn.Linear(h, h)
         self.wk = nn.Linear(h, h, bias=False)
         self.wv = nn.Linear(h, h)
         self.wo = nn.Linear(h, h)
-        self.dist_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.d_max + 2))
-        self.axis_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.d_max))
+        self.orbit_bias = nn.Parameter(torch.zeros(cfg.heads, BIAS_ROWS))
         self.ln_ffn = nn.LayerNorm(h)
         self.ffn = nn.Sequential(
             nn.Linear(h, cfg.ffn_factor * h), nn.ReLU(), nn.Linear(cfg.ffn_factor * h, h)
@@ -610,6 +594,7 @@ class _Block(nn.Module):
         c: Tensor | None,
         batch: Batch,
         seq_lens: Tensor,
+        orbit_table: Tensor,
         plan: message_passing.IncidencePlan,
         pairs,
         latent_layout: tuple[Tensor, Tensor, Tensor],
@@ -715,8 +700,8 @@ class _Block(nn.Module):
         k = self.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         v = self.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
 
-        # Coordinates become distance buckets inside the attention kernel.
-        # Each position's key loop stops at its live prefix instead of doing
+        # Coordinates become orbit buckets inside the attention kernel. Each
+        # position's key loop stops at its live prefix instead of doing
         # quadratic work over padding.
         out = fused_attention(
             q,
@@ -724,8 +709,8 @@ class _Block(nn.Module):
             v,
             batch.coords,
             seq_lens,
-            self.dist_bias,
-            self.axis_bias,
+            self.orbit_bias,
+            orbit_table,
             global_rows,
         )
         out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(p * max_t, cfg.h)
@@ -780,6 +765,10 @@ class MantisNet(nn.Module):
             self.cell_nearest_table = nn.Embedding(cell_nodes.NEAREST_BUCKETS, h)
 
         self.blocks = nn.ModuleList(_Block(cfg) for _index in range(cfg.blocks))
+        # The §4.1 displacement → orbit table the stone attention gathers
+        # from; a constant, so it travels with the module but not the
+        # checkpoint.
+        self.register_buffer("orbit_table", orbit_lut("cpu").clone(), persistent=False)
         self.ln_out = nn.LayerNorm(h)  # shared final LN over S, W, g (§5)
 
         # §6 policy decoder. MLP_P([h_a; g]) as a _PairMlp, so the g half of
@@ -1003,6 +992,7 @@ class MantisNet(nn.Module):
                 c,
                 batch,
                 seq_lens,
+                self.orbit_table,
                 plan,
                 pairs,
                 latent_layout,

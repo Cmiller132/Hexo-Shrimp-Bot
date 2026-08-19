@@ -48,7 +48,6 @@ its rotation, reflection, or colour swap.
 | B | trunk blocks | 4 |
 | A | attention heads | 4 |
 | F | FFN expansion factor | 2 |
-| D_MAX | hex-distance clamp for attention bias | 12 |
 | Q | state-value readout queries | 4 |
 | K | state-value bins (odd, so an exact-zero bin exists) | 65 |
 | P_H | decoder MLP hidden width | 128 |
@@ -71,7 +70,7 @@ Architecture knobs (validated jointly at construction):
 The production training configuration at this writing is `cell_latents=True,
 cell_nodes=True, cell_node_scope="all", window_attention=False`; the default
 configuration keeps window attention on and cell state off. Parameter count
-is 4,803,813 at defaults (pinned by tests) and 5,196,965 at the production
+is 4,804,213 at defaults (pinned by tests) and 5,197,365 at the production
 configuration.
 
 ## 3. Input entities
@@ -81,7 +80,7 @@ configuration.
 One node per stone. The only per-stone feature is ownership relative to the
 side to move (own / opponent, a 2-row embedding). Stone coordinates never
 enter node features; geometry acts only through the relational structures
-below and the distance buckets of §4.1.
+below and the displacement orbits of §4.1.
 
 ### 3.2 Live windows
 
@@ -132,13 +131,17 @@ model knows arrives through the entities above and the encodings of §4.
 
 ## 4. Feature encodings
 
-### 4.1 Hex distance buckets
+### 4.1 Displacement orbits
 
-Stone self-attention (§5.3) is biased by bucketed hex distance: distances
-1..D_MAX (clamped) occupy buckets 0..D_MAX−1, then SELF, then TOKEN (the
-latent rows); padding is a finite sentinel appended at compute time, not a
-learned row. A second learned table (`axis_bias`) adds an on-axis bias for
-pairs that share a board axis, bucketed by the same clamped distance.
+Stone self-attention (§5.3) is biased by the D6 orbit of each query–key
+displacement: the same frozen **orbit-48** vocabulary the cell-node edges
+use (§4.2), covering every displacement of hex distance 1..12, then FAR for
+pairs beyond radius 12, SELF on the diagonal, and TOKEN for any pair that
+touches a latent row — 51 learned rows per head (`orbit_bias`). Padding is
+a finite sentinel appended at compute time, not a learned row. The orbit is
+symmetric under negating the displacement, so the bias is symmetric in the
+pair. The kernels gather the orbit from a constant 25×25 displacement table
+generated from the orbit function, never hand-written.
 
 ### 4.2 Cell-node vocabularies
 
@@ -149,7 +152,8 @@ The edge type is the product of three invariant classifications, 48 × 2 × 2
 - the **orbit-48** class: the source-to-destination offset vector's orbit
   under the twelve board symmetries, a frozen 48-class vocabulary generated
   from the axial transforms and independently checked against a
-  cube-coordinate oracle;
+  cube-coordinate oracle — the one geometry vocabulary of the model, shared
+  with the stone attention of §4.1;
 - whether the source stone is **own or opponent**;
 - whether source and destination are **on a shared axis**.
 
@@ -337,7 +341,7 @@ encoding; `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing; either bump invalidates checkpoints, and loaders refuse
 mismatches rather than adapt. Checkpoints record their `model_config`;
 configurations from the architecture's knob era are accepted exactly when
-they match the baked values (`axis_bias=True`, `off_axis_bias=False`,
+they match the baked values (`axis_bias=True`, `off_axis_bias=False`, `d_max=12`,
 `cell_pass=True`, `cell_pass_from=0`, `cell_pass_rounds=1`,
 `joint_incidence=True`, `mixed_windows=True`, `action_rows=True`,
 `state_latents=4`) and refused loudly otherwise.

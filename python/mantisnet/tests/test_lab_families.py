@@ -25,7 +25,6 @@ TINY = MantisConfig(
     blocks=1,
     heads=2,
     ffn_factor=2,
-    d_max=5,
     value_queries=2,
     value_bins=9,
     policy_hidden=12,
@@ -181,7 +180,6 @@ def test_infer_config_recovers_a_nondefault_deep_shape_exactly():
         blocks=6,
         heads=2,
         ffn_factor=3,
-        d_max=9,
         value_queries=3,
         value_bins=33,
         policy_hidden=48,
@@ -230,7 +228,7 @@ def test_legacy_knob_recording_of_another_architecture_refuses(tmp_path):
 
 
 def test_recorded_config_contradicting_tensors_is_refused(tmp_path):
-    recorded = dataclasses.asdict(replace(TINY, heads=1, d_max=11))
+    recorded = dataclasses.asdict(replace(TINY, heads=1))
     path = _write_production(tmp_path, TINY, model_config=recorded)
     with pytest.raises(ValueError, match="does not match the configuration inferred"):
         load_checkpoint(path)
@@ -244,7 +242,6 @@ def test_pre_baked_trunk_identifies_and_refuses_with_its_profile(tmp_path):
         for key in list(state):
             if key.startswith(prefix) and (
                 "_cp" in key or "_wa" in key or key.endswith("wa_bias")
-                or key.endswith("axis_bias")
             ):
                 del state[key]
         for key in (prefix + "e_ws.weight", prefix + "e_sw.weight"):
@@ -258,7 +255,7 @@ def test_pre_baked_trunk_identifies_and_refuses_with_its_profile(tmp_path):
 def test_baked_keys_on_only_some_blocks_are_refused(tmp_path):
     cfg = replace(TINY, blocks=2)
     state = _family_state("trinomial-joint", cfg=cfg)
-    del state["blocks.1.axis_bias"]
+    del state["blocks.1.orbit_bias"]
     path = tmp_path / "torn.pt"
     torch.save({"model": state, "versions": _versions(), "iteration": 1}, path)
     with pytest.raises(ValueError, match="not identifiable by the family registry"):

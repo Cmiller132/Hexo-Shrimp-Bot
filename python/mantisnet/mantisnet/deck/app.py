@@ -19,6 +19,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from ..attention import _bucket_index, orbit_lut
 from ..builder import collate_prefixes
 from ..klent import telemetry
 from ..klent.evaluate import argmax_choose, play_match
@@ -695,7 +696,14 @@ def create_app(
             for hook in hooks:
                 hook.remove()
             length = int(batch.attn_valid[0].sum())
-            coords = batch.coords[0, :length].cpu()
+            coords = batch.coords[:1, :length].cpu()
+            seq_lens = torch.tensor([length], dtype=torch.int32)
+            # The same bucket law the kernels apply (§4.1): orbit, FAR, SELF,
+            # TOKEN for the four latent rows, PAD never (no padding here).
+            buckets, _valid = _bucket_index(
+                coords, seq_lens, length, orbit_lut("cpu"), global_rows=4
+            )
+            buckets = buckets[0]
             layers = []
             for index, (block, captured) in enumerate(zip(model.blocks, captures)):
                 h, heads = model.cfg.h, model.cfg.heads
@@ -703,14 +711,7 @@ def create_app(
                 q = captured["q"][0, :length].view(length, heads, dim).transpose(0, 1)
                 k = captured["k"][0, :length].view(length, heads, dim).transpose(0, 1)
                 logits = q.float() @ k.float().transpose(-1, -2) / math.sqrt(dim)
-                dq = coords[:, None, 0] - coords[None, :, 0]
-                dr = coords[:, None, 1] - coords[None, :, 1]
-                distance = torch.maximum(torch.maximum(dq.abs(), dr.abs()), (dq + dr).abs())
-                buckets = (distance - 1).clamp(0, model.cfg.d_max - 1).long()
-                buckets[distance == 0] = model.cfg.self_bucket
-                buckets[0, :] = model.cfg.token_bucket
-                buckets[:, 0] = model.cfg.token_bucket
-                logits += block.dist_bias.float()[:, buckets]
+                logits += block.orbit_bias.detach().float().cpu()[:, buckets].to(logits.device)
                 layers.append({
                     "block": index,
                     "heads": torch.softmax(logits, dim=-1).cpu().tolist(),

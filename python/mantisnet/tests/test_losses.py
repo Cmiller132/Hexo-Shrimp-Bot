@@ -77,7 +77,7 @@ def test_param_groups_partition_and_membership(model):
     assert no_decay["weight_decay"] == 0.0
 
     assert id(model.stone_table.weight) in ids_n  # embedding table
-    assert id(model.blocks[0].dist_bias) in ids_n  # attention-bias table
+    assert id(model.blocks[0].orbit_bias) in ids_n  # attention-bias table
     assert id(model.latent_base) in ids_d  # learned matrix
     assert id(model.blocks[0].wq.bias) in ids_n  # ndim 1
     assert id(model.blocks[0].wq.weight) in ids_d

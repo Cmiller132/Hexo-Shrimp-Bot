@@ -21,6 +21,7 @@ from ..builder import (
     TERN_PATTERNS,
     TERN_POST1_CLASSES,
 )
+from ..attention import BIAS_ROWS
 from ..cell_latents import LINE_CLASSES
 from ..cell_nodes import ADJACENCY_CLASSES, NEAREST_BUCKETS, RADIUS_CLASSES
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
@@ -206,14 +207,13 @@ _BLOCK_SUFFIXES = {
     "v.weight", "e_sw.weight", "mlp_s.lin_a.weight", "mlp_s.lin_a.bias",
     "mlp_s.lin_b.weight", "mlp_s.out.weight", "mlp_s.out.bias",
     "ln_attn.weight", "ln_attn.bias", "wq.weight", "wq.bias", "wk.weight",
-    "wv.weight", "wv.bias", "wo.weight", "wo.bias", "dist_bias",
+    "wv.weight", "wv.bias", "wo.weight", "wo.bias", "orbit_bias",
     "ln_ffn.weight", "ln_ffn.bias", "ffn.0.weight", "ffn.0.bias",
     "ffn.2.weight", "ffn.2.bias",
 }
 
 # Trunk-stage parameter groups: the relay (§5.1b), typed window attention
-# (§5.1c), the axis-aware §5.3 bias, and joint incidence classes are baked
-# into this build. The profile is still read off the state dict so an
+# (§5.1c), and joint incidence classes are baked into this build. The profile is still read off the state dict so an
 # unexpected checkpoint shape refuses with its actual profile named, rather
 # than a key-set mismatch.
 _CP_SUFFIXES = {
@@ -297,8 +297,6 @@ _ACT_LATENT_KEYS = {
 
 @dataclass(frozen=True, slots=True)
 class _Knobs:
-    axis_bias: bool
-    off_axis_bias: bool
     cell_pass: bool
     cell_pass_from: int
     joint_incidence: bool
@@ -334,8 +332,6 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
     e_ws = state_dict.get("blocks.0.e_ws.weight")
     latent_base = state_dict.get("latent_base")
     return _Knobs(
-        axis_bias="blocks.0.axis_bias" in state_dict,
-        off_axis_bias="blocks.0.off_axis_bias" in state_dict,
         cell_pass=bool(relayed),
         cell_pass_from=relayed[0] if relayed else 0,
         joint_incidence=(
@@ -365,8 +361,6 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
 # The profile this build instantiates. Window attention remains live, so its
 # value is normalized during profile comparison.
 _BAKED = _Knobs(
-    axis_bias=True,
-    off_axis_bias=False,
     cell_pass=True,
     cell_pass_from=0,
     joint_incidence=True,
@@ -404,10 +398,6 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
         keys |= _ACT_LATENT_KEYS
     for index in range(blocks):
         prefix = f"blocks.{index}."
-        if knobs.axis_bias:
-            keys.add(prefix + "axis_bias")
-        if knobs.off_axis_bias:
-            keys.add(prefix + "off_axis_bias")
         if knobs.window_attention:
             keys |= {prefix + suffix for suffix in _WA_SUFFIXES}
         if knobs.line_pass:
@@ -610,8 +600,7 @@ def _expected_shapes(
             shapes[prefix + "wa_bias"] = (cfg.heads, WA_CLASSES)
         if cfg.line_pass:
             shapes[prefix + "lp_bias"] = (cfg.heads, LINE_CLASSES)
-        shapes[prefix + "dist_bias"] = (cfg.heads, cfg.d_max + 2)
-        shapes[prefix + "axis_bias"] = (cfg.heads, cfg.d_max)
+        shapes[prefix + "orbit_bias"] = (cfg.heads, BIAS_ROWS)
         shapes[prefix + "ffn.0.weight"] = (fh, h)
         shapes[prefix + "ffn.0.bias"] = (fh,)
         shapes[prefix + "ffn.2.weight"] = (h, fh)
@@ -646,15 +635,16 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
     if blocks is None:
         raise ValueError("tensor block indices are missing or not contiguous from blocks.0")
 
-    bias = _require_tensor(state_dict, "blocks.0.dist_bias")
-    if bias.ndim != 2 or bias.shape[0] <= 0 or bias.shape[1] < 3:
+    bias = _require_tensor(state_dict, "blocks.0.orbit_bias")
+    if bias.ndim != 2 or bias.shape[0] <= 0 or bias.shape[1] != BIAS_ROWS:
         raise ValueError(
-            f"tensor 'blocks.0.dist_bias' has shape {tuple(bias.shape)}, expected (heads, d_max+2)"
+            f"tensor 'blocks.0.orbit_bias' has shape {tuple(bias.shape)}, "
+            f"expected (heads, {BIAS_ROWS})"
         )
-    heads, d_max = int(bias.shape[0]), int(bias.shape[1] - 2)
+    heads = int(bias.shape[0])
     if h % heads:
         raise ValueError(
-            "tensors 'stone_table.weight' and 'blocks.0.dist_bias' imply "
+            "tensors 'stone_table.weight' and 'blocks.0.orbit_bias' imply "
             f"H={h}, heads={heads}, which do not divide evenly"
         )
 
@@ -726,7 +716,6 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         blocks=blocks,
         heads=heads,
         ffn_factor=ffn_factor,
-        d_max=d_max,
         value_queries=value_queries,
         value_bins=value_bins,
         policy_hidden=policy_hidden,

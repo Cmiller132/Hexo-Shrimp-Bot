@@ -19,7 +19,7 @@ candidate window is represented under ternary slot patterns
 (empty/own/opponent, 377 canonical classes), with 726 decoder classes and
 1458 incidence classes. The input representation is D6-invariant by
 construction: every input -- stone colour (own/opponent relative to the
-side to move), window pattern, joint slot classes, hex-distance buckets, and
+side to move), window pattern, joint slot classes, displacement orbits, and
 `moves_remaining` -- is invariant under the twelve board symmetries.
 
 The **trunk** interleaves bipartite message passing (stones to/from windows)
@@ -67,7 +67,6 @@ heads produce outputs in engine legal-move order.
 | B | trunk blocks | 4 |
 | A | attention heads | 4 |
 | F | FFN expansion factor | 2 |
-| D_MAX | hex-distance clamp | 12 |
 | Q | value-readout queries | 4 |
 | K | value bins (odd) | 65 |
 | P_H | policy/action-value MLP hidden width | 128 |
@@ -386,7 +385,7 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `builder.py` | Position-to-graph representation, Rust batch conversion, collation, version constants |
 | `cell_latents.py` | Step 15 typed legal-cell/window attention and whole-line table derivation |
 | `cell_nodes.py` | Step 13 radius/adjacency edge plans on the typed cell-attention kernels |
-| `attention.py` | Fused coordinate-biased multi-head attention with Triton kernel and reference path |
+| `attention.py` | Fused orbit-biased multi-head attention (§4.1 displacement orbits) with Triton kernels and reference path |
 | `row_encoder.py` | Action-row encoder: 729-class post-placement window rows for both decoder heads |
 | `window_latents.py` | Fused ragged window-latent read/broadcast cycle for the state latents |
 | `optim.py` | Fused-Adam execution policy, recorded and reapplied across checkpoint loads |
@@ -424,7 +423,7 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 
 | File | Description |
 |---|---|
-| `__init__.py` | Package exports: corpus format version, distance buckets, variant registry |
+| `__init__.py` | Package exports: corpus format version, variant registry |
 | `__main__.py` | Command-line interface for all lab commands |
 | `corpus.py` | Frozen corpus freeze, load, replay verification, and sample access |
 | `train.py` | Supervised lab-cell fitting through the production model and fit engine |
