@@ -252,7 +252,7 @@ def test_the_manifest_identifies_both_checkpoints_and_the_match(checkpoints):
         assert result[side]["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
         assert result[side]["iteration"] == iteration
         assert result[side]["versions"] == _versions()
-        assert result[side]["versions"]["MODEL_REPR_VERSION"] == 8
+        assert result[side]["versions"]["MODEL_REPR_VERSION"] == 9
     assert result["match"] == {
         "pairs": 1,
         "games": 2,

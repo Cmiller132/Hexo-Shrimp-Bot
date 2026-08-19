@@ -30,16 +30,16 @@ types window pairs by colinear/crossing relations. In every block the four
 latents read the real windows, self-mix, and broadcast back to those windows;
 their final normalized mean is the global context consumed by the heads.
 
-With `cell_nodes=True`, uncovered legal cells initialize from occupancy,
-legality, and nearest-stone-distance embeddings, while covered cells retain
-the Step 15 learned-base initialization. In every block cells also attend to
-all stones within radius 8 through exact orbit-48, source-owner, and on-axis
-classes. `cell_node_scope="all"` is the default and sends those radius edges
-to every legal cell; `"uncovered"` sends them only to cells with no decoder
-incidence. The scope filters edges only: every legal cell retains its latent
-and occupancy, legality, and nearest-distance features. `cell_adjacency=True`
-is a separate sub-knob adding directed distance-one cell messages with
-axis-shared weights, and its destination cells follow the same scope. Both
+With `cell_nodes=True`, uncovered legal cells initialize from the
+nearest-stone-distance embedding, while covered cells retain the Step 15
+learned-base initialization. In every block cells also attend to all stones
+within radius 8 through exact orbit-48, source-owner, and on-axis classes.
+`cell_node_scope="all"` is the default and sends those radius edges to every
+legal cell; `"uncovered"` sends them only to cells with no decoder incidence.
+The scope filters edges only: every legal cell retains its latent and its
+nearest-distance feature. `cell_adjacency=True` is a separate sub-knob adding
+directed distance-one cell messages with axis-shared weights, and its
+destination cells follow the same scope. Both
 `cell_adjacency=True` and the non-default scope are refused when they would be
 inert without `cell_nodes`.
 
@@ -86,7 +86,7 @@ no graph break.
 
 ### Versioning
 
-`MODEL_REPR_VERSION` (model-owned, currently 8) covers the builder and every
+`MODEL_REPR_VERSION` (model-owned, currently 9) covers the builder and every
 feature encoding. `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing. Either bump invalidates checkpoints.
 

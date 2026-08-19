@@ -131,8 +131,7 @@ def test_the_read_is_permutation_invariant():
     inverse = torch.empty_like(permutation)
     inverse[permutation] = torch.arange(permutation.numel())
     reordered = {name: value for name, value in vars(batch).items()}
-    for name in ("cell_pos", "cell_occupancy", "cell_is_legal", "cell_nearest",
-                 "act_empty", "act_tactical"):
+    for name in ("cell_pos", "cell_nearest", "act_empty", "act_tactical"):
         reordered[name] = reordered[name][permutation]
     reordered["dec_cell"] = inverse[batch.dec_cell]
     reordered["radius_dst"] = inverse[batch.radius_dst]

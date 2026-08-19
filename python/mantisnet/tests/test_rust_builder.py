@@ -29,8 +29,6 @@ _TENSOR_FIELDS = [
     "value_valid",
     "legal_offsets",
     "cell_pos",
-    "cell_occupancy",
-    "cell_is_legal",
     "cell_nearest",
     "radius_src",
     "radius_dst",
