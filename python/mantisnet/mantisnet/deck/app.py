@@ -711,7 +711,7 @@ def create_app(
                 q = captured["q"][0, :length].view(length, heads, dim).transpose(0, 1)
                 k = captured["k"][0, :length].view(length, heads, dim).transpose(0, 1)
                 logits = q.float() @ k.float().transpose(-1, -2) / math.sqrt(dim)
-                logits += block.orbit_bias.detach().float().cpu()[:, buckets].to(logits.device)
+                logits += block.bias_table().detach().float().cpu()[:, buckets].to(logits.device)
                 layers.append({
                     "block": index,
                     "heads": torch.softmax(logits, dim=-1).cpu().tolist(),

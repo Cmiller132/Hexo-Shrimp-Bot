@@ -73,6 +73,82 @@ def orbit_lut(device: torch.device | str) -> Tensor:
         _ORBIT_LUTS[device] = lut
     return lut
 
+
+# Coarse (distance, on-axis) rows — the vocabulary the orbit rows refine.
+# Distance 1 is all on-axis, so distances 1..12 give 23 classes; FAR, SELF
+# and TOKEN follow in the orbit table's order.
+AXIS_CLASSES = 23
+AXIS_ROWS = AXIS_CLASSES + 3
+
+_AXIS_INDICES: dict[torch.device, Tensor] = {}
+
+
+def _axis_index_cpu() -> Tensor:
+    """(BIAS_ROWS,) int64: each bias row's coarse row — an orbit's
+    (distance, on-axis) class, FAR/SELF/TOKEN their own rows.
+
+    Derived from the builder's orbit function: every displacement of an orbit
+    must agree on its class (D6 preserves distance and axis membership), and
+    every class must be reached — both checked here, never assumed."""
+    keys = [(1, True)] + [(d, on) for d in range(2, ORBIT_RADIUS + 1) for on in (True, False)]
+    classes = {key: i for i, key in enumerate(keys)}
+    assert len(classes) == AXIS_CLASSES
+    index = torch.full((BIAS_ROWS,), -1, dtype=torch.int64)
+    for dq in range(-ORBIT_RADIUS, ORBIT_RADIUS + 1):
+        for dr in range(-ORBIT_RADIUS, ORBIT_RADIUS + 1):
+            distance = max(abs(dq), abs(dr), abs(dq + dr))
+            if distance == 0 or distance > ORBIT_RADIUS:
+                continue
+            on_axis = dq == 0 or dr == 0 or dq + dr == 0
+            orbit = orbit48_id(dq, dr)
+            cls = classes[(distance, on_axis)]
+            if index[orbit] == -1:
+                index[orbit] = cls
+            elif int(index[orbit]) != cls:
+                raise AssertionError(
+                    f"orbit {orbit} straddles (distance, on-axis) classes {int(index[orbit])} and {cls}"
+                )
+    if int((index[:ORBIT_CLASSES] < 0).sum()) != 0:
+        raise AssertionError("an orbit has no displacement within the LUT radius")
+    if len(set(index[:ORBIT_CLASSES].tolist())) != AXIS_CLASSES:
+        raise AssertionError("the orbits do not cover every (distance, on-axis) class")
+    index[FAR_BUCKET] = AXIS_CLASSES
+    index[SELF_BUCKET] = AXIS_CLASSES + 1
+    index[TOKEN_BUCKET] = AXIS_CLASSES + 2
+    return index
+
+
+def axis_index(device: torch.device | str) -> Tensor:
+    """The bias-row → coarse-row table resident on ``device``, built once."""
+    device = torch.device(device)
+    index = _AXIS_INDICES.get(device)
+    if index is None:
+        index = _axis_index_cpu().to(device)
+        _AXIS_INDICES[device] = index
+    return index
+
+
+def compose_bias_table(axis_bias: Tensor, orbit_bias: Tensor, index: Tensor) -> Tensor:
+    """The ``(A, BIAS_ROWS)`` table the kernels consume.
+
+    Every orbit row is its coarse (distance, on-axis) row plus the orbit's
+    learned residual; FAR, SELF and TOKEN are their coarse rows alone. The
+    coarse rows pool gradient across every displacement of a distance, so the
+    radial profile learns at the rate of a (distance, on-axis) table while the
+    residual adds orbit resolution only where the data asks for it.
+    """
+    if axis_bias.ndim != 2 or axis_bias.shape[1] != AXIS_ROWS:
+        raise ValueError(
+            f"axis_bias must have shape (A, {AXIS_ROWS}), got {tuple(axis_bias.shape)}"
+        )
+    if orbit_bias.shape != (axis_bias.shape[0], ORBIT_CLASSES):
+        raise ValueError(
+            f"orbit_bias must have shape ({axis_bias.shape[0]}, {ORBIT_CLASSES}), "
+            f"got {tuple(orbit_bias.shape)}"
+        )
+    coarse = axis_bias.index_select(1, index)
+    return torch.cat((coarse[:, :ORBIT_CLASSES] + orbit_bias, coarse[:, ORBIT_CLASSES:]), dim=1)
+
 # Fixed launch geometry keeps symbolic shape changes out of Triton's tuning cache.
 _BLOCK_M = 64
 _BLOCK_N = 64
@@ -774,16 +850,16 @@ if triton is not None:
             tl.store(dv_ptrs, dv_acc, mask=offs_n[:, None] < n_ctx)
 
 
-def _bias_table(q: Tensor, orbit_bias: Tensor) -> Tensor:
+def _bias_table(q: Tensor, bias_table: Tensor) -> Tensor:
     """Cast the learned rows once and append the finite PAD sentinel.
 
     Layout: orbits 0..47, FAR, SELF, TOKEN, then PAD — ``TABLE_WIDTH`` wide.
     """
-    if orbit_bias.ndim != 2 or orbit_bias.shape[1] != BIAS_ROWS:
+    if bias_table.ndim != 2 or bias_table.shape[1] != BIAS_ROWS:
         raise ValueError(
-            f"orbit_bias must have shape (A, {BIAS_ROWS}), got {tuple(orbit_bias.shape)}"
+            f"bias_table must have shape (A, {BIAS_ROWS}), got {tuple(bias_table.shape)}"
         )
-    table = orbit_bias.to(q.dtype)
+    table = bias_table.to(q.dtype)
     pad = table.new_full((table.shape[0], 1), _PAD_BIAS)
     return torch.cat((table, pad), dim=1)
 
@@ -850,13 +926,13 @@ def _attention_reference(
     v: Tensor,
     coords: Tensor,
     seq_lens: Tensor,
-    orbit_bias: Tensor,
+    bias_table: Tensor,
     lut: Tensor,
     global_rows: int = 1,
 ) -> Tensor:
-    """Reference attention over the learned ``orbit_bias`` rows."""
+    """Reference attention over the learned ``bias_table`` rows."""
     return _attention_reference_table(
-        q, k, v, coords, seq_lens, _bias_table(q, orbit_bias), lut, global_rows
+        q, k, v, coords, seq_lens, _bias_table(q, bias_table), lut, global_rows
     )
 
 
@@ -1330,16 +1406,17 @@ def fused_attention(
     v: Tensor,
     coords: Tensor,
     seq_lens: Tensor,
-    orbit_bias: Tensor,
+    bias_table: Tensor,
     lut: Tensor,
     global_rows: int = 1,
 ) -> Tensor:
     """Orbit-biased attention over ``[latent rows; stones]`` per position.
 
-    ``orbit_bias`` is the learned ``(A, BIAS_ROWS)`` table; ``lut`` the
+    ``bias_table`` is the ``(A, BIAS_ROWS)`` table of per-head bias rows (the
+    model composes it with :func:`compose_bias_table`); ``lut`` the
     device-resident displacement table from :func:`orbit_lut`.
     """
     out, _ = _fused_attention_op(
-        q, k, v, coords, seq_lens, _bias_table(q, orbit_bias), lut, global_rows
+        q, k, v, coords, seq_lens, _bias_table(q, bias_table), lut, global_rows
     )
     return out

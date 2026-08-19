@@ -70,7 +70,7 @@ Architecture knobs (validated jointly at construction):
 The production training configuration at this writing is `cell_latents=True,
 cell_nodes=True, cell_node_scope="all", window_attention=False`; the default
 configuration keeps window attention on and cell state off. Parameter count
-is 4,804,213 at defaults (pinned by tests) and 5,197,365 at the production
+is 4,804,581 at defaults (pinned by tests) and 5,197,733 at the production
 configuration.
 
 ## 3. Input entities
@@ -137,8 +137,15 @@ Stone self-attention (§5.3) is biased by the D6 orbit of each query–key
 displacement: the same frozen **orbit-48** vocabulary the cell-node edges
 use (§4.2), covering every displacement of hex distance 1..12, then FAR for
 pairs beyond radius 12, SELF on the diagonal, and TOKEN for any pair that
-touches a latent row — 51 learned rows per head (`orbit_bias`). Padding is
-a finite sentinel appended at compute time, not a learned row. The orbit is
+touches a latent row — 51 bias rows per head. The rows are learned in two
+parts: a coarse table over the 23 (distance, on-axis) classes of distances
+1..12 plus FAR, SELF and TOKEN (`axis_bias`, 26 rows), and a per-orbit
+residual (`orbit_bias`, 48 rows); an orbit's bias row is its class row plus
+its residual, and FAR/SELF/TOKEN are class rows alone. Both are
+zero-initialised, so the table starts as a (distance, on-axis) table whose
+class rows pool gradient over every displacement at a distance, and the
+residual adds orbit resolution where the data asks for it. Padding is a
+finite sentinel appended at compute time, not a learned row. The orbit is
 symmetric under negating the displacement, so the bias is symmetric in the
 pair. The kernels gather the orbit from a constant 25×25 displacement table
 generated from the orbit function, never hand-written.

@@ -220,14 +220,14 @@ def test_cell_node_model_is_d6_invariant(scope):
 
 
 def test_parameter_counts_are_pinned_for_cell_node_states_and_scopes():
-    assert sum(p.numel() for p in MantisNet(MantisConfig()).parameters()) == 4_804_213
+    assert sum(p.numel() for p in MantisNet(MantisConfig()).parameters()) == 4_804_581
     for scope in ("all", "uncovered"):
         assert sum(
             p.numel()
             for p in MantisNet(
                 MantisConfig(cell_nodes=True, cell_node_scope=scope)
             ).parameters()
-        ) == 5_462_837
+        ) == 5_463_205
         assert sum(
             p.numel()
             for p in MantisNet(
@@ -237,7 +237,7 @@ def test_parameter_counts_are_pinned_for_cell_node_states_and_scopes():
                     cell_adjacency=True,
                 )
             ).parameters()
-        ) == 5_729_093
+        ) == 5_729_461
 
 
 def test_cell_adjacency_is_a_separate_validated_subknob():
@@ -248,7 +248,7 @@ def test_cell_adjacency_is_a_separate_validated_subknob():
     else:
         raise AssertionError("an inert adjacency knob was accepted")
     model = MantisNet(MantisConfig(cell_nodes=True, cell_adjacency=True))
-    assert sum(parameter.numel() for parameter in model.parameters()) == 5_729_093
+    assert sum(parameter.numel() for parameter in model.parameters()) == 5_729_461
 
 
 def test_cell_node_scope_is_validated():

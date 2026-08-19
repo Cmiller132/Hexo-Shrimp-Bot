@@ -11,6 +11,8 @@ import mantisnet.attention as attention_impl
 from mantisnet.attention import (
     _FAILED_BACKWARD_SHAPES,
     _FAILED_SHAPES,
+    AXIS_CLASSES,
+    AXIS_ROWS,
     BIAS_ROWS,
     FAR_BUCKET,
     ORBIT_CLASSES,
@@ -20,6 +22,8 @@ from mantisnet.attention import (
     TOKEN_BUCKET,
     _attention_reference,
     _bucket_index,
+    axis_index,
+    compose_bias_table,
     fused_attention,
     orbit_lut,
 )
@@ -204,6 +208,54 @@ def test_orbit_lut_covers_every_orbit_and_only_them():
     assert orbits == set(range(ORBIT_CLASSES))
 
 
+def test_axis_index_groups_orbits_by_distance_and_axis():
+    # Independent of the implementation: group the displacements of each
+    # orbit and check they share one (distance, on-axis) class, that the
+    # classes are numbered in (distance, on-axis first) order, and that the
+    # three non-orbit rows keep their own coarse rows.
+    index = axis_index("cpu")
+    assert index.shape == (BIAS_ROWS,)
+    seen: dict[int, tuple[int, bool]] = {}
+    for dq in range(-ORBIT_RADIUS, ORBIT_RADIUS + 1):
+        for dr in range(-ORBIT_RADIUS, ORBIT_RADIUS + 1):
+            distance = max(abs(dq), abs(dr), abs(dq + dr))
+            if distance == 0 or distance > ORBIT_RADIUS:
+                continue
+            key = (distance, dq == 0 or dr == 0 or dq + dr == 0)
+            orbit = orbit48_id(dq, dr)
+            assert seen.setdefault(orbit, key) == key, (orbit, key)
+    classes = sorted(set(seen.values()), key=lambda k: (k[0], not k[1]))
+    assert len(classes) == AXIS_CLASSES
+    for orbit, key in seen.items():
+        assert int(index[orbit]) == classes.index(key), (orbit, key)
+    assert int(index[FAR_BUCKET]) == AXIS_CLASSES
+    assert int(index[SELF_BUCKET]) == AXIS_CLASSES + 1
+    assert int(index[TOKEN_BUCKET]) == AXIS_CLASSES + 2
+    assert AXIS_ROWS == AXIS_CLASSES + 3
+
+
+def test_compose_bias_table_is_coarse_row_plus_residual():
+    index = axis_index("cpu")
+    generator = torch.Generator().manual_seed(7)
+    axis_bias = torch.randn((_HEADS, AXIS_ROWS), generator=generator)
+    orbit_bias = torch.randn((_HEADS, ORBIT_CLASSES), generator=generator)
+    table = compose_bias_table(axis_bias, orbit_bias, index)
+    assert table.shape == (_HEADS, BIAS_ROWS)
+    for orbit in range(ORBIT_CLASSES):
+        expected = axis_bias[:, int(index[orbit])] + orbit_bias[:, orbit]
+        assert torch.equal(table[:, orbit], expected)
+    for bucket in (FAR_BUCKET, SELF_BUCKET, TOKEN_BUCKET):
+        assert torch.equal(table[:, bucket], axis_bias[:, int(index[bucket])])
+    # A zero residual is exactly the coarse table: the residual form starts
+    # where the (distance, on-axis) vocabulary starts.
+    zero = compose_bias_table(axis_bias, torch.zeros_like(orbit_bias), index)
+    assert torch.equal(zero, axis_bias.index_select(1, index))
+    with pytest.raises(ValueError, match="axis_bias"):
+        compose_bias_table(axis_bias[:, :-1], orbit_bias, index)
+    with pytest.raises(ValueError, match="orbit_bias"):
+        compose_bias_table(axis_bias, orbit_bias[:, :-1], index)
+
+
 @pytest.mark.parametrize(
     "shape",
     [(_HEADS, 0), (_HEADS, BIAS_ROWS - 1), (_HEADS, BIAS_ROWS + 1)],
@@ -215,7 +267,7 @@ def test_public_attention_rejects_wrong_bias_shape(shape: tuple[int, int]):
     q, k, v = _qkv(p, t, d, torch.float16, seed=9_000)
     orbit_bias = torch.zeros(shape, dtype=torch.float32, device=_DEVICE)
 
-    with pytest.raises(ValueError, match="orbit_bias"):
+    with pytest.raises(ValueError, match="bias_table"):
         fused_attention(q, k, v, coords, seq_lens, orbit_bias, _lut())
 
 

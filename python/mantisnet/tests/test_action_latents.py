@@ -174,6 +174,6 @@ def test_parameter_counts_pin_the_knob():
         + 9 * (h * h + h)  # biased projections
         + 3 * h * h  # bias-free keys
     )
-    assert base == 4_804_213
+    assert base == 4_804_581
     assert on - base == expected
-    assert on == 5_003_509
+    assert on == 5_003_877

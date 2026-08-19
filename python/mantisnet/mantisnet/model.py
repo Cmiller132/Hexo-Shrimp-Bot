@@ -35,7 +35,14 @@ from . import (
     window_latents,
     window_pairs,
 )
-from .attention import BIAS_ROWS, fused_attention, orbit_lut
+from .attention import (
+    AXIS_ROWS,
+    ORBIT_CLASSES,
+    axis_index,
+    compose_bias_table,
+    fused_attention,
+    orbit_lut,
+)
 from .builder import (
     ACTION_EMPTY_CLASSES,
     TACTICAL_FEATURES,
@@ -376,18 +383,27 @@ class _Block(nn.Module):
         self.e_sw = nn.Embedding(cfg.occ_classes, h)
         self.mlp_s = _PairMlp(h, h, h)
         # §5.3 stone self-attention + state latents. The bias table is typed
-        # by the §4.1 orbit vocabulary: 48 orbits, FAR, SELF, TOKEN per head.
+        # by the §4.1 orbit vocabulary and learned in two parts per head: a
+        # coarse (distance, on-axis) table with FAR/SELF/TOKEN, plus a
+        # per-orbit residual; `bias_table()` composes the rows the kernel sees.
         self.ln_attn = nn.LayerNorm(h)
         self.wq = nn.Linear(h, h)
         self.wk = nn.Linear(h, h, bias=False)
         self.wv = nn.Linear(h, h)
         self.wo = nn.Linear(h, h)
-        self.orbit_bias = nn.Parameter(torch.zeros(cfg.heads, BIAS_ROWS))
+        self.axis_bias = nn.Parameter(torch.zeros(cfg.heads, AXIS_ROWS))
+        self.orbit_bias = nn.Parameter(torch.zeros(cfg.heads, ORBIT_CLASSES))
+        self.register_buffer("axis_index", axis_index("cpu").clone(), persistent=False)
         self.ln_ffn = nn.LayerNorm(h)
         self.ffn = nn.Sequential(
             nn.Linear(h, cfg.ffn_factor * h), nn.ReLU(), nn.Linear(cfg.ffn_factor * h, h)
         )
         self.drop = nn.Dropout(cfg.dropout)
+
+    def bias_table(self) -> Tensor:
+        """The per-head ``(A, BIAS_ROWS)`` attention-bias rows: coarse
+        (distance, on-axis) rows plus the per-orbit residual."""
+        return compose_bias_table(self.axis_bias, self.orbit_bias, self.axis_index)
 
     def _cell_pass(
         self,
@@ -709,7 +725,7 @@ class _Block(nn.Module):
             v,
             batch.coords,
             seq_lens,
-            self.orbit_bias,
+            self.bias_table(),
             orbit_table,
             global_rows,
         )

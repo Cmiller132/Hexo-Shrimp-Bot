@@ -34,7 +34,7 @@ def test_baked_model_has_only_latent_parameters_and_keeps_the_parameter_pin():
     model = MantisNet(MantisConfig())
     assert model.latent_base.shape == (4, model.cfg.h)
     assert "token_base" not in model.state_dict()
-    assert sum(parameter.numel() for parameter in model.parameters()) == 4_804_213
+    assert sum(parameter.numel() for parameter in model.parameters()) == 4_804_581
 
 
 def test_python_and_rust_collation_match_the_baked_global_prefix(positions):

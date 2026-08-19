@@ -21,7 +21,7 @@ from ..builder import (
     TERN_PATTERNS,
     TERN_POST1_CLASSES,
 )
-from ..attention import BIAS_ROWS
+from ..attention import AXIS_ROWS, ORBIT_CLASSES
 from ..cell_latents import LINE_CLASSES
 from ..cell_nodes import ADJACENCY_CLASSES, NEAREST_BUCKETS, RADIUS_CLASSES
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
@@ -207,7 +207,7 @@ _BLOCK_SUFFIXES = {
     "v.weight", "e_sw.weight", "mlp_s.lin_a.weight", "mlp_s.lin_a.bias",
     "mlp_s.lin_b.weight", "mlp_s.out.weight", "mlp_s.out.bias",
     "ln_attn.weight", "ln_attn.bias", "wq.weight", "wq.bias", "wk.weight",
-    "wv.weight", "wv.bias", "wo.weight", "wo.bias", "orbit_bias",
+    "wv.weight", "wv.bias", "wo.weight", "wo.bias", "axis_bias", "orbit_bias",
     "ln_ffn.weight", "ln_ffn.bias", "ffn.0.weight", "ffn.0.bias",
     "ffn.2.weight", "ffn.2.bias",
 }
@@ -600,7 +600,8 @@ def _expected_shapes(
             shapes[prefix + "wa_bias"] = (cfg.heads, WA_CLASSES)
         if cfg.line_pass:
             shapes[prefix + "lp_bias"] = (cfg.heads, LINE_CLASSES)
-        shapes[prefix + "orbit_bias"] = (cfg.heads, BIAS_ROWS)
+        shapes[prefix + "axis_bias"] = (cfg.heads, AXIS_ROWS)
+        shapes[prefix + "orbit_bias"] = (cfg.heads, ORBIT_CLASSES)
         shapes[prefix + "ffn.0.weight"] = (fh, h)
         shapes[prefix + "ffn.0.bias"] = (fh,)
         shapes[prefix + "ffn.2.weight"] = (h, fh)
@@ -636,10 +637,10 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         raise ValueError("tensor block indices are missing or not contiguous from blocks.0")
 
     bias = _require_tensor(state_dict, "blocks.0.orbit_bias")
-    if bias.ndim != 2 or bias.shape[0] <= 0 or bias.shape[1] != BIAS_ROWS:
+    if bias.ndim != 2 or bias.shape[0] <= 0 or bias.shape[1] != ORBIT_CLASSES:
         raise ValueError(
             f"tensor 'blocks.0.orbit_bias' has shape {tuple(bias.shape)}, "
-            f"expected (heads, {BIAS_ROWS})"
+            f"expected (heads, {ORBIT_CLASSES})"
         )
     heads = int(bias.shape[0])
     if h % heads:
