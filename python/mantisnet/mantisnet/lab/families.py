@@ -27,6 +27,7 @@ from ..cell_nodes import ADJACENCY_CLASSES, NEAREST_BUCKETS, RADIUS_CLASSES
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
 from ..model import (
     ACTION_LATENTS,
+    MAGNITUDE_COUNTS,
     MantisConfig,
     MantisNet,
     ModelOutput,
@@ -293,6 +294,10 @@ _ACT_LATENT_KEYS = {
     "act_wv_bcast.weight", "act_wv_bcast.bias",
     "act_wo_bcast.weight", "act_wo_bcast.bias",
 }
+_MAGNITUDE_KEYS = {
+    "magnitude_pattern",
+    "magnitude_counts.weight", "magnitude_counts.bias",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -309,6 +314,7 @@ class _Knobs:
     cell_adjacency: bool
     action_tactical: bool
     action_latents: bool
+    global_magnitude: bool
 
 
 def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
@@ -355,6 +361,7 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         cell_adjacency="blocks.0.adj_bias" in state_dict,
         action_tactical="tactical_a.weight" in state_dict,
         action_latents="act_latent_base" in state_dict,
+        global_magnitude="magnitude_pattern" in state_dict,
     )
 
 
@@ -373,6 +380,7 @@ _BAKED = _Knobs(
     cell_adjacency=False,
     action_tactical=False,
     action_latents=False,
+    global_magnitude=False,
 )
 
 
@@ -392,6 +400,8 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
         keys |= _TACTICAL_KEYS
     if knobs.action_latents:
         keys |= _ACT_LATENT_KEYS
+    if knobs.global_magnitude:
+        keys |= _MAGNITUDE_KEYS
     for index in range(blocks):
         prefix = f"blocks.{index}."
         if knobs.window_attention:
@@ -516,6 +526,10 @@ def _expected_shapes(
             shapes[name + ".bias"] = (h,)
         for name in ("act_wk_read", "act_wk_mix", "act_wk_bcast"):
             shapes[name + ".weight"] = (h, h)
+    if cfg.global_magnitude:
+        shapes["magnitude_pattern"] = (cfg.window_vocab, h)
+        shapes["magnitude_counts.weight"] = (h, MAGNITUDE_COUNTS)
+        shapes["magnitude_counts.bias"] = (h,)
     fh = cfg.ffn_factor * h
     ln_names = ["ln_ws_s", "ln_ws_w", "ln_sw_w",
                 "ln_sw_s", "ln_attn", "ln_ffn"]
@@ -703,6 +717,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         cell_pass=not (knobs.cell_latents or knobs.cell_nodes),
         action_tactical=knobs.action_tactical,
         action_latents=knobs.action_latents,
+        global_magnitude=knobs.global_magnitude,
     )
     if knobs != expected:
         raise _baked_profile_error(knobs)
@@ -723,6 +738,7 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
         cell_adjacency=knobs.cell_adjacency,
         action_tactical=knobs.action_tactical,
         action_latents=knobs.action_latents,
+        global_magnitude=knobs.global_magnitude,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")

@@ -43,6 +43,15 @@ destination cells follow the same scope. Both
 `cell_adjacency=True` and the non-default scope are refused when they would be
 inert without `cell_nodes`.
 
+The model is magnitude-blind at the position level: `moves_remaining` is the
+only whole-position quantity the four latents initialize from.
+`global_magnitude=True` lifts that, adding one shared row per position to all
+four latents — the live windows' 377-class pattern histogram under `log1p`
+through a learned table, plus `log1p` of the stone and legal-cell counts
+through one linear. Every term is a count over D6-invariant inputs, and both
+parameter groups are zero-initialized, so the knob is an exact no-op at
+initialization.
+
 Three heads read the trunk output:
 
 - **Policy decoder**: one raw logit per legal cell. Each action's 18
