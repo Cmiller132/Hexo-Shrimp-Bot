@@ -24,7 +24,6 @@ from mantisnet.attention import (
     _bucket_index,
     axis_index,
     compose_bias_table,
-    compose_row_bias_table,
     fused_attention,
     orbit_lut,
 )
@@ -95,30 +94,6 @@ def _orbit_bias(dtype: torch.dtype, seed: int) -> torch.Tensor:
     )
 
 
-def _orbit_vec(d: int, dtype: torch.dtype, seed: int) -> torch.Tensor:
-    generator = torch.Generator(device=_DEVICE).manual_seed(seed)
-    return (
-        torch.randn(
-            (_HEADS, BIAS_ROWS, d),
-            device=_DEVICE,
-            dtype=dtype,
-            generator=generator,
-        )
-        * 0.1
-    )
-
-
-def _static_rows(orbit_bias: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
-    """The per-row table of a purely static bias — every query row alike."""
-    return compose_row_bias_table(
-        orbit_bias,
-        torch.zeros(
-            (_HEADS, BIAS_ROWS, q.shape[-1]), dtype=orbit_bias.dtype, device=_DEVICE
-        ),
-        q,
-    )
-
-
 def _literal_bucket(
     qi: int, ki: int, coords: torch.Tensor, live: int, global_rows: int = 1
 ) -> int:
@@ -144,13 +119,9 @@ def _literal_bucket(
 
 
 def _dense_bias(
-    coords: torch.Tensor, seq_lens: torch.Tensor, bias: torch.Tensor
+    coords: torch.Tensor, seq_lens: torch.Tensor, orbit_bias: torch.Tensor
 ) -> torch.Tensor:
-    """Independently form the bias tensor for the hand-written softmax check.
-
-    ``bias`` is either the static ``(A, BIAS_ROWS)`` table — every query row
-    alike — or the ``(P, A, T, BIAS_ROWS)`` per-query-row one, in which case
-    each pair reads its own query row and the gather is four-dimensional."""
+    """Independently form the bias tensor for the hand-written softmax check."""
     p, t = coords.shape[:2]
     bucket = torch.empty((p, t, t), dtype=torch.long)
     for pi in range(p):
@@ -158,17 +129,10 @@ def _dense_bias(
         for qi in range(t):
             for ki in range(t):
                 bucket[pi, qi, ki] = _literal_bucket(qi, ki, coords[pi].cpu(), live)
-    bucket = bucket.to(_DEVICE)
-    if bias.ndim == 2:
-        table = torch.cat([bias, bias.new_full((_HEADS, 1), -3.0e4)], dim=1)
-        return table[:, bucket].permute(1, 0, 2, 3)
-    table = torch.cat([bias, bias.new_full((p, _HEADS, t, 1), -3.0e4)], dim=3)
-    return table[
-        torch.arange(p, device=_DEVICE)[:, None, None, None],
-        torch.arange(_HEADS, device=_DEVICE)[None, :, None, None],
-        torch.arange(t, device=_DEVICE)[None, None, :, None],
-        bucket[:, None, :, :],
-    ]
+    table = torch.cat(
+        [orbit_bias, orbit_bias.new_full((_HEADS, 1), -3.0e4)], dim=1
+    )
+    return table[:, bucket.to(_DEVICE)].permute(1, 0, 2, 3)
 
 
 def test_orbit_bucket_semantics_are_hand_derived():
@@ -294,28 +258,17 @@ def test_compose_bias_table_is_coarse_row_plus_residual():
 
 @pytest.mark.parametrize(
     "shape",
-    [
-        (_HEADS, 0),
-        (_HEADS, BIAS_ROWS - 1),
-        (_HEADS, BIAS_ROWS + 1),
-        # Only ranks 2 and 4 name a bias; a right-width rank 3 is still wrong.
-        (1, _HEADS, BIAS_ROWS),
-        (1, _HEADS, 2, BIAS_ROWS - 1),
-        (1, _HEADS, 2, BIAS_ROWS + 1),
-        # Right rank and width, wrong query-row or position count.
-        (1, _HEADS, 1, BIAS_ROWS),
-        (2, _HEADS, 2, BIAS_ROWS),
-    ],
+    [(_HEADS, 0), (_HEADS, BIAS_ROWS - 1), (_HEADS, BIAS_ROWS + 1)],
 )
-def test_public_attention_rejects_wrong_bias_shape(shape: tuple[int, ...]):
+def test_public_attention_rejects_wrong_bias_shape(shape: tuple[int, int]):
     p, t, d = 1, 2, 16
     seq_lens = _seq_lens(p, t, ragged=False)
     coords = _coords(p, t, seq_lens)
     q, k, v = _qkv(p, t, d, torch.float16, seed=9_000)
-    bias = torch.zeros(shape, dtype=torch.float32, device=_DEVICE)
+    orbit_bias = torch.zeros(shape, dtype=torch.float32, device=_DEVICE)
 
-    with pytest.raises(ValueError, match="bias_table|bias table"):
-        fused_attention(q, k, v, coords, seq_lens, bias, _lut())
+    with pytest.raises(ValueError, match="bias_table"):
+        fused_attention(q, k, v, coords, seq_lens, orbit_bias, _lut())
 
 
 @pytest.mark.parametrize(
@@ -630,331 +583,6 @@ def test_dynamic_fullgraph_compile_backward_reaches_orbit_bias():
     assert not _FAILED_SHAPES, _FAILED_SHAPES
     assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
     for name, tensor in (("q", q), ("k", k), ("v", v), ("orbit_bias", orbit_bias)):
-        assert tensor.grad is not None, name
-        assert torch.isfinite(tensor.grad).all(), name
-        assert tensor.grad.abs().sum().item() > 0, name
-
-
-# --- the per-row bias table of the `orbit_vectors` knob -------------------
-#
-# The tests above drive the knob-off kernel, whose table is one row per head.
-# These drive its per-row specialization: the same seam, a table indexed by
-# (query row, bucket).
-
-
-@pytest.mark.parametrize(
-    ("d", "dtype"),
-    [(16, torch.bfloat16), (32, torch.float16), (64, torch.bfloat16)],
-)
-def test_row_table_specializations_use_triton(d: int, dtype: torch.dtype):
-    assert attention_impl.triton is not None
-    p, t = 2, 65
-    seq_lens = torch.tensor([t, 17], dtype=torch.int32, device=_DEVICE)
-    coords = _coords(p, t, seq_lens)
-    q, k, v = _qkv(p, t, d, dtype, seed=130_000 + d)
-    table = compose_row_bias_table(
-        _orbit_bias(torch.float32, seed=131_000 + d),
-        _orbit_vec(d, torch.float32, seed=132_000 + d),
-        q,
-    )
-
-    with torch.no_grad():
-        expected = _attention_reference(q, k, v, coords, seq_lens, table, _lut())
-        actual = fused_attention(q, k, v, coords, seq_lens, table, _lut())
-
-    torch.cuda.synchronize()
-    assert not _FAILED_SHAPES, _FAILED_SHAPES
-    max_abs = (actual.float() - expected.float()).abs().max().item()
-    assert max_abs <= 2.0e-2, f"D={d}, dtype={dtype}: max abs diff {max_abs:.6g}"
-
-
-def test_zero_orbit_vec_is_exactly_the_static_kernel():
-    """A zero content vector leaves the static-table model untouched: the two
-    kernel specializations are then the same function of the same rows, and
-    route the same gradient back to those rows."""
-    p, t, d = 2, 65, 32
-    seq_lens = _seq_lens(p, t, ragged=True)
-    coords = _coords(p, t, seq_lens)
-    q, k, v = _qkv(p, t, d, torch.bfloat16, seed=120_000)
-    static = _orbit_bias(torch.float32, seed=120_001)
-    zero = torch.zeros((_HEADS, BIAS_ROWS, d), dtype=torch.float32, device=_DEVICE)
-    generator = torch.Generator(device=_DEVICE).manual_seed(120_002)
-    upstream = torch.randn(
-        (p, _HEADS, t, d), dtype=torch.bfloat16, device=_DEVICE, generator=generator
-    )
-
-    # Every query row carries exactly the static row, bit for bit.
-    assert torch.equal(
-        compose_row_bias_table(static, zero, q),
-        static.to(q.dtype)[None, :, None, :].expand(p, _HEADS, t, BIAS_ROWS),
-    )
-
-    row_static = static.detach().clone().requires_grad_()
-    row_out = fused_attention(
-        q, k, v, coords, seq_lens, compose_row_bias_table(row_static, zero, q), _lut()
-    )
-    (row_grad,) = torch.autograd.grad((row_out * upstream).sum(), (row_static,))
-
-    flat_static = static.detach().clone().requires_grad_()
-    flat_out = fused_attention(q, k, v, coords, seq_lens, flat_static, _lut())
-    (flat_grad,) = torch.autograd.grad((flat_out * upstream).sum(), (flat_static,))
-
-    torch.cuda.synchronize()
-    assert not _FAILED_SHAPES, _FAILED_SHAPES
-    assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
-    max_abs = (row_out.float() - flat_out.float()).abs().max().item()
-    assert max_abs <= 2.0e-2, f"max abs diff {max_abs:.6g}"
-    relative = (
-        (row_grad - flat_grad).norm() / flat_grad.norm().clamp_min(1.0e-7)
-    ).item()
-    assert relative <= 3.0e-2, f"static gradient relative error {relative:.6g}"
-
-
-_ROW_GRAD_SHAPES = (
-    (1, 2, 32),
-    (1, 65, 32),
-    (3, 31, 32),
-    (3, 64, 16),
-    (3, 65, 64),
-    (3, 200, 32),
-    (64, 513, 32),
-)
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(("p", "t", "d"), _ROW_GRAD_SHAPES)
-def test_row_table_forward_and_gradients_match_reference(
-    p: int, t: int, d: int, dtype: torch.dtype
-):
-    q0, k0, v0 = _qkv(p, t, d, dtype, seed=140_000 + p * 1000 + t * 10 + d)
-    bias0 = _orbit_bias(torch.float32, seed=150_000 + p * 1000 + t * 10 + d)
-    vec0 = _orbit_vec(d, torch.float32, seed=160_000 + p * 1000 + t * 10 + d)
-    generator = torch.Generator(device=_DEVICE).manual_seed(
-        170_000 + p * 1000 + t * 10 + d
-    )
-    upstream = torch.randn(
-        (p, _HEADS, t, d), dtype=dtype, device=_DEVICE, generator=generator
-    )
-
-    cases = [("dense", _seq_lens(p, t, ragged=False))]
-    ragged = _seq_lens(p, t, ragged=True)
-    if not torch.equal(ragged, cases[0][1]):
-        cases.append(("ragged", ragged))
-
-    for case_name, seq_lens in cases:
-        coords = _coords(p, t, seq_lens)
-        fast_inputs = [
-            x.detach().clone().requires_grad_() for x in (q0, k0, v0, bias0, vec0)
-        ]
-        ref_inputs = [
-            x.detach().clone().requires_grad_() for x in (q0, k0, v0, bias0, vec0)
-        ]
-
-        fast_table = compose_row_bias_table(
-            fast_inputs[3], fast_inputs[4], fast_inputs[0]
-        )
-        fast_out = fused_attention(
-            *fast_inputs[:3], coords, seq_lens, fast_table, _lut()
-        )
-        fast_grads = torch.autograd.grad(
-            (fast_out * upstream).sum(), tuple(fast_inputs)
-        )
-
-        ref_table = compose_row_bias_table(ref_inputs[3], ref_inputs[4], ref_inputs[0])
-        ref_out = _attention_reference(
-            *ref_inputs[:3], coords, seq_lens, ref_table, _lut()
-        )
-        ref_grads = torch.autograd.grad((ref_out * upstream).sum(), tuple(ref_inputs))
-
-        torch.cuda.synchronize()
-        assert not _FAILED_SHAPES, _FAILED_SHAPES
-        assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
-        assert fast_out.stride() == q0.stride()
-        assert torch.isfinite(fast_out).all(), case_name
-        invalid = torch.arange(t, device=_DEVICE).unsqueeze(0) >= seq_lens.unsqueeze(1)
-        invalid_rows = fast_out.detach().permute(0, 2, 1, 3)[invalid]
-        assert torch.equal(invalid_rows, torch.zeros_like(invalid_rows)), case_name
-        max_abs = (fast_out.float() - ref_out.float()).abs().max().item()
-        assert max_abs <= 2.0e-2, (
-            f"{case_name}, P={p}, T={t}, D={d}, dtype={dtype}: "
-            f"max abs diff {max_abs:.6g}"
-        )
-        for grad_name, actual, expected in zip(
-            ("q", "k", "v", "orbit_bias", "orbit_vec"), fast_grads, ref_grads
-        ):
-            assert torch.isfinite(actual).all(), f"{case_name}: {grad_name}"
-            expected_float = expected.float()
-            denominator = expected_float.norm().clamp_min(1.0e-7)
-            relative = ((actual.float() - expected_float).norm() / denominator).item()
-            assert relative <= 3.0e-2, (
-                f"{case_name}, P={p}, T={t}, D={d}, dtype={dtype}, {grad_name}: "
-                f"relative gradient error {relative:.6g}"
-            )
-
-
-def test_row_table_fp32_pad_keys_have_exactly_zero_weight():
-    p, t, d = 2, 8, 16
-    seq_lens = torch.tensor([t, 3], dtype=torch.int32, device=_DEVICE)
-    coords = _coords(p, t, seq_lens)
-    q, k, _ = _qkv(p, t, d, torch.float32, seed=180_001)
-    q = q * 0.2
-    k = k * 0.2
-    table = compose_row_bias_table(
-        _orbit_bias(torch.float32, seed=180_002),
-        _orbit_vec(d, torch.float32, seed=180_003),
-        q,
-    )
-
-    # With identity values, the first T output channels are the attention weights.
-    v = torch.zeros((p, _HEADS, t, d), dtype=torch.float32, device=_DEVICE)
-    v[..., :t] = torch.eye(t, dtype=torch.float32, device=_DEVICE)
-
-    actual = fused_attention(q, k, v, coords, seq_lens, table, _lut())
-    scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(d)
-    scores = scores + _dense_bias(coords, seq_lens, table)
-    key_valid = (
-        torch.arange(t, device=_DEVICE)[None, None, None, :]
-        < seq_lens[:, None, None, None]
-    )
-    weights = scores.masked_fill(~key_valid, -torch.inf).softmax(-1)
-    expected = torch.matmul(weights, v)
-    query_valid = (
-        torch.arange(t, device=_DEVICE)[None, None, :, None]
-        < seq_lens[:, None, None, None]
-    )
-    expected = expected.masked_fill(~query_valid, 0)
-
-    torch.testing.assert_close(actual, expected, atol=5.0e-4, rtol=5.0e-4)
-    pad_weights = actual[1, :, :3, 3:t]
-    assert torch.equal(pad_weights, torch.zeros_like(pad_weights))
-
-
-def test_row_bias_gradient_histogram_is_per_query_row():
-    p, t, d = 1, 4, 32
-    seq_lens = torch.tensor([t], dtype=torch.int32, device=_DEVICE)
-    coords = torch.tensor(
-        [[[0, 0], [0, 0], [1, 0], [20, 0]]],
-        dtype=torch.int32,
-        device=_DEVICE,
-    )
-    q = torch.zeros((p, _HEADS, t, d), dtype=torch.float16, device=_DEVICE)
-    k = torch.zeros_like(q)
-    v = torch.zeros_like(q)
-    v[..., :t] = torch.eye(t, dtype=torch.float16, device=_DEVICE)
-    table = torch.zeros(
-        (p, _HEADS, t, BIAS_ROWS),
-        dtype=torch.float16,
-        device=_DEVICE,
-        requires_grad=True,
-    )
-    upstream = torch.zeros_like(q)
-    upstream[:, :, 1, 2:4] = 1
-
-    out = fused_attention(q, k, v, coords, seq_lens, table, _lut())
-    (grad,) = torch.autograd.grad((out * upstream).sum(), (table,))
-    torch.cuda.synchronize()
-
-    assert not _FAILED_SHAPES, _FAILED_SHAPES
-    assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
-    assert torch.isfinite(grad).all()
-    # Query row 1 sees the token (row 0), itself, a distance-one neighbour
-    # (row 2), and a FAR stone (row 3); the softmax couples all four rows.
-    present_rows = [TOKEN_BUCKET, SELF_BUCKET, orbit48_id(-1, 0), FAR_BUCKET]
-    present = grad[:, :, 1, present_rows]
-    assert torch.count_nonzero(present).item() == present.numel()
-    absent_rows = [b for b in range(BIAS_ROWS) if b not in present_rows]
-    absent = grad[:, :, 1, absent_rows]
-    assert torch.equal(absent, torch.zeros_like(absent))
-    # Only the query row the loss reads has any table gradient at all — the
-    # table is per row, so a row with no upstream signal keeps none.
-    others = grad[:, :, [0, 2, 3], :]
-    assert torch.equal(others, torch.zeros_like(others))
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_row_table_backward_has_exactly_zero_gradients_for_padded_rows(
-    dtype: torch.dtype,
-):
-    p, t, d = 3, 65, 32
-    seq_lens = torch.tensor([t, 17, 1], dtype=torch.int32, device=_DEVICE)
-    coords = _coords(p, t, seq_lens)
-    q, k, v = _qkv(p, t, d, dtype, seed=190_000)
-    inputs = [x.requires_grad_() for x in (q, k, v)]
-    table = compose_row_bias_table(
-        _orbit_bias(torch.float32, seed=190_001).requires_grad_(),
-        _orbit_vec(d, torch.float32, seed=190_003).requires_grad_(),
-        inputs[0],
-    )
-    generator = torch.Generator(device=_DEVICE).manual_seed(190_002)
-    upstream = torch.randn(
-        (p, _HEADS, t, d), dtype=dtype, device=_DEVICE, generator=generator
-    )
-
-    out = fused_attention(*inputs, coords, seq_lens, table, _lut())
-    grads = torch.autograd.grad((out * upstream).sum(), tuple(inputs))
-    torch.cuda.synchronize()
-
-    assert not _FAILED_SHAPES, _FAILED_SHAPES
-    assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
-    invalid = torch.arange(t, device=_DEVICE).unsqueeze(0) >= seq_lens.unsqueeze(1)
-    assert invalid.any()
-    for name, grad in zip(("q", "k", "v"), grads):
-        padded_rows = grad.permute(0, 2, 1, 3)[invalid]
-        assert torch.equal(padded_rows, torch.zeros_like(padded_rows)), name
-
-
-def test_row_table_compile_traces_the_composition_and_keeps_the_kernel_opaque():
-    # The composition is ordinary torch ops and traces into the graph; only
-    # the kernel op stays opaque.
-    def attention(q, k, v, coords, seq_lens, orbit_bias, orbit_vec, lut):
-        table = compose_row_bias_table(orbit_bias, orbit_vec, q)
-        return fused_attention(q, k, v, coords, seq_lens, table, lut)
-
-    compiled = torch.compile(attention, dynamic=True, fullgraph=True)
-    orbit_bias = _orbit_bias(torch.float32, seed=200_001)
-    orbit_vec = _orbit_vec(32, torch.float32, seed=200_002)
-    for t in (31, 65):
-        seq_lens = _seq_lens(3, t, ragged=True)
-        coords = _coords(3, t, seq_lens)
-        q, k, v = _qkv(3, t, 32, torch.bfloat16, seed=200_003 + t)
-        with torch.no_grad():
-            actual = compiled(q, k, v, coords, seq_lens, orbit_bias, orbit_vec, _lut())
-            expected = _attention_reference(
-                q,
-                k,
-                v,
-                coords,
-                seq_lens,
-                compose_row_bias_table(orbit_bias, orbit_vec, q),
-                _lut(),
-            )
-        assert not _FAILED_SHAPES, _FAILED_SHAPES
-        assert actual.stride() == q.stride()
-        max_abs = (actual.float() - expected.float()).abs().max().item()
-        assert max_abs <= 2.0e-2, f"T={t}: max abs diff {max_abs:.6g}"
-
-    q, k, v = _qkv(2, 17, 32, torch.bfloat16, seed=200_100)
-    seq_lens = torch.tensor([17, 6], dtype=torch.int32, device=_DEVICE)
-    coords = _coords(2, 17, seq_lens)
-    q.requires_grad_()
-    k.requires_grad_()
-    v.requires_grad_()
-    orbit_bias = orbit_bias.detach().clone().requires_grad_()
-    orbit_vec = orbit_vec.detach().clone().requires_grad_()
-    compiled(
-        q, k, v, coords, seq_lens, orbit_bias, orbit_vec, _lut()
-    ).float().square().mean().backward()
-    torch.cuda.synchronize()
-
-    assert not _FAILED_SHAPES, _FAILED_SHAPES
-    assert not _FAILED_BACKWARD_SHAPES, _FAILED_BACKWARD_SHAPES
-    for name, tensor in (
-        ("q", q),
-        ("k", k),
-        ("v", v),
-        ("orbit_bias", orbit_bias),
-        ("orbit_vec", orbit_vec),
-    ):
         assert tensor.grad is not None, name
         assert torch.isfinite(tensor.grad).all(), name
         assert tensor.grad.abs().sum().item() > 0, name

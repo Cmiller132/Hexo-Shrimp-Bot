@@ -84,15 +84,6 @@ def test_param_groups_partition_and_membership(model):
     assert id(model.value_queries) in ids_d  # listed nowhere in §10's exclusions
 
 
-def test_param_groups_leave_the_content_bias_undecayed():
-    from mantisnet import MantisConfig, MantisNet
-
-    net = MantisNet(MantisConfig(h=32, blocks=1, heads=4, orbit_vectors=True))
-    _decay, no_decay = param_groups(net, weight_decay=0.1)
-    # The same bias as the tables, in content form — not a projection matrix.
-    assert id(net.blocks[0].orbit_vec) in {id(p) for p in no_decay["params"]}
-
-
 def test_every_parameter_receives_gradient(positions):
     torch.manual_seed(3)
     from mantisnet import MantisConfig, MantisNet

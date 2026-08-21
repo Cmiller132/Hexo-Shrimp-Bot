@@ -37,11 +37,9 @@ from . import (
 )
 from .attention import (
     AXIS_ROWS,
-    BIAS_ROWS,
     ORBIT_CLASSES,
     axis_index,
     compose_bias_table,
-    compose_row_bias_table,
     fused_attention,
     orbit_lut,
 )
@@ -86,10 +84,6 @@ class MantisConfig:
     cell_nodes: bool = False
     cell_node_scope: str = "all"
     cell_adjacency: bool = False
-    # Step 11c: give the §4.1 stone-attention bias a content term, so what a
-    # head makes of a displacement depends on the querying stone rather than
-    # on the geometry alone. Zero-initialised, hence a no-op at init.
-    orbit_vectors: bool = False
     # Step S1: covered cells start from invariant structure rather than one
     # shared row, and a block's cell reads gain a nonlinear residual on top
     # of the additive path they already take.
@@ -443,13 +437,10 @@ class _Block(nn.Module):
         self.v = nn.Linear(h, h, bias=False)
         self.e_sw = nn.Embedding(cfg.occ_classes, h)
         self.mlp_s = _PairMlp(h, h, h)
-        # §5.3 stone self-attention + state latents. The bias is typed by the
-        # §4.1 orbit vocabulary and learned in zero-initialised parts per head:
-        # a coarse (distance, on-axis) table with FAR/SELF/TOKEN and a
-        # per-orbit residual on top of it (`bias_table()`), plus — with the
-        # `orbit_vectors` knob — a per-orbit vector the query projects onto,
-        # which makes the bias a function of the asking stone rather than of
-        # the geometry alone. `attention_bias()` composes what the kernel sees.
+        # §5.3 stone self-attention + state latents. The bias table is typed
+        # by the §4.1 orbit vocabulary and learned in two parts per head: a
+        # coarse (distance, on-axis) table with FAR/SELF/TOKEN, plus a
+        # per-orbit residual; `bias_table()` composes the rows the kernel sees.
         self.ln_attn = nn.LayerNorm(h)
         self.wq = nn.Linear(h, h)
         self.wk = nn.Linear(h, h, bias=False)
@@ -457,10 +448,6 @@ class _Block(nn.Module):
         self.wo = nn.Linear(h, h)
         self.axis_bias = nn.Parameter(torch.zeros(cfg.heads, AXIS_ROWS))
         self.orbit_bias = nn.Parameter(torch.zeros(cfg.heads, ORBIT_CLASSES))
-        if cfg.orbit_vectors:
-            self.orbit_vec = nn.Parameter(
-                torch.zeros(cfg.heads, BIAS_ROWS, h // cfg.heads)
-            )
         self.register_buffer("axis_index", axis_index("cpu").clone(), persistent=False)
         self.ln_ffn = nn.LayerNorm(h)
         self.ffn = nn.Sequential(
@@ -469,18 +456,9 @@ class _Block(nn.Module):
         self.drop = nn.Dropout(cfg.dropout)
 
     def bias_table(self) -> Tensor:
-        """The static per-head ``(A, BIAS_ROWS)`` attention-bias rows: coarse
+        """The per-head ``(A, BIAS_ROWS)`` attention-bias rows: coarse
         (distance, on-axis) rows plus the per-orbit residual."""
         return compose_bias_table(self.axis_bias, self.orbit_bias, self.axis_index)
-
-    def attention_bias(self, q: Tensor) -> Tensor:
-        """The §5.3 bias the kernel reads for queries ``q``: the static rows,
-        or with ``orbit_vectors`` the ``(P, A, T, BIAS_ROWS)`` table carrying
-        each query's own content term on top of them."""
-        static = self.bias_table()
-        if not self.cfg.orbit_vectors:
-            return static
-        return compose_row_bias_table(static, self.orbit_vec, q)
 
     def _cell_pass(
         self,
@@ -818,7 +796,7 @@ class _Block(nn.Module):
             v,
             batch.coords,
             seq_lens,
-            self.attention_bias(q),
+            self.bias_table(),
             orbit_table,
             global_rows,
         )

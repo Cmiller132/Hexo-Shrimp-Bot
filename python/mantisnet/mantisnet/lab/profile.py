@@ -147,7 +147,7 @@ def _replicated_block(
         k = block.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         v = block.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         out = fused_attention(
-            q, k, v, batch.coords, seq_lens, block.attention_bias(q), orbit_table, 4
+            q, k, v, batch.coords, seq_lens, block.bias_table(), orbit_table, 4
         )
         out = block.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(
             p * max_t, cfg.h
