@@ -32,6 +32,7 @@ from . import (
     message_passing,
     relay,
     row_encoder,
+    site_attention,
     window_latents,
     window_pairs,
 )
@@ -88,6 +89,13 @@ class MantisConfig:
     # shared row, and a block's cell reads gain a nonlinear residual on top
     # of the additive path they already take.
     cell_structure: bool = False
+    # Site attention: one softmax per position over [state latents; stones;
+    # legal cells], pure content scores, replacing the §5.3 stone attention
+    # and the Step 13 radius read. Covered cells take the Step S1 static
+    # identity init — as attention peers their initial state is their
+    # identity — while the S1 nonlinear cell residual is subsumed by the
+    # sites' shared FFN, so the two knobs are exclusive.
+    site_attention: bool = False
     # Step 5: encode the builder's deterministic per-action tactical scalars
     # into the action row through a small MLP (measured arm True).
     action_tactical: bool = False
@@ -122,6 +130,29 @@ class MantisConfig:
             )
         if self.cell_structure and not self.cell_latents:
             raise ValueError("cell_structure requires cell_latents=True")
+        if self.site_attention:
+            if not (self.cell_latents and self.cell_nodes):
+                raise ValueError(
+                    "site_attention requires cell_latents=True and "
+                    "cell_nodes=True: every legal cell must carry state to "
+                    "join the softmax"
+                )
+            if self.cell_structure:
+                raise ValueError(
+                    "site_attention subsumes cell_structure: the static "
+                    "identity init is part of the site path and the sites' "
+                    "FFN replaces the nonlinear cell residual"
+                )
+            if self.cell_adjacency:
+                raise ValueError(
+                    "site_attention subsumes cell_adjacency: cells attend "
+                    "to each other in the joint softmax"
+                )
+            if self.cell_node_scope != "all":
+                raise ValueError(
+                    "site_attention replaces the radius read; a non-default "
+                    "cell_node_scope would be inert"
+                )
 
     @property
     def uses_cell_state(self) -> bool:
@@ -322,7 +353,7 @@ class _Block(nn.Module):
             self.wr_wv = nn.Linear(h, h)
             self.wr_wo = nn.Linear(h, h)
             self.wr_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.dec_classes))
-            if cfg.cell_nodes:
+            if cfg.cell_nodes and not cfg.site_attention:
                 self.ln_radius_c = nn.LayerNorm(h)
                 self.ln_radius_s = nn.LayerNorm(h)
                 self.radius_wq = nn.Linear(h, h)
@@ -409,14 +440,21 @@ class _Block(nn.Module):
         # by the §4.1 orbit vocabulary and learned in two parts per head: a
         # coarse (distance, on-axis) table with FAR/SELF/TOKEN, plus a
         # per-orbit residual; `bias_table()` composes the rows the kernel sees.
+        # Under site_attention the same projections attend over the joint
+        # [latents; stones; cells] rows with pure content scores, and the
+        # bias tables do not exist — the eval-time knock-out measured them
+        # decorative in the trained function.
         self.ln_attn = nn.LayerNorm(h)
         self.wq = nn.Linear(h, h)
         self.wk = nn.Linear(h, h, bias=False)
         self.wv = nn.Linear(h, h)
         self.wo = nn.Linear(h, h)
-        self.axis_bias = nn.Parameter(torch.zeros(cfg.heads, AXIS_ROWS))
-        self.orbit_bias = nn.Parameter(torch.zeros(cfg.heads, ORBIT_CLASSES))
-        self.register_buffer("axis_index", axis_index("cpu").clone(), persistent=False)
+        if not cfg.site_attention:
+            self.axis_bias = nn.Parameter(torch.zeros(cfg.heads, AXIS_ROWS))
+            self.orbit_bias = nn.Parameter(torch.zeros(cfg.heads, ORBIT_CLASSES))
+            self.register_buffer(
+                "axis_index", axis_index("cpu").clone(), persistent=False
+            )
         self.ln_ffn = nn.LayerNorm(h)
         self.ffn = nn.Sequential(
             nn.Linear(h, cfg.ffn_factor * h), nn.ReLU(), nn.Linear(cfg.ffn_factor * h, h)
@@ -495,7 +533,7 @@ class _Block(nn.Module):
         reads = self.cr_wo(read.reshape(n_c, cfg.h).to(zc.dtype))
         c = c + self.drop(reads)
 
-        if cfg.cell_nodes:
+        if cfg.cell_nodes and not cfg.site_attention:
             if radius is None:
                 raise ValueError("cell_nodes is on but radius tables are missing")
             zc = self.ln_radius_c(c)
@@ -513,7 +551,7 @@ class _Block(nn.Module):
             if cfg.cell_structure:
                 reads = reads + stone
         elif radius is not None:
-            raise ValueError("radius tables were passed but cell_nodes is off")
+            raise ValueError("radius tables were passed but the radius read is off")
 
         if cfg.cell_structure:
             # Without cell_nodes there is no stone read and ``reads`` is the
@@ -657,6 +695,8 @@ class _Block(nn.Module):
         ctab: cell_latents.CellTables | None,
         radius: cell_latents.CellTables | None,
         adjacency: cell_latents.CellTables | None,
+        site: site_attention.SiteLayout | None,
+        site_mask,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         cfg = self.cfg
         # Sizes come from tensor shapes, not the Batch's ints: under
@@ -739,39 +779,61 @@ class _Block(nn.Module):
         ).to(agg.dtype)
         s = s + self.drop(self.mlp_s(self.ln_sw_s(s), agg))
 
-        # §5.3: attention over [global rows; stones], block-diagonal per position.
-        rows = s.new_zeros(p * max_t, cfg.h)
         global_rows = 4
-        global_slot = (
-            torch.arange(p, device=s.device)[:, None] * max_t
-            + torch.arange(global_rows, device=s.device)[None, :]
-        ).reshape(-1)
-        rows.index_copy_(0, global_slot, g.reshape(-1, cfg.h))
-        rows.index_copy_(0, batch.stone_slot, s)
-        z = self.ln_attn(rows.view(p, max_t, cfg.h))
-
         hd = cfg.h // cfg.heads
-        q = self.wq(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
-        k = self.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
-        v = self.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
+        if cfg.site_attention:
+            # §5.3 as site attention: one content softmax per position over
+            # [state latents; stones; legal cells]. Same projections, no
+            # bias rows; the packed layout came from the trunk.
+            rows = site_attention.pack_rows(g, s, c, site)
+            z = self.ln_attn(rows)
+            q = self.wq(z).view(-1, cfg.heads, hd)
+            k = self.wk(z).view(-1, cfg.heads, hd)
+            v = self.wv(z).view(-1, cfg.heads, hd)
+            out = site_attention.site_attention(q, k, v, site, site_mask)
+            out = self.wo(out.reshape(-1, cfg.h))
+            s = s + self.drop(out.index_select(0, site.stone_rows))
+            g = g + self.drop(
+                out.index_select(0, site.global_rows.reshape(-1)).view(
+                    p, global_rows, cfg.h
+                )
+            )
+            c = c + self.drop(out.index_select(0, site.cell_rows))
+        else:
+            # §5.3: attention over [global rows; stones], block-diagonal per
+            # position.
+            rows = s.new_zeros(p * max_t, cfg.h)
+            global_slot = (
+                torch.arange(p, device=s.device)[:, None] * max_t
+                + torch.arange(global_rows, device=s.device)[None, :]
+            ).reshape(-1)
+            rows.index_copy_(0, global_slot, g.reshape(-1, cfg.h))
+            rows.index_copy_(0, batch.stone_slot, s)
+            z = self.ln_attn(rows.view(p, max_t, cfg.h))
 
-        # Coordinates become orbit buckets inside the attention kernel. Each
-        # position's key loop stops at its live prefix instead of doing
-        # quadratic work over padding.
-        out = fused_attention(
-            q,
-            k,
-            v,
-            batch.coords,
-            seq_lens,
-            self.bias_table(),
-            orbit_table,
-            global_rows,
-        )
-        out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(p * max_t, cfg.h)
-        s = s + self.drop(out.index_select(0, batch.stone_slot))
-        global_delta = out.index_select(0, global_slot)
-        g = g + self.drop(global_delta.view(p, global_rows, cfg.h))
+            q = self.wq(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
+            k = self.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
+            v = self.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
+
+            # Coordinates become orbit buckets inside the attention kernel.
+            # Each position's key loop stops at its live prefix instead of
+            # doing quadratic work over padding.
+            out = fused_attention(
+                q,
+                k,
+                v,
+                batch.coords,
+                seq_lens,
+                self.bias_table(),
+                orbit_table,
+                global_rows,
+            )
+            out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(
+                p * max_t, cfg.h
+            )
+            s = s + self.drop(out.index_select(0, batch.stone_slot))
+            global_delta = out.index_select(0, global_slot)
+            g = g + self.drop(global_delta.view(p, global_rows, cfg.h))
         # Same recompute-in-backward policy as the cell stage: the cycle
         # touches every window row three times and its saves were the
         # second-widest slice of the peak, while its replay is a fraction
@@ -786,11 +848,22 @@ class _Block(nn.Module):
         )
 
         # FFN over the same rows — row-independent, so no padding needed.
+        # Under site attention the cells are attention rows, so they take
+        # the FFN too: the nonlinear per-cell update the S1 residual
+        # supplied, from the shared machinery.
         global_flat = g.reshape(-1, cfg.h)
-        rows = torch.cat([s, global_flat], dim=0)
-        rows = self.drop(self.ffn(self.ln_ffn(rows)))
-        s = s + rows[: s.shape[0]]
-        global_flat = global_flat + rows[s.shape[0] :]
+        if cfg.site_attention:
+            rows = torch.cat([s, global_flat, c], dim=0)
+            rows = self.drop(self.ffn(self.ln_ffn(rows)))
+            s = s + rows[: s.shape[0]]
+            split = s.shape[0] + global_flat.shape[0]
+            global_flat = global_flat + rows[s.shape[0] : split]
+            c = c + rows[split:]
+        else:
+            rows = torch.cat([s, global_flat], dim=0)
+            rows = self.drop(self.ffn(self.ln_ffn(rows)))
+            s = s + rows[: s.shape[0]]
+            global_flat = global_flat + rows[s.shape[0] :]
         g = global_flat.view(p, global_rows, cfg.h)
         return s, w, g, c
 
@@ -817,12 +890,14 @@ class MantisNet(nn.Module):
             self.cell_base = nn.Parameter(torch.empty(h))
         if cfg.cell_nodes or cfg.cell_structure:
             self.cell_nearest_table = nn.Embedding(cell_nodes.NEAREST_BUCKETS, h)
-        if cfg.cell_structure:
+        if cfg.cell_structure or cfg.site_attention:
             # Step S1: a covered cell's static identity — the 726-class
             # decoder incidence it sits in, its nearest-stone bucket (the
             # same table uncovered cells initialize from), and how many live
             # windows cover it. Both tables are zero at init, so the knob
-            # starts at the incumbent function on these two terms.
+            # starts at the incumbent function on these two terms. Site
+            # attention shares the init: cells that join the softmax carry
+            # their own identity rather than one shared row.
             self.cell_class_table = nn.Embedding(cfg.dec_classes, h)
             self.cell_coverage_table = nn.Embedding(COVERAGE_BUCKETS, h)
             self.register_buffer(
@@ -933,9 +1008,10 @@ class MantisNet(nn.Module):
             nn.init.normal_(self.act_latent_base, std=0.02)
             nn.init.zeros_(self.act_wo_bcast.weight)
             nn.init.zeros_(self.act_wo_bcast.bias)
-        if self.cfg.cell_structure:
+        if self.cfg.cell_structure or self.cfg.site_attention:
             nn.init.zeros_(self.cell_class_table.weight)
             nn.init.zeros_(self.cell_coverage_table.weight)
+        if self.cfg.cell_structure:
             for block in self.blocks:
                 nn.init.zeros_(block.mlp_c.out.weight)
                 nn.init.zeros_(block.mlp_c.out.bias)
@@ -981,16 +1057,17 @@ class MantisNet(nn.Module):
     ) -> Tensor:
         """The initial state of the covered legal cells, ``(N_cov, H)``.
 
-        Off ``cell_structure`` that is the one shared learned row, identical
-        for every covered cell. On it the shared row stays as the bias and
-        three invariant static encodings of the cell's own coverage join it:
-        the sum of its decoder incidence classes, its nearest-stone bucket —
-        the same table uncovered cells initialize from — and the bucketed
-        number of live windows that contain it.
+        Off ``cell_structure`` and ``site_attention`` that is the one shared
+        learned row, identical for every covered cell. On either the shared
+        row stays as the bias and three invariant static encodings of the
+        cell's own coverage join it: the sum of its decoder incidence
+        classes, its nearest-stone bucket — the same table uncovered cells
+        initialize from — and the bucketed number of live windows that
+        contain it.
         """
         cfg = self.cfg
         base = self.cell_base.expand(ctab.covered.shape[0], cfg.h)
-        if not cfg.cell_structure:
+        if not (cfg.cell_structure or cfg.site_attention):
             return base
         n_cells = batch.cell_pos.shape[0]
         classes = message_passing.class_row_sum(
@@ -1080,12 +1157,27 @@ class MantisNet(nn.Module):
             if cfg.cell_nodes:
                 c = self.cell_nearest_table(batch.cell_nearest).clone()
                 c.index_copy_(0, ctab.covered, covered_init)
-                radius = self._radius_tables(batch, ctab.covered, s.shape[0])
+                if not cfg.site_attention:
+                    radius = self._radius_tables(batch, ctab.covered, s.shape[0])
                 if cfg.cell_adjacency:
                     adjacency = self._adjacency_tables(batch, ctab.covered)
             else:
                 c = covered_init
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
+        site = site_mask = None
+        if cfg.site_attention:
+            # Derived on device like the §5.1c tables, once for all blocks:
+            # the layout — and its FlexAttention block mask — depends only
+            # on the batch.
+            site = site_attention.site_layout(
+                seq_lens,
+                batch.legal_offsets,
+                batch.cell_pos,
+                batch.stone_slot,
+                batch.attn_valid.shape[1],
+                s.shape[0],
+            )
+            site_mask = site_attention.document_mask(site)
         for block in self.blocks:
             s, w, g, c = block(
                 s,
@@ -1102,6 +1194,8 @@ class MantisNet(nn.Module):
                 ctab,
                 radius,
                 adjacency,
+                site,
+                site_mask,
             )
         global_rows = self.ln_out(g).mean(dim=1)
         cells = None
