@@ -189,16 +189,33 @@ def document_mask(layout: SiteLayout):
     )
 
 
+_compiled_flex = None
+
+
+@torch.compiler.disable
 def site_attention(
     q: Tensor, k: Tensor, v: Tensor, layout: SiteLayout, block_mask
 ) -> Tensor:
     """Dispatch: FlexAttention under the prebuilt document mask on CUDA, the
-    packed reference elsewhere. Inputs and output are ``(total, heads, hd)``."""
+    packed reference elsewhere. Inputs and output are ``(total, heads, hd)``.
+
+    Compiler-disabled, with flex compiled once here as its own dynamic-shape
+    unit: inside the trunk's graph the mask tensors arrive as guarded inputs
+    whose ``blocks`` extent varies per chunk, and the per-extent
+    specializations exhaust the recompile limit — after which dynamo runs
+    the region eager, where flex takes its slow decomposed path. As a
+    separate unit the mask is flex's own pytree input and one dynamic graph
+    serves every chunk.
+    """
     if not q.is_cuda:
         return site_attention_reference(q, k, v, layout.doc)
-    from torch.nn.attention.flex_attention import flex_attention
+    global _compiled_flex
+    if _compiled_flex is None:
+        from torch.nn.attention.flex_attention import flex_attention
 
-    out = flex_attention(
+        _compiled_flex = torch.compile(flex_attention, dynamic=True)
+
+    out = _compiled_flex(
         q.transpose(0, 1)[None],
         k.transpose(0, 1)[None],
         v.transpose(0, 1)[None],
