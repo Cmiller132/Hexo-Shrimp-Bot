@@ -19,6 +19,9 @@ from mantisnet.klent import telemetry
 
 
 def pytest_configure(config):
+    config.addinivalue_line(
+        "markers", "cuda_lane: tests whose file touches the GPU; run serially"
+    )
     # Under xdist every worker would otherwise open a full-width OMP pool —
     # n workers × n cores threads thrash the box into being slower than the
     # serial run. Serial invocations keep torch's full width.
@@ -29,10 +32,15 @@ def pytest_configure(config):
 # both stones of a turn, and boards from empty to crowded.
 PLIES = [0, 1, 2, 3, 5, 9, 12, 21, 34, 60]
 
-# Files whose tests touch the GPU. Under pytest-xdist with --dist loadgroup
-# they all share one worker, so the one-GPU-consumer rule holds while every
-# CPU test fans out across the others; without xdist the marker is inert.
-# The full suite runs as: pytest tests/ -n auto --dist loadgroup
+# Files whose tests touch the GPU. The fast suite runs in two lanes,
+# because even `torch.manual_seed` initializes a CUDA context and one
+# context per xdist worker exhausts the card:
+#   CUDA_VISIBLE_DEVICES= pytest tests/ -n auto -m "not cuda_lane"
+#   pytest tests/ -m cuda_lane
+# The first fans every CPU test across workers with the GPU invisible (the
+# CUDA tests skip); the second runs the GPU files serially — the
+# one-GPU-consumer rule. The xdist_group is defense for a plain `-n auto`
+# run: all GPU files share one worker instead of thirty-two.
 _CUDA_FILES = {
     "test_attention_kernel.py",
     "test_cell_latents.py",
@@ -52,6 +60,7 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if Path(item.fspath).name in _CUDA_FILES:
             item.add_marker(pytest.mark.xdist_group("cuda"))
+            item.add_marker(pytest.mark.cuda_lane)
 
 
 def random_moves(plies: int, seed: int) -> list[tuple[int, int]]:
