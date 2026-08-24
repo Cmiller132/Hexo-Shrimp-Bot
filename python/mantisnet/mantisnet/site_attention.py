@@ -164,9 +164,11 @@ def document_mask(layout: SiteLayout):
     kv_first = doc_first_block.index_select(0, lo)
     kv_last = doc_last_block.index_select(0, hi)
     kv_num = (kv_last - kv_first + 1).to(torch.int32)
-    span = int(kv_num.max())
+    # The ordered format is full-width: one column per kv block, entries
+    # past ``kv_num`` ignored — the transpose helper sizes its dense buffer
+    # from this width, so a compressed span would index out of bounds.
     kv_indices = torch.minimum(
-        kv_first[:, None] + torch.arange(span, device=device)[None, :],
+        kv_first[:, None] + torch.arange(blocks, device=device)[None, :],
         kv_first.new_tensor(blocks - 1),
     ).to(torch.int32)
 
@@ -180,7 +182,7 @@ def document_mask(layout: SiteLayout):
 
     return BlockMask.from_kv_blocks(
         kv_num.view(1, 1, blocks),
-        kv_indices.view(1, 1, blocks, span),
+        kv_indices.view(1, 1, blocks, blocks),
         BLOCK_SIZE=block,
         mask_mod=same_doc,
         seq_lengths=(total, total),
