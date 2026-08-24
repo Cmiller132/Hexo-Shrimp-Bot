@@ -6,7 +6,9 @@ constructor.
 
 from __future__ import annotations
 
+import os
 import random
+from pathlib import Path
 
 import hexo_py
 import pytest
@@ -15,9 +17,41 @@ import torch
 from mantisnet import MantisConfig, MantisNet
 from mantisnet.klent import telemetry
 
+
+def pytest_configure(config):
+    # Under xdist every worker would otherwise open a full-width OMP pool —
+    # n workers × n cores threads thrash the box into being slower than the
+    # serial run. Serial invocations keep torch's full width.
+    if os.environ.get("PYTEST_XDIST_WORKER"):
+        torch.set_num_threads(2)
+
 # Ply depths for the shared position set: both movers, all three turn phases,
 # both stones of a turn, and boards from empty to crowded.
 PLIES = [0, 1, 2, 3, 5, 9, 12, 21, 34, 60]
+
+# Files whose tests touch the GPU. Under pytest-xdist with --dist loadgroup
+# they all share one worker, so the one-GPU-consumer rule holds while every
+# CPU test fans out across the others; without xdist the marker is inert.
+# The full suite runs as: pytest tests/ -n auto --dist loadgroup
+_CUDA_FILES = {
+    "test_attention_kernel.py",
+    "test_cell_latents.py",
+    "test_message_passing.py",
+    "test_mixed_row_sums.py",
+    "test_model.py",
+    "test_optim.py",
+    "test_relay.py",
+    "test_row_encoder.py",
+    "test_site_attention.py",
+    "test_window_latent_kernel.py",
+    "test_window_pairs.py",
+}
+
+
+def pytest_collection_modifyitems(config, items):
+    for item in items:
+        if Path(item.fspath).name in _CUDA_FILES:
+            item.add_marker(pytest.mark.xdist_group("cuda"))
 
 
 def random_moves(plies: int, seed: int) -> list[tuple[int, int]]:

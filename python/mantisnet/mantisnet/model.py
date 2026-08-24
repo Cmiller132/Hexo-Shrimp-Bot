@@ -695,8 +695,8 @@ class _Block(nn.Module):
         ctab: cell_latents.CellTables | None,
         radius: cell_latents.CellTables | None,
         adjacency: cell_latents.CellTables | None,
-        site: site_attention.SiteLayout | None,
-        site_mask,
+        site: site_attention.SiteLayout | None = None,
+        site_mask=None,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         cfg = self.cfg
         # Sizes come from tensor shapes, not the Batch's ints: under
