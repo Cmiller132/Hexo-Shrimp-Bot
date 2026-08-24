@@ -249,9 +249,10 @@ def test_flex_survives_torch_compile_with_dynamic_shapes():
             layout.total,
         )
         torch.manual_seed(9)
-        q = torch.randn(layout.total, 2, 8, device=device, dtype=torch.bfloat16)
-        k = torch.randn(layout.total, 2, 8, device=device, dtype=torch.bfloat16)
-        v = torch.randn(layout.total, 2, 8, device=device, dtype=torch.bfloat16)
+        # The compiled lowering requires head dim >= 16; the model's is 32.
+        q = torch.randn(layout.total, 2, 16, device=device, dtype=torch.bfloat16)
+        k = torch.randn(layout.total, 2, 16, device=device, dtype=torch.bfloat16)
+        v = torch.randn(layout.total, 2, 16, device=device, dtype=torch.bfloat16)
         mask = document_mask(layout)
         fast = compiled(q, k, v, layout, mask)
         slow = site_attention_reference(q, k, v, layout.doc)
