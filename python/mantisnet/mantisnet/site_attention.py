@@ -120,6 +120,7 @@ def site_attention_reference(q: Tensor, k: Tensor, v: Tensor, doc: Tensor) -> Te
     return out.to(v.dtype)
 
 
+@torch.compiler.disable
 def document_mask(layout: SiteLayout):
     """The FlexAttention block mask for one batch's document layout.
 
@@ -127,23 +128,62 @@ def document_mask(layout: SiteLayout):
     block — and only on CUDA; the reference backend masks from ``doc``
     directly. The mask captures no learned tensor, so no gradient flows
     through it and the flex backward takes no atomic-add path.
+
+    Documents are contiguous row ranges, so each query block's live kv
+    blocks are one contiguous span; the ``BlockMask`` is assembled directly
+    from the doc array instead of through ``create_block_mask``, whose
+    generic mask evaluation does not survive ``torch.compile``'s symbolic
+    shapes (inductor ``CantSplit``) and would materialize the full row-pair
+    grid in eager. The builder is compiler-disabled: it runs eagerly at
+    every forward and the compiled graph consumes the finished mask.
     """
     if not layout.doc.is_cuda:
         return None
-    from torch.nn.attention.flex_attention import create_block_mask
+    from torch.nn.attention.flex_attention import BlockMask
 
-    doc = layout.doc
+    block = 128
+    total = layout.total
+    device = layout.doc.device
+    blocks = (total + block - 1) // block
+    # Row spans per document: the four latent rows lead each document, so
+    # its first packed row is its first latent row.
+    doc_start = layout.global_rows[:, 0]
+    doc_end = (
+        torch.cat(
+            [doc_start[1:], torch.tensor([total], device=device)]
+        )
+        - 1
+    )
+    doc_first_block = doc_start // block
+    doc_last_block = doc_end // block
+
+    starts = torch.arange(blocks, device=device) * block
+    ends = torch.minimum(starts + block - 1, starts.new_tensor(total - 1))
+    lo = layout.doc.index_select(0, starts).long()
+    hi = layout.doc.index_select(0, ends).long()
+    kv_first = doc_first_block.index_select(0, lo)
+    kv_last = doc_last_block.index_select(0, hi)
+    kv_num = (kv_last - kv_first + 1).to(torch.int32)
+    span = int(kv_num.max())
+    kv_indices = torch.minimum(
+        kv_first[:, None] + torch.arange(span, device=device)[None, :],
+        kv_first.new_tensor(blocks - 1),
+    ).to(torch.int32)
+
+    # The tail of the last block is dead rows; a sentinel keeps the mask_mod
+    # defined there without joining any real document.
+    doc = torch.full((blocks * block,), -1, dtype=torch.int32, device=device)
+    doc[:total] = layout.doc
 
     def same_doc(b, h, q_idx, kv_idx):
         return doc[q_idx] == doc[kv_idx]
 
-    return create_block_mask(
-        same_doc,
-        B=None,
-        H=None,
-        Q_LEN=layout.total,
-        KV_LEN=layout.total,
-        device=doc.device,
+    return BlockMask.from_kv_blocks(
+        kv_num.view(1, 1, blocks),
+        kv_indices.view(1, 1, blocks, span),
+        BLOCK_SIZE=block,
+        mask_mod=same_doc,
+        seq_lengths=(total, total),
     )
 
 

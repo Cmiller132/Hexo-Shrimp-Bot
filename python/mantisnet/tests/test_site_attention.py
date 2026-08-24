@@ -233,6 +233,34 @@ def test_knob_on_handles_the_opening_position():
 @pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the flex backend requires CUDA"
 )
+def test_flex_survives_torch_compile_with_dynamic_shapes():
+    """The fit compiles the trunk; the flex call must survive inductor with
+    symbolic row counts (the eager tests cannot see a CantSplit)."""
+    device = torch.device("cuda")
+    compiled = torch.compile(site_attention, dynamic=True)
+    for seeds, plies in (((3, 5, 11), (6, 1, 17)), ((21, 22), (9, 30))):
+        batch = _batch(seeds=seeds, plies=plies)
+        layout = _layout(batch)
+        layout = type(layout)(
+            layout.global_rows.to(device),
+            layout.stone_rows.to(device),
+            layout.cell_rows.to(device),
+            layout.doc.to(device),
+            layout.total,
+        )
+        torch.manual_seed(9)
+        q = torch.randn(layout.total, 2, 8, device=device, dtype=torch.bfloat16)
+        k = torch.randn(layout.total, 2, 8, device=device, dtype=torch.bfloat16)
+        v = torch.randn(layout.total, 2, 8, device=device, dtype=torch.bfloat16)
+        mask = document_mask(layout)
+        fast = compiled(q, k, v, layout, mask)
+        slow = site_attention_reference(q, k, v, layout.doc)
+        torch.testing.assert_close(fast, slow, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the flex backend requires CUDA"
+)
 def test_flex_matches_the_reference():
     batch = _batch(seeds=(3, 5, 11, 13), plies=(6, 1, 17, 40))
     layout = _layout(batch)
