@@ -21,11 +21,9 @@ from ..builder import (
     TERN_PATTERNS,
     TERN_POST1_CLASSES,
 )
-from ..cell_latents import LINE_CLASSES
 from ..cell_nodes import ADJACENCY_CLASSES, NEAREST_BUCKETS, RADIUS_CLASSES
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
 from ..model import (
-    ACTION_LATENTS,
     COVERAGE_BUCKETS,
     MantisConfig,
     MantisNet,
@@ -270,36 +268,11 @@ _CELL_STRUCTURE_SUFFIXES = {
     "mlp_c.lin_a.weight", "mlp_c.lin_a.bias", "mlp_c.lin_b.weight",
     "mlp_c.out.weight", "mlp_c.out.bias",
 }
-_LP_SUFFIXES = {
-    "ln_lp.weight", "ln_lp.bias",
-    "lp_wq.weight", "lp_wq.bias", "lp_wk.weight",
-    "lp_wv.weight", "lp_wv.bias", "lp_wo.weight", "lp_wo.bias",
-    "lp_bias",
-}
 # Step 5/6 knob keys live on the model, not the blocks.
 _TACTICAL_KEYS = {
     "tactical_a.weight", "tactical_a.bias",
     "tactical_out.weight", "tactical_out.bias",
 }
-_ACT_LATENT_KEYS = {
-    "act_latent_base",
-    "act_ln_read_q.weight", "act_ln_read_q.bias",
-    "act_ln_read_rows.weight", "act_ln_read_rows.bias",
-    "act_wq_read.weight", "act_wq_read.bias", "act_wk_read.weight",
-    "act_wv_read.weight", "act_wv_read.bias",
-    "act_wo_read.weight", "act_wo_read.bias",
-    "act_ln_mix.weight", "act_ln_mix.bias",
-    "act_wq_mix.weight", "act_wq_mix.bias", "act_wk_mix.weight",
-    "act_wv_mix.weight", "act_wv_mix.bias",
-    "act_wo_mix.weight", "act_wo_mix.bias",
-    "act_ln_bcast_l.weight", "act_ln_bcast_l.bias",
-    "act_ln_bcast_q.weight", "act_ln_bcast_q.bias",
-    "act_wq_bcast.weight", "act_wq_bcast.bias", "act_wk_bcast.weight",
-    "act_wv_bcast.weight", "act_wv_bcast.bias",
-    "act_wo_bcast.weight", "act_wo_bcast.bias",
-}
-
-
 @dataclass(frozen=True, slots=True)
 class _Knobs:
     cell_pass: bool
@@ -309,12 +282,10 @@ class _Knobs:
     mixed_windows: bool
     state_latents: int
     cell_latents: bool
-    line_pass: bool
     cell_nodes: bool
     cell_adjacency: bool
     cell_structure: bool
     action_tactical: bool
-    action_latents: bool
 
 
 def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
@@ -361,12 +332,10 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         # so an all-cell profile names only `cell_nodes` — except under
         # `cell_structure`, which requires `cell_latents=True`.
         cell_latents=("cell_base" in state_dict and not nodes) or structure,
-        line_pass="blocks.0.lp_bias" in state_dict,
         cell_nodes=nodes,
         cell_adjacency="blocks.0.adj_bias" in state_dict,
         cell_structure=structure,
         action_tactical="tactical_a.weight" in state_dict,
-        action_latents="act_latent_base" in state_dict,
     )
 
 
@@ -380,12 +349,10 @@ _BAKED = _Knobs(
     mixed_windows=True,
     state_latents=4,
     cell_latents=False,
-    line_pass=False,
     cell_nodes=False,
     cell_adjacency=False,
     cell_structure=False,
     action_tactical=False,
-    action_latents=False,
 )
 
 
@@ -405,14 +372,10 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
     keys |= _ACT_KEYS
     if knobs.action_tactical:
         keys |= _TACTICAL_KEYS
-    if knobs.action_latents:
-        keys |= _ACT_LATENT_KEYS
     for index in range(blocks):
         prefix = f"blocks.{index}."
         if knobs.window_attention:
             keys |= {prefix + suffix for suffix in _WA_SUFFIXES}
-        if knobs.line_pass:
-            keys |= {prefix + suffix for suffix in _LP_SUFFIXES}
         keys |= {prefix + suffix for suffix in _LATENT_SUFFIXES}
         if knobs.cell_latents or knobs.cell_nodes:
             keys |= {prefix + suffix for suffix in _CELL_SUFFIXES}
@@ -519,23 +482,6 @@ def _expected_shapes(
             "tactical_out.weight": (h, h),
             "tactical_out.bias": (h,),
         })
-    if cfg.action_latents:
-        shapes["act_latent_base"] = (ACTION_LATENTS, h)
-        for name in (
-            "act_ln_read_q", "act_ln_read_rows", "act_ln_mix",
-            "act_ln_bcast_l", "act_ln_bcast_q",
-        ):
-            shapes[name + ".weight"] = (h,)
-            shapes[name + ".bias"] = (h,)
-        for name in (
-            "act_wq_read", "act_wv_read", "act_wo_read",
-            "act_wq_mix", "act_wv_mix", "act_wo_mix",
-            "act_wq_bcast", "act_wv_bcast", "act_wo_bcast",
-        ):
-            shapes[name + ".weight"] = (h, h)
-            shapes[name + ".bias"] = (h,)
-        for name in ("act_wk_read", "act_wk_mix", "act_wk_bcast"):
-            shapes[name + ".weight"] = (h, h)
     fh = cfg.ffn_factor * h
     ln_names = ["ln_ws_s", "ln_ws_w", "ln_sw_w",
                 "ln_sw_s", "ln_attn", "ln_ffn"]
@@ -561,10 +507,6 @@ def _expected_shapes(
         ln_names.append("ln_wa")
         biased += ["wq_wa", "wv_wa", "wo_wa"]
         bias_free.append("wk_wa")
-    if cfg.line_pass:
-        ln_names.append("ln_lp")
-        biased += ["lp_wq", "lp_wv", "lp_wo"]
-        bias_free.append("lp_wk")
     ln_names += [
         "latent_ln_read_q", "latent_ln_read_w", "latent_ln_mix",
         "latent_ln_bcast_q", "latent_ln_bcast_l",
@@ -616,8 +558,6 @@ def _expected_shapes(
             shapes[prefix + name + ".weight"] = (h, h)
         if cfg.window_attention:
             shapes[prefix + "wa_bias"] = (cfg.heads, WA_CLASSES)
-        if cfg.line_pass:
-            shapes[prefix + "lp_bias"] = (cfg.heads, LINE_CLASSES)
         shapes[prefix + "ffn.0.weight"] = (fh, h)
         shapes[prefix + "ffn.0.bias"] = (fh,)
         shapes[prefix + "ffn.2.weight"] = (h, fh)
@@ -666,13 +606,11 @@ def infer_config(
         _BAKED,
         window_attention=knobs.window_attention,
         cell_latents=knobs.cell_latents,
-        line_pass=knobs.line_pass,
         cell_nodes=knobs.cell_nodes,
         cell_adjacency=knobs.cell_adjacency,
         cell_structure=knobs.cell_structure,
         cell_pass=not (knobs.cell_latents or knobs.cell_nodes),
         action_tactical=knobs.action_tactical,
-        action_latents=knobs.action_latents,
     )
     if knobs != expected:
         raise _baked_profile_error(knobs)
@@ -680,7 +618,7 @@ def infer_config(
     # the head count comes from whichever knob's per-head bias is present,
     # falling back to the recorded-config hint.
     source = None
-    for name in ("cr_bias", "wa_bias", "radius_bias", "lp_bias", "adj_bias"):
+    for name in ("cr_bias", "wa_bias", "radius_bias", "adj_bias"):
         bias = state_dict.get(f"blocks.0.{name}")
         if isinstance(bias, Tensor):
             if bias.ndim != 2 or bias.shape[0] <= 0:
@@ -693,7 +631,7 @@ def infer_config(
     if heads is None:
         raise ValueError(
             "state dict carries no per-head bias tensor "
-            "(cr_bias/wa_bias/radius_bias/lp_bias/adj_bias) and no recorded "
+            "(cr_bias/wa_bias/radius_bias/adj_bias) and no recorded "
             "config supplied the head count"
         )
     if h % heads:
@@ -759,12 +697,10 @@ def infer_config(
         dropout=0.0,
         window_attention=knobs.window_attention,
         cell_latents=knobs.cell_latents,
-        line_pass=knobs.line_pass,
         cell_nodes=knobs.cell_nodes,
         cell_adjacency=knobs.cell_adjacency,
         cell_structure=knobs.cell_structure,
         action_tactical=knobs.action_tactical,
-        action_latents=knobs.action_latents,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")

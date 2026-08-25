@@ -432,7 +432,7 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `__init__.py` | Public exports: model, builder, losses, representation constants |
 | `model.py` | `MantisConfig`, `MantisNet` trunk, policy/action-value/state-value heads, `ModelOutput` |
 | `builder.py` | Position-to-graph representation, Rust batch conversion, collation, version constants |
-| `cell_latents.py` | Step 15 typed legal-cell/window attention and whole-line table derivation |
+| `cell_latents.py` | Step 15 typed legal-cell/window attention table derivation |
 | `cell_nodes.py` | Step 13 radius/adjacency edge plans on the typed cell-attention kernels |
 | `attention.py` | Fused block-diagonal multi-head attention (§5.3) with Triton kernels and reference path |
 | `row_encoder.py` | Action-row encoder: 729-class post-placement window rows for both decoder heads |

@@ -1,6 +1,5 @@
 """Step 15 cell-latent oracles: table derivations against pairwise brute
-force, typed attention against a dense per-segment composition, and the
-line pass through §5.1c's edge attention.
+force, and typed attention against a dense per-segment composition.
 
 The attention oracle loops query rows in Python and uses dense softmax
 slices, so the vectorized scatter composition and the oracle share nothing
@@ -19,21 +18,12 @@ import mantisnet.cell_latents as cell_latents
 from mantisnet import from_position
 from mantisnet.builder import AXES, TERN_DEC_CLASSES
 from mantisnet.cell_latents import (
-    LINE_CLASSES,
-    LINE_FAR,
-    LINE_SELF,
     CellTables,
     cell_read,
     cell_tables,
-    line_tables,
     window_read,
 )
 from mantisnet.window_pairs import edge_attention
-
-
-def test_line_class_layout():
-    assert LINE_CLASSES == 13  # offsets 1..11, FAR, SELF
-    assert LINE_FAR == 11 and LINE_SELF == 12
 
 
 def _synthetic_incidence(seed: int, n_cells: int = 14, n_windows: int = 12):
@@ -113,91 +103,6 @@ def _check_tables_against(
         for cls in range(TERN_DEC_CLASSES):
             lo, hi = int(tables.cls_ptr[cls]), int(tables.cls_ptr[cls + 1])
             assert bool((ordered[lo:hi] == cls).all())
-
-
-def _oracle_line_class(a, b):
-    """The directed line class of edge b -> a, or None. One pair, literal."""
-    (ax_a, q_a, r_a), (ax_b, q_b, r_b) = a, b
-    if ax_a != ax_b:
-        return None
-    va = AXES[ax_a]
-    dq, dr = q_b - q_a, r_b - r_a
-    if dq * int(va[1]) != dr * int(va[0]):
-        return None
-    offset = dq if int(va[0]) else dr
-    if offset == 0:
-        return None
-    return abs(offset) - 1 if abs(offset) <= 11 else LINE_FAR
-
-
-def test_line_tables_match_the_brute_force(positions):
-    for pos in positions[:6]:
-        g = from_position(pos)
-        ids = [tuple(map(int, row)) for row in g.window_id]
-        n_w = len(ids)
-        tables = line_tables(
-            torch.from_numpy(g.window_id), torch.zeros(n_w, dtype=torch.long)
-        )
-        got = set()
-        dst = torch.repeat_interleave(
-            torch.arange(n_w), tables.ptr[1:] - tables.ptr[:-1]
-        )
-        for d, s, c in zip(dst.tolist(), tables.src.tolist(), tables.cls.tolist()):
-            got.add((d, s, c))
-
-        expected = {(w, w, LINE_SELF) for w in range(n_w)}
-        for i in range(n_w):
-            for j in range(n_w):
-                if i == j:
-                    continue
-                cls = _oracle_line_class(ids[i], ids[j])
-                if cls is not None:
-                    expected.add((i, j, cls))
-        assert got == expected
-
-
-def test_line_tables_far_offsets_and_position_isolation():
-    # One line per axis with a far member, duplicated in a second position:
-    # offsets 5 and 15 give classes 4 and FAR, and nothing crosses positions.
-    window_id = torch.tensor(
-        [[0, 0, 0], [0, 5, 0], [0, 20, 0], [1, 3, -2], [1, 3, 10]] * 2,
-        dtype=torch.long,
-    )
-    window_pos = torch.tensor([0] * 5 + [1] * 5, dtype=torch.long)
-    tables = line_tables(window_id, window_pos)
-    n_w = 10
-    dst = torch.repeat_interleave(torch.arange(n_w), tables.ptr[1:] - tables.ptr[:-1])
-    got = set(zip(dst.tolist(), tables.src.tolist(), tables.cls.tolist()))
-    per_position = [
-        (0, 1, 4),
-        (1, 0, 4),
-        (0, 2, LINE_FAR),
-        (2, 0, LINE_FAR),
-        (1, 2, LINE_FAR),
-        (2, 1, LINE_FAR),
-        (3, 4, LINE_FAR),
-        (4, 3, LINE_FAR),
-    ]
-    expected = {(w, w, LINE_SELF) for w in range(n_w)}
-    for d, s, c in per_position:
-        expected.add((d, s, c))
-        expected.add((d + 5, s + 5, c))
-    assert got == expected
-
-
-def test_line_views_are_symmetric_and_consistent():
-    window_id = torch.tensor(
-        [[0, 0, 0], [0, 3, 0], [0, 7, 0], [2, 1, 1], [2, 4, -2]], dtype=torch.long
-    )
-    tables = line_tables(window_id, torch.zeros(5, dtype=torch.long))
-    # Line classes are reversal-symmetric, so the source view is the
-    # destination view outright.
-    assert tables.sptr is tables.ptr and tables.sdst is tables.src
-    assert tables.scls is tables.cls
-    e = tables.src.shape[0]
-    assert torch.equal(tables.cedge.sort().values, torch.arange(e))
-    ordered = tables.cls[tables.cedge]
-    assert bool((ordered[1:] >= ordered[:-1]).all())
 
 
 def _compose(q, k, v, bias, vcls, seg_ptr, src, cls):
@@ -296,23 +201,6 @@ def test_entryless_windows_read_zero_without_nan():
     for g in grads:
         assert bool(torch.isfinite(g).all())
     assert bool((grads[0][0] == 0).all()) and bool((grads[0][7] == 0).all())
-
-
-def test_line_pass_through_edge_attention_matches_dense(positions):
-    g = from_position(positions[8])
-    n_w = g.n_windows
-    tables = line_tables(
-        torch.from_numpy(g.window_id), torch.zeros(n_w, dtype=torch.long)
-    )
-    gen = torch.Generator().manual_seed(11)
-    heads, hd = 4, 8
-    q = torch.randn(n_w, heads, hd, generator=gen)
-    k = torch.randn(n_w, heads, hd, generator=gen)
-    v = torch.randn(n_w, heads, hd, generator=gen)
-    bias = torch.randn(heads, LINE_CLASSES, generator=gen)
-    out = edge_attention(q, k, v, bias, *tables)
-    ref = _compose(q, k, v, bias, None, tables.ptr, tables.src, tables.cls)
-    torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")

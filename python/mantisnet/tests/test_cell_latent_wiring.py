@@ -1,5 +1,5 @@
 """Step 15 knob wiring: config contracts, the cell-latent trunk stream and
-decoder read, the line-pass slot, and knob-off inertness."""
+decoder read, and knob-off inertness."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from mantisnet.cell_latents import cell_tables
 from mantisnet.lab.families import infer_config
 
 # Dot-anchored so "mlp_p.lin_a.weight" does not read as a line-pass key.
-_STEP15_MARKS = ("cell_base", ".cr_", ".wr_", ".lp_", ".ln_cr", ".ln_wr", ".ln_lp")
+_STEP15_MARKS = ("cell_base", ".cr_", ".wr_", ".ln_cr", ".ln_wr")
 
 
 def _config(**overrides) -> MantisConfig:
@@ -27,7 +27,6 @@ def _config(**overrides) -> MantisConfig:
         policy_hidden=16,
         value_hidden=16,
         cell_latents=True,
-        line_pass=True,
         window_attention=False,
     )
     values.update(overrides)
@@ -40,7 +39,6 @@ def _batch(positions, count=6):
 
 def test_the_knobs_are_path_selectors():
     assert MantisConfig().cell_latents is False
-    assert MantisConfig().line_pass is False
     assert MantisConfig().claim_reach == 5
     for value in (-1, 1, 3, 4, 6):
         with pytest.raises(ValueError, match=r"claim_reach"):
@@ -59,12 +57,10 @@ def test_the_cell_stage_replaces_the_relay():
     assert "cell_base" in state
     assert "blocks.0.cr_vclass.weight" in state
     assert "blocks.1.wr_bias" in state
-    assert "blocks.0.lp_bias" in state
     relay = ("u_cp", "e_cp", "mlp_cp", "ln_cp_in", "ln_cp_w")
     assert not any(mark in key for key in state for mark in relay)
-    line_only = MantisNet(_config(cell_latents=False, window_attention=True))
-    assert "blocks.0.u_cp.weight" in line_only.state_dict()
-    assert "blocks.0.lp_bias" in line_only.state_dict()
+    relayed = MantisNet(_config(cell_latents=False, window_attention=True))
+    assert "blocks.0.u_cp.weight" in relayed.state_dict()
 
 
 def test_every_step15_parameter_trains(positions):
@@ -85,8 +81,8 @@ def test_every_step15_parameter_trains(positions):
         for name, parameter in model.named_parameters()
         if any(mark in name for mark in _STEP15_MARKS)
     ]
-    # Per block: 25 cell-stage tensors and 10 line-pass tensors, plus the base.
-    assert len(step15) == 2 * (25 + 10) + 1
+    # Per block: 25 cell-stage tensors, plus the base.
+    assert len(step15) == 2 * 25 + 1
     for name, parameter in step15:
         assert parameter.grad is not None, name
         assert torch.isfinite(parameter.grad).all(), name
@@ -142,11 +138,9 @@ def test_arm_shapes_infer_and_reload(positions):
     # as the baseline shape.
     arms = {
         "B": _config(),
-        "C": _config(line_pass=False),
-        "D": _config(cell_latents=False),
+        "D": _config(cell_latents=False, window_attention=True),
         "E": _config(
-            cell_latents=False, line_pass=False,
-            window_attention=True, claim_reach=0,
+            cell_latents=False, window_attention=True, claim_reach=0,
         ),
     }
     for arm, cfg in arms.items():

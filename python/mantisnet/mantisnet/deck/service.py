@@ -360,7 +360,7 @@ def _config_from_checkpoint(raw: dict) -> MantisConfig:
     h = state["stone_table.weight"].shape[1]
     # No unconditional per-head tensor survives the §4.1 bias removal, so
     # sniff whichever knob's per-head bias the checkpoint carries.
-    for key in ("blocks.0.cr_bias", "blocks.0.wa_bias", "blocks.0.lp_bias"):
+    for key in ("blocks.0.cr_bias", "blocks.0.wa_bias"):
         if key in state:
             heads = state[key].shape[0]
             break

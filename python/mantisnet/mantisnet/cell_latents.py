@@ -56,12 +56,6 @@ except ImportError:
     tl = None
 
 
-# Line-pass relation classes: |offset| - 1 for offsets 1..11 (the §5.1c
-# colinear vocabulary), FAR for offsets 12 and beyond, SELF loops.
-LINE_CLASSES = 13
-LINE_FAR = 11
-LINE_SELF = 12
-
 # Key packing, as §5.1c: coordinates are i16-bounded, so 17 bits per
 # component after an offset is collision-free.
 _KOFF = 1 << 16
@@ -213,96 +207,6 @@ def _(dec_cell, dec_window, dec_class, n_windows, n_classes, n_cells):
         edges(),
         dec_cell.new_empty((n_classes + 1,), dtype=torch.long),
         edges(),
-        edges(),
-    )
-
-
-def line_tables(window_id: Tensor, window_pos: Tensor) -> window_pairs.PairTables:
-    """Every intra-line directed window pair, in §5.1c's three CSR views.
-
-    Same grouping as the §5.1c colinear join — (position, axis, line),
-    ordered by position-on-line — without the offset cutoff: within a group
-    every ordered pair is an edge. Line classes are symmetric under
-    reversal, so the source-major view shares the destination view's arrays
-    outright.
-    """
-    if window_id.ndim != 2 or window_id.shape[1] != 3:
-        raise ValueError("window_id must have shape (N_w, 3)")
-    if window_pos.shape != window_id.shape[:1]:
-        raise ValueError("window_pos must have one entry per window")
-    n_w = window_id.shape[0]
-    device = window_id.device
-    axis, sq, sr = window_id.unbind(1)
-
-    line = torch.where(axis == 0, sr, torch.where(axis == 1, sq, sq + sr))
-    pos_on = torch.where(axis == 1, sr, sq)
-    group = (window_pos * 4 + axis) * _KSPAN + (line + _KOFF)
-    key = group * _KSPAN + (pos_on + _KOFF)
-    order = torch.argsort(key)
-    sgroup = group[order]
-    spos = pos_on[order]
-
-    dsts, srcs, classes = [], [], []
-    if n_w:
-        slot = torch.arange(n_w, device=device)
-        starts = torch.ones(n_w, dtype=torch.bool, device=device)
-        starts[1:] = sgroup[1:] != sgroup[:-1]
-        run = starts.cumsum(0) - 1
-        run_end = run.new_empty(n_w).scatter_reduce_(
-            0, run, slot + 1, "amax", include_self=False
-        )[run]
-        first, second = window_pairs._segment_pairs(run_end - slot - 1, slot)
-        offset = spos.index_select(0, second) - spos.index_select(0, first)
-        cls = torch.where(
-            offset <= LINE_FAR, offset - 1, torch.full_like(offset, LINE_FAR)
-        )
-        near = order.index_select(0, first)
-        far = order.index_select(0, second)
-        dsts.append(torch.cat([near, far]))
-        srcs.append(torch.cat([far, near]))
-        classes.append(torch.cat([cls, cls]))
-
-    loop = torch.arange(n_w, device=device)
-    dsts.append(loop)
-    srcs.append(loop)
-    classes.append(torch.full((n_w,), LINE_SELF, dtype=torch.long, device=device))
-
-    dst = torch.cat(dsts)
-    src = torch.cat(srcs)
-    cls = torch.cat(classes)
-    order = torch.argsort(dst.to(torch.int32), stable=True)
-    dst, src, cls = dst[order], src[order], cls[order]
-    ptr = torch.searchsorted(dst, torch.arange(n_w + 1, device=device))
-    corder = torch.argsort(cls.to(torch.int32), stable=True)
-    cptr = torch.searchsorted(
-        cls[corder], torch.arange(LINE_CLASSES + 1, device=device)
-    )
-    return window_pairs.PairTables(ptr, src, cls, ptr, src, cls, cptr, corder)
-
-
-@torch.library.custom_op("mantisnet::line_tables", mutates_args=())
-def derive_line_tables(
-    window_id: Tensor, window_pos: Tensor
-) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """``line_tables``' distinct tensors as an opaque op; the symmetric
-    source view is reassembled by the caller."""
-    tables = line_tables(window_id, window_pos)
-    return (tables.ptr, tables.src, tables.cls, tables.cptr, tables.cedge)
-
-
-@derive_line_tables.register_fake
-def _(window_id, window_pos):
-    n_w = window_id.shape[0]
-    e = torch.library.get_ctx().new_dynamic_size()
-
-    def edges():
-        return window_id.new_empty((e,), dtype=torch.long)
-
-    return (
-        window_id.new_empty((n_w + 1,), dtype=torch.long),
-        edges(),
-        edges(),
-        window_id.new_empty((LINE_CLASSES + 1,), dtype=torch.long),
         edges(),
     )
 

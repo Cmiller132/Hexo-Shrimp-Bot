@@ -60,13 +60,11 @@ Architecture knobs (validated jointly at construction):
 | `window_attention` | `True` | the §5.1c typed window-pair attention stage |
 | `claim_reach` | `5` | §5.1c crossing-join reach; `{0, 5}`, a path selector |
 | `cell_latents` | `False` | persistent covered-cell latents replacing the §5.1b relay |
-| `line_pass` | `False` | whole-line window attention in the §5.1c slot |
 | `cell_nodes` | `False` | extends persistent cell state to every legal cell, with radius edges |
 | `cell_node_scope` | `"all"` | radius/adjacency edge destinations: `all` or `uncovered` |
 | `cell_adjacency` | `False` | directed distance-one cell↔cell messages (requires `cell_nodes`) |
 | `cell_structure` | `False` | structured covered-cell init and a nonlinear cell update (requires `cell_latents`) |
 | `action_tactical` | `False` | encodes the §4.4 tactical scalars into the action row through a small MLP |
-| `action_latents` | `False` | two invariant latents read/mix/broadcast over each legal set (§6) |
 
 The production training configuration at this writing is `cell_latents=True,
 cell_nodes=True, cell_node_scope="all", window_attention=False`; the default
@@ -194,8 +192,7 @@ slot, so a window and its mirror image produce identical classes. Window
 pair relations (§5.1c) use a **48-class** vocabulary typing
 colinear/crossing geometry; `claim_reach` selects the crossing join — `5`
 joins window pairs through any claimed cell within the donor geometry's
-reach, `0` restricts to pairs sharing an in-span cell. The whole-line pass
-uses a **13-class** colinear vocabulary at unbounded offset.
+reach, `0` restricts to pairs sharing an in-span cell.
 
 ### 4.4 Action rows
 
@@ -248,9 +245,7 @@ in order:
    parameter-tied transient relay lets windows exchange state through shared
    empty cells instead.
 3. **§5.1c window attention** — multi-head attention over each window's
-   typed pair relations (48 classes), when `window_attention` is on; the
-   whole-line pass (13 classes) runs in the same slot when `line_pass` is
-   on.
+   typed pair relations (48 classes), when `window_attention` is on.
 4. **§5.2 stone ← windows** — the mirror of §5.1: stones aggregate their
    windows plus the class row sum.
 5. **§5.3 stone self-attention** — attention over `[latent rows; stones]`,
@@ -281,14 +276,7 @@ Both cell heads read the same per-cell input rows:
   incidence: each covered cell sums its windows' rows; uncovered cells read
   zero.
 
-With `action_latents` on, the shared action-row encoding first passes a
-read/mix/broadcast cycle: two invariant latents per position read the
-position's rows under an fp32 segment softmax, self-mix densely, and
-broadcast back — permutation-invariant context about the alternatives,
-without quadratic action attention. Keys are bias-free and the broadcast
-output is zero-initialized, so the cycle starts as the identity.
-
-Each head then forms, per legal cell, `lin(rows) + class_row_sum(e_head) +
+Each head forms, per legal cell, `lin(rows) + class_row_sum(e_head) +
 extension(action_rows)` — its own projection of the shared input, its own
 726-class embedding summed over the cell's decoder incidence, and its own
 extension of the shared §4.4 action-row encoding — feeds the sum through the

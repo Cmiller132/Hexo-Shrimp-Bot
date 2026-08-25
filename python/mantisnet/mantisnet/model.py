@@ -68,11 +68,9 @@ class MantisConfig:
     # join to pairs sharing an in-span cell (Step 15 arm E, pricing the
     # out-of-span crossing signal). A path selector, not a tunable radius.
     claim_reach: int = 5
-    # Step 15 knobs: cell latents replace the §5.1b relay with persistent
-    # typed state on the covered legal cells; the line pass runs whole-line
-    # window attention in the §5.1c slot.
+    # Step 15 knob: cell latents replace the §5.1b relay with persistent
+    # typed state on the covered legal cells.
     cell_latents: bool = False
-    line_pass: bool = False
     # Step 13: extend persistent state to every legal cell and let each block
     # read invariant radius-8 stone context. Adjacency is a factored sub-knob.
     cell_nodes: bool = False
@@ -85,9 +83,6 @@ class MantisConfig:
     # Step 5: encode the builder's deterministic per-action tactical scalars
     # into the action row through a small MLP (measured arm True).
     action_tactical: bool = False
-    # Step 6: two learned action latents read the action rows, mix, and
-    # broadcast context about the alternatives back (measured arm True).
-    action_latents: bool = False
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
@@ -149,8 +144,6 @@ class ModelOutput:
 # Width of appendix B's categorical action-value readout: the three logits
 # [z_pos, z_neg, z_zero]. Every reader takes the checkpoint shape from here.
 CRITIC_LOGITS = 3
-# Step 6: invariant latent queries over each position's legal action set.
-ACTION_LATENTS = 2
 
 # Step S1 coverage vocabulary: how many live windows contain a covered cell,
 # 1..18, folded into eight buckets — 1, 2, 3, 4, 5-6, 7-9, 10-13, 14-18.
@@ -179,6 +172,8 @@ LEGACY_BAKED_KNOBS: dict[str, object] = {
     "mixed_windows": True,
     "action_rows": True,
     "state_latents": 4,
+    "action_latents": False,
+    "line_pass": False,
 }
 
 
@@ -360,17 +355,6 @@ class _Block(nn.Module):
             self.wa_bias = nn.Parameter(
                 torch.zeros(cfg.heads, window_pairs.WA_CLASSES)
             )
-        if cfg.line_pass:
-            # Whole-line window attention: the §5.1c colinear vocabulary at
-            # unbounded offset, on the same edge-attention kernels.
-            self.ln_lp = nn.LayerNorm(h)
-            self.lp_wq = nn.Linear(h, h)
-            self.lp_wk = nn.Linear(h, h, bias=False)
-            self.lp_wv = nn.Linear(h, h)
-            self.lp_wo = nn.Linear(h, h)
-            self.lp_bias = nn.Parameter(
-                torch.zeros(cfg.heads, cell_latents.LINE_CLASSES)
-            )
         # Window read, latent self-mix, and window broadcast. Every key
         # projection is bias-free because a shared key bias cancels from
         # its softmax row.
@@ -534,24 +518,6 @@ class _Block(nn.Module):
         w = w + self.drop(self.wr_wo(back.reshape(n_w, cfg.h).to(zw.dtype)))
         return w, c
 
-    def _line_pass(self, w: Tensor, lines) -> Tensor:
-        """Whole-line attention over each window's colinear edges, on the
-        §5.1c edge op with the 13-class line vocabulary. ``lines`` is the
-        trunk's per-batch ``PairTables``, derived once on device."""
-        cfg = self.cfg
-        heads, hd = cfg.heads, cfg.h // cfg.heads
-        n_w = w.shape[0]
-
-        z = self.ln_lp(w)
-        out = window_pairs.edge_attention(
-            self.lp_wq(z).view(n_w, heads, hd),
-            self.lp_wk(z).view(n_w, heads, hd),
-            self.lp_wv(z).view(n_w, heads, hd),
-            self.lp_bias,
-            *lines,
-        )
-        return w + self.drop(self.lp_wo(out.reshape(n_w, cfg.h).to(z.dtype)))
-
     def _window_attention(self, w: Tensor, pairs) -> Tensor:
         """§5.1c: multi-head attention over each window's relation edges.
 
@@ -637,7 +603,6 @@ class _Block(nn.Module):
         plan: message_passing.IncidencePlan,
         pairs,
         latent_layout: tuple[Tensor, Tensor, Tensor],
-        lines,
         ctab: cell_latents.CellTables | None,
         radius: cell_latents.CellTables | None,
         adjacency: cell_latents.CellTables | None,
@@ -697,8 +662,6 @@ class _Block(nn.Module):
             )
         if cfg.window_attention:
             w = self._window_attention(w, pairs)
-        if cfg.line_pass:
-            w = self._line_pass(w, lines)
 
         # §5.2: stones aggregate their windows.
         y = self.v(self.ln_sw_w(w))
@@ -869,33 +832,6 @@ class MantisNet(nn.Module):
             # exactly the incumbent function.
             self.tactical_a = nn.Linear(TACTICAL_FEATURES, h)
             self.tactical_out = nn.Linear(h, h)
-        if cfg.action_latents:
-            # Step 6: two invariant latents per position read the action rows
-            # (fp32 segment softmax over the legal runs), self-mix, and
-            # broadcast context about the alternatives back into the rows
-            # both heads read. Stage layout mirrors the §5.4 window-latent
-            # cycle; keys are bias-free (a constant key bias cancels in the
-            # softmax); the zero-init broadcast output starts the knob-on
-            # arm at exactly the incumbent function.
-            self.act_latent_base = nn.Parameter(torch.empty(ACTION_LATENTS, h))
-            self.act_ln_read_q = nn.LayerNorm(h)
-            self.act_ln_read_rows = nn.LayerNorm(h)
-            self.act_wq_read = nn.Linear(h, h)
-            self.act_wk_read = nn.Linear(h, h, bias=False)
-            self.act_wv_read = nn.Linear(h, h)
-            self.act_wo_read = nn.Linear(h, h)
-            self.act_ln_mix = nn.LayerNorm(h)
-            self.act_wq_mix = nn.Linear(h, h)
-            self.act_wk_mix = nn.Linear(h, h, bias=False)
-            self.act_wv_mix = nn.Linear(h, h)
-            self.act_wo_mix = nn.Linear(h, h)
-            self.act_ln_bcast_l = nn.LayerNorm(h)
-            self.act_ln_bcast_q = nn.LayerNorm(h)
-            self.act_wq_bcast = nn.Linear(h, h)
-            self.act_wk_bcast = nn.Linear(h, h, bias=False)
-            self.act_wv_bcast = nn.Linear(h, h)
-            self.act_wo_bcast = nn.Linear(h, h)
-
         # §7 value head.
         self.value_queries = nn.Parameter(torch.empty(cfg.value_queries, h))
         self.ln_value = nn.LayerNorm(h)
@@ -928,10 +864,6 @@ class MantisNet(nn.Module):
         if self.cfg.action_tactical:
             nn.init.zeros_(self.tactical_out.weight)
             nn.init.zeros_(self.tactical_out.bias)
-        if self.cfg.action_latents:
-            nn.init.normal_(self.act_latent_base, std=0.02)
-            nn.init.zeros_(self.act_wo_bcast.weight)
-            nn.init.zeros_(self.act_wo_bcast.bias)
         if self.cfg.cell_structure:
             nn.init.zeros_(self.cell_class_table.weight)
             nn.init.zeros_(self.cell_coverage_table.weight)
@@ -951,15 +883,6 @@ class MantisNet(nn.Module):
             batch.window_id, batch.window_slot // batch.max_w, self.cfg.claim_reach
         )
         return window_pairs.PairTables(ptr, src, cls, ptr, src, scls, cptr, cedge)
-
-    def _line_tables(self, batch: Batch) -> window_pairs.PairTables:
-        # Born on device for the same reasons as the §5.1c tables. Line
-        # classes are reversal-symmetric, so the source view shares the
-        # destination view's arrays outright.
-        ptr, src, cls, cptr, cedge = cell_latents.derive_line_tables(
-            batch.window_id, batch.window_slot // batch.max_w
-        )
-        return window_pairs.PairTables(ptr, src, cls, ptr, src, cls, cptr, cedge)
 
     def _cell_tables(self, batch: Batch, n_windows: int) -> cell_latents.CellTables:
         # The decoder incidence resorted into the cell-attention views, with
@@ -1073,7 +996,6 @@ class MantisNet(nn.Module):
             window_pos, g.shape[0]
         )
         latent_layout = (window_pos, offsets, order)
-        lines = self._line_tables(batch) if cfg.line_pass else None
         ctab = c = radius = adjacency = None
         if cfg.uses_cell_state:
             ctab = self._cell_tables(batch, w.shape[0])
@@ -1118,7 +1040,6 @@ class MantisNet(nn.Module):
                 plan,
                 pairs,
                 latent_layout,
-                lines,
                 ctab,
                 radius,
                 adjacency,
@@ -1218,83 +1139,6 @@ class MantisNet(nn.Module):
             acts = acts + tactical.float()
         return acts
 
-    def _action_latent_cycle(self, acts: Tensor, batch: Batch) -> Tensor:
-        """Step 6: two invariant latents per position read the legal set,
-        self-mix, and broadcast permutation-invariant context about the
-        alternatives back into the rows both heads read.
-
-        The ragged read runs on the ``segments`` machinery — position ids
-        from ``legal_offsets``, an ``amax`` reduce, and an ``index_add`` sum —
-        with the softmax in fp32 regardless of autocast, exactly the
-        discipline of the §5.4 cycle. Every position has at least one legal
-        cell, so no segment is empty. The mix is a dense two-by-two.
-        """
-        cfg = self.cfg
-        heads, head_dim = cfg.heads, cfg.h // cfg.heads
-        p = batch.legal_offsets.shape[0] - 1
-        n_cells = acts.shape[0]
-        seg = segment_ids(batch.legal_offsets)
-
-        # Read: the shared latent base queries every position's action rows.
-        rows = self.act_ln_read_rows(acts)
-        q = self.act_wq_read(self.act_ln_read_q(self.act_latent_base)).view(
-            ACTION_LATENTS, heads, head_dim
-        )
-        k = self.act_wk_read(rows).view(n_cells, heads, head_dim)
-        v = self.act_wv_read(rows).view(n_cells, heads, head_dim)
-        scores = (
-            torch.einsum("nad,lad->nla", k, q.to(k.dtype)) / math.sqrt(head_dim)
-        ).float()
-        flat = scores.reshape(n_cells, ACTION_LATENTS * heads)
-        peak = flat.new_full(
-            (p, ACTION_LATENTS * heads), torch.finfo(torch.float32).min
-        )
-        peak.index_reduce_(0, seg, flat, "amax", include_self=True)
-        exp = (flat - peak.index_select(0, seg)).exp()
-        denom = flat.new_zeros(p, ACTION_LATENTS * heads).index_add_(0, seg, exp)
-        weights = (exp / denom.index_select(0, seg)).view(
-            n_cells, ACTION_LATENTS, heads
-        )
-        contrib = weights.unsqueeze(-1) * v.float().unsqueeze(1)
-        read = acts.new_zeros(p, ACTION_LATENTS, heads, head_dim).index_add_(
-            0, seg, contrib
-        )
-        g_act = self.act_latent_base.to(acts.dtype).unsqueeze(0) + self.act_wo_read(
-            read.reshape(p, ACTION_LATENTS, cfg.h).to(acts.dtype)
-        )
-
-        # Mix: both slots are live, dense softmax fp32 independent of autocast.
-        z = self.act_ln_mix(g_act)
-        q = self.act_wq_mix(z).view(p, ACTION_LATENTS, heads, head_dim)
-        k = self.act_wk_mix(z).view(p, ACTION_LATENTS, heads, head_dim)
-        v = self.act_wv_mix(z).view(p, ACTION_LATENTS, heads, head_dim)
-        mix_scores = torch.einsum("pqhd,pkhd->phqk", q, k) / math.sqrt(head_dim)
-        mixed = torch.einsum(
-            "phqk,pkhd->pqhd", mix_scores.float().softmax(dim=-1), v.float()
-        )
-        g_act = g_act + self.act_wo_mix(
-            mixed.reshape(p, ACTION_LATENTS, cfg.h).to(g_act.dtype)
-        )
-
-        # Broadcast: each row attends over its position's two latents.
-        latent_rows = self.act_ln_bcast_l(g_act)
-        q = self.act_wq_bcast(self.act_ln_bcast_q(acts)).view(
-            n_cells, heads, head_dim
-        )
-        k = self.act_wk_bcast(latent_rows).view(p, ACTION_LATENTS, heads, head_dim)
-        v = self.act_wv_bcast(latent_rows).view(p, ACTION_LATENTS, heads, head_dim)
-        bcast_scores = (
-            torch.einsum("nhd,nlhd->nlh", q, k.index_select(0, seg).to(q.dtype))
-            / math.sqrt(head_dim)
-        ).float()
-        bcast_weights = bcast_scores.softmax(dim=1)
-        out = (
-            bcast_weights.unsqueeze(-1)
-            * v.index_select(0, seg).float()
-        ).sum(dim=1)
-        delta = self.act_wo_bcast(out.reshape(n_cells, cfg.h).to(acts.dtype))
-        return acts + delta.float()
-
     def _cell_scores(
         self,
         rows: Tensor,
@@ -1328,8 +1172,6 @@ class MantisNet(nn.Module):
     ) -> Tensor:
         """§6: one raw policy logit per legal cell, engine legal order."""
         acts = self._action_contribution(w, batch)
-        if self.cfg.action_latents:
-            acts = self._action_latent_cycle(acts, batch)
         g_half = self.mlp_p.lin_b(g)
         rows = self._decoder_input(w, cells, batch, g_half.dtype)
         extra = message_passing.class_row_sum(
@@ -1354,8 +1196,6 @@ class MantisNet(nn.Module):
         pass answers both.
         """
         acts = self._action_contribution(w, batch)
-        if self.cfg.action_latents:
-            acts = self._action_latent_cycle(acts, batch)
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
         rows = self._decoder_input(w, cells, batch, g_p.dtype)
         h = self.cfg.h
