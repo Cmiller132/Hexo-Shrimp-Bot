@@ -331,14 +331,14 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
             )
             fast = block(
                 s, w, g, None, batch, seq_lens, plan, pairs,
-                layout, None, None, None, None, ws_rows, sw_rows, update_stones=True,
+                layout, None, None, None, ws_rows, sw_rows, update_stones=True,
             )
 
             monkeypatch.setattr(message_impl, "aggregate_to_windows", windows)
             monkeypatch.setattr(message_impl, "aggregate_to_stones", stones)
             reference = block(
                 s, w, g, None, batch, seq_lens, plan, pairs,
-                layout, None, None, None, None, ws_rows, sw_rows, update_stones=True,
+                layout, None, None, None, ws_rows, sw_rows, update_stones=True,
             )
     finally:
         model.to("cpu")
