@@ -41,6 +41,7 @@ from .builder import (
     TERN_DEC_CLASSES,
     TERN_OCC_CLASSES,
     TERN_PATTERN_CLASS_COUNTS,
+    TERN_PATTERN_SITE_COUNTS,
     TERN_PATTERNS,
     TERN_POST1_CLASSES,
     Batch,
@@ -76,6 +77,15 @@ class MantisConfig:
     # Step 5: encode the builder's deterministic per-action tactical scalars
     # into the action row through a small MLP (measured arm True).
     action_tactical: bool = False
+    # Step M1: the merged site-token trunk. Stones and legal cells are one
+    # token set exchanging state with windows through the joint
+    # (pattern, slot) site classes; replaces the split stone/cell stages,
+    # so the cell knobs must stay off with it.
+    merged_sites: bool = False
+    # Step M1 mixing arm: True is full self-attention over
+    # [latent rows; sites]; False replaces it with the linear latent
+    # cross-reads (latents <- sites, then sites <- latents).
+    site_self_attention: bool = True
 
     def __post_init__(self) -> None:
         if self.h % self.heads != 0:
@@ -95,6 +105,21 @@ class MantisConfig:
             )
         if self.cell_structure and not self.cell_latents:
             raise ValueError("cell_structure requires cell_latents=True")
+        if self.merged_sites and (
+            self.cell_latents
+            or self.cell_nodes
+            or self.cell_adjacency
+            or self.cell_structure
+        ):
+            raise ValueError(
+                "merged_sites replaces the split cell stage; the cell knobs "
+                "must stay off with it"
+            )
+        if not self.site_self_attention and not self.merged_sites:
+            raise ValueError(
+                "site_self_attention=False modifies the merged trunk, which "
+                "merged_sites=False removes; the knob would be inert"
+            )
 
     @property
     def uses_cell_state(self) -> bool:
@@ -111,6 +136,15 @@ class MantisConfig:
     @property
     def occ_classes(self) -> int:
         return TERN_OCC_CLASSES
+
+    @property
+    def site_classes(self) -> int:
+        return TERN_OCC_CLASSES + TERN_DEC_CLASSES
+
+    @property
+    def cells_in_trunk(self) -> bool:
+        """Whether the trunk returns refined per-legal-cell rows."""
+        return self.uses_cell_state or self.merged_sites
 
 
 @dataclass
@@ -262,6 +296,63 @@ class _PairMlp(nn.Module):
 
     def forward(self, a: Tensor, b: Tensor) -> Tensor:
         return self.out(F.relu(self.lin_a(a) + self.lin_b(b)))
+
+
+
+def _latent_cycle(
+    block: "_Block | _SiteBlock",
+    w: Tensor,
+    g: Tensor,
+    layout: tuple[Tensor, Tensor, Tensor],
+) -> tuple[Tensor, Tensor]:
+    """Latents read flat windows, self-mix, then broadcast to windows.
+
+    Free-standing because both trunk block types declare the same cycle
+    parameters and run the same arithmetic."""
+    self = block
+    cfg = self.cfg
+    p, slots, h = g.shape
+    heads, head_dim = cfg.heads, h // cfg.heads
+    window_pos, offsets, order = layout
+
+    # The fused op owns gather, fp32 scores, softmax, and weighted sum.
+    # An empty position run returns an exact zero read delta.
+    q = self.latent_wq_read(self.latent_ln_read_q(g)).view(
+        p, slots, heads, head_dim
+    )
+    window_rows = self.latent_ln_read_w(w)
+    k = self.latent_wk_read(window_rows).view(-1, heads, head_dim)
+    v = self.latent_wv_read(window_rows).view(-1, heads, head_dim)
+    read = window_latents.read_attention(q, k, v, window_pos, offsets, order)
+    delta = self.latent_wo_read(read.reshape(p, slots, h).to(g.dtype))
+    g = g + self.drop(delta)
+
+    # Mix. All four slots are live, so the dense K-by-K softmax needs no
+    # mask and stays fp32 independently of autocast.
+    z = self.latent_ln_mix(g)
+    q = self.latent_wq_mix(z).view(p, slots, heads, head_dim)
+    k = self.latent_wk_mix(z).view(p, slots, heads, head_dim)
+    v = self.latent_wv_mix(z).view(p, slots, heads, head_dim)
+    scores = torch.einsum("pqhd,pkhd->phqk", q, k) / math.sqrt(head_dim)
+    weights = scores.float().softmax(dim=-1)
+    mixed = torch.einsum("phqk,pkhd->pqhd", weights, v.float())
+    delta = self.latent_wo_mix(mixed.reshape(p, slots, h).to(g.dtype))
+    g = g + self.drop(delta)
+
+    # K is fixed at four, so the fused op uses multiply-sum reductions
+    # rather than a small-dimension dot and returns flat window rows.
+    latent_rows = self.latent_ln_bcast_l(g)
+    q = self.latent_wq_bcast(self.latent_ln_bcast_q(w)).view(
+        -1, heads, head_dim
+    )
+    k = self.latent_wk_bcast(latent_rows).view(p, slots, heads, head_dim)
+    v = self.latent_wv_bcast(latent_rows).view(p, slots, heads, head_dim)
+    broadcast = window_latents.broadcast_attention(
+        q, k, v, window_pos, offsets, order
+    )
+    delta = self.latent_wo_bcast(broadcast.reshape(-1, h).to(w.dtype))
+    w = w + self.drop(delta)
+    return w, g
 
 
 class _Block(nn.Module):
@@ -500,50 +591,8 @@ class _Block(nn.Module):
         g: Tensor,
         layout: tuple[Tensor, Tensor, Tensor],
     ) -> tuple[Tensor, Tensor]:
-        """Latents read flat windows, self-mix, then broadcast to windows."""
-        cfg = self.cfg
-        p, slots, h = g.shape
-        heads, head_dim = cfg.heads, h // cfg.heads
-        window_pos, offsets, order = layout
+        return _latent_cycle(self, w, g, layout)
 
-        # The fused op owns gather, fp32 scores, softmax, and weighted sum.
-        # An empty position run returns an exact zero read delta.
-        q = self.latent_wq_read(self.latent_ln_read_q(g)).view(
-            p, slots, heads, head_dim
-        )
-        window_rows = self.latent_ln_read_w(w)
-        k = self.latent_wk_read(window_rows).view(-1, heads, head_dim)
-        v = self.latent_wv_read(window_rows).view(-1, heads, head_dim)
-        read = window_latents.read_attention(q, k, v, window_pos, offsets, order)
-        delta = self.latent_wo_read(read.reshape(p, slots, h).to(g.dtype))
-        g = g + self.drop(delta)
-
-        # Mix. All four slots are live, so the dense K-by-K softmax needs no
-        # mask and stays fp32 independently of autocast.
-        z = self.latent_ln_mix(g)
-        q = self.latent_wq_mix(z).view(p, slots, heads, head_dim)
-        k = self.latent_wk_mix(z).view(p, slots, heads, head_dim)
-        v = self.latent_wv_mix(z).view(p, slots, heads, head_dim)
-        scores = torch.einsum("pqhd,pkhd->phqk", q, k) / math.sqrt(head_dim)
-        weights = scores.float().softmax(dim=-1)
-        mixed = torch.einsum("phqk,pkhd->pqhd", weights, v.float())
-        delta = self.latent_wo_mix(mixed.reshape(p, slots, h).to(g.dtype))
-        g = g + self.drop(delta)
-
-        # K is fixed at four, so the fused op uses multiply-sum reductions
-        # rather than a small-dimension dot and returns flat window rows.
-        latent_rows = self.latent_ln_bcast_l(g)
-        q = self.latent_wq_bcast(self.latent_ln_bcast_q(w)).view(
-            -1, heads, head_dim
-        )
-        k = self.latent_wk_bcast(latent_rows).view(p, slots, heads, head_dim)
-        v = self.latent_wv_bcast(latent_rows).view(p, slots, heads, head_dim)
-        broadcast = window_latents.broadcast_attention(
-            q, k, v, window_pos, offsets, order
-        )
-        delta = self.latent_wo_bcast(broadcast.reshape(-1, h).to(w.dtype))
-        w = w + self.drop(delta)
-        return w, g
 
     def forward(
         self,
@@ -702,6 +751,266 @@ class _Block(nn.Module):
         return s, w, g, c
 
 
+class _SiteBlock(nn.Module):
+    """One merged-site trunk block (§5M): window <- its six sites, the
+    window/latent cycle, site <- its windows plus the typed radius read,
+    the mixing arm, and one FFN over sites and latents.
+
+    Stones and legal cells are one token set. The window exchange is typed
+    by the joint (pattern, slot) site classes — occupied classes first,
+    empty (decoder) classes offset behind them — so every kept window
+    carries exactly six site edges.
+    """
+
+    def __init__(self, cfg: MantisConfig) -> None:
+        super().__init__()
+        h = cfg.h
+        self.cfg = cfg
+        # §5M.1 window <- its six sites.
+        self.ln_ws_s = nn.LayerNorm(h)
+        self.ln_ws_w = nn.LayerNorm(h)
+        self.u = nn.Linear(h, h, bias=False)
+        self.e_wsite = nn.Embedding(cfg.site_classes, h)
+        self.mlp_w = _PairMlp(h, h, h)
+        # Window read, latent self-mix, and window broadcast — the same
+        # cycle parameters and arithmetic as the split trunk (§5.4).
+        self.latent_ln_read_q = nn.LayerNorm(h)
+        self.latent_ln_read_w = nn.LayerNorm(h)
+        self.latent_wq_read = nn.Linear(h, h)
+        self.latent_wk_read = nn.Linear(h, h, bias=False)
+        self.latent_wv_read = nn.Linear(h, h)
+        self.latent_wo_read = nn.Linear(h, h)
+
+        self.latent_ln_mix = nn.LayerNorm(h)
+        self.latent_wq_mix = nn.Linear(h, h)
+        self.latent_wk_mix = nn.Linear(h, h, bias=False)
+        self.latent_wv_mix = nn.Linear(h, h)
+        self.latent_wo_mix = nn.Linear(h, h)
+
+        self.latent_ln_bcast_q = nn.LayerNorm(h)
+        self.latent_ln_bcast_l = nn.LayerNorm(h)
+        self.latent_wq_bcast = nn.Linear(h, h)
+        self.latent_wk_bcast = nn.Linear(h, h, bias=False)
+        self.latent_wv_bcast = nn.Linear(h, h)
+        self.latent_wo_bcast = nn.Linear(h, h)
+        # §5M.2 site <- its windows: typed attention, class value rows.
+        self.ln_sr_s = nn.LayerNorm(h)
+        self.ln_sr_w = nn.LayerNorm(h)
+        self.sr_wq = nn.Linear(h, h)
+        self.sr_wk = nn.Linear(h, h, bias=False)
+        self.sr_wv = nn.Linear(h, h)
+        self.sr_wo = nn.Linear(h, h)
+        self.sr_bias = nn.Parameter(torch.zeros(cfg.heads, cfg.site_classes))
+        self.sr_vclass = nn.Embedding(cfg.site_classes, h)
+        # §5M.2b cells read stones through the typed radius edges — the one
+        # relation windows cannot carry (off-axis proximity), and the only
+        # typed input of a legal cell no live window covers.
+        self.ln_radius_c = nn.LayerNorm(h)
+        self.ln_radius_s = nn.LayerNorm(h)
+        self.radius_wq = nn.Linear(h, h)
+        self.radius_wk = nn.Linear(h, h, bias=False)
+        self.radius_wv = nn.Linear(h, h)
+        self.radius_wo = nn.Linear(h, h)
+        self.radius_bias = nn.Parameter(
+            torch.zeros(cfg.heads, cell_nodes.RADIUS_CLASSES)
+        )
+        self.radius_vclass = nn.Embedding(cell_nodes.RADIUS_CLASSES, h)
+        # §5M.3: the mixing arm. Key projections are bias-free because a
+        # shared key bias cancels from its softmax row.
+        if cfg.site_self_attention:
+            self.ln_attn = nn.LayerNorm(h)
+            self.wq = nn.Linear(h, h)
+            self.wk = nn.Linear(h, h, bias=False)
+            self.wv = nn.Linear(h, h)
+            self.wo = nn.Linear(h, h)
+        else:
+            self.ln_gs_g = nn.LayerNorm(h)
+            self.ln_gs_s = nn.LayerNorm(h)
+            self.gs_wq = nn.Linear(h, h)
+            self.gs_wk = nn.Linear(h, h, bias=False)
+            self.gs_wv = nn.Linear(h, h)
+            self.gs_wo = nn.Linear(h, h)
+            self.ln_sg_s = nn.LayerNorm(h)
+            self.ln_sg_g = nn.LayerNorm(h)
+            self.sg_wq = nn.Linear(h, h)
+            self.sg_wk = nn.Linear(h, h, bias=False)
+            self.sg_wv = nn.Linear(h, h)
+            self.sg_wo = nn.Linear(h, h)
+        self.ln_ffn = nn.LayerNorm(h)
+        self.ffn = nn.Sequential(
+            nn.Linear(h, cfg.ffn_factor * h), nn.ReLU(), nn.Linear(cfg.ffn_factor * h, h)
+        )
+        self.drop = nn.Dropout(cfg.dropout)
+
+    def _window_latent_cycle(
+        self,
+        w: Tensor,
+        g: Tensor,
+        layout: tuple[Tensor, Tensor, Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        return _latent_cycle(self, w, g, layout)
+
+    def _site_read_stage(
+        self,
+        sites: Tensor,
+        w: Tensor,
+        mtab: cell_latents.CellTables,
+        rtab: cell_latents.CellTables,
+        n_stones: int,
+    ) -> Tensor:
+        """§5M.2: every site reads its at most 18 windows — class-biased
+        scores, class value rows; a site no live window covers reads an
+        exact zero — then the cells read their radius-8 stones."""
+        cfg = self.cfg
+        heads, hd = cfg.heads, cfg.h // cfg.heads
+        n_t, n_w = sites.shape[0], w.shape[0]
+        zs = self.ln_sr_s(sites)
+        zw = self.ln_sr_w(w)
+        read = cell_latents.cell_read(
+            self.sr_wq(zs).view(n_t, heads, hd),
+            self.sr_wk(zw).view(n_w, heads, hd),
+            self.sr_wv(zw).view(n_w, heads, hd),
+            self.sr_bias,
+            self.sr_vclass.weight,
+            mtab,
+        )
+        sites = sites + self.drop(self.sr_wo(read.reshape(n_t, cfg.h).to(zs.dtype)))
+
+        stones = sites[:n_stones]
+        cells = sites[n_stones:]
+        zc = self.ln_radius_c(cells)
+        zst = self.ln_radius_s(stones)
+        read = cell_latents.cell_read(
+            self.radius_wq(zc).view(cells.shape[0], heads, hd),
+            self.radius_wk(zst).view(n_stones, heads, hd),
+            self.radius_wv(zst).view(n_stones, heads, hd),
+            self.radius_bias,
+            self.radius_vclass.weight,
+            rtab,
+        )
+        delta = self.radius_wo(read.reshape(cells.shape[0], cfg.h).to(zc.dtype))
+        return sites + torch.cat(
+            [sites.new_zeros(n_stones, cfg.h), self.drop(delta)]
+        )
+
+    def _site_attention(
+        self, sites: Tensor, g: Tensor, batch: Batch, seq_lens: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        """§5M.3, full arm: attention over [latent rows; sites],
+        block-diagonal per position, content-only scores."""
+        cfg = self.cfg
+        p, max_ts = g.shape[0], batch.site_valid.shape[1]
+        global_rows = g.shape[1]
+        rows = sites.new_zeros(p * max_ts, cfg.h)
+        global_slot = (
+            torch.arange(p, device=sites.device)[:, None] * max_ts
+            + torch.arange(global_rows, device=sites.device)[None, :]
+        ).reshape(-1)
+        rows.index_copy_(0, global_slot, g.reshape(-1, cfg.h).to(rows.dtype))
+        rows.index_copy_(0, batch.site_slot, sites)
+        z = self.ln_attn(rows.view(p, max_ts, cfg.h))
+        hd = cfg.h // cfg.heads
+        q = self.wq(z).view(p, max_ts, cfg.heads, hd).transpose(1, 2)
+        k = self.wk(z).view(p, max_ts, cfg.heads, hd).transpose(1, 2)
+        v = self.wv(z).view(p, max_ts, cfg.heads, hd).transpose(1, 2)
+        out = fused_attention(q, k, v, seq_lens)
+        out = self.wo(out.transpose(1, 2).reshape(p, max_ts, cfg.h)).view(
+            p * max_ts, cfg.h
+        )
+        sites = sites + self.drop(out.index_select(0, batch.site_slot))
+        g = g + self.drop(out.index_select(0, global_slot).view(p, global_rows, cfg.h))
+        return sites, g
+
+    def _latent_cross(
+        self, sites: Tensor, g: Tensor, layout: tuple[Tensor, Tensor, Tensor]
+    ) -> tuple[Tensor, Tensor]:
+        """§5M.3, latent arm: the four latents read the sites, then every
+        site reads its position's latents — linear in the site count, and
+        the one global input a windowless (uncovered) cell receives."""
+        cfg = self.cfg
+        p, slots, _ = g.shape
+        heads, hd = cfg.heads, cfg.h // cfg.heads
+        site_pos, offsets, order = layout
+        q = self.gs_wq(self.ln_gs_g(g)).view(p, slots, heads, hd)
+        zs = self.ln_gs_s(sites)
+        k = self.gs_wk(zs).view(-1, heads, hd)
+        v = self.gs_wv(zs).view(-1, heads, hd)
+        read = window_latents.read_attention(q, k, v, site_pos, offsets, order)
+        g = g + self.drop(self.gs_wo(read.reshape(p, slots, cfg.h).to(g.dtype)))
+
+        latent_rows = self.ln_sg_g(g)
+        q = self.sg_wq(self.ln_sg_s(sites)).view(-1, heads, hd)
+        k = self.sg_wk(latent_rows).view(p, slots, heads, hd)
+        v = self.sg_wv(latent_rows).view(p, slots, heads, hd)
+        out = window_latents.broadcast_attention(q, k, v, site_pos, offsets, order)
+        sites = sites + self.drop(self.sg_wo(out.reshape(-1, cfg.h).to(sites.dtype)))
+        return sites, g
+
+    def forward(
+        self,
+        sites: Tensor,
+        w: Tensor,
+        g: Tensor,
+        batch: Batch,
+        mtab: cell_latents.CellTables,
+        rtab: cell_latents.CellTables,
+        latent_layout: tuple[Tensor, Tensor, Tensor],
+        site_layout: tuple[Tensor, Tensor, Tensor] | None,
+        site_seq_lens: Tensor | None,
+        ws_rows: Tensor,
+        n_stones: int,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        cfg = self.cfg
+        # §5M.1: windows aggregate all six sites. Sum, not mean; the class
+        # half arrives precomputed per pattern (``ws_rows``).
+        x = self.u(self.ln_ws_s(sites))
+        agg = message_passing.aggregate_to_windows(
+            x,
+            mtab.edge_wcell,
+            mtab.edge_wwin,
+            mtab.edge_cell,
+            mtab.edge_window,
+            w.shape[0],
+        )
+        agg = agg + ws_rows.to(agg.dtype)
+        w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
+
+        # The cycle runs before the site read, so sites read latent-mixed
+        # windows within their own block.
+        w, g = checkpoint(
+            self._window_latent_cycle,
+            w,
+            g,
+            latent_layout,
+            use_reentrant=False,
+            context_fn=_attention_saved_contexts,
+        )
+
+        # Recompute-in-backward: the site read is the trunk's widest
+        # activation footprint, and every kernel involved is deterministic.
+        sites = checkpoint(
+            self._site_read_stage,
+            sites,
+            w,
+            mtab,
+            rtab,
+            n_stones,
+            use_reentrant=False,
+            context_fn=_attention_saved_contexts,
+        )
+
+        if cfg.site_self_attention:
+            sites, g = self._site_attention(sites, g, batch, site_seq_lens)
+        else:
+            sites, g = self._latent_cross(sites, g, site_layout)
+
+        rows = torch.cat([sites, g.reshape(-1, cfg.h)], dim=0)
+        rows = self.drop(self.ffn(self.ln_ffn(rows)))
+        sites = sites + rows[: sites.shape[0]]
+        g = g + rows[sites.shape[0] :].view(g.shape)
+        return sites, w, g
+
+
 class MantisNet(nn.Module):
     """Embeddings, B trunk blocks, policy, action-value, and state-value heads."""
 
@@ -716,13 +1025,14 @@ class MantisNet(nn.Module):
         self.window_table = nn.Embedding(cfg.window_vocab, h)
         self.latent_base = nn.Parameter(torch.empty(4, h))
         self.token_moves = nn.Embedding(2, h)  # moves_remaining in {1, 2}
-        if cfg.uses_cell_state:
-            # The shared covered-cell row; identity accrues through the typed
+        if cfg.cells_in_trunk:
+            # The shared cell row; identity accrues through the typed
             # reads, and under `cell_structure` also from the static
-            # encodings this row then biases. Legal cells no live window
-            # covers keep this row at the decoder — far-ring semantics.
+            # encodings this row then biases. In the split trunk, legal
+            # cells no live window covers keep this row at the decoder —
+            # far-ring semantics; the merged trunk refines every legal cell.
             self.cell_base = nn.Parameter(torch.empty(h))
-        if cfg.cell_nodes or cfg.cell_structure:
+        if cfg.cell_nodes or cfg.cell_structure or cfg.merged_sites:
             self.cell_nearest_table = nn.Embedding(cell_nodes.NEAREST_BUCKETS, h)
         if cfg.cell_structure:
             # Step S1: a covered cell's static identity — the 726-class
@@ -738,16 +1048,25 @@ class MantisNet(nn.Module):
                 persistent=False,
             )
 
-        self.blocks = nn.ModuleList(_Block(cfg) for _index in range(cfg.blocks))
-        # S4: the per-pattern occupied-slot class counts — a constant of the
-        # ternary vocabulary, so it travels with the module, not the
-        # checkpoint. ``counts @ e_ws`` turns the §5.1 class-row sum into one
-        # gather per window, with a dense deterministic matmul gradient.
-        self.register_buffer(
-            "pattern_counts",
-            torch.from_numpy(TERN_PATTERN_CLASS_COUNTS.copy()),
-            persistent=False,
-        )
+        block_type = _SiteBlock if cfg.merged_sites else _Block
+        self.blocks = nn.ModuleList(block_type(cfg) for _index in range(cfg.blocks))
+        # S4: the per-pattern class counts — a constant of the ternary
+        # vocabulary, so it travels with the module, not the checkpoint.
+        # ``counts @ table`` turns the window-side class-row sum into one
+        # gather per window, with a dense deterministic matmul gradient. The
+        # merged trunk's table spans all six slots' classes.
+        if cfg.merged_sites:
+            self.register_buffer(
+                "site_pattern_counts",
+                torch.from_numpy(TERN_PATTERN_SITE_COUNTS.copy()),
+                persistent=False,
+            )
+        else:
+            self.register_buffer(
+                "pattern_counts",
+                torch.from_numpy(TERN_PATTERN_CLASS_COUNTS.copy()),
+                persistent=False,
+            )
         self.ln_out = nn.LayerNorm(h)  # shared final LN over S, W, g (§5)
 
         # §6 policy decoder. MLP_P([h_a; g]) as a _PairMlp, so the g half of
@@ -799,7 +1118,7 @@ class MantisNet(nn.Module):
             if isinstance(m, nn.Embedding):
                 nn.init.normal_(m.weight, std=0.02)
         nn.init.normal_(self.latent_base, std=0.02)
-        if self.cfg.uses_cell_state:
+        if self.cfg.cells_in_trunk:
             nn.init.normal_(self.cell_base, std=0.02)
         nn.init.normal_(self.value_queries, std=0.02)
         nn.init.normal_(self.act_empty_base, std=0.02)
@@ -906,6 +1225,73 @@ class MantisNet(nn.Module):
             self.cfg.cell_node_scope == "uncovered",
         )
 
+    def _site_trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor]:
+        """§5M: the merged-site trunk. Sites are [stones; legal cells] in
+        batch order; every legal cell — covered or not — carries state
+        through every block, so the decoder reads trunk-refined rows for
+        the whole legal set."""
+        cfg = self.cfg
+        s = self.stone_table(batch.stone_own)
+        cells = self.cell_base + self.cell_nearest_table(batch.cell_nearest)
+        sites = torch.cat([s, cells], dim=0)
+        w = self.window_table(batch.window_feat)
+        moves = self.token_moves(batch.moves_idx)
+        g = self.latent_base[None, :, :] + moves[:, None, :]
+        p = g.shape[0]
+        n_stones = s.shape[0]
+
+        window_pos = batch.window_slot // batch.max_w
+        offsets, order = window_latents.window_latent_layout(window_pos, p)
+        latent_layout = (window_pos, offsets, order)
+
+        # The merged incidence: exactly six site edges per kept window —
+        # occupied slots from the stone incidence, empty slots from the
+        # decoder incidence, cells offset behind the stones and empty
+        # classes offset behind the occupied vocabulary.
+        empty = batch.inc_stone.new_empty(0)
+        msite = torch.cat([batch.inc_stone, batch.dec_cell + n_stones])
+        mwin = torch.cat([batch.inc_window, batch.dec_window])
+        mcls = torch.cat([batch.inc_class, batch.dec_class + TERN_OCC_CLASSES])
+        mtab = cell_nodes.tables_from_op(
+            mwin, msite, mcls, empty, w.shape[0], sites.shape[0],
+            cfg.site_classes, False,
+        )
+        rtab = self._radius_tables(batch, empty, n_stones)
+
+        site_layout = site_seq_lens = None
+        if cfg.site_self_attention:
+            site_seq_lens = batch.site_valid.sum(dim=1, dtype=torch.int32)
+        else:
+            site_pos = torch.cat([batch.stone_slot // batch.max_t, batch.cell_pos])
+            s_offsets, s_order = window_latents.window_latent_layout(site_pos, p)
+            site_layout = (site_pos, s_offsets, s_order)
+
+        # Every block's §5M.1 class term in one pass: ``counts @ [every
+        # e_wsite]`` then one gather per window, fp32 under autocast.
+        with torch.autocast(device_type=w.device.type, enabled=False):
+            tables = torch.cat(
+                [block.e_wsite.weight for block in self.blocks], dim=1
+            )
+            ws_all = (self.site_pattern_counts @ tables).index_select(
+                0, batch.window_feat
+            )
+        for index, block in enumerate(self.blocks):
+            sites, w, g = block(
+                sites,
+                w,
+                g,
+                batch,
+                mtab,
+                rtab,
+                latent_layout,
+                site_layout,
+                site_seq_lens,
+                ws_all[:, index * cfg.h : (index + 1) * cfg.h],
+                n_stones,
+            )
+        global_rows = self.ln_out(g).mean(dim=1)
+        return self.ln_out(w), global_rows, self.ln_out(sites[n_stones:])
+
     def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor | None]:
         """Embeddings through the B blocks and the shared final LN (§5).
 
@@ -917,6 +1303,8 @@ class MantisNet(nn.Module):
         legal cells carry the learned base row.
         """
         cfg = self.cfg
+        if cfg.merged_sites:
+            return self._site_trunk(batch)
         s = self.stone_table(batch.stone_own)
         w = self.window_table(batch.window_feat)
         moves = self.token_moves(batch.moves_idx)
@@ -1029,7 +1417,7 @@ class MantisNet(nn.Module):
         latents when that knob is on, the one-shot window aggregate
         otherwise. A ``cells`` value that disagrees with the config is a
         caller wiring bug, not a fallback opportunity."""
-        if self.cfg.uses_cell_state:
+        if self.cfg.cells_in_trunk:
             if cells is None:
                 raise ValueError(
                     "cell state is on but the trunk's cell rows were not "

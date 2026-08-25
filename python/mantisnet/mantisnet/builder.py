@@ -185,6 +185,44 @@ def _tern_pattern_class_counts() -> np.ndarray:
 TERN_PATTERN_CLASS_COUNTS = _tern_pattern_class_counts()
 
 
+TERN_SITE_CLASSES = TERN_OCC_CLASSES + TERN_DEC_CLASSES
+
+
+def _tern_pattern_site_counts() -> np.ndarray:
+    """(377, 2184) float32: per canonical pattern, the class counts of all
+    six slots — occupied classes first, empty (decoder) classes offset by
+    ``TERN_OCC_CLASSES``. The merged-site window class sum is one gather
+    from this table. Both orbit representatives are checked to agree.
+    """
+    counts = np.full((TERN_PATTERNS, TERN_SITE_CLASSES), -1.0, dtype=np.float32)
+    for p in range(1, 729):
+        row = np.zeros(TERN_SITE_CLASSES, dtype=np.float32)
+        for s in range(WINDOW_LEN):
+            occ = _TERN_OCC_CLASS[p, s]
+            if occ >= 0:
+                row[occ] += 1.0
+            else:
+                dec = _TERN_DEC_CLASS[p, s]
+                assert dec >= 0
+                row[TERN_OCC_CLASSES + dec] += 1.0
+        rank = _TERN_RANK[p]
+        if counts[rank].max() < 0:
+            counts[rank] = row
+        elif not np.array_equal(counts[rank], row):
+            raise AssertionError(
+                f"pattern {p} and its reversal disagree on site class counts"
+            )
+    assert counts.min() >= 0
+    assert (counts.sum(axis=1) == WINDOW_LEN).all()
+    return counts
+
+
+TERN_PATTERN_SITE_COUNTS = _tern_pattern_site_counts()
+assert np.array_equal(
+    TERN_PATTERN_SITE_COUNTS[:, :TERN_OCC_CLASSES], TERN_PATTERN_CLASS_COUNTS
+)
+
+
 # --- Step 4 action-row tables (MANTIS_GRAFT_SPEC §4, Step 4).
 #
 # Every legal action has 18 hypothetical post-placement windows (3 axes x 6
@@ -690,6 +728,11 @@ class Batch:
     stone_slot: torch.Tensor  # (N_s,) long, flat index into (P * max_t)
     coords: torch.Tensor  # (P, max_t, 2) int32; global rows and padding are zero
     attn_valid: torch.Tensor  # (P, max_t) bool
+    # Merged-site attention padding: rows [global context; stones; legal
+    # cells] per position (the §5M grid; unread by the split trunk).
+    max_ts: int
+    site_slot: torch.Tensor  # (N_s + N_c,) long, flat index into (P * max_ts)
+    site_valid: torch.Tensor  # (P, max_ts) bool
     # Value-readout padding: rows [pooled global; windows] per position.
     max_w: int
     window_slot: torch.Tensor  # (N_w,) long, flat index into (P * max_w)
@@ -775,6 +818,32 @@ def _relay_fields(
     return dict(zip(_RELAY_FIELDS, tables))
 
 
+def _site_fields(attn_valid: torch.Tensor, legal_offsets: torch.Tensor) -> dict:
+    """The merged-site grid: stones then legal cells behind the four global
+    rows, per position. Derived at collation from the stone grid and the
+    legal CSR, exactly as the relay tables are — the wire format is
+    unchanged."""
+    p = int(attn_valid.shape[0])
+    global_rows = 4
+    ns = attn_valid.sum(dim=1).to(torch.long) - global_rows
+    nc = legal_offsets[1:] - legal_offsets[:-1]
+    max_ts = global_rows + (int((ns + nc).max()) if p else 0)
+    pos = torch.arange(p, dtype=torch.long)
+    stone_pos = torch.repeat_interleave(pos, ns)
+    stone_starts = torch.cat([ns.new_zeros(1), ns.cumsum(0)[:-1]])
+    stone_rank = torch.arange(int(ns.sum())) - stone_starts.repeat_interleave(ns)
+    cell_pos = torch.repeat_interleave(pos, nc)
+    cell_rank = torch.arange(int(nc.sum())) - legal_offsets[:-1].repeat_interleave(nc)
+    site_slot = torch.cat(
+        [
+            stone_pos * max_ts + global_rows + stone_rank,
+            cell_pos * max_ts + global_rows + ns.repeat_interleave(nc) + cell_rank,
+        ]
+    )
+    site_valid = torch.arange(max_ts)[None, :] < (global_rows + ns + nc)[:, None]
+    return {"max_ts": max_ts, "site_slot": site_slot, "site_valid": site_valid}
+
+
 def batch_from_arrays(**fields) -> Batch:
     """A ``Batch`` from per-tensor arrays, with the derived tables built here.
 
@@ -789,6 +858,9 @@ def batch_from_arrays(**fields) -> Batch:
         for name in ("n_pos", "max_t", "max_w", "n_cells")
         if name in fields
     }
+    fields.pop("max_ts", None)
+    fields.pop("site_slot", None)
+    fields.pop("site_valid", None)
     t = {name: torch.as_tensor(value) for name, value in fields.items()}
     derived = {
         "n_pos": int(t["attn_valid"].shape[0]),
@@ -802,6 +874,7 @@ def batch_from_arrays(**fields) -> Batch:
     return Batch(
         **derived,
         **t,
+        **_site_fields(t["attn_valid"], t["legal_offsets"]),
         **_relay_fields(
             t["dec_cell"],
             t["dec_window"],
@@ -951,6 +1024,9 @@ def collate(graphs: list[PositionGraph]) -> Batch:
         dec_cell=dec_cell,
         dec_window=dec_window,
         dec_class=dec_class,
+        **_site_fields(
+            torch.from_numpy(attn_valid), torch.from_numpy(cell_off.astype(np.int64))
+        ),
         **_relay_fields(dec_cell, dec_window, dec_class, int(win_off[-1])),
         **_action_fields(graphs, dec_window),
     )

@@ -239,15 +239,15 @@ in order:
    empty cells instead.
 3. **§5.2 stone ← windows** — the mirror of §5.1: stones aggregate their
    windows plus the class row sum.
-5. **§5.3 stone self-attention** — attention over `[latent rows; stones]`,
+4. **§5.3 stone self-attention** — attention over `[latent rows; stones]`,
    block-diagonal per position, content-only scores (§4.1). The four latent
    rows attend as ordinary rows. In the last block only the four latent-row
    reads are computed: no head reads post-trunk stone rows, so their
    attention outputs and FFN half would be dead work.
-6. **§5.4 window-latent cycle** — the latents read the window set
+5. **§5.4 window-latent cycle** — the latents read the window set
    (attention over each position's real windows), mix among themselves
    (dense 4×4 attention), and broadcast back to the windows.
-7. **FFN** — one shared feed-forward over stones and latents (latents
+6. **FFN** — one shared feed-forward over stones and latents (latents
    alone in the last block).
 
 Every stage is residual with pre-LayerNorm; every ragged attention runs its
@@ -257,6 +257,36 @@ the mean-pooled latent context `g`, and — with cell state on — the refined
 cell rows scattered into engine legal order, uncovered cells carrying the
 (normalized) learned base row. Stone rows end inside the last block; the
 trunk does not emit them.
+
+### 5M. The merged site-token trunk (`merged_sites`, experimental)
+
+Under `merged_sites` the split trunk above is replaced whole: stones and
+legal cells are one **site** token set, and a block runs
+
+1. **window ← its six sites** — a typed sum over the joint (pattern, slot)
+   site classes: the 1458 occupied classes first, the 726 empty (decoder)
+   classes offset behind them, 2184 in all. Every kept window carries
+   exactly six site edges, and the class half of the sum is one gather from
+   a per-pattern table (the §5.1 hoist extended to all six slots).
+2. **the window/latent cycle** — §5.4 unchanged, run before the site read
+   so sites read latent-mixed windows within their block.
+3. **site ← its windows** — typed attention over the same 2184 classes
+   with class value rows (the §5.1b cell read generalized to every site);
+   occupied sites select among their windows instead of summing them. The
+   cells then read their radius-8 stones through the 192-class typed radius
+   edges — the one relation windows cannot carry, and the only typed input
+   of a legal cell no live window covers.
+4. **the mixing arm** — `site_self_attention=True` is full self-attention
+   over `[latent rows; sites]`, block-diagonal per position, content-only
+   scores; `False` replaces it with two linear cross-reads: the four
+   latents read the sites, then every site reads its position's latents —
+   how an uncovered cell hears the global state in that arm.
+5. **one FFN over sites and latents.**
+
+Every legal cell — covered or not — carries state through every block, and
+the §6 decoders read trunk-refined rows for the whole legal set. The wire
+format is unchanged: the merged incidence and the site attention grid are
+derived at collation and on-device from the split fields.
 
 ## 6. Legal-cell decoders
 

@@ -28,6 +28,10 @@ relay — or, in the production configuration, persistent typed cell state —
 lets windows exchange state through shared empty cells. In every block the four
 latents read the real windows, self-mix, and broadcast back to those windows;
 their final normalized mean is the global context consumed by the heads.
+The experimental `merged_sites` knob (MODEL_SPEC §5M) replaces the split
+trunk whole: stones and legal cells become one site token set typed by the
+joint (pattern, slot) classes, with `site_self_attention` selecting full
+`[latents; sites]` attention or linear latent cross-reads.
 
 With `cell_nodes=True`, uncovered legal cells initialize from the
 nearest-stone-distance embedding, while covered cells retain the Step 15

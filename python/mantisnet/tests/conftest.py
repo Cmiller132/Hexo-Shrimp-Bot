@@ -43,6 +43,7 @@ PLIES = [0, 1, 2, 3, 5, 9, 12, 21, 34, 60]
 # run: all GPU files share one worker instead of thirty-two.
 _CUDA_FILES = {
     "test_attention_kernel.py",
+    "test_merged_sites_cuda.py",
     "test_cell_latents.py",
     "test_message_passing.py",
     "test_mixed_row_sums.py",

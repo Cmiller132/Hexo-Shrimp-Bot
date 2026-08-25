@@ -262,6 +262,32 @@ _CELL_STRUCTURE_SUFFIXES = {
     "mlp_c.lin_a.weight", "mlp_c.lin_a.bias", "mlp_c.lin_b.weight",
     "mlp_c.out.weight", "mlp_c.out.bias",
 }
+# Step M1 merged-site block suffixes: the core stages every merged block
+# carries, then one of the two mixing arms. The radius set is shared with
+# the split cell_nodes stage.
+_SITE_CORE_SUFFIXES = {
+    "ln_ws_s.weight", "ln_ws_s.bias", "ln_ws_w.weight", "ln_ws_w.bias",
+    "u.weight", "e_wsite.weight", "mlp_w.lin_a.weight", "mlp_w.lin_a.bias",
+    "mlp_w.lin_b.weight", "mlp_w.out.weight", "mlp_w.out.bias",
+    "ln_sr_s.weight", "ln_sr_s.bias", "ln_sr_w.weight", "ln_sr_w.bias",
+    "sr_wq.weight", "sr_wq.bias", "sr_wk.weight",
+    "sr_wv.weight", "sr_wv.bias", "sr_wo.weight", "sr_wo.bias",
+    "sr_bias", "sr_vclass.weight",
+    "ln_ffn.weight", "ln_ffn.bias", "ffn.0.weight", "ffn.0.bias",
+    "ffn.2.weight", "ffn.2.bias",
+}
+_SITE_ATTN_SUFFIXES = {
+    "ln_attn.weight", "ln_attn.bias", "wq.weight", "wq.bias", "wk.weight",
+    "wv.weight", "wv.bias", "wo.weight", "wo.bias",
+}
+_SITE_CROSS_SUFFIXES = {
+    "ln_gs_g.weight", "ln_gs_g.bias", "ln_gs_s.weight", "ln_gs_s.bias",
+    "gs_wq.weight", "gs_wq.bias", "gs_wk.weight",
+    "gs_wv.weight", "gs_wv.bias", "gs_wo.weight", "gs_wo.bias",
+    "ln_sg_s.weight", "ln_sg_s.bias", "ln_sg_g.weight", "ln_sg_g.bias",
+    "sg_wq.weight", "sg_wq.bias", "sg_wk.weight",
+    "sg_wv.weight", "sg_wv.bias", "sg_wo.weight", "sg_wo.bias",
+}
 # Step 5/6 knob keys live on the model, not the blocks.
 _TACTICAL_KEYS = {
     "tactical_a.weight", "tactical_a.bias",
@@ -279,6 +305,8 @@ class _Knobs:
     cell_adjacency: bool
     cell_structure: bool
     action_tactical: bool
+    merged_sites: bool
+    site_self_attention: bool
 
 
 def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
@@ -299,21 +327,33 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         and window_table.ndim == 2
         and window_table.shape[0] == TERN_PATTERNS
     )
-    e_ws = state_dict.get("blocks.0.e_ws.weight")
-    latent_base = state_dict.get("latent_base")
-    # The all-cell stage is identified by its radius tensors, not by the
-    # nearest-distance table, which `cell_structure` also brings in.
-    nodes = "blocks.0.radius_bias" in state_dict
-    structure = "cell_class_table.weight" in state_dict
-    return _Knobs(
-        cell_pass=bool(relayed),
-        cell_pass_from=relayed[0] if relayed else 0,
-        joint_incidence=(
+    # The merged-site trunk is identified by its site-read bias; its radius
+    # tensors belong to it, not to the split cell_nodes stage.
+    merged = "blocks.0.sr_bias" in state_dict
+    if merged:
+        table = state_dict.get("blocks.0.e_wsite.weight")
+        joint = (
+            isinstance(table, Tensor)
+            and table.ndim == 2
+            and table.shape[0] == TERN_OCC_CLASSES + TERN_DEC_CLASSES
+        )
+    else:
+        e_ws = state_dict.get("blocks.0.e_ws.weight")
+        joint = (
             isinstance(e_ws, Tensor)
             and e_ws.ndim == 2
             and e_ws.shape[0]
             == (TERN_OCC_CLASSES if mixed else _HISTORIC_OCC_CLASSES)
-        ),
+        )
+    latent_base = state_dict.get("latent_base")
+    # The all-cell stage is identified by its radius tensors, not by the
+    # nearest-distance table, which `cell_structure` also brings in.
+    nodes = "blocks.0.radius_bias" in state_dict and not merged
+    structure = "cell_class_table.weight" in state_dict
+    return _Knobs(
+        cell_pass=bool(relayed),
+        cell_pass_from=relayed[0] if relayed else 0,
+        joint_incidence=joint,
         mixed_windows=mixed,
         state_latents=(
             int(latent_base.shape[0])
@@ -323,11 +363,14 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
         # Cell state is one stage and `cell_nodes` subsumes `cell_latents`,
         # so an all-cell profile names only `cell_nodes` — except under
         # `cell_structure`, which requires `cell_latents=True`.
-        cell_latents=("cell_base" in state_dict and not nodes) or structure,
+        cell_latents=("cell_base" in state_dict and not nodes and not merged)
+        or structure,
         cell_nodes=nodes,
         cell_adjacency="blocks.0.adj_bias" in state_dict,
         cell_structure=structure,
         action_tactical="tactical_a.weight" in state_dict,
+        merged_sites=merged,
+        site_self_attention=not merged or "blocks.0.wq.weight" in state_dict,
     )
 
 
@@ -343,10 +386,27 @@ _BAKED = _Knobs(
     cell_adjacency=False,
     cell_structure=False,
     action_tactical=False,
+    merged_sites=False,
+    site_self_attention=True,
 )
 
 
 def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
+    if knobs.merged_sites:
+        keys = _COMMON_KEYS | _ACT_KEYS | {
+            "latent_base", "cell_base", "cell_nearest_table.weight",
+        }
+        if knobs.action_tactical:
+            keys |= _TACTICAL_KEYS
+        arm = (
+            _SITE_ATTN_SUFFIXES
+            if knobs.site_self_attention
+            else _SITE_CROSS_SUFFIXES
+        )
+        block_set = _SITE_CORE_SUFFIXES | _RADIUS_SUFFIXES | _LATENT_SUFFIXES | arm
+        for index in range(blocks):
+            keys |= {f"blocks.{index}.{suffix}" for suffix in block_set}
+        return keys
     keys = _COMMON_KEYS | {
         f"blocks.{index}.{suffix}"
         for index in range(blocks)
@@ -456,9 +516,9 @@ def _expected_shapes(
         "act_empty_base": (h,),
         "p_act.weight": (h, h), "q_act.weight": (h, h),
     })
-    if cfg.uses_cell_state:
+    if cfg.cells_in_trunk:
         shapes["cell_base"] = (h,)
-    if cfg.cell_nodes or cfg.cell_structure:
+    if cfg.cell_nodes or cfg.cell_structure or cfg.merged_sites:
         shapes["cell_nearest_table.weight"] = (NEAREST_BUCKETS, h)
     if cfg.cell_structure:
         shapes["cell_class_table.weight"] = (cfg.dec_classes, h)
@@ -471,6 +531,58 @@ def _expected_shapes(
             "tactical_out.bias": (h,),
         })
     fh = cfg.ffn_factor * h
+    if cfg.merged_sites:
+        if cfg.site_self_attention:
+            arm_ln = ["ln_attn"]
+            arm_biased = ["wq", "wv", "wo"]
+            arm_free = ["wk"]
+        else:
+            arm_ln = ["ln_gs_g", "ln_gs_s", "ln_sg_s", "ln_sg_g"]
+            arm_biased = ["gs_wq", "gs_wv", "gs_wo", "sg_wq", "sg_wv", "sg_wo"]
+            arm_free = ["gs_wk", "sg_wk"]
+        ln_names = [
+            "ln_ws_s", "ln_ws_w", "ln_sr_s", "ln_sr_w",
+            "ln_radius_c", "ln_radius_s",
+            "latent_ln_read_q", "latent_ln_read_w", "latent_ln_mix",
+            "latent_ln_bcast_q", "latent_ln_bcast_l",
+            "ln_ffn",
+        ] + arm_ln
+        biased = [
+            "sr_wq", "sr_wv", "sr_wo", "radius_wq", "radius_wv", "radius_wo",
+            "latent_wq_read", "latent_wv_read", "latent_wo_read",
+            "latent_wq_mix", "latent_wv_mix", "latent_wo_mix",
+            "latent_wq_bcast", "latent_wv_bcast", "latent_wo_bcast",
+        ] + arm_biased
+        bias_free = [
+            "sr_wk", "radius_wk",
+            "latent_wk_read", "latent_wk_mix", "latent_wk_bcast",
+        ] + arm_free
+        for index in range(cfg.blocks):
+            prefix = f"blocks.{index}."
+            for name in ln_names:
+                shapes[prefix + name + ".weight"] = (h,)
+                shapes[prefix + name + ".bias"] = (h,)
+            shapes[prefix + "u.weight"] = (h, h)
+            shapes[prefix + "e_wsite.weight"] = (cfg.site_classes, h)
+            shapes[prefix + "sr_bias"] = (cfg.heads, cfg.site_classes)
+            shapes[prefix + "sr_vclass.weight"] = (cfg.site_classes, h)
+            shapes[prefix + "radius_bias"] = (cfg.heads, RADIUS_CLASSES)
+            shapes[prefix + "radius_vclass.weight"] = (RADIUS_CLASSES, h)
+            shapes[prefix + "mlp_w.lin_a.weight"] = (h, h)
+            shapes[prefix + "mlp_w.lin_a.bias"] = (h,)
+            shapes[prefix + "mlp_w.lin_b.weight"] = (h, h)
+            shapes[prefix + "mlp_w.out.weight"] = (h, h)
+            shapes[prefix + "mlp_w.out.bias"] = (h,)
+            for name in biased:
+                shapes[prefix + name + ".weight"] = (h, h)
+                shapes[prefix + name + ".bias"] = (h,)
+            for name in bias_free:
+                shapes[prefix + name + ".weight"] = (h, h)
+            shapes[prefix + "ffn.0.weight"] = (fh, h)
+            shapes[prefix + "ffn.0.bias"] = (fh,)
+            shapes[prefix + "ffn.2.weight"] = (h, fh)
+            shapes[prefix + "ffn.2.bias"] = (h,)
+        return shapes
     ln_names = ["ln_ws_s", "ln_ws_w", "ln_sw_w",
                 "ln_sw_s", "ln_attn", "ln_ffn"]
     biased = ["wq", "wv", "wo"]
@@ -590,8 +702,12 @@ def infer_config(
         cell_nodes=knobs.cell_nodes,
         cell_adjacency=knobs.cell_adjacency,
         cell_structure=knobs.cell_structure,
-        cell_pass=not (knobs.cell_latents or knobs.cell_nodes),
+        cell_pass=not (
+            knobs.cell_latents or knobs.cell_nodes or knobs.merged_sites
+        ),
         action_tactical=knobs.action_tactical,
+        merged_sites=knobs.merged_sites,
+        site_self_attention=knobs.site_self_attention,
     )
     if knobs != expected:
         raise _baked_profile_error(knobs)
@@ -599,7 +715,7 @@ def infer_config(
     # the head count comes from whichever knob's per-head bias is present,
     # falling back to the recorded-config hint.
     source = None
-    for name in ("cr_bias", "radius_bias", "adj_bias"):
+    for name in ("sr_bias", "cr_bias", "radius_bias", "adj_bias"):
         bias = state_dict.get(f"blocks.0.{name}")
         if isinstance(bias, Tensor):
             if bias.ndim != 2 or bias.shape[0] <= 0:
@@ -681,6 +797,8 @@ def infer_config(
         cell_adjacency=knobs.cell_adjacency,
         cell_structure=knobs.cell_structure,
         action_tactical=knobs.action_tactical,
+        merged_sites=knobs.merged_sites,
+        site_self_attention=knobs.site_self_attention,
     )
 
     table = _require_tensor(state_dict, "e_pw.weight")
