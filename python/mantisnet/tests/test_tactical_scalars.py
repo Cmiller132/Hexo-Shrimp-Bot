@@ -266,7 +266,7 @@ def test_parameter_counts_pin_the_knob():
         p.numel()
         for p in MantisNet(MantisConfig(action_tactical=True)).parameters()
     )
-    assert base == 4_803_397
+    assert base == 4_537_925
     h = MantisConfig().h
     assert on - base == (h * TACTICAL_FEATURES + h) + (h * h + h)
-    assert on == 4_821_445
+    assert on == 4_555_973

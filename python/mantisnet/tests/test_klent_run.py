@@ -389,9 +389,9 @@ def test_checkpoints_carry_and_enforce_their_model_config(tmp_path):
     with pytest.raises(ValueError, match="no longer implements"):
         load_model(path)
 
-    # The live Step 12 knobs are real config: a knobbed model round-trips.
+    # A live knob is real config: a knobbed model round-trips.
     knobbed_cfg = MantisConfig(
-        h=64, policy_hidden=64, window_attention=False
+        h=64, policy_hidden=64, cell_latents=True
     )
     knobbed = MantisNet(knobbed_cfg)
     knobbed_path = tmp_path / "knobbed.pt"
@@ -404,7 +404,7 @@ def test_checkpoints_carry_and_enforce_their_model_config(tmp_path):
     )
     reloaded = load_model(knobbed_path)
     assert dataclasses.asdict(reloaded.cfg) == dataclasses.asdict(knobbed_cfg)
-    assert not hasattr(reloaded.blocks[0], "wa_bias")
+    assert hasattr(reloaded, "cell_base")
 
 
 def test_lab_cell_init_validates_format_build_and_model_kw(tmp_path):
@@ -434,14 +434,15 @@ def test_lab_cell_init_validates_format_build_and_model_kw(tmp_path):
     with pytest.raises(ValueError, match="model_kw"):
         load_lab_cell(path, target, {"h": 64, "policy_hidden": 64, "heads": 8})
 
-    # Legacy knob keys naming the baked architecture are stripped; the live
-    # window_attention knob at its default compares equal through the config.
+    # Legacy knob keys naming the baked architecture are stripped.
     load_lab_cell(path, target, {**model_kw, "cell_pass": True,
-                                 "joint_incidence": True, "window_attention": True})
+                                 "joint_incidence": True,
+                                 "window_attention": False})
 
-    # A recorded axis_bias=True names the removed §4.1 bias channel.
-    with pytest.raises(ValueError, match="no longer implements"):
-        load_lab_cell(path, target, {**model_kw, "axis_bias": True})
+    # Recorded knobs naming removed machinery are refused.
+    for legacy in ({"axis_bias": True}, {"window_attention": True}):
+        with pytest.raises(ValueError, match="no longer implements"):
+            load_lab_cell(path, target, {**model_kw, **legacy})
 
     torch.save({**cell, "lab_cell_format": 2}, path)
     with pytest.raises(ValueError, match="not a lab cell"):

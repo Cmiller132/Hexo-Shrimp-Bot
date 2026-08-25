@@ -6,7 +6,6 @@ import torch
 
 from mantisnet import MantisConfig, MantisNet, collate, from_position
 from mantisnet.attention import fused_attention
-from mantisnet.window_pairs import edge_attention, pair_tables
 
 
 def test_softmax_key_projection_parameter_census():
@@ -14,15 +13,12 @@ def test_softmax_key_projection_parameter_census():
     parameters = dict(MantisNet(cfg).named_parameters())
 
     for index in range(cfg.blocks):
-        for projection in ("wk", "wk_wa"):
-            bias_key = f"blocks.{index}.{projection}.bias"
-            weight_key = f"blocks.{index}.{projection}.weight"
-            assert bias_key not in parameters
-            assert weight_key in parameters
+        assert f"blocks.{index}.wk.bias" not in parameters
+        assert f"blocks.{index}.wk.weight" in parameters
 
 
 @torch.no_grad()
-def test_constant_post_projection_key_bias_cancels_in_both_cpu_attention_paths(
+def test_constant_post_projection_key_bias_cancels_in_cpu_attention(
     positions,
 ):
     torch.manual_seed(37)
@@ -60,19 +56,4 @@ def test_constant_post_projection_key_bias_cancels_in_both_cpu_attention_paths(
     stone_expected = fused_attention(q, k, v, seq_lens)
     stone_actual = fused_attention(q, k + key_bias[None, :, None, :], v, seq_lens)
 
-    # Real window rows and pair relations from the same collated batch.
-    windows = net.window_table(batch.window_feat)
-    wz = block.ln_wa(windows)
-    n_windows = windows.shape[0]
-    wq = block.wq_wa(wz).view(n_windows, heads, head_dim)
-    wk = block.wk_wa(wz).view(n_windows, heads, head_dim)
-    wv = block.wv_wa(wz).view(n_windows, heads, head_dim)
-    pairs = pair_tables(batch.window_id, batch.window_slot // batch.max_w)
-    window_bias = torch.linspace(-0.75, -0.125, cfg.h).view(heads, head_dim)
-    window_expected = edge_attention(wq, wk, wv, block.wa_bias, *pairs)
-    window_actual = edge_attention(
-        wq, wk + window_bias[None, :, :], wv, block.wa_bias, *pairs
-    )
-
     torch.testing.assert_close(stone_actual, stone_expected, rtol=1e-6, atol=1e-6)
-    torch.testing.assert_close(window_actual, window_expected, rtol=1e-6, atol=1e-6)

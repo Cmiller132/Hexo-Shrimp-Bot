@@ -66,7 +66,6 @@ def _profile_activities(device: str):
 # claims a row, so the in-repo Triton kernels come before the generic families
 # ("triton_" alone would also claim them).
 _FIT_BUCKETS = {
-    "window_pairs": ("_wa_",),
     "relay": (
         "_cell_values_kernel",
         "_cell_grad_kernel",

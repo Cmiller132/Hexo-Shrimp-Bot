@@ -318,7 +318,7 @@ def test_outputs_are_d6_invariant():
 def test_checkpoint_round_trips_through_the_family_registry(tmp_path):
     from mantisnet.lab.families import infer_config, load_checkpoint
 
-    cfg = MantisConfig()
+    cfg = MantisConfig(cell_latents=True)
     torch.manual_seed(2)
     model = MantisNet(cfg)
     inferred = infer_config(model.state_dict())

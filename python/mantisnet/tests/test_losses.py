@@ -77,11 +77,17 @@ def test_param_groups_partition_and_membership(model):
     assert no_decay["weight_decay"] == 0.0
 
     assert id(model.stone_table.weight) in ids_n  # embedding table
-    assert id(model.blocks[0].wa_bias) in ids_n  # attention-bias table
     assert id(model.latent_base) in ids_d  # learned matrix
     assert id(model.blocks[0].wq.bias) in ids_n  # ndim 1
     assert id(model.blocks[0].wq.weight) in ids_d
     assert id(model.value_queries) in ids_d  # listed nowhere in §10's exclusions
+
+    # The attention-bias tables live behind the cell knobs now.
+    from mantisnet import MantisConfig, MantisNet
+
+    celled = MantisNet(MantisConfig(cell_latents=True))
+    _decay_c, no_decay_c = param_groups(celled, weight_decay=0.1)
+    assert id(celled.blocks[0].cr_bias) in {id(p) for p in no_decay_c["params"]}
 
 
 def test_every_parameter_receives_gradient(positions):

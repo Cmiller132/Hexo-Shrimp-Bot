@@ -285,7 +285,6 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
     batch = _batch_for_case(positions, "ragged")
     model = model.to(_DEVICE)
     block = model.blocks[0]
-    pairs = model._pair_tables(batch)
     plan = incidence_plan(batch.inc_stone, batch.inc_window, batch.inc_class)
     seen: set[str] = set()
 
@@ -330,14 +329,14 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
                 batch.stone_own.shape[0], message_impl.STONE_RUN,
             )
             fast = block(
-                s, w, g, None, batch, seq_lens, plan, pairs,
+                s, w, g, None, batch, seq_lens, plan,
                 layout, None, None, None, ws_rows, sw_rows, update_stones=True,
             )
 
             monkeypatch.setattr(message_impl, "aggregate_to_windows", windows)
             monkeypatch.setattr(message_impl, "aggregate_to_stones", stones)
             reference = block(
-                s, w, g, None, batch, seq_lens, plan, pairs,
+                s, w, g, None, batch, seq_lens, plan,
                 layout, None, None, None, ws_rows, sw_rows, update_stones=True,
             )
     finally:

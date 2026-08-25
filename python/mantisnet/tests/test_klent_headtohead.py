@@ -235,7 +235,8 @@ def test_each_pair_plays_both_seats_from_its_own_shared_opening(checkpoints):
 
     assert result["pairs"] == 3 and result["games"] == 6
     assert result["a_wins"] == result["score_as_p0"] + result["score_as_p1"]
-    assert bool(result["warnings"]) == (result["capped"] > 0)
+    capped_warnings = [w for w in result["warnings"] if "capped" in w]
+    assert bool(capped_warnings) == (result["capped"] > 0)
     for row in result["per_pair"]:
         assert row["seats"] == [0, 1]
         assert 2 <= len(row["opening"]) <= 6

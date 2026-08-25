@@ -33,7 +33,6 @@ from . import (
     relay,
     row_encoder,
     window_latents,
-    window_pairs,
 )
 from .attention import fused_attention
 from .builder import (
@@ -62,12 +61,6 @@ class MantisConfig:
     policy_hidden: int = 128  # P_H
     value_hidden: int = 128  # V_H
     dropout: float = 0.0
-    # Live knob for the §5.1c typed window-pair attention stage.
-    window_attention: bool = True
-    # §5.1c claim reach: 5 is the donor geometry; 0 restricts the crossing
-    # join to pairs sharing an in-span cell (Step 15 arm E, pricing the
-    # out-of-span crossing signal). A path selector, not a tunable radius.
-    claim_reach: int = 5
     # Step 15 knob: cell latents replace the §5.1b relay with persistent
     # typed state on the covered legal cells.
     cell_latents: bool = False
@@ -89,15 +82,6 @@ class MantisConfig:
             raise ValueError(f"H={self.h} must divide into A={self.heads} heads")
         if self.value_bins % 2 == 0:
             raise ValueError(f"K={self.value_bins} must be odd so an exact-zero bin exists")
-        if self.claim_reach not in (0, 5):
-            raise ValueError(
-                f"claim_reach must be one of {{0, 5}}, got {self.claim_reach}"
-            )
-        if self.claim_reach == 0 and not self.window_attention:
-            raise ValueError(
-                "claim_reach=0 modifies the §5.1c stage, which "
-                "window_attention=False removes; the knob would be inert"
-            )
         if self.cell_adjacency and not self.cell_nodes:
             raise ValueError("cell_adjacency requires cell_nodes=True")
         if self.cell_node_scope not in cell_nodes.CELL_NODE_SCOPES:
@@ -174,6 +158,8 @@ LEGACY_BAKED_KNOBS: dict[str, object] = {
     "state_latents": 4,
     "action_latents": False,
     "line_pass": False,
+    "window_attention": False,
+    "claim_reach": 5,
 }
 
 
@@ -345,16 +331,6 @@ class _Block(nn.Module):
             self.e_cp = nn.Embedding(cfg.dec_classes, h)
             self.ln_cp_w = nn.LayerNorm(h)
             self.mlp_cp = _PairMlp(h, h, h)
-        # §5.1c window <- windows through typed pair relations.
-        if cfg.window_attention:
-            self.ln_wa = nn.LayerNorm(h)
-            self.wq_wa = nn.Linear(h, h)
-            self.wk_wa = nn.Linear(h, h, bias=False)
-            self.wv_wa = nn.Linear(h, h)
-            self.wo_wa = nn.Linear(h, h)
-            self.wa_bias = nn.Parameter(
-                torch.zeros(cfg.heads, window_pairs.WA_CLASSES)
-            )
         # Window read, latent self-mix, and window broadcast. Every key
         # projection is bias-free because a shared key bias cancels from
         # its softmax row.
@@ -518,29 +494,6 @@ class _Block(nn.Module):
         w = w + self.drop(self.wr_wo(back.reshape(n_w, cfg.h).to(zw.dtype)))
         return w, c
 
-    def _window_attention(self, w: Tensor, pairs) -> Tensor:
-        """§5.1c: multi-head attention over each window's relation edges.
-
-        The edge op runs scores, softmax, and the weighted sum in fp32
-        whatever autocast chose for the projections, saves only the softmax
-        stats, and recomputes every per-edge quantity in backward. ``pairs``
-        is the trunk's per-batch ``PairTables``, derived once on device.
-        """
-        cfg = self.cfg
-        heads, hd = cfg.heads, cfg.h // cfg.heads
-        n_w = w.shape[0]
-
-        z = self.ln_wa(w)
-        out = window_pairs.edge_attention(
-            self.wq_wa(z).view(n_w, heads, hd),
-            self.wk_wa(z).view(n_w, heads, hd),
-            self.wv_wa(z).view(n_w, heads, hd),
-            self.wa_bias,
-            *pairs,
-        )
-        out = self.wo_wa(out.reshape(n_w, cfg.h).to(z.dtype))
-        return w + self.drop(out)
-
     def _window_latent_cycle(
         self,
         w: Tensor,
@@ -601,7 +554,6 @@ class _Block(nn.Module):
         batch: Batch,
         seq_lens: Tensor,
         plan: message_passing.IncidencePlan,
-        pairs,
         latent_layout: tuple[Tensor, Tensor, Tensor],
         ctab: cell_latents.CellTables | None,
         radius: cell_latents.CellTables | None,
@@ -660,8 +612,6 @@ class _Block(nn.Module):
                 batch.relay_cls_ptr,
                 batch.relay_ccell,
             )
-        if cfg.window_attention:
-            w = self._window_attention(w, pairs)
 
         # §5.2: stones aggregate their windows.
         y = self.v(self.ln_sw_w(w))
@@ -871,19 +821,6 @@ class MantisNet(nn.Module):
                 nn.init.zeros_(block.mlp_c.out.weight)
                 nn.init.zeros_(block.mlp_c.out.bias)
 
-    def _pair_tables(self, batch: Batch):
-        # §5.1c tables are born on the batch's device from the window
-        # identities: the int64 edge views cost several times more to ship
-        # over PCIe than to derive beside the model, and every block shares
-        # one derivation. The op is opaque to the compiler — a graph break
-        # here would spill the surrounding message passing to eager. The
-        # source view shares the destination view's arrays (reversal
-        # closure), reassembled here because ops may not return aliases.
-        ptr, src, cls, scls, cptr, cedge = window_pairs.derive_pair_tables(
-            batch.window_id, batch.window_slot // batch.max_w, self.cfg.claim_reach
-        )
-        return window_pairs.PairTables(ptr, src, cls, ptr, src, scls, cptr, cedge)
-
     def _cell_tables(self, batch: Batch, n_windows: int) -> cell_latents.CellTables:
         # The decoder incidence resorted into the cell-attention views, with
         # the covered -> legal mapping the heads scatter refined latents by.
@@ -990,7 +927,6 @@ class MantisNet(nn.Module):
             batch.inc_window,
             batch.inc_class,
         )
-        pairs = self._pair_tables(batch) if cfg.window_attention else None
         window_pos = batch.window_slot // batch.max_w
         offsets, order = window_latents.window_latent_layout(
             window_pos, g.shape[0]
@@ -1038,7 +974,6 @@ class MantisNet(nn.Module):
                 batch,
                 seq_lens,
                 plan,
-                pairs,
                 latent_layout,
                 ctab,
                 radius,

@@ -24,9 +24,8 @@ side to move), window pattern, joint slot classes, displacement orbits, and
 
 The **trunk** interleaves bipartite message passing (stones to/from windows)
 with content-only self-attention over the stone set. A cell-pass
-relay lets windows exchange state through shared empty cells, and a
-window-attention layer (the live `window_attention` knob, on by default)
-types window pairs by colinear/crossing relations. In every block the four
+relay — or, in the production configuration, persistent typed cell state —
+lets windows exchange state through shared empty cells. In every block the four
 latents read the real windows, self-mix, and broadcast back to those windows;
 their final normalized mean is the global context consumed by the heads.
 
@@ -274,8 +273,8 @@ numbers go to `docs/ABLATIONS.md`.
 
 The family registry identifies a checkpoint structurally from its model key
 set, native critic-readout width, and decoder-table row count. Configuration
-is inferred from state-dict tensor shapes, including the live
-`window_attention` knob from the presence of §5.1c tensors. Cell state is one
+is inferred from state-dict tensor shapes; head count needs a per-head
+tensor (a cell-stage bias table) or the recorded-config hint. Cell state is one
 stage, so an all-cell profile is named `cell_nodes` alone — except under
 `cell_structure`, whose own requirement puts `cell_latents` back on. The
 latent base, per-block latent cycle, and row encoder are required. Shipped
@@ -440,7 +439,6 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `optim.py` | Fused-Adam execution policy, recorded and reapplied across checkpoint loads |
 | `message_passing.py` | Fused incidence aggregation for the two trunk message-passing directions |
 | `relay.py` | Cell-pass relay: windows exchange state through shared empty cells via Triton segment kernels |
-| `window_pairs.py` | Window-pair relation tables (colinear/crossing) and typed window attention |
 | `segments.py` | Ragged segment reductions: ids, sum, max, log-softmax over CSR offsets |
 | `losses.py` | Policy cross-entropy, distributional value cross-entropy, value target projection, param groups |
 | `fitloop.py` | Architecture-agnostic packed epoch engine: chunk packing, prefetch, fitting loop |

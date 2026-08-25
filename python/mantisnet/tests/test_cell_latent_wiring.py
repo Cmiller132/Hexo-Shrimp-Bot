@@ -27,7 +27,6 @@ def _config(**overrides) -> MantisConfig:
         policy_hidden=16,
         value_hidden=16,
         cell_latents=True,
-        window_attention=False,
     )
     values.update(overrides)
     return MantisConfig(**values)
@@ -39,12 +38,6 @@ def _batch(positions, count=6):
 
 def test_the_knobs_are_path_selectors():
     assert MantisConfig().cell_latents is False
-    assert MantisConfig().claim_reach == 5
-    for value in (-1, 1, 3, 4, 6):
-        with pytest.raises(ValueError, match=r"claim_reach"):
-            MantisConfig(claim_reach=value)
-    with pytest.raises(ValueError, match="inert"):
-        MantisConfig(claim_reach=0, window_attention=False)
 
 
 def test_knobs_off_leave_no_step15_trace():
@@ -59,7 +52,7 @@ def test_the_cell_stage_replaces_the_relay():
     assert "blocks.1.wr_bias" in state
     relay = ("u_cp", "e_cp", "mlp_cp", "ln_cp_in", "ln_cp_w")
     assert not any(mark in key for key in state for mark in relay)
-    relayed = MantisNet(_config(cell_latents=False, window_attention=True))
+    relayed = MantisNet(_config(cell_latents=False))
     assert "blocks.0.u_cp.weight" in relayed.state_dict()
 
 
@@ -120,7 +113,7 @@ def test_uncovered_legal_cells_read_the_base_row(positions):
 
 def test_the_decoder_input_contract_fails_loudly(positions):
     batch = _batch(positions, count=2)
-    off = MantisNet(_config(cell_latents=False, window_attention=True)).eval()
+    off = MantisNet(_config(cell_latents=False)).eval()
     on = MantisNet(_config()).eval()
     with torch.no_grad():
         w_off, g_off, cells_off = off.trunk(batch)
@@ -133,19 +126,15 @@ def test_the_decoder_input_contract_fails_loudly(positions):
 
 
 def test_arm_shapes_infer_and_reload(positions):
-    # Every measured Step 15 arm round-trips shape inference and a strict
-    # state-dict load; claim_reach leaves no tensor trace, so arm E infers
-    # as the baseline shape.
+    # The surviving Step 15 arms round-trip shape inference and a strict
+    # state-dict load. The relay arm carries no per-head tensor, so its
+    # head count rides the recorded-config hint.
     arms = {
-        "B": _config(),
-        "D": _config(cell_latents=False, window_attention=True),
-        "E": _config(
-            cell_latents=False, window_attention=True, claim_reach=0,
-        ),
+        "B": (_config(), None),
+        "D": (_config(cell_latents=False), 2),
     }
-    for arm, cfg in arms.items():
+    for arm, (cfg, heads) in arms.items():
         state = MantisNet(cfg).state_dict()
-        inferred = infer_config(state)
-        expected = cfg if arm != "E" else replace(cfg, claim_reach=5)
-        assert inferred == expected, arm
+        inferred = infer_config(state, heads=heads)
+        assert inferred == cfg, arm
         MantisNet(inferred).load_state_dict(state, strict=True)

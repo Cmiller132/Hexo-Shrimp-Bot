@@ -23,7 +23,6 @@ from mantisnet.cell_latents import (
     cell_tables,
     window_read,
 )
-from mantisnet.window_pairs import edge_attention
 
 
 def _synthetic_incidence(seed: int, n_cells: int = 14, n_windows: int = 12):

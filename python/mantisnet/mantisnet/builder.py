@@ -720,10 +720,6 @@ class Batch:
     relay_wcell: torch.Tensor  # (E_d,) long: compact edge cells, window order
     relay_cls_ptr: torch.Tensor  # (TERN_DEC_CLASSES + 1,) long
     relay_ccell: torch.Tensor  # (E_d,) long: compact edge cells, class order
-    # The §5.1c window-pair views are not collated: a window_attention model
-    # derives them on its own device from window_id — the edge views cost
-    # several times more to ship than to derive beside the model.
-    #
     # Action-row tables. The kept rows (a nonempty candidate window through
     # the action cell) are in bijection with the decoder incidence — the same
     # 18-candidate walk in the same order — so they ride the ``dec_*`` views

@@ -3,7 +3,7 @@
 The reference description of the MantisNet network: what it plays, what it
 sees, how it computes, what it outputs, and how it is trained. It is written
 for readers outside the project; no prior knowledge of the codebase is
-assumed. Code comments cite this document's section numbers (`§5.1c`,
+assumed. Code comments cite this document's section numbers (`§5.1b`,
 `appendix B`, …), so the numbering is part of the interface and is kept
 stable.
 
@@ -57,8 +57,6 @@ Architecture knobs (validated jointly at construction):
 
 | Knob | Default | Meaning |
 | --- | --- | --- |
-| `window_attention` | `True` | the §5.1c typed window-pair attention stage |
-| `claim_reach` | `5` | §5.1c crossing-join reach; `{0, 5}`, a path selector |
 | `cell_latents` | `False` | persistent covered-cell latents replacing the §5.1b relay |
 | `cell_nodes` | `False` | extends persistent cell state to every legal cell, with radius edges |
 | `cell_node_scope` | `"all"` | radius/adjacency edge destinations: `all` or `uncovered` |
@@ -67,10 +65,9 @@ Architecture knobs (validated jointly at construction):
 | `action_tactical` | `False` | encodes the §4.4 tactical scalars into the action row through a small MLP |
 
 The production training configuration at this writing is `cell_latents=True,
-cell_nodes=True, cell_node_scope="all", window_attention=False`; the default
-configuration keeps window attention on and cell state off. Parameter count
-is 4,804,581 at defaults (pinned by tests) and 5,197,093 at the production
-configuration. `cell_structure` adds 726·H + 8·H for its two static tables
+cell_nodes=True, cell_node_scope="all"`; the default configuration keeps
+cell state off. Parameter count is 4,537,925 at defaults (pinned by tests)
+and 5,195,909 at the production configuration. `cell_structure` adds 726·H + 8·H for its two static tables
 and B·(2H + 3H² + 2H) for the per-block update MLP — 292,608 at the default
 widths and four blocks.
 
@@ -188,11 +185,7 @@ pattern:
   and the empty candidate slot.
 
 Both vocabularies are folded under simultaneous reversal of pattern and
-slot, so a window and its mirror image produce identical classes. Window
-pair relations (§5.1c) use a **48-class** vocabulary typing
-colinear/crossing geometry; `claim_reach` selects the crossing join — `5`
-joins window pairs through any claimed cell within the donor geometry's
-reach, `0` restricts to pairs sharing an in-span cell.
+slot, so a window and its mirror image produce identical classes.
 
 ### 4.4 Action rows
 
@@ -244,9 +237,7 @@ in order:
    and the adjacency pass are unaffected. With cell state off, a
    parameter-tied transient relay lets windows exchange state through shared
    empty cells instead.
-3. **§5.1c window attention** — multi-head attention over each window's
-   typed pair relations (48 classes), when `window_attention` is on.
-4. **§5.2 stone ← windows** — the mirror of §5.1: stones aggregate their
+3. **§5.2 stone ← windows** — the mirror of §5.1: stones aggregate their
    windows plus the class row sum.
 5. **§5.3 stone self-attention** — attention over `[latent rows; stones]`,
    block-diagonal per position, content-only scores (§4.1). The four latent
@@ -322,10 +313,9 @@ and reverse views, cell fields, radius and adjacency edges, and
 `moves_remaining`; all index tensors are mandatory, and a missing input is
 an error rather than a silently substituted default. The production builder
 is the Rust encoder (shared with the engine bindings); the Python builder
-is its oracle. Relational tables that depend only on window identities —
-§5.1c pairs, lines, cell views — are derived once per forward on the
-model's device through compiler-opaque operations, so compiled execution
-has no graph break.
+is its oracle. Relational tables that depend only on window identities — the cell
+views — are derived once per forward on the model's device through
+compiler-opaque operations, so compiled execution has no graph break.
 
 ## 10. Numerics and conventions
 

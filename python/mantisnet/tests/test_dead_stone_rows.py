@@ -50,7 +50,6 @@ def test_last_block_attention_and_ffn_still_learn(positions):
         value_bins=9,
         policy_hidden=24,
         value_hidden=20,
-        window_attention=False,
         cell_latents=True,
         cell_nodes=True,
         action_tactical=True,

@@ -17,8 +17,6 @@ at O(incidence) instead of O(pairs). Two mechanisms live here:
 - **Line tables.** Windows grouped per (position, axis, line), every
   intra-line pair an edge at unbounded offset: the colinear vocabulary of
   §5.1c exactly (|offset| − 1 for offsets 1..11), an out-of-reach FAR
-  class, and SELF. The views are ``window_pairs.PairTables``, so the line
-  pass runs on ``window_pairs.edge_attention`` unchanged.
 
 Both derivations run on-device from batch tensors, as §5.1c's tables do:
 the int64 edge views cost more to ship over PCIe than to derive beside the
@@ -46,7 +44,6 @@ from typing import NamedTuple
 import torch
 from torch import Tensor
 
-from . import window_pairs
 
 try:
     import triton

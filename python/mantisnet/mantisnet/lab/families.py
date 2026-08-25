@@ -31,7 +31,6 @@ from ..model import (
     strip_legacy_knobs,
 )
 from ..segments import segment_ids, segment_max
-from ..window_pairs import WA_CLASSES
 
 
 _HISTORIC_OCC_CLASSES = 93
@@ -220,11 +219,6 @@ _CP_SUFFIXES = {
     "mlp_cp.lin_a.bias", "mlp_cp.lin_b.weight", "mlp_cp.out.weight",
     "mlp_cp.out.bias",
 }
-_WA_SUFFIXES = {
-    "ln_wa.weight", "ln_wa.bias", "wq_wa.weight", "wq_wa.bias",
-    "wk_wa.weight", "wv_wa.weight", "wv_wa.bias",
-    "wo_wa.weight", "wo_wa.bias", "wa_bias",
-}
 _LATENT_SUFFIXES = {
     "latent_ln_read_q.weight", "latent_ln_read_q.bias",
     "latent_ln_read_w.weight", "latent_ln_read_w.bias",
@@ -278,7 +272,6 @@ class _Knobs:
     cell_pass: bool
     cell_pass_from: int
     joint_incidence: bool
-    window_attention: bool
     mixed_windows: bool
     state_latents: int
     cell_latents: bool
@@ -321,7 +314,6 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
             and e_ws.shape[0]
             == (TERN_OCC_CLASSES if mixed else _HISTORIC_OCC_CLASSES)
         ),
-        window_attention="blocks.0.wa_bias" in state_dict,
         mixed_windows=mixed,
         state_latents=(
             int(latent_base.shape[0])
@@ -339,13 +331,11 @@ def _knob_profile(state_dict: Mapping[str, Tensor], blocks: int) -> _Knobs:
     )
 
 
-# The profile this build instantiates. Window attention remains live, so its
-# value is normalized during profile comparison.
+# The profile this build instantiates.
 _BAKED = _Knobs(
     cell_pass=True,
     cell_pass_from=0,
     joint_incidence=True,
-    window_attention=True,
     mixed_windows=True,
     state_latents=4,
     cell_latents=False,
@@ -374,8 +364,6 @@ def _base_keys(blocks: int, knobs: _Knobs) -> set[str]:
         keys |= _TACTICAL_KEYS
     for index in range(blocks):
         prefix = f"blocks.{index}."
-        if knobs.window_attention:
-            keys |= {prefix + suffix for suffix in _WA_SUFFIXES}
         keys |= {prefix + suffix for suffix in _LATENT_SUFFIXES}
         if knobs.cell_latents or knobs.cell_nodes:
             keys |= {prefix + suffix for suffix in _CELL_SUFFIXES}
@@ -503,10 +491,6 @@ def _expected_shapes(
         bias_free += ["adj_wk"]
     if cfg.cell_structure:
         ln_names.append("ln_c")
-    if cfg.window_attention:
-        ln_names.append("ln_wa")
-        biased += ["wq_wa", "wv_wa", "wo_wa"]
-        bias_free.append("wk_wa")
     ln_names += [
         "latent_ln_read_q", "latent_ln_read_w", "latent_ln_mix",
         "latent_ln_bcast_q", "latent_ln_bcast_l",
@@ -556,8 +540,6 @@ def _expected_shapes(
             shapes[prefix + name + ".bias"] = (h,)
         for name in bias_free:
             shapes[prefix + name + ".weight"] = (h, h)
-        if cfg.window_attention:
-            shapes[prefix + "wa_bias"] = (cfg.heads, WA_CLASSES)
         shapes[prefix + "ffn.0.weight"] = (fh, h)
         shapes[prefix + "ffn.0.bias"] = (fh,)
         shapes[prefix + "ffn.2.weight"] = (h, fh)
@@ -604,7 +586,6 @@ def infer_config(
     # profile.
     expected = replace(
         _BAKED,
-        window_attention=knobs.window_attention,
         cell_latents=knobs.cell_latents,
         cell_nodes=knobs.cell_nodes,
         cell_adjacency=knobs.cell_adjacency,
@@ -618,7 +599,7 @@ def infer_config(
     # the head count comes from whichever knob's per-head bias is present,
     # falling back to the recorded-config hint.
     source = None
-    for name in ("cr_bias", "wa_bias", "radius_bias", "adj_bias"):
+    for name in ("cr_bias", "radius_bias", "adj_bias"):
         bias = state_dict.get(f"blocks.0.{name}")
         if isinstance(bias, Tensor):
             if bias.ndim != 2 or bias.shape[0] <= 0:
@@ -631,7 +612,7 @@ def infer_config(
     if heads is None:
         raise ValueError(
             "state dict carries no per-head bias tensor "
-            "(cr_bias/wa_bias/radius_bias/adj_bias) and no recorded "
+            "(cr_bias/radius_bias/adj_bias) and no recorded "
             "config supplied the head count"
         )
     if h % heads:
@@ -695,7 +676,6 @@ def infer_config(
         policy_hidden=policy_hidden,
         value_hidden=value_hidden,
         dropout=0.0,
-        window_attention=knobs.window_attention,
         cell_latents=knobs.cell_latents,
         cell_nodes=knobs.cell_nodes,
         cell_adjacency=knobs.cell_adjacency,
@@ -876,14 +856,11 @@ def load_checkpoint(
         state, heads=None if recorded_cfg is None else recorded_cfg.heads
     )
     if recorded_cfg is not None:
-        # claim_reach leaves no tensor trace, so shape inference cannot see
-        # it; it is compared out here and adopted from the record below.
-        if replace(recorded_cfg, dropout=0.0, claim_reach=config.claim_reach) != config:
+        if replace(recorded_cfg, dropout=0.0) != config:
             raise ValueError(
                 f"checkpoint model_config {recorded_cfg} does not match the "
                 f"configuration inferred from its tensors {config}"
             )
-        config = replace(config, claim_reach=recorded_cfg.claim_reach)
     model = entry.load(state, config, device)
     assert entry.composition is not None
     return LoadedCheckpoint(

@@ -29,6 +29,7 @@ TINY = MantisConfig(
     value_bins=9,
     policy_hidden=12,
     value_hidden=10,
+    cell_latents=True,
 )
 
 
@@ -64,7 +65,8 @@ def _family_state(name: str, *, cfg=TINY):
         for index in range(cfg.blocks):
             for suffix in ("e_ws.weight", "e_sw.weight", "e_cp.weight"):
                 key = f"blocks.{index}.{suffix}"
-                state[key] = state[key][:93]
+                if key in state:  # e_cp only exists in relay-mode blocks
+                    state[key] = state[key][:93]
     if name == "tail-slot":
         fh = cfg.ffn_factor * cfg.h
         state.update(
@@ -185,6 +187,7 @@ def test_infer_config_recovers_a_nondefault_deep_shape_exactly():
         policy_hidden=48,
         value_hidden=40,
         dropout=0.0,
+        cell_latents=True,
     )
     assert infer_config(MantisNet(cfg).state_dict()) == cfg
 
@@ -240,9 +243,7 @@ def test_pre_baked_trunk_identifies_and_refuses_with_its_profile(tmp_path):
     for index in range(blocks):
         prefix = f"blocks.{index}."
         for key in list(state):
-            if key.startswith(prefix) and (
-                "_cp" in key or "_wa" in key or key.endswith("wa_bias")
-            ):
+            if key.startswith(prefix) and "_cp" in key:
                 del state[key]
         for key in (prefix + "e_ws.weight", prefix + "e_sw.weight"):
             state[key] = state[key][:3]
@@ -255,7 +256,7 @@ def test_pre_baked_trunk_identifies_and_refuses_with_its_profile(tmp_path):
 def test_baked_keys_on_only_some_blocks_are_refused(tmp_path):
     cfg = replace(TINY, blocks=2)
     state = _family_state("trinomial-joint", cfg=cfg)
-    del state["blocks.1.wa_bias"]
+    del state["blocks.1.ffn.0.weight"]
     path = tmp_path / "torn.pt"
     torch.save({"model": state, "versions": _versions(), "iteration": 1}, path)
     with pytest.raises(ValueError, match="not identifiable by the family registry"):

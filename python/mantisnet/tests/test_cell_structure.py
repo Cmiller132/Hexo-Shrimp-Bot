@@ -20,7 +20,6 @@ PRODUCTION = dict(
     cell_latents=True,
     cell_nodes=True,
     cell_node_scope="all",
-    window_attention=False,
 )
 ARM_B = dict(PRODUCTION, action_tactical=True)
 
@@ -269,7 +268,7 @@ def _count(**overrides) -> int:
 
 
 def test_parameter_counts_are_pinned_on_and_off_the_knob():
-    assert _count() == 4_803_397
+    assert _count() == 4_537_925
     assert _count(**PRODUCTION) == 5_195_909
     assert _count(**ARM_B) == 5_213_957
     assert _count(**ARM_B, cell_structure=True) == 5_506_565
@@ -279,7 +278,6 @@ def test_the_knob_is_inferable_from_a_state_dict():
     for cfg in (
         MantisConfig(**ARM_B, cell_structure=True),
         MantisConfig(cell_latents=True, cell_structure=True),
-        MantisConfig(cell_latents=True, cell_structure=True, window_attention=False),
     ):
         assert infer_config(MantisNet(cfg).state_dict()) == cfg
     # An all-cell profile without the knob still names only `cell_nodes`.

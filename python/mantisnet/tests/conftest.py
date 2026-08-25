@@ -51,7 +51,6 @@ _CUDA_FILES = {
     "test_relay.py",
     "test_row_encoder.py",
     "test_window_latent_kernel.py",
-    "test_window_pairs.py",
 }
 
 

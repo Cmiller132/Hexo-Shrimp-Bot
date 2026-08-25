@@ -115,18 +115,10 @@ def test_rust_python_parity():
             assert getattr(rust, name) == value, name
 
 
-_ARM_CONFIGS = {
-    "attention-on": {},
-    "attention-off": {"window_attention": False},
-}
-
-
-@pytest.mark.parametrize("arm", sorted(_ARM_CONFIGS))
-def test_knobbed_arms_forward_and_shapes(arm):
-    """Each matrix arm builds, runs every head, and sizes its tables to its
-    scope; window-attention off means no §5.1c parameters at all."""
-    kw = _ARM_CONFIGS[arm]
-    cfg = MantisConfig(h=32, heads=2, blocks=2, policy_hidden=32, value_hidden=32, **kw)
+def test_baked_model_forward_and_shapes():
+    """The baked model builds, runs every head, and sizes its tables;
+    the deleted §5.1c stage leaves no parameters."""
+    cfg = MantisConfig(h=32, heads=2, blocks=2, policy_hidden=32, value_hidden=32)
     torch.manual_seed(0)
     model = MantisNet(cfg).eval()
 
@@ -134,8 +126,7 @@ def test_knobbed_arms_forward_and_shapes(arm):
     assert model.e_pw.weight.shape[0] == cfg.dec_classes
     assert model.blocks[0].e_ws.weight.shape[0] == cfg.occ_classes
     assert model.blocks[0].e_cp.weight.shape[0] == cfg.dec_classes
-    has_wa = any("wa" in name for name, _ in model.named_parameters())
-    assert has_wa == cfg.window_attention
+    assert not any("wa" in name for name, _ in model.named_parameters())
 
     batch = collate([from_position(pos) for pos in _positions()])
     with torch.no_grad():
@@ -168,11 +159,9 @@ def _transform(move):
     return telemetry.D6_TRANSFORMS[1](move)
 
 
-@pytest.mark.parametrize("arm", sorted(_ARM_CONFIGS))
-def test_knobbed_arms_are_d6_invariant(arm):
-    """Value invariance and policy equivariance hold for every arm."""
-    kw = _ARM_CONFIGS[arm]
-    cfg = MantisConfig(h=32, heads=2, blocks=2, policy_hidden=32, value_hidden=32, **kw)
+def test_baked_model_is_d6_invariant():
+    """Value invariance and policy equivariance hold for the baked model."""
+    cfg = MantisConfig(h=32, heads=2, blocks=2, policy_hidden=32, value_hidden=32)
     torch.manual_seed(1)
     model = MantisNet(cfg).eval()
 
@@ -197,10 +186,10 @@ def test_knobbed_arms_are_d6_invariant(arm):
 
 
 def test_checkpoint_round_trips_through_the_family_registry(tmp_path):
-    """A wa-off checkpoint is identified, config-inferred, and loaded."""
+    """A recorded-config checkpoint is identified, inferred, and loaded."""
     from mantisnet.lab.families import infer_config, load_checkpoint
 
-    cfg = MantisConfig(window_attention=False)
+    cfg = MantisConfig()
     torch.manual_seed(2)
     model = MantisNet(cfg)
     # With every per-head knob off no tensor carries the head count:
@@ -208,7 +197,7 @@ def test_checkpoint_round_trips_through_the_family_registry(tmp_path):
     with pytest.raises(ValueError, match="per-head"):
         infer_config(model.state_dict())
     inferred = infer_config(model.state_dict(), heads=cfg.heads)
-    assert not inferred.window_attention
+    assert inferred == cfg
 
     path = tmp_path / "mixed.pt"
     torch.save(
@@ -228,7 +217,7 @@ def test_checkpoint_round_trips_through_the_family_registry(tmp_path):
     )
     loaded = load_checkpoint(path)
     assert loaded.family.name == "trinomial-joint"
-    assert not loaded.config.window_attention
+    assert loaded.config == cfg
 
     batch = collate_prefixes(_GAMES[2:], [len(g) for g in _GAMES[2:]])
     with torch.no_grad():
