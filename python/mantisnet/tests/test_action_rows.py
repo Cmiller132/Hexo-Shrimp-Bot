@@ -345,7 +345,7 @@ def test_checkpoint_round_trips_through_the_family_registry(tmp_path):
         reference.load_state_dict(model.state_dict())
         expected = reference(batch, 0.2)
         got_policy, _score, got_q = loaded.model.cell_heads(
-            *loaded.model.trunk(batch)[1:], batch, 0.2
+            *loaded.model.trunk(batch), batch, 0.2
         )
     assert torch.allclose(got_policy, expected.policy_logits, atol=1e-6)
     assert torch.allclose(got_q, expected.q_values, atol=1e-6)

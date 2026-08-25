@@ -134,7 +134,7 @@ def _critic_target(z: torch.Tensor) -> torch.Tensor:
 
 
 def _evaluation_heads(model, batch, include_state_value: bool):
-    _stones, windows, token, cells = model.trunk(batch)
+    windows, token, cells = model.trunk(batch)
     policy, critic = model.cell_head_logits(windows, token, cells, batch)
     if include_state_value:
         value, _value_dist, value_logits = model.value_head(windows, token, batch)

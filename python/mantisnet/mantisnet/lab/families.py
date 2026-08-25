@@ -21,7 +21,6 @@ from ..builder import (
     TERN_PATTERNS,
     TERN_POST1_CLASSES,
 )
-from ..attention import AXIS_ROWS, ORBIT_CLASSES
 from ..cell_latents import LINE_CLASSES
 from ..cell_nodes import ADJACENCY_CLASSES, NEAREST_BUCKETS, RADIUS_CLASSES
 from ..klent.train import KlentConfig, _gpu_lock, _policy_q_fn
@@ -140,7 +139,7 @@ class FamilyMantisNet(MantisNet):
         )
 
     def forward(self, batch, mass_floor: float) -> ModelOutput:
-        _stones, windows, token, cells = self.trunk(batch)
+        windows, token, cells = self.trunk(batch)
         value, value_dist, value_logits = self.value_head(windows, token, batch)
         policy, q_score, q_values = self.cell_heads(
             windows, token, cells, batch, mass_floor
@@ -208,7 +207,7 @@ _BLOCK_SUFFIXES = {
     "v.weight", "e_sw.weight", "mlp_s.lin_a.weight", "mlp_s.lin_a.bias",
     "mlp_s.lin_b.weight", "mlp_s.out.weight", "mlp_s.out.bias",
     "ln_attn.weight", "ln_attn.bias", "wq.weight", "wq.bias", "wk.weight",
-    "wv.weight", "wv.bias", "wo.weight", "wo.bias", "axis_bias", "orbit_bias",
+    "wv.weight", "wv.bias", "wo.weight", "wo.bias",
     "ln_ffn.weight", "ln_ffn.bias", "ffn.0.weight", "ffn.0.bias",
     "ffn.2.weight", "ffn.2.bias",
 }
@@ -619,8 +618,6 @@ def _expected_shapes(
             shapes[prefix + "wa_bias"] = (cfg.heads, WA_CLASSES)
         if cfg.line_pass:
             shapes[prefix + "lp_bias"] = (cfg.heads, LINE_CLASSES)
-        shapes[prefix + "axis_bias"] = (cfg.heads, AXIS_ROWS)
-        shapes[prefix + "orbit_bias"] = (cfg.heads, ORBIT_CLASSES)
         shapes[prefix + "ffn.0.weight"] = (fh, h)
         shapes[prefix + "ffn.0.bias"] = (fh,)
         shapes[prefix + "ffn.2.weight"] = (h, fh)
@@ -637,12 +634,17 @@ def _baked_profile_error(knobs: _Knobs) -> ValueError:
     )
 
 
-def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
+def infer_config(
+    state_dict: Mapping[str, Tensor], *, heads: int | None = None
+) -> MantisConfig:
     """Recover every tensor-backed MantisConfig field from a state dict.
 
     The dict must carry every baked trunk stage; a knob-era or pre-knob
-    checkpoint (missing relay, §5.1c, or axis tensors, or three-row incidence
-    tables) names its actual profile in the refusal.
+    checkpoint (missing relay or §5.1c tensors, or three-row incidence
+    tables) names its actual profile in the refusal. ``heads`` is a
+    fallback from a recorded config: with every per-head knob off, no
+    tensor carries the head count, and inference without either source
+    refuses.
     """
 
     stone = _require_tensor(state_dict, "stone_table.weight")
@@ -655,17 +657,49 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
     if blocks is None:
         raise ValueError("tensor block indices are missing or not contiguous from blocks.0")
 
-    bias = _require_tensor(state_dict, "blocks.0.orbit_bias")
-    if bias.ndim != 2 or bias.shape[0] <= 0 or bias.shape[1] != ORBIT_CLASSES:
+    knobs = _knob_profile(state_dict, blocks)
+    # The live knobs read off the dict are accepted as-is; everything else —
+    # including the baked latents, and the relay, which is present exactly
+    # when the cell-latent stage has not replaced it — must be the baked
+    # profile.
+    expected = replace(
+        _BAKED,
+        window_attention=knobs.window_attention,
+        cell_latents=knobs.cell_latents,
+        line_pass=knobs.line_pass,
+        cell_nodes=knobs.cell_nodes,
+        cell_adjacency=knobs.cell_adjacency,
+        cell_structure=knobs.cell_structure,
+        cell_pass=not (knobs.cell_latents or knobs.cell_nodes),
+        action_tactical=knobs.action_tactical,
+        action_latents=knobs.action_latents,
+    )
+    if knobs != expected:
+        raise _baked_profile_error(knobs)
+    # No unconditional per-head tensor survives the §4.1 bias removal, so
+    # the head count comes from whichever knob's per-head bias is present,
+    # falling back to the recorded-config hint.
+    source = None
+    for name in ("cr_bias", "wa_bias", "radius_bias", "lp_bias", "adj_bias"):
+        bias = state_dict.get(f"blocks.0.{name}")
+        if isinstance(bias, Tensor):
+            if bias.ndim != 2 or bias.shape[0] <= 0:
+                raise ValueError(
+                    f"tensor 'blocks.0.{name}' has shape {tuple(bias.shape)}, "
+                    "expected (heads, classes)"
+                )
+            heads, source = int(bias.shape[0]), f"blocks.0.{name}"
+            break
+    if heads is None:
         raise ValueError(
-            f"tensor 'blocks.0.orbit_bias' has shape {tuple(bias.shape)}, "
-            f"expected (heads, {ORBIT_CLASSES})"
+            "state dict carries no per-head bias tensor "
+            "(cr_bias/wa_bias/radius_bias/lp_bias/adj_bias) and no recorded "
+            "config supplied the head count"
         )
-    heads = int(bias.shape[0])
     if h % heads:
         raise ValueError(
-            "tensors 'stone_table.weight' and 'blocks.0.orbit_bias' imply "
-            f"H={h}, heads={heads}, which do not divide evenly"
+            f"'stone_table.weight' and {source or 'the recorded config'} "
+            f"imply H={h}, heads={heads}, which do not divide evenly"
         )
 
     ffn = _require_tensor(state_dict, "blocks.0.ffn.0.weight")
@@ -713,25 +747,6 @@ def infer_config(state_dict: Mapping[str, Tensor]) -> MantisConfig:
             f"tensor 'mlp_v.2.weight' implies even value_bins={value_bins}; an odd width is required"
         )
 
-    knobs = _knob_profile(state_dict, blocks)
-    # The live knobs read off the dict are accepted as-is; everything else —
-    # including the baked latents, and the relay, which is present exactly
-    # when the cell-latent stage has not replaced it — must be the baked
-    # profile.
-    expected = replace(
-        _BAKED,
-        window_attention=knobs.window_attention,
-        cell_latents=knobs.cell_latents,
-        line_pass=knobs.line_pass,
-        cell_nodes=knobs.cell_nodes,
-        cell_adjacency=knobs.cell_adjacency,
-        cell_structure=knobs.cell_structure,
-        cell_pass=not (knobs.cell_latents or knobs.cell_nodes),
-        action_tactical=knobs.action_tactical,
-        action_latents=knobs.action_latents,
-    )
-    if knobs != expected:
-        raise _baked_profile_error(knobs)
     cfg = MantisConfig(
         h=h,
         blocks=blocks,
@@ -913,14 +928,18 @@ def load_checkpoint(
 
     if not entry.scoreable:
         raise ValueError(_unscoreable_message(entry))
-    config = infer_config(state)
     recorded = raw.get("model_config")
+    recorded_cfg = None
     if recorded is not None:
         if not isinstance(recorded, Mapping):
             raise ValueError(
                 f"checkpoint {checkpoint_path} model_config is not a mapping"
             )
         recorded_cfg = MantisConfig(**strip_legacy_knobs(dict(recorded)))
+    config = infer_config(
+        state, heads=None if recorded_cfg is None else recorded_cfg.heads
+    )
+    if recorded_cfg is not None:
         # claim_reach leaves no tensor trace, so shape inference cannot see
         # it; it is compared out here and adopted from the record below.
         if replace(recorded_cfg, dropout=0.0, claim_reach=config.claim_reach) != config:

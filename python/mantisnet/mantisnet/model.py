@@ -35,19 +35,13 @@ from . import (
     window_latents,
     window_pairs,
 )
-from .attention import (
-    AXIS_ROWS,
-    ORBIT_CLASSES,
-    axis_index,
-    compose_bias_table,
-    fused_attention,
-    orbit_lut,
-)
+from .attention import fused_attention
 from .builder import (
     ACTION_EMPTY_CLASSES,
     TACTICAL_FEATURES,
     TERN_DEC_CLASSES,
     TERN_OCC_CLASSES,
+    TERN_PATTERN_CLASS_COUNTS,
     TERN_PATTERNS,
     TERN_POST1_CLASSES,
     Batch,
@@ -175,7 +169,7 @@ COVERAGE_BUCKET_OF = (0, 0, 1, 2, 3, 4, 4, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 7)
 # recorded config carrying exactly these is this architecture and loads; any
 # other value names a model this build no longer implements.
 LEGACY_BAKED_KNOBS: dict[str, object] = {
-    "axis_bias": True,
+    "axis_bias": False,
     "off_axis_bias": False,
     "d_max": 12,
     "cell_pass": True,
@@ -405,28 +399,19 @@ class _Block(nn.Module):
         self.v = nn.Linear(h, h, bias=False)
         self.e_sw = nn.Embedding(cfg.occ_classes, h)
         self.mlp_s = _PairMlp(h, h, h)
-        # §5.3 stone self-attention + state latents. The bias table is typed
-        # by the §4.1 orbit vocabulary and learned in two parts per head: a
-        # coarse (distance, on-axis) table with FAR/SELF/TOKEN, plus a
-        # per-orbit residual; `bias_table()` composes the rows the kernel sees.
+        # §5.3 stone self-attention + state latents. No learned pair bias:
+        # the Step-11 knock-out measured the geometric bias channel decorative
+        # in the trained function, so scores are content-only.
         self.ln_attn = nn.LayerNorm(h)
         self.wq = nn.Linear(h, h)
         self.wk = nn.Linear(h, h, bias=False)
         self.wv = nn.Linear(h, h)
         self.wo = nn.Linear(h, h)
-        self.axis_bias = nn.Parameter(torch.zeros(cfg.heads, AXIS_ROWS))
-        self.orbit_bias = nn.Parameter(torch.zeros(cfg.heads, ORBIT_CLASSES))
-        self.register_buffer("axis_index", axis_index("cpu").clone(), persistent=False)
         self.ln_ffn = nn.LayerNorm(h)
         self.ffn = nn.Sequential(
             nn.Linear(h, cfg.ffn_factor * h), nn.ReLU(), nn.Linear(cfg.ffn_factor * h, h)
         )
         self.drop = nn.Dropout(cfg.dropout)
-
-    def bias_table(self) -> Tensor:
-        """The per-head ``(A, BIAS_ROWS)`` attention-bias rows: coarse
-        (distance, on-axis) rows plus the per-orbit residual."""
-        return compose_bias_table(self.axis_bias, self.orbit_bias, self.axis_index)
 
     def _cell_pass(
         self,
@@ -649,7 +634,6 @@ class _Block(nn.Module):
         c: Tensor | None,
         batch: Batch,
         seq_lens: Tensor,
-        orbit_table: Tensor,
         plan: message_passing.IncidencePlan,
         pairs,
         latent_layout: tuple[Tensor, Tensor, Tensor],
@@ -657,6 +641,9 @@ class _Block(nn.Module):
         ctab: cell_latents.CellTables | None,
         radius: cell_latents.CellTables | None,
         adjacency: cell_latents.CellTables | None,
+        ws_rows: Tensor,
+        sw_rows: Tensor,
+        update_stones: bool,
     ) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
         cfg = self.cfg
         # Sizes come from tensor shapes, not the Batch's ints: under
@@ -664,11 +651,10 @@ class _Block(nn.Module):
         p, max_t = g.shape[0], batch.attn_valid.shape[1]
 
         # §5.1: windows aggregate their stones. Sum, not mean — the count is
-        # signal. The class term of each pass is a dense ``counts @ table``
-        # whose gradient is another matmul, not a per-entry gather whose
-        # backward scatters into a few rows; the wide ternary
-        # vocabularies run-reduce the same table rows (``class_row_sum``)
-        # without materializing the per-edge gather.
+        # signal. The class terms of both passes arrive precomputed from the
+        # trunk (``ws_rows``/``sw_rows``): the window side is one gather from
+        # the per-pattern summed-row table, the stone side one run-reduction
+        # over all blocks' tables at once.
         x = self.u(self.ln_ws_s(s))
         agg = message_passing.aggregate_to_windows(
             x,
@@ -678,13 +664,7 @@ class _Block(nn.Module):
             plan.run_window,
             w.shape[0],
         )
-        agg = agg + message_passing.class_row_sum(
-            self.e_ws.weight,
-            batch.inc_class,
-            batch.inc_window,
-            w.shape[0],
-            message_passing.WINDOW_RUN,
-        ).to(agg.dtype)
+        agg = agg + ws_rows.to(agg.dtype)
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
         if cfg.uses_cell_state:
@@ -730,13 +710,7 @@ class _Block(nn.Module):
             plan.run_window,
             s.shape[0],
         )
-        agg = agg + message_passing.class_row_sum(
-            self.e_sw.weight,
-            plan.run_class,
-            plan.run_stone,
-            s.shape[0],
-            message_passing.STONE_RUN,
-        ).to(agg.dtype)
+        agg = agg + sw_rows.to(agg.dtype)
         s = s + self.drop(self.mlp_s(self.ln_sw_s(s), agg))
 
         # §5.3: attention over [global rows; stones], block-diagonal per position.
@@ -751,27 +725,43 @@ class _Block(nn.Module):
         z = self.ln_attn(rows.view(p, max_t, cfg.h))
 
         hd = cfg.h // cfg.heads
-        q = self.wq(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         k = self.wk(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
         v = self.wv(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
 
-        # Coordinates become orbit buckets inside the attention kernel. Each
-        # position's key loop stops at its live prefix instead of doing
-        # quadratic work over padding.
-        out = fused_attention(
-            q,
-            k,
-            v,
-            batch.coords,
-            seq_lens,
-            self.bias_table(),
-            orbit_table,
-            global_rows,
-        )
-        out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(p * max_t, cfg.h)
-        s = s + self.drop(out.index_select(0, batch.stone_slot))
-        global_delta = out.index_select(0, global_slot)
-        g = g + self.drop(global_delta.view(p, global_rows, cfg.h))
+        if update_stones:
+            q = self.wq(z).view(p, max_t, cfg.heads, hd).transpose(1, 2)
+            # Each position's key loop stops at its live prefix instead of
+            # doing quadratic work over padding.
+            out = fused_attention(q, k, v, seq_lens)
+            out = self.wo(out.transpose(1, 2).reshape(p, max_t, cfg.h)).view(
+                p * max_t, cfg.h
+            )
+            s = s + self.drop(out.index_select(0, batch.stone_slot))
+            global_delta = out.index_select(0, global_slot)
+            g = g + self.drop(global_delta.view(p, global_rows, cfg.h))
+        else:
+            # Nothing past this block reads the stone rows — the heads read
+            # windows, cells, and the latents — so only the latent rows'
+            # reads are computed: a four-query cross-read over the same keys
+            # instead of the full grid. Dead keys are masked hard; scores
+            # and softmax run fp32 whatever autocast chose.
+            q = self.wq(z[:, :global_rows]).view(
+                p, global_rows, cfg.heads, hd
+            ).transpose(1, 2)
+            scores = (
+                torch.einsum("phqd,phkd->phqk", q.float(), k.float())
+                / math.sqrt(hd)
+            )
+            scores = scores.masked_fill(
+                ~batch.attn_valid[:, None, None, :], -torch.inf
+            )
+            read = torch.einsum(
+                "phqk,phkd->phqd", scores.softmax(dim=-1), v.float()
+            )
+            delta = self.wo(
+                read.transpose(1, 2).reshape(p, global_rows, cfg.h).to(g.dtype)
+            )
+            g = g + self.drop(delta)
         # Same recompute-in-backward policy as the cell stage: the cycle
         # touches every window row three times and its saves were the
         # second-widest slice of the peak, while its replay is a fraction
@@ -785,12 +775,16 @@ class _Block(nn.Module):
             context_fn=_attention_saved_contexts,
         )
 
-        # FFN over the same rows — row-independent, so no padding needed.
+        # FFN over the same rows — row-independent, so no padding needed. When
+        # the stone rows are dead their half of the sweep is skipped with them.
         global_flat = g.reshape(-1, cfg.h)
-        rows = torch.cat([s, global_flat], dim=0)
-        rows = self.drop(self.ffn(self.ln_ffn(rows)))
-        s = s + rows[: s.shape[0]]
-        global_flat = global_flat + rows[s.shape[0] :]
+        if update_stones:
+            rows = torch.cat([s, global_flat], dim=0)
+            rows = self.drop(self.ffn(self.ln_ffn(rows)))
+            s = s + rows[: s.shape[0]]
+            global_flat = global_flat + rows[s.shape[0] :]
+        else:
+            global_flat = global_flat + self.drop(self.ffn(self.ln_ffn(global_flat)))
         g = global_flat.view(p, global_rows, cfg.h)
         return s, w, g, c
 
@@ -832,10 +826,15 @@ class MantisNet(nn.Module):
             )
 
         self.blocks = nn.ModuleList(_Block(cfg) for _index in range(cfg.blocks))
-        # The §4.1 displacement → orbit table the stone attention gathers
-        # from; a constant, so it travels with the module but not the
-        # checkpoint.
-        self.register_buffer("orbit_table", orbit_lut("cpu").clone(), persistent=False)
+        # S4: the per-pattern occupied-slot class counts — a constant of the
+        # ternary vocabulary, so it travels with the module, not the
+        # checkpoint. ``counts @ e_ws`` turns the §5.1 class-row sum into one
+        # gather per window, with a dense deterministic matmul gradient.
+        self.register_buffer(
+            "pattern_counts",
+            torch.from_numpy(TERN_PATTERN_CLASS_COUNTS.copy()),
+            persistent=False,
+        )
         self.ln_out = nn.LayerNorm(h)  # shared final LN over S, W, g (§5)
 
         # §6 policy decoder. MLP_P([h_a; g]) as a _PairMlp, so the g half of
@@ -1047,13 +1046,15 @@ class MantisNet(nn.Module):
             self.cfg.cell_node_scope == "uncovered",
         )
 
-    def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor, Tensor | None]:
+    def trunk(self, batch: Batch) -> tuple[Tensor, Tensor, Tensor | None]:
         """Embeddings through the B blocks and the shared final LN (§5).
 
-        The fourth output is the refined cell latents scattered into the
-        decoder's legal order — ``(N_cells, H)``, already through the shared
-        LN — when the knob is on, else ``None``. Uncovered legal cells carry
-        the learned base row.
+        Returns ``(windows, global, cells)``. No head reads the stone rows,
+        so the last block computes only its latent-row reads and the trunk
+        does not return stones. The third output is the refined cell latents
+        scattered into the decoder's legal order — ``(N_cells, H)``, already
+        through the shared LN — when the knob is on, else ``None``. Uncovered
+        legal cells carry the learned base row.
         """
         cfg = self.cfg
         s = self.stone_table(batch.stone_own)
@@ -1086,7 +1087,27 @@ class MantisNet(nn.Module):
             else:
                 c = covered_init
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
-        for block in self.blocks:
+        # Every block's §5.1/§5.2 class terms in one pass each: the window
+        # side is ``counts @ [every e_ws]`` then one gather per window, the
+        # stone side one run-reduction over the concatenated tables. Both
+        # fp32 — the discipline the per-block class sums always had — so
+        # the matmul is guarded from autocast.
+        if len(self.blocks):
+            with torch.autocast(device_type=w.device.type, enabled=False):
+                ws_tables = torch.cat(
+                    [block.e_ws.weight for block in self.blocks], dim=1
+                )
+                ws_all = (self.pattern_counts @ ws_tables).index_select(
+                    0, batch.window_feat
+                )
+            sw_all = message_passing.class_row_sum(
+                torch.cat([block.e_sw.weight for block in self.blocks], dim=1),
+                plan.run_class,
+                plan.run_stone,
+                s.shape[0],
+                message_passing.STONE_RUN,
+            )
+        for index, block in enumerate(self.blocks):
             s, w, g, c = block(
                 s,
                 w,
@@ -1094,7 +1115,6 @@ class MantisNet(nn.Module):
                 c,
                 batch,
                 seq_lens,
-                self.orbit_table,
                 plan,
                 pairs,
                 latent_layout,
@@ -1102,6 +1122,9 @@ class MantisNet(nn.Module):
                 ctab,
                 radius,
                 adjacency,
+                ws_all[:, index * cfg.h : (index + 1) * cfg.h],
+                sw_all[:, index * cfg.h : (index + 1) * cfg.h],
+                update_stones=index + 1 < len(self.blocks),
             )
         global_rows = self.ln_out(g).mean(dim=1)
         cells = None
@@ -1115,7 +1138,7 @@ class MantisNet(nn.Module):
                     .clone()
                 )
                 cells.index_copy_(0, ctab.covered, self.ln_out(c).to(cells.dtype))
-        return self.ln_out(s), self.ln_out(w), global_rows, cells
+        return self.ln_out(w), global_rows, cells
 
     def _decoder_rows(self, w: Tensor, batch: Batch, dtype: torch.dtype) -> Tensor:
         """The pass over the decoder incidence, shared by both cell heads.
@@ -1279,7 +1302,7 @@ class MantisNet(nn.Module):
         g_half: Tensor,
         batch: Batch,
         lin: nn.Linear,
-        e_w: nn.Embedding,
+        extra: Tensor,
         extend: nn.Linear,
         mlp: _PairMlp,
     ) -> Tensor:
@@ -1289,16 +1312,10 @@ class MantisNet(nn.Module):
         runs per position.
 
         The ternary scope composes the quantity without a histogram:
-        ``lin_a(proj @ Σw + Σ e_class rows + extension) + bias``, the class
-        sum run-reduced fp32. ``extend`` is the action-row extension matrix
-        reading the shared encoder sum."""
-        extra = message_passing.class_row_sum(
-            e_w.weight,
-            batch.dec_class,
-            batch.dec_cell,
-            rows.shape[0],
-            message_passing.STONE_RUN,
-        )
+        ``lin_a(proj @ Σw + Σ e_class rows + extension) + bias``. ``extra``
+        is the head's fp32 class-row sum, run-reduced by the caller — for
+        both heads over the concatenated tables at once. ``extend`` is the
+        action-row extension matrix reading the shared encoder sum."""
         base = F.linear(rows, lin.weight) + F.linear(
             acts.to(rows.dtype), extend.weight
         )
@@ -1315,8 +1332,15 @@ class MantisNet(nn.Module):
             acts = self._action_latent_cycle(acts, batch)
         g_half = self.mlp_p.lin_b(g)
         rows = self._decoder_input(w, cells, batch, g_half.dtype)
+        extra = message_passing.class_row_sum(
+            self.e_pw.weight,
+            batch.dec_class,
+            batch.dec_cell,
+            batch.cell_pos.shape[0],
+            message_passing.STONE_RUN,
+        )
         return self._cell_scores(
-            rows, acts, g_half, batch, self.p, self.e_pw, self.p_act, self.mlp_p
+            rows, acts, g_half, batch, self.p, extra, self.p_act, self.mlp_p
         ).squeeze(-1)
 
     def cell_head_logits(
@@ -1334,12 +1358,20 @@ class MantisNet(nn.Module):
             acts = self._action_latent_cycle(acts, batch)
         g_p, g_q = self.mlp_p.lin_b(g), self.mlp_q.lin_b(g)
         rows = self._decoder_input(w, cells, batch, g_p.dtype)
+        h = self.cfg.h
+        extra = message_passing.class_row_sum(
+            torch.cat((self.e_pw.weight, self.e_qw.weight), dim=1),
+            batch.dec_class,
+            batch.dec_cell,
+            batch.cell_pos.shape[0],
+            message_passing.STONE_RUN,
+        )
         return (
             self._cell_scores(
-                rows, acts, g_p, batch, self.p, self.e_pw, self.p_act, self.mlp_p
+                rows, acts, g_p, batch, self.p, extra[:, :h], self.p_act, self.mlp_p
             ).squeeze(-1),
             self._cell_scores(
-                rows, acts, g_q, batch, self.q, self.e_qw, self.q_act, self.mlp_q
+                rows, acts, g_q, batch, self.q, extra[:, h:], self.q_act, self.mlp_q
             ),
         )
 
@@ -1390,7 +1422,7 @@ class MantisNet(nn.Module):
     def forward(self, batch: Batch, mass_floor: float) -> ModelOutput:
         """Every head. KLENT's loop composes `trunk` with the two heads it
         trains instead, skipping the value readout it never reads."""
-        s_, w, g, cells = self.trunk(batch)
+        w, g, cells = self.trunk(batch)
         value, value_dist, value_logits = self.value_head(w, g, batch)
         policy_logits, q_score, q_values = self.cell_heads(
             w, g, cells, batch, mass_floor

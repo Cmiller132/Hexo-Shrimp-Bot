@@ -57,19 +57,8 @@ def test_constant_post_projection_key_bias_cancels_in_both_cpu_attention_paths(
     v = block.wv(z).view(n_pos, max_t, heads, head_dim).transpose(1, 2)
     seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
     key_bias = torch.linspace(0.125, 1.0, cfg.h).view(heads, head_dim)
-    stone_expected = fused_attention(
-        q, k, v, batch.coords, seq_lens, block.bias_table(), net.orbit_table, 4
-    )
-    stone_actual = fused_attention(
-        q,
-        k + key_bias[None, :, None, :],
-        v,
-        batch.coords,
-        seq_lens,
-        block.bias_table(),
-        net.orbit_table,
-        4,
-    )
+    stone_expected = fused_attention(q, k, v, seq_lens)
+    stone_actual = fused_attention(q, k + key_bias[None, :, None, :], v, seq_lens)
 
     # Real window rows and pair relations from the same collated batch.
     windows = net.window_table(batch.window_feat)

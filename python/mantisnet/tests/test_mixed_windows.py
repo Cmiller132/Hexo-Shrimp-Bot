@@ -203,7 +203,11 @@ def test_checkpoint_round_trips_through_the_family_registry(tmp_path):
     cfg = MantisConfig(window_attention=False)
     torch.manual_seed(2)
     model = MantisNet(cfg)
-    inferred = infer_config(model.state_dict())
+    # With every per-head knob off no tensor carries the head count:
+    # tensor-only inference refuses, and the recorded config supplies it.
+    with pytest.raises(ValueError, match="per-head"):
+        infer_config(model.state_dict())
+    inferred = infer_config(model.state_dict(), heads=cfg.heads)
     assert not inferred.window_attention
 
     path = tmp_path / "mixed.pt"
@@ -232,7 +236,7 @@ def test_checkpoint_round_trips_through_the_family_registry(tmp_path):
         reference.load_state_dict(model.state_dict())
         expected = reference(batch, 0.2)
         got_policy, got_score, got_q = loaded.model.cell_heads(
-            *loaded.model.trunk(batch)[1:], batch, 0.2
+            *loaded.model.trunk(batch), batch, 0.2
         )
     assert torch.allclose(got_policy, expected.policy_logits, atol=1e-6)
     assert torch.allclose(got_q, expected.q_values, atol=1e-6)

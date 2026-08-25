@@ -23,7 +23,7 @@ side to move), window pattern, joint slot classes, displacement orbits, and
 `moves_remaining` -- is invariant under the twelve board symmetries.
 
 The **trunk** interleaves bipartite message passing (stones to/from windows)
-with self-attention over the stone set biased by hex distance. A cell-pass
+with content-only self-attention over the stone set. A cell-pass
 relay lets windows exchange state through shared empty cells, and a
 window-attention layer (the live `window_attention` knob, on by default)
 types window pairs by colinear/crossing relations. In every block the four
@@ -434,7 +434,7 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `builder.py` | Position-to-graph representation, Rust batch conversion, collation, version constants |
 | `cell_latents.py` | Step 15 typed legal-cell/window attention and whole-line table derivation |
 | `cell_nodes.py` | Step 13 radius/adjacency edge plans on the typed cell-attention kernels |
-| `attention.py` | Fused orbit-biased multi-head attention (§4.1 displacement orbits) with Triton kernels and reference path |
+| `attention.py` | Fused block-diagonal multi-head attention (§5.3) with Triton kernels and reference path |
 | `row_encoder.py` | Action-row encoder: 729-class post-placement window rows for both decoder heads |
 | `window_latents.py` | Fused ragged window-latent read/broadcast cycle for the state latents |
 | `optim.py` | Fused-Adam execution policy, recorded and reapplied across checkpoint loads |

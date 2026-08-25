@@ -121,7 +121,7 @@ def test_every_scoreable_family_identifies_loads_and_runs_full_forward(
 def test_scalar_joint_matches_native_tanh_and_trigraft_transform(tmp_path):
     loaded = load_checkpoint(_write(tmp_path, "scalar-joint"), device="cpu")
     batch = collate_prefixes([[]], [0])
-    _s, windows, token, cells = loaded.model.trunk(batch)
+    windows, token, cells = loaded.model.trunk(batch)
     _policy, logits = loaded.model.cell_head_logits(windows, token, cells, batch)
     scalar = loaded.composition.q_value(logits)
     grafted = torch.cat((logits, -logits, torch.full_like(logits, -20.0)), dim=-1)
@@ -255,7 +255,7 @@ def test_pre_baked_trunk_identifies_and_refuses_with_its_profile(tmp_path):
 def test_baked_keys_on_only_some_blocks_are_refused(tmp_path):
     cfg = replace(TINY, blocks=2)
     state = _family_state("trinomial-joint", cfg=cfg)
-    del state["blocks.1.orbit_bias"]
+    del state["blocks.1.wa_bias"]
     path = tmp_path / "torn.pt"
     torch.save({"model": state, "versions": _versions(), "iteration": 1}, path)
     with pytest.raises(ValueError, match="not identifiable by the family registry"):

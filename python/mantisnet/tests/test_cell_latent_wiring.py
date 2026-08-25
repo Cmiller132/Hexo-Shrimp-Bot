@@ -98,7 +98,7 @@ def test_uncovered_legal_cells_read_the_base_row(positions):
     model = MantisNet(_config()).eval()
     batch = _batch(positions)
     with torch.no_grad():
-        _s, _w, _g, cells = model.trunk(batch)
+        _w, _g, cells = model.trunk(batch)
     n_cells = batch.cell_pos.shape[0]
     assert cells is not None and cells.shape == (n_cells, model.cfg.h)
 
@@ -127,8 +127,8 @@ def test_the_decoder_input_contract_fails_loudly(positions):
     off = MantisNet(_config(cell_latents=False, window_attention=True)).eval()
     on = MantisNet(_config()).eval()
     with torch.no_grad():
-        _s, w_off, g_off, cells_off = off.trunk(batch)
-        _s, w_on, g_on, cells_on = on.trunk(batch)
+        w_off, g_off, cells_off = off.trunk(batch)
+        w_on, g_on, cells_on = on.trunk(batch)
         assert cells_off is None
         with pytest.raises(ValueError, match="cell state is off"):
             off.cell_head_logits(w_off, g_off, cells_on, batch)

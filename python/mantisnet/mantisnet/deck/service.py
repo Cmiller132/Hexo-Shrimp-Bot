@@ -358,7 +358,17 @@ def _config_from_checkpoint(raw: dict) -> MantisConfig:
         [int(k.split(".")[1]) for k in state if k.startswith("blocks.")], default=-1
     )
     h = state["stone_table.weight"].shape[1]
-    heads = state["blocks.0.orbit_bias"].shape[0]
+    # No unconditional per-head tensor survives the §4.1 bias removal, so
+    # sniff whichever knob's per-head bias the checkpoint carries.
+    for key in ("blocks.0.cr_bias", "blocks.0.wa_bias", "blocks.0.lp_bias"):
+        if key in state:
+            heads = state[key].shape[0]
+            break
+    else:
+        raise ValueError(
+            "checkpoint records no model_config and carries no per-head "
+            "tensor to infer the head count from"
+        )
     return MantisConfig(
         h=h,
         blocks=blocks,

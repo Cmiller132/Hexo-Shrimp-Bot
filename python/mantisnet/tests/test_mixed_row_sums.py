@@ -210,9 +210,9 @@ def test_mixed_model_call_sites_match_the_literal_forms(positions, monkeypatch):
 
     def run():
         with torch.autocast("cuda", torch.bfloat16):
-            s, w, g, cells = model.trunk(batch)
+            w, g, cells = model.trunk(batch)
             policy, critic = model.cell_head_logits(w, g, cells, batch)
-        return s, w, g, policy, critic
+        return w, g, policy, critic
 
     fast = run()
     seen: set[str] = set()

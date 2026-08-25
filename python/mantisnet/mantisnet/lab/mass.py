@@ -84,7 +84,7 @@ def probe_mass(
     with torch.no_grad(), torch.autocast(
         device, torch.bfloat16, enabled=cfg.autocast
     ):
-        _s, w, g, cells = model.trunk(batch)
+        w, g, cells = model.trunk(batch)
         _policy, critic = model.cell_head_logits(w, g, cells, batch)
     mass = loaded.composition.mass(critic)
     q_value = loaded.composition.q_value(critic)

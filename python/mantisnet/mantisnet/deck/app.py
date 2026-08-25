@@ -19,7 +19,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from ..attention import _bucket_index, orbit_lut
 from ..builder import collate_prefixes
 from ..klent import telemetry
 from ..klent.evaluate import argmax_choose, play_match
@@ -696,22 +695,16 @@ def create_app(
             for hook in hooks:
                 hook.remove()
             length = int(batch.attn_valid[0].sum())
-            coords = batch.coords[:1, :length].cpu()
-            seq_lens = torch.tensor([length], dtype=torch.int32)
-            # The same bucket law the kernels apply (§4.1): orbit, FAR, SELF,
-            # TOKEN for the four latent rows, PAD never (no padding here).
-            buckets, _valid = _bucket_index(
-                coords, seq_lens, length, orbit_lut("cpu"), global_rows=4
-            )
-            buckets = buckets[0]
             layers = []
             for index, (block, captured) in enumerate(zip(model.blocks, captures)):
                 h, heads = model.cfg.h, model.cfg.heads
                 dim = h // heads
-                q = captured["q"][0, :length].view(length, heads, dim).transpose(0, 1)
+                # The last block computes only the four latent-row queries;
+                # its stone rows are dead past it and have no attention rows.
+                q_rows = length if index + 1 < model.cfg.blocks else 4
+                q = captured["q"][0, :q_rows].view(q_rows, heads, dim).transpose(0, 1)
                 k = captured["k"][0, :length].view(length, heads, dim).transpose(0, 1)
                 logits = q.float() @ k.float().transpose(-1, -2) / math.sqrt(dim)
-                logits += block.bias_table().detach().float().cpu()[:, buckets].to(logits.device)
                 layers.append({
                     "block": index,
                     "heads": torch.softmax(logits, dim=-1).cpu().tolist(),

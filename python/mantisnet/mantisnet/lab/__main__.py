@@ -196,9 +196,9 @@ def build_parser() -> argparse.ArgumentParser:
     _model_kw(sweep)
     _device(sweep)
 
-    profile = commands.add_parser("profile", help="attribute trunk/decode/seam stages")
+    profile = commands.add_parser("profile", help="attribute decode/seam/fit stages")
     profile_modes = profile.add_subparsers(dest="profile_mode", required=True)
-    for name in ("trunk", "decode", "seam"):
+    for name in ("decode", "seam"):
         mode = profile_modes.add_parser(name)
         _cohort(mode, checkpoint_required=True)
         mode.add_argument("--iters", type=int, default=5)

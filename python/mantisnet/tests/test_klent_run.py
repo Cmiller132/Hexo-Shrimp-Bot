@@ -436,8 +436,12 @@ def test_lab_cell_init_validates_format_build_and_model_kw(tmp_path):
 
     # Legacy knob keys naming the baked architecture are stripped; the live
     # window_attention knob at its default compares equal through the config.
-    load_lab_cell(path, target, {**model_kw, "axis_bias": True, "cell_pass": True,
+    load_lab_cell(path, target, {**model_kw, "cell_pass": True,
                                  "joint_incidence": True, "window_attention": True})
+
+    # A recorded axis_bias=True names the removed §4.1 bias channel.
+    with pytest.raises(ValueError, match="no longer implements"):
+        load_lab_cell(path, target, {**model_kw, "axis_bias": True})
 
     torch.save({**cell, "lab_cell_format": 2}, path)
     with pytest.raises(ValueError, match="not a lab cell"):

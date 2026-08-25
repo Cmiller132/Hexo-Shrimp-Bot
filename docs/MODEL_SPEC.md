@@ -83,7 +83,7 @@ widths and four blocks.
 One node per stone. The only per-stone feature is ownership relative to the
 side to move (own / opponent, a 2-row embedding). Stone coordinates never
 enter node features; geometry acts only through the relational structures
-below and the displacement orbits of §4.1.
+below and the radius-edge orbits of §4.2.
 
 ### 3.2 Live windows
 
@@ -142,24 +142,15 @@ model knows arrives through the entities above and the encodings of §4.
 
 ## 4. Feature encodings
 
-### 4.1 Displacement orbits
+### 4.1 Stone-attention geometry
 
-Stone self-attention (§5.3) is biased by the D6 orbit of each query–key
-displacement: the same frozen **orbit-48** vocabulary the cell-node edges
-use (§4.2), covering every displacement of hex distance 1..12, then FAR for
-pairs beyond radius 12, SELF on the diagonal, and TOKEN for any pair that
-touches a latent row — 51 bias rows per head. The rows are learned in two
-parts: a coarse table over the 23 (distance, on-axis) classes of distances
-1..12 plus FAR, SELF and TOKEN (`axis_bias`, 26 rows), and a per-orbit
-residual (`orbit_bias`, 48 rows); an orbit's bias row is its class row plus
-its residual, and FAR/SELF/TOKEN are class rows alone. Both are
-zero-initialised, so the table starts as a (distance, on-axis) table whose
-class rows pool gradient over every displacement at a distance, and the
-residual adds orbit resolution where the data asks for it. Padding is a
-finite sentinel appended at compute time, not a learned row. The orbit is
-symmetric under negating the displacement, so the bias is symmetric in the
-pair. The kernels gather the orbit from a constant 25×25 displacement table
-generated from the orbit function, never hand-written.
+Stone self-attention (§5.3) carries no learned pair bias: scores are
+content-only, and each position's rows attend within their live
+`[latents; stones]` prefix with keys past it masked hard. Geometry reaches
+the model only through the relational structures of §5 and the radius-edge
+vocabulary of §4.2. (An eval-time knock-out measured the former per-pair
+orbit bias decorative in the trained function; the measurement lives in
+`docs/ABLATIONS.md`.)
 
 ### 4.2 Cell-node vocabularies
 
@@ -170,8 +161,7 @@ The edge type is the product of three invariant classifications, 48 × 2 × 2
 - the **orbit-48** class: the source-to-destination offset vector's orbit
   under the twelve board symmetries, a frozen 48-class vocabulary generated
   from the axial transforms and independently checked against a
-  cube-coordinate oracle — the one geometry vocabulary of the model, shared
-  with the stone attention of §4.1;
+  cube-coordinate oracle — the one geometry vocabulary of the model;
 - whether the source stone is **own or opponent**;
 - whether source and destination are **on a shared axis**.
 
@@ -264,20 +254,23 @@ in order:
 4. **§5.2 stone ← windows** — the mirror of §5.1: stones aggregate their
    windows plus the class row sum.
 5. **§5.3 stone self-attention** — attention over `[latent rows; stones]`,
-   block-diagonal per position, biased by the §4.1 distance and axis
-   tables. The four latent rows attend as ordinary rows under the TOKEN
-   bucket.
+   block-diagonal per position, content-only scores (§4.1). The four latent
+   rows attend as ordinary rows. In the last block only the four latent-row
+   reads are computed: no head reads post-trunk stone rows, so their
+   attention outputs and FFN half would be dead work.
 6. **§5.4 window-latent cycle** — the latents read the window set
    (attention over each position's real windows), mix among themselves
    (dense 4×4 attention), and broadcast back to the windows.
-7. **FFN** — one shared feed-forward over stones and latents.
+7. **FFN** — one shared feed-forward over stones and latents (latents
+   alone in the last block).
 
 Every stage is residual with pre-LayerNorm; every ragged attention runs its
 scores, softmax, and weighted sums in fp32 regardless of autocast. After the
-last block a single shared LayerNorm produces the head inputs: stone rows,
-window rows, the mean-pooled latent context `g`, and — with cell state on —
-the refined cell rows scattered into engine legal order, uncovered cells
-carrying the (normalized) learned base row.
+last block a single shared LayerNorm produces the head inputs: window rows,
+the mean-pooled latent context `g`, and — with cell state on — the refined
+cell rows scattered into engine legal order, uncovered cells carrying the
+(normalized) learned base row. Stone rows end inside the last block; the
+trunk does not emit them.
 
 ## 6. Legal-cell decoders
 
@@ -385,7 +378,7 @@ encoding; `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing; either bump invalidates checkpoints, and loaders refuse
 mismatches rather than adapt. Checkpoints record their `model_config`;
 configurations from the architecture's knob era are accepted exactly when
-they match the baked values (`axis_bias=True`, `off_axis_bias=False`, `d_max=12`,
+they match the baked values (`axis_bias=False`, `off_axis_bias=False`, `d_max=12`,
 `cell_pass=True`, `cell_pass_from=0`, `cell_pass_rounds=1`,
 `joint_incidence=True`, `mixed_windows=True`, `action_rows=True`,
 `state_latents=4`) and refused loudly otherwise.

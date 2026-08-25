@@ -51,7 +51,7 @@ def inspect_position(
 
     batch = collate_prefixes([moves], [t]).to(device)
     with torch.no_grad():
-        _s, w, g, cells = model.trunk(batch)
+        w, g, cells = model.trunk(batch)
         logits, q_score, q_values = model.cell_heads(w, g, cells, batch, mass_floor)
         logits, q_values = logits.float().cpu(), q_values.float().cpu()
         q_score = q_score.float().cpu()

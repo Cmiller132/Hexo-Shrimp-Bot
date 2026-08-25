@@ -251,10 +251,10 @@ def test_forward_shapes_on_a_small_config():
     cfg = _tiny(**ARM_B, cell_structure=True)
     torch.manual_seed(13)
     model = MantisNet(cfg).eval()
-    stones, windows, glob, cells = model.trunk(batch)
+    windows, glob, cells = model.trunk(batch)
     assert cells is not None and cells.shape == (batch.n_cells, cfg.h)
     assert glob.shape == (len(positions), cfg.h)
-    assert stones.shape[1] == windows.shape[1] == cfg.h
+    assert windows.shape[1] == cfg.h
     out = model(batch, 0.2)
     assert out.policy_logits.shape == (batch.n_cells,)
     assert out.q_values.shape == (batch.n_cells,)
@@ -269,10 +269,10 @@ def _count(**overrides) -> int:
 
 
 def test_parameter_counts_are_pinned_on_and_off_the_knob():
-    assert _count() == 4_804_581
-    assert _count(**PRODUCTION) == 5_197_093
-    assert _count(**ARM_B) == 5_215_141
-    assert _count(**ARM_B, cell_structure=True) == 5_507_749
+    assert _count() == 4_803_397
+    assert _count(**PRODUCTION) == 5_195_909
+    assert _count(**ARM_B) == 5_213_957
+    assert _count(**ARM_B, cell_structure=True) == 5_506_565
 
 
 def test_the_knob_is_inferable_from_a_state_dict():

@@ -132,8 +132,8 @@ def test_far_cell_alias_is_removed_by_radius_edges(scope):
     torch.manual_seed(7)
     on = MantisNet(_tiny(cell_nodes=True, cell_node_scope=scope)).eval()
     with torch.no_grad():
-        off_cells = off.trunk(batch)[3]
-        on_cells = on.trunk(batch)[3]
+        off_cells = off.trunk(batch)[2]
+        on_cells = on.trunk(batch)[2]
     for left, right in itertools.combinations(cells, 2):
         assert torch.equal(off_cells[left], off_cells[right])
         assert not torch.equal(on_cells[left], on_cells[right])
@@ -212,14 +212,14 @@ def test_cell_node_model_is_d6_invariant(scope):
 
 
 def test_parameter_counts_are_pinned_for_cell_node_states_and_scopes():
-    assert sum(p.numel() for p in MantisNet(MantisConfig()).parameters()) == 4_804_581
+    assert sum(p.numel() for p in MantisNet(MantisConfig()).parameters()) == 4_803_397
     for scope in ("all", "uncovered"):
         assert sum(
             p.numel()
             for p in MantisNet(
                 MantisConfig(cell_nodes=True, cell_node_scope=scope)
             ).parameters()
-        ) == 5_462_565
+        ) == 5_461_381
         assert sum(
             p.numel()
             for p in MantisNet(
@@ -229,7 +229,7 @@ def test_parameter_counts_are_pinned_for_cell_node_states_and_scopes():
                     cell_adjacency=True,
                 )
             ).parameters()
-        ) == 5_728_821
+        ) == 5_727_637
 
 
 def test_cell_adjacency_is_a_separate_validated_subknob():
@@ -240,7 +240,7 @@ def test_cell_adjacency_is_a_separate_validated_subknob():
     else:
         raise AssertionError("an inert adjacency knob was accepted")
     model = MantisNet(MantisConfig(cell_nodes=True, cell_adjacency=True))
-    assert sum(parameter.numel() for parameter in model.parameters()) == 5_728_821
+    assert sum(parameter.numel() for parameter in model.parameters()) == 5_727_637
 
 
 def test_cell_node_scope_is_validated():

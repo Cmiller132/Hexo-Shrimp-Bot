@@ -10,7 +10,6 @@ import torch
 
 from mantisnet import MantisConfig, MantisNet, collate, collate_positions, from_position
 from mantisnet import window_latents
-from mantisnet.attention import TOKEN_BUCKET, _bucket_index, orbit_lut
 from mantisnet.klent.selfplay import _chunk_live
 from mantisnet.lab.families import infer_config, load_checkpoint
 from mantisnet.lab.train import scoped_attention_lengths
@@ -34,7 +33,7 @@ def test_baked_model_has_only_latent_parameters_and_keeps_the_parameter_pin():
     model = MantisNet(MantisConfig())
     assert model.latent_base.shape == (4, model.cfg.h)
     assert "token_base" not in model.state_dict()
-    assert sum(parameter.numel() for parameter in model.parameters()) == 4_804_581
+    assert sum(parameter.numel() for parameter in model.parameters()) == 4_803_397
 
 
 def test_python_and_rust_collation_match_the_baked_global_prefix(positions):
@@ -60,20 +59,6 @@ def test_python_and_rust_collation_match_the_baked_global_prefix(positions):
         ]
     )
     assert torch.equal(rust.stone_slot, expected)
-
-
-def test_every_latent_pair_uses_the_token_bias_bucket(positions):
-    batch = collate([from_position(position) for position in positions[:4]])
-    seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
-    bucket, _valid = _bucket_index(
-        batch.coords, seq_lens, batch.max_t, orbit_lut("cpu"), global_rows=4
-    )
-    rows = torch.arange(batch.max_t)
-    touches_latent = (rows[:, None] < 4) | (rows[None, :] < 4)
-    live_pair = (
-        rows[None, :, None] < seq_lens[:, None, None]
-    ) & (rows[None, None, :] < seq_lens[:, None, None])
-    assert torch.all(bucket[live_pair & touches_latent] == TOKEN_BUCKET)
 
 
 @torch.no_grad()
@@ -160,7 +145,7 @@ def test_final_ln_mean_is_the_only_global_reader_context(positions):
     cfg = _config(blocks=0)
     model = MantisNet(cfg).eval()
     batch = collate([from_position(position) for position in positions[:4]])
-    _s, w, pooled, _cells = model.trunk(batch)
+    w, pooled, _cells = model.trunk(batch)
     raw = model.latent_base[None] + model.token_moves(batch.moves_idx)[:, None]
     expected = model.ln_out(raw).mean(dim=1)
     torch.testing.assert_close(pooled, expected)

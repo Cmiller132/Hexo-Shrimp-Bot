@@ -155,6 +155,36 @@ assert TERN_DEC_CLASSES == 726 and TERN_OCC_CLASSES == 1458
 assert TERN_DEC_CLASSES + TERN_OCC_CLASSES == 2184
 
 
+def _tern_pattern_class_counts() -> np.ndarray:
+    """(377, 1458) float32: each canonical pattern's occupied-slot class counts.
+
+    ``_TERN_OCC_CLASS`` is constant on joint ``(pattern, slot)`` reversal
+    orbits, so a window's class multiset is a function of its canonical
+    pattern alone and the §5.1 class-row sum is one gather from a
+    per-pattern table of summed rows. Both representatives of every orbit
+    are checked to agree, never assumed.
+    """
+    counts = np.full((TERN_PATTERNS, TERN_OCC_CLASSES), -1.0, dtype=np.float32)
+    for p in range(1, 729):
+        row = np.zeros(TERN_OCC_CLASSES, dtype=np.float32)
+        for s in range(WINDOW_LEN):
+            c = _TERN_OCC_CLASS[p, s]
+            if c >= 0:
+                row[c] += 1
+        rank = _TERN_RANK[p]
+        if counts[rank].max() < 0:
+            counts[rank] = row
+        elif not np.array_equal(counts[rank], row):
+            raise AssertionError(
+                f"pattern {p} and its reversal disagree on class counts"
+            )
+    assert counts.min() >= 0
+    return counts
+
+
+TERN_PATTERN_CLASS_COUNTS = _tern_pattern_class_counts()
+
+
 # --- Step 4 action-row tables (MANTIS_GRAFT_SPEC §4, Step 4).
 #
 # Every legal action has 18 hypothetical post-placement windows (3 axes x 6
