@@ -65,9 +65,31 @@ Spec section `docs/MODEL_SPEC.md` §5M on the branch.
   in the incumbent too; the bar is kernel-level and the test says so).
   Full CPU suite 334 green, CUDA lane 150 green, `xtask verify` green.
 
-## Screen v3 — staged, NOT launched (GPU free per ruling)
+## Screen v3 — LAUNCHED 2026-08-26 03:20Z (owner: "you have 8 hours... make the best of it")
 
-Everything is one command away but nothing is running:
+Queue reordered arm-first before launch (the staged fixture-first order
+would have spent the night on seed noise). Running order: full s0, latent
+s0, fixture s0, then s1/s2 triples, then fixture s3-s5; verdict runs
+automatically when all twelve cells are scored (writes
+`runs/lab/v3/verdict.json`). Interim scoreboard (val-EMA, scored):
+
+| cell | critic_ce | policy_nll | top1 | steady sps |
+| --- | --- | --- | --- | --- |
+| fixture s0 | 0.6242 | 1.9581 | 46.6% | 1125 |
+| msite-full s0 | 0.6257 | 2.0126 | 45.3% | ~800 |
+| msite-full s1 | **0.6210** | **1.9209** | **46.9%** | ~880 |
+| msite-latent s0 | 0.6256 | 2.0028 | 45.4% | 931 |
+
+full s1 beats fixture s0 on all three metrics; the arms straddle the
+fixture, so the verdict is genuinely open. No pathologies: near-terminal
+critic decisive (~0.04 at 1-4 plies), no paging (VRAM ~11.9/12 GiB but
+power stays ~165 W), no crashes; every cell exit 0 so far. latent s1 in
+flight (slow-starting seed, monotone). Cells ~1.3-1.7 h each; full drain
+~17:30Z. Monitors: persistent epoch/crash watcher in this session;
+keepalive holds the WSL VM.
+
+The original launch recipe (for relaunch-after-crash — skip-if-scored
+makes it idempotent):
 
 - `/root/run_v3_cell.sh` — per-cell train+evaluate under RECIPE, root
   `runs/lab/v3`, **no default kw** (every cell spells its config).
@@ -113,9 +135,10 @@ Everything is one command away but nothing is running:
 
 ## Environment
 
-- GPU idle (~840 MiB desktop baseline) and left free per ruling.
+- GPU running the v3 screen queue since 03:20Z (launched under the 8-hour
+  autonomy grant).
 - Deck stack stopped; strix bridge down; nothing tonight needs them.
-- WSL keepalive NOT running (nothing to keep alive); start it before any
-  detached launch — memory `wsl-vm-idle-death`.
+- WSL keepalive RUNNING (hidden `wsl.exe sleep infinity`); kill it after
+  the queue drains — memory `wsl-vm-idle-death`.
 - This worktree (`claude/overnight-handoff-autonomous-967f3b`) sits at the
   merged-sites tip; main is `2310aaf`.
