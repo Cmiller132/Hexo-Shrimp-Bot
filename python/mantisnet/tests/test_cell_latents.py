@@ -1,5 +1,5 @@
-"""Step 15 cell-latent oracles: table derivations against pairwise brute
-force, and typed attention against a dense per-segment composition.
+"""Cell-latent oracles: table derivations against pairwise brute force, and
+typed attention against a dense per-segment composition.
 
 The attention oracle loops query rows in Python and uses dense softmax
 slices, so the vectorized scatter composition and the oracle share nothing

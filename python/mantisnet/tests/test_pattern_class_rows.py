@@ -1,11 +1,10 @@
-"""S4: the §5.1 window class term is one gather from a per-pattern table.
+"""The §5.1 window class term is one gather from a per-pattern table.
 
 ``_TERN_OCC_CLASS`` is constant on joint ``(pattern, slot)`` reversal
 orbits, so a window's occupied-slot class multiset is a function of its
 canonical pattern. The trunk therefore computes ``counts @ e_ws`` once and
-gathers per window; this pins that path to the literal per-edge sum the
-class-row reduction used to take, on real batch geometry including the
-empty board.
+gathers per window; this pins that path to the literal per-edge sum, on real
+batch geometry including the empty board.
 """
 
 from __future__ import annotations

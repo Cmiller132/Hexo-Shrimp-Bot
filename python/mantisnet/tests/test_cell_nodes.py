@@ -1,4 +1,4 @@
-"""Step 13 cell-node representation, geometry, and wiring laws (CPU)."""
+"""Cell-node representation, geometry, and wiring laws (CPU)."""
 
 from __future__ import annotations
 

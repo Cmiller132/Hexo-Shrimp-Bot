@@ -1,12 +1,12 @@
 """§5.1/§5.2 CUDA message-passing parity, gradients, and compilation.
 
-The oracle is the literal torch formulation that preceded the CUDA path:
-gather the source rows, add the incidence-class embedding, then ``index_add_``
-into the destination rows.  The production decomposition since split the class
-term into ``incidence_counts @ class_weight``; every composition test here
-still compares against that one historical formula, so the split cannot
-quietly change the §5 math.  The oracle deliberately does not use the
-implementation's run discovery or any reordered incidence table.
+The oracle is the literal torch formulation: gather the source rows, add the
+incidence-class embedding, then ``index_add_`` into the destination rows.
+The production decomposition splits the class term into
+``incidence_counts @ class_weight``; every composition test here compares
+against the literal formula instead, so the split cannot quietly change the
+§5 math.  The oracle deliberately does not use the implementation's run
+discovery or any reordered incidence table.
 """
 
 from __future__ import annotations
@@ -279,7 +279,7 @@ def test_block_call_sites_match_the_old_formulas(positions, model, monkeypatch):
     """The integrated block passes each primitive the §5 direction and counts.
 
     Primitive parity alone would not catch swapping two incidence arguments at
-    the call site.  Replace only the primitives with the old literal formulas,
+    the call site.  Replace only the primitives with the literal formulas,
     while pinning every argument by identity, then compare the whole block.
     """
     batch = _batch_for_case(positions, "ragged")

@@ -37,8 +37,8 @@ import torch
 from .evaluate import SCORES_FORMAT, scores_filename
 from .train import TrainConfig
 
-# The lean screen budgets of the Step 12+ recipe on the whole realized train
-# split (train_subset=0 fits the full split), EMA alongside the raw weights.
+# The screen budgets, on the whole realized train split (train_subset=0 fits
+# the full split), with EMA alongside the raw weights.
 RECIPE = TrainConfig(
     epochs=4,
     device="cuda",

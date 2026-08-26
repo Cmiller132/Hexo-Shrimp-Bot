@@ -111,10 +111,10 @@ def fit_epoch(
     packed chunks before grouping. ``progress(consumed, total)`` is called
     after every consumed chunk.
 
-    ``steady=(warmup, measure)`` is the benchmark window of the graft
-    campaign's speed gate (``docs/MANTIS_GRAFT_SPEC.md`` §2.2): consume
-    ``warmup`` chunks, synchronize CUDA, time the next ``measure`` chunks,
-    synchronize again, then stop the epoch early. The returned mapping gains
+    ``steady=(warmup, measure)`` is the benchmark window of the speed gate
+    (``docs/MANTIS_GRAFT_SPEC.md`` §2.2): consume ``warmup`` chunks,
+    synchronize CUDA, time the next ``measure`` chunks, synchronize again,
+    then stop the epoch early. The returned mapping gains
     a ``"steady"`` sub-mapping with the windowed throughput and approximate
     per-chunk latency quantiles (chunk boundaries are wall-clock stamps
     without per-chunk synchronization, so quantiles are indicative while the
@@ -231,10 +231,9 @@ def fit_epoch(
             _refuse_nonfinite_parameters(model, fit_step)
 
     if total == 0:
-        # Preserve the production fit's historical empty-buffer refusal. It
-        # previously failed while dividing its named metric totals by zero;
-        # returning a partial {"fit_steps": 0} result would violate fit's
-        # public four-key metric contract.
+        # An empty buffer is refused rather than reported: returning a partial
+        # {"fit_steps": 0} result would violate fit's public four-key metric
+        # contract.
         raise ZeroDivisionError("float division by zero")
     result: dict[str, float | int] = {
         name: float(value) / total for name, value in stat_sums.items()

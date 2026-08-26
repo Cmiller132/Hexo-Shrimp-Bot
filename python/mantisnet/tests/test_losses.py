@@ -82,7 +82,7 @@ def test_param_groups_partition_and_membership(model):
     assert id(model.blocks[0].wq.weight) in ids_d
     assert id(model.value_queries) in ids_d  # listed nowhere in §10's exclusions
 
-    # The attention-bias tables live behind the cell knobs now.
+    # The attention-bias tables live behind the cell knobs.
     from mantisnet import MantisConfig, MantisNet
 
     celled = MantisNet(MantisConfig(cell_latents=True))

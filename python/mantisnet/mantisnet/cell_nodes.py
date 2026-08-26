@@ -1,4 +1,4 @@
-"""Step 13 all-cell geometry on the Step 15 typed-attention kernels.
+"""All-cell geometry on the typed-attention kernels.
 
 The Rust builder ships only invariant edge fields and global indices. This
 module derives the destination-, source-, and class-major CSR views on the

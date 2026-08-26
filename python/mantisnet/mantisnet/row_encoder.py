@@ -1,4 +1,4 @@
-"""Step 4's fused action-row encoder: the kept-row hidden sum per legal cell.
+"""Fused action-row encoder: the kept-row hidden sum per legal cell.
 
 Each kept action row pairs a window with its post-placement class; the row's
 hidden vector is ``relu(pre_w[window] + table[class])`` and a cell's rows sum

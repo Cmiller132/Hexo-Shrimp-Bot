@@ -1,4 +1,4 @@
-﻿"""Supervised lab-cell fitting through the production model and fit engine."""
+"""Supervised lab-cell fitting through the production model and fit engine."""
 
 from __future__ import annotations
 
@@ -51,8 +51,8 @@ class TrainConfig:
     # seed) so every arm and seed of a paired screen fits identical samples.
     train_subset: int = 0
     train_subset_seed: int = 0
-    # Ablation-by-freezing control: parameter-name suffixes held at their
-    # initial value (left out of the optimizer). Empty = train everything.
+    # Freezing control: parameter-name suffixes held at their initial value
+    # (left out of the optimizer). Empty = train everything.
     freeze: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -278,7 +278,7 @@ def _supervised_fn(compile_model: bool):
         if _supervised_heads_compiled is None:
             # Packed chunks span tail-to-full sizes and the AOT cache guards
             # them by size range, so the graph set splits past the stock limit
-            # of 8 â€” after which every new range runs eager for the rest of
+            # of 8 — after which every new range runs eager for the rest of
             # the session. The set converges; give it room.
             torch._dynamo.config.recompile_limit = 64
             _supervised_heads_compiled = torch.compile(_supervised_heads, dynamic=True)
@@ -514,9 +514,8 @@ def train_cell(
     """Train one fresh variant/seed cell and write its complete artifacts.
 
     ``cell_budget`` caps the accumulation micro-chunks, not the optimizer
-    batch: gradients are summed over the same samples either way, so it is
-    an execution/memory knob, not a recipe change. Window-heavy arms use it
-    to keep their edge tables resident instead of paging.
+    batch: gradients are summed over the same samples either way, so it is an
+    execution/memory knob, not a recipe change.
     """
 
     cfg = config or TrainConfig()

@@ -323,7 +323,7 @@ def test_checkpoint_refuses_version_drift(tmp_path):
 
 
 def test_two_row_brm_checkpoint_fails_strictly_at_the_named_readout(tmp_path):
-    """There is no compatibility shim for the superseded two-row head."""
+    """There is no compatibility shim for the two-row head."""
     import dataclasses
 
     from mantisnet import MantisConfig, MantisNet

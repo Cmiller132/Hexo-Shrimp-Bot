@@ -4,8 +4,8 @@
 # and every other flag is repeated because resume restores model, optimizer,
 # and RNG state, not the run's configuration.
 #
-# STRIX_SEAT_ADDR must be set: the strix seat is a client of the WSL-side
-# bridge, and an unset address is what killed newmodeltest at iteration 25.
+# STRIX_SEAT_ADDR must be set: the strix eval seat reaches the WSL-side bridge
+# through it, and `set -u` aborts the launch when it is unset.
 set -eu
 cd /workspace/python/mantisnet
 export VIRTUAL_ENV=/opt/venv

@@ -1,4 +1,4 @@
-"""The Step 4 structural alias diagnostic."""
+"""The structural alias diagnostic."""
 
 from __future__ import annotations
 

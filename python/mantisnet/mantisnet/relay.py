@@ -35,8 +35,8 @@ _NUM_WARPS = 1
 
 # Class runs are the hostile layout — tens of thousands of edges can share a
 # class, so ``d_emb`` slices every run across programs, each summing 32-row
-# tiles into its own partial. 64 slices keep the worst run to a few hundred
-# iterations while the (classes * 64, H) fp32 partial stays a few MB.
+# tiles into its own partial. The slice count trades the per-program run
+# length against the size of the (classes * splits, H) fp32 partial.
 _CLASS_SPLITS = 64
 _CLASS_BLOCK_E = 32
 _CLASS_NUM_WARPS = 4

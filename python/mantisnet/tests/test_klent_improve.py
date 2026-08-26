@@ -121,7 +121,7 @@ def test_expectations_stay_inside_the_q_range_when_every_action_is_lost():
     """A lost endgame has every legal move at exactly Q = -1, so the fp32
     softmax's mass error reaches E[Q] with nothing to cancel it. The operator
     divides by the segment's own mass, so |v_hat| cannot leave |Q|'s range at
-    any width — the width is what made this a live failure at 3000 cells."""
+    any width."""
     for n in (1, 2, 1000, 3000):
         offsets = torch.tensor([0, n])
         q = -torch.ones(n)

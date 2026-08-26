@@ -1,23 +1,15 @@
 #!/bin/bash
-# tactical-1: KLENT successor carrying Step 5 tactical scalars (screen arm B,
-# the only arm positive on every seed of the step56 factorial) on the
-# recompute-in-backward trunk.
+# Launch tactical-1: KLENT at the production cell-node configuration plus
+# `action_tactical` (the §4.4 tactical scalars), at MODEL_REPR_VERSION 8,
+# initialized from a supervised lab cell. The reference recipe is passed
+# explicitly, as it must be on every launch: the CLI defaults are the paper's
+# coefficients and differ.
 #
-# Same recipe as cellnodes-1 wherever the recipe is the science:
-# tau/lam/mass_floor/lam_ret/gamma/lr, games/envs/batch/cap, eval cadence.
-# The chunk budgets are the lean-instrument pair (2M/125k fit, 6M/600k
-# collect): the selective-recompute trunk fits at 3.5 GiB on the pinned
-# instrument where cellnodes-1's budgets were sized against a 6.3 GiB fit
-# path on a 12 GiB card. Chunking changes memory and speed only — gradients
-# and metrics are identical for any chunking.
+# The chunk budgets change memory and speed only - gradients and metrics are
+# identical for any chunking.
 #
-# The initialization is the arm-B screen cell: 4 epochs on cn1-late-v1
-# (cellnodes-1 self-play, iterations 302-401), production config plus
-# action_tactical, seed 2 — the same prefit-from-screen-cell pattern that
-# seeded cellnodes-1's line.
-#
-# STRIX_SEAT_ADDR must be set: the strix seat is a client of the WSL-side
-# bridge, and an unset address is what killed newmodeltest at iteration 25.
+# STRIX_SEAT_ADDR must be set: the strix eval seat reaches the WSL-side bridge
+# through it, and `set -u` aborts the launch when it is unset.
 set -eu
 cd /workspace/python/mantisnet
 export VIRTUAL_ENV=/opt/venv

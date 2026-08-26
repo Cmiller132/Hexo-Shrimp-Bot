@@ -180,7 +180,7 @@ def _spread(choose, position, seeds):
 
 def test_unit_temperature_is_the_unscaled_draw():
     # The cross-language Gumbel fixtures are generated through this chooser, so
-    # the default has to be the old behaviour exactly and not merely closely.
+    # the default must reproduce the unscaled draw exactly, not merely closely.
     positions = [
         hexo_py.Position.replay([(0, 0)]),
         hexo_py.Position.replay([(0, 0), (1, 2), (-2, 1)]),

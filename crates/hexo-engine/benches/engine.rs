@@ -155,7 +155,7 @@ fn enumerate(c: &mut Criterion, f: &Fixtures) {
     g.finish();
 }
 
-/// The two directions of the canonical ordering against the naive walk they replaced.
+/// The two directions of the canonical ordering, each against the naive walk.
 fn ordering(c: &mut Criterion, f: &Fixtures) {
     let mut g = c.benchmark_group("ordering");
     let mut subjects: Vec<(String, &Position)> = f

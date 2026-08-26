@@ -2,7 +2,7 @@
 
 The registry is intentionally small.  A representation only belongs here once
 its model and collation path exist; ordinary MantisNet width/depth/head
-ablations are typed ``MantisConfig`` overrides, not separate variants.
+variations are typed ``MantisConfig`` overrides, not separate variants.
 """
 
 from __future__ import annotations

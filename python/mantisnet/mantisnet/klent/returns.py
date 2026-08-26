@@ -39,7 +39,7 @@ def lambda_returns(signs: np.ndarray, v_hats, lam_ret: float, gamma: float) -> n
     """Per-ply returns ``G_0..G_T`` of a won episode, each in its mover's frame.
 
     ``signs`` and ``v_hats`` cover plies ``0..T`` — the acting-time values of
-    ``KLENT_FOR_HEXO.md`` §1.4 K6; ``v_hats[t]`` is `v̂_t` and only entries ``1..T`` are read.
+    ``KLENT_FOR_HEXO.md`` §1 K6; ``v_hats[t]`` is `v̂_t` and only entries ``1..T`` are read.
     ``signs[T]`` is likewise never read: the recursion terminates at the win,
     and a terminal position's frozen phase must answer nothing
     (``KLENT_FOR_HEXO.md`` §1.1).

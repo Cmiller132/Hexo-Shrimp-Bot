@@ -307,8 +307,7 @@ const ACTION_EMPTY: i64 = 2;
 const ACTION_MIXED: i64 = 3;
 const ACTION_EMPTY_ORBITS: usize = 3;
 
-/// Step 5: deterministic tactical scalars per legal action — ACT §19.3 minus
-/// its mixed-created column. Order:
+/// Deterministic tactical scalars per legal action, in this order:
 ///
 /// ```text
 /// 0 immediate_win                     1 max own count after / 6
@@ -1157,8 +1156,8 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
     let mut live_ref = Vec::new();
     // Sorted for binary-search lookup by the decoder.
     let mut live_keys: Vec<i64> = Vec::new();
-    // Step 5 global threat census: opponent-only windows one or two stones
-    // from six. Live windows are deduplicated, so plain counts need no set.
+    // Global threat census: opponent-only windows one or two stones from six.
+    // Live windows are deduplicated, so plain counts need no set.
     let mut opp_five_global = 0usize;
     let mut opp_four_global = 0usize;
     for &(key, wr, m0, m1) in &candidates {
@@ -1205,8 +1204,8 @@ pub fn build(pos: &engine::Position) -> Result<Graph, String> {
         }
     }
 
-    // Decoder table: legal-cell-major, then (axis, offset) order. The Step 4
-    // action rows ride the same walk: the candidate's mask gives the row's
+    // Decoder table: legal-cell-major, then (axis, offset) order. The action
+    // rows ride the same walk: the candidate's mask gives the row's
     // status and pre pattern, the inserted stone is one power-of-three away,
     // and the decoder's own binary search is the kept-window index — no
     // second engine walk. The kept/decoder agreement stays asserted per row.
@@ -1425,8 +1424,7 @@ pub struct RawBatch {
     pub act_rev: Vec<i64>,
     /// EMPTY-row counts in `(legal cell, slot orbit)` row-major order.
     pub act_empty: Vec<i64>,
-    /// Step 5 tactical scalars in `(legal cell, TACTICAL_FEATURES)` row-major
-    /// order.
+    /// Tactical scalars in `(legal cell, TACTICAL_FEATURES)` row-major order.
     pub act_tactical: Vec<f32>,
 }
 

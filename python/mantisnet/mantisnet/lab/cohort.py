@@ -1,9 +1,8 @@
 """Production-shaped position cohorts for lab measurements.
 
-Positions come from stepping the real ``Collector`` or replaying prefixes
-from a frozen corpus, not random playouts: random play averages roughly
-2,400 legal cells per position at ply 50, versus roughly 540 under real
-collection.
+Positions come from stepping the real ``Collector`` or replaying prefixes from
+a frozen corpus, never random playouts: random play reaches far denser
+positions than real collection does.
 """
 
 from __future__ import annotations

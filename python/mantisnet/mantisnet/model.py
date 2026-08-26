@@ -2,14 +2,12 @@
 
 The forward consumes a :class:`~mantisnet.builder.Batch` and performs no
 data-dependent index discovery: every gather, scatter, and pad slot was
-precomputed by the builder. Weights are fp32; the forward is written to run
-under bf16 autocast without assuming it (buffers inherit dtype from inputs,
-and the scalar value decode is done in fp32).
-
-Linear maps written as bare matrices in the spec (``U``, ``V``, ``P``) are
-bias-free — the per-class embedding added alongside them is the additive term.
-Attention key projections are bias-free; FFN, MLP, and the other attention
-linears keep the framework-default bias (§10).
+precomputed by the builder. Weights are fp32; the forward runs under bf16
+autocast without assuming it (buffers inherit dtype from inputs, and the scalar
+value decode is done in fp32). Linear maps written as bare matrices in the spec
+(``U``, ``V``, ``P``) are bias-free — the per-class embedding added alongside
+them is the additive term; attention key projections are bias-free, and FFN,
+MLP, and the other attention linears keep the framework-default bias (§10).
 """
 
 from __future__ import annotations
@@ -61,20 +59,20 @@ class MantisConfig:
     policy_hidden: int = 128  # P_H
     value_hidden: int = 128  # V_H
     dropout: float = 0.0
-    # Step 15 knob: cell latents replace the §5.1b relay with persistent
-    # typed state on the covered legal cells.
+    # Cell latents replace the §5.1b relay with persistent typed state on the
+    # covered legal cells.
     cell_latents: bool = False
-    # Step 13: extend persistent state to every legal cell and let each block
-    # read invariant radius-8 stone context. Adjacency is a factored sub-knob.
+    # Extend persistent state to every legal cell and let each block read
+    # invariant radius-8 stone context. Adjacency is a factored sub-knob.
     cell_nodes: bool = False
     cell_node_scope: str = "all"
     cell_adjacency: bool = False
-    # Step S1: covered cells start from invariant structure rather than one
-    # shared row, and a block's cell reads gain a nonlinear residual on top
-    # of the additive path they already take.
+    # Covered cells start from invariant structure rather than one shared row,
+    # and a block's cell reads gain a nonlinear residual on top of the additive
+    # path they already take.
     cell_structure: bool = False
-    # Step 5: encode the builder's deterministic per-action tactical scalars
-    # into the action row through a small MLP (measured arm True).
+    # Encode the builder's deterministic per-action tactical scalars into the
+    # action row through a small MLP.
     action_tactical: bool = False
 
     def __post_init__(self) -> None:
@@ -129,10 +127,9 @@ class ModelOutput:
 # [z_pos, z_neg, z_zero]. Every reader takes the checkpoint shape from here.
 CRITIC_LOGITS = 3
 
-# Step S1 coverage vocabulary: how many live windows contain a covered cell,
-# 1..18, folded into eight buckets — 1, 2, 3, 4, 5-6, 7-9, 10-13, 14-18.
-# Resolution where it separates a barely-touched cell from a contested one,
-# coarse in the crowded tail where one more window changes little.
+# Coverage vocabulary: how many live windows contain a covered cell, 1..18,
+# folded into eight buckets — 1, 2, 3, 4, 5-6, 7-9, 10-13, 14-18. Fine where it
+# separates a barely-touched cell from a contested one, coarse in the tail.
 COVERAGE_BUCKETS = 8
 # Bucket of each degree 0..18. Entry 0 is unreachable: a cell is covered
 # exactly when it has decoder incidence, so every row this table indexes has
@@ -140,11 +137,10 @@ COVERAGE_BUCKETS = 8
 # and indexes out of the table rather than folding into the last bucket.
 COVERAGE_BUCKET_OF = (0, 0, 1, 2, 3, 4, 4, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 7)
 
-# The trunk stages were config knobs while they were ablations; checkpoints
-# written in that window record the knob fields in their model_config. These
-# are the values that describe the architecture this build bakes in — a
-# recorded config carrying exactly these is this architecture and loads; any
-# other value names a model this build no longer implements.
+# Knob fields older checkpoints still record in their model_config, at the
+# values that describe the architecture this build bakes in. A recorded config
+# carrying exactly these is this architecture and loads; any other value names
+# a model this build no longer implements.
 LEGACY_BAKED_KNOBS: dict[str, object] = {
     "axis_bias": False,
     "off_axis_bias": False,
@@ -320,9 +316,9 @@ class _Block(nn.Module):
                 )
                 self.adj_vclass = nn.Embedding(cell_nodes.ADJACENCY_CLASSES, h)
             if cfg.cell_structure:
-                # Step S1: one more residual, an MLP over the block's
-                # incoming normalized cell state and the summed read
-                # outputs, after the two additive read residuals.
+                # One more residual, an MLP over the block's incoming
+                # normalized cell state and the summed read outputs, after the
+                # two additive read residuals.
                 self.ln_c = nn.LayerNorm(h)
                 self.mlp_c = _PairMlp(h, h, h)
         else:
@@ -360,8 +356,7 @@ class _Block(nn.Module):
         self.e_sw = nn.Embedding(cfg.occ_classes, h)
         self.mlp_s = _PairMlp(h, h, h)
         # §5.3 stone self-attention + state latents. No learned pair bias:
-        # the Step-11 knock-out measured the geometric bias channel decorative
-        # in the trained function, so scores are content-only.
+        # scores are content-only.
         self.ln_attn = nn.LayerNorm(h)
         self.wq = nn.Linear(h, h)
         self.wk = nn.Linear(h, h, bias=False)
@@ -418,8 +413,8 @@ class _Block(nn.Module):
         ``cell_structure`` adds a second, nonlinear residual on top of that
         additive path rather than replacing it: one MLP over the block's
         incoming cell state and the same read outputs the additive path
-        applied. Its zero-init output layer makes the knob-on arm start at
-        exactly the incumbent function."""
+        applied. Its output layer is zero-initialized, so the term starts at
+        exactly zero."""
         cfg = self.cfg
         heads, hd = cfg.heads, cfg.h // cfg.heads
         n_c, n_w = c.shape[0], w.shape[0]
@@ -585,11 +580,8 @@ class _Block(nn.Module):
         w = w + self.drop(self.mlp_w(self.ln_ws_w(w), agg))
 
         if cfg.uses_cell_state:
-            # Execution policy, not architecture: the cell stage is the
-            # trunk's widest activation footprint, so its internals are
-            # recomputed in backward instead of saved. Every kernel involved
-            # is deterministic, so the replay — and therefore every gradient
-            # — is bit-identical to the saved-activations execution.
+            # Recomputed in backward to cut peak memory; every kernel involved
+            # is deterministic, so the replayed gradients are bit-identical.
             w, c = checkpoint(
                 self._cell_stage,
                 s,
@@ -676,9 +668,7 @@ class _Block(nn.Module):
             )
             g = g + self.drop(delta)
         # Same recompute-in-backward policy as the cell stage: the cycle
-        # touches every window row three times and its saves were the
-        # second-widest slice of the peak, while its replay is a fraction
-        # of a percent of the step.
+        # touches every window row three times.
         w, g = checkpoint(
             self._window_latent_cycle,
             w,
@@ -725,11 +715,11 @@ class MantisNet(nn.Module):
         if cfg.cell_nodes or cfg.cell_structure:
             self.cell_nearest_table = nn.Embedding(cell_nodes.NEAREST_BUCKETS, h)
         if cfg.cell_structure:
-            # Step S1: a covered cell's static identity — the 726-class
-            # decoder incidence it sits in, its nearest-stone bucket (the
-            # same table uncovered cells initialize from), and how many live
-            # windows cover it. Both tables are zero at init, so the knob
-            # starts at the incumbent function on these two terms.
+            # A covered cell's static identity — the 726-class decoder
+            # incidence it sits in, its nearest-stone bucket (the same table
+            # uncovered cells initialize from), and how many live windows
+            # cover it. Both tables are zero at init, so these terms start at
+            # exactly zero.
             self.cell_class_table = nn.Embedding(cfg.dec_classes, h)
             self.cell_coverage_table = nn.Embedding(COVERAGE_BUCKETS, h)
             self.register_buffer(
@@ -739,7 +729,7 @@ class MantisNet(nn.Module):
             )
 
         self.blocks = nn.ModuleList(_Block(cfg) for _index in range(cfg.blocks))
-        # S4: the per-pattern occupied-slot class counts — a constant of the
+        # The per-pattern occupied-slot class counts — a constant of the
         # ternary vocabulary, so it travels with the module, not the
         # checkpoint. ``counts @ e_ws`` turns the §5.1 class-row sum into one
         # gather per window, with a dense deterministic matmul gradient.
@@ -777,9 +767,9 @@ class MantisNet(nn.Module):
             persistent=False,
         )
         if cfg.action_tactical:
-            # Step 5: the tactical scalars join the action row through one
-            # small MLP. Zero-init on its output starts the knob-on arm at
-            # exactly the incumbent function.
+            # The tactical scalars join the action row through one small MLP.
+            # Its output layer is zero-initialized, so the term starts at
+            # exactly zero.
             self.tactical_a = nn.Linear(TACTICAL_FEATURES, h)
             self.tactical_out = nn.Linear(h, h)
         # §7 value head.
@@ -809,8 +799,7 @@ class MantisNet(nn.Module):
         for head in (self.mlp_p, self.mlp_q):
             nn.init.zeros_(head.out.weight)
             nn.init.zeros_(head.out.bias)
-        # Knob-on arms start at the incumbent function: the added terms are
-        # exactly zero until their output layers move.
+        # The optional terms are exactly zero until their output layers move.
         if self.cfg.action_tactical:
             nn.init.zeros_(self.tactical_out.weight)
             nn.init.zeros_(self.tactical_out.bias)
@@ -893,7 +882,7 @@ class MantisNet(nn.Module):
         self, batch: Batch, covered: Tensor
     ) -> cell_latents.CellTables:
         # The structural axis is emitted for the future equivariant route. In
-        # the invariant Step 13 channel all three axes share one relation row.
+        # this invariant channel all three axes share one relation row.
         classes = torch.zeros_like(batch.adjacency_axis)
         return cell_nodes.tables_from_op(
             batch.adjacency_src,
@@ -947,9 +936,8 @@ class MantisNet(nn.Module):
         seq_lens = batch.attn_valid.sum(dim=1, dtype=torch.int32)
         # Every block's §5.1/§5.2 class terms in one pass each: the window
         # side is ``counts @ [every e_ws]`` then one gather per window, the
-        # stone side one run-reduction over the concatenated tables. Both
-        # fp32 — the discipline the per-block class sums always had — so
-        # the matmul is guarded from autocast.
+        # stone side one run-reduction over the concatenated tables. Both are
+        # fp32, so the matmul is guarded from autocast.
         if len(self.blocks):
             with torch.autocast(device_type=w.device.type, enabled=False):
                 ws_tables = torch.cat(
@@ -1068,8 +1056,8 @@ class MantisNet(nn.Module):
         counts = batch.act_empty.to(torch.float32)
         acts = acts + (counts.unsqueeze(-1) * empty_rows.unsqueeze(0)).sum(dim=1)
         if self.cfg.action_tactical:
-            # Step 5: the deterministic scalars enter through one small MLP;
-            # the term joins the same fp32 accumulator as the row sums.
+            # The deterministic scalars enter through one small MLP; the term
+            # joins the same fp32 accumulator as the row sums.
             tactical = self.tactical_out(F.relu(self.tactical_a(batch.act_tactical)))
             acts = acts + tactical.float()
         return acts

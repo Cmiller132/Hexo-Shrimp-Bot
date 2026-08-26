@@ -1,9 +1,9 @@
 //! The command line and the configuration each subcommand parses into.
 //!
-//! `docs/CONTAINER_SPEC.md` §3 ships only the subcommands that work. `serve` is
-//! available because §3.1 now pins its native protocol. `play` remains absent:
-//! §15 has not named its foreign harness, so there is still no edge protocol an
-//! adapter could correctly parse.
+//! `docs/CONTAINER_SPEC.md` §3 defines the subcommands this binary carries.
+//! `serve` is one of them because §3.1 pins its native protocol. `play` is not:
+//! §15 names no foreign harness, so there is no edge protocol an adapter could
+//! correctly parse.
 //!
 //! Nothing is defaulted that decides how a run behaves. The defaults that do
 //! exist — batch size, ply cap, the flush window, the worker count — are

@@ -1,5 +1,5 @@
-"""Step 15 knob wiring: config contracts, the cell-latent trunk stream and
-decoder read, and knob-off inertness."""
+"""Cell-latent knob wiring: config contracts, the cell-latent trunk stream
+and decoder read, and knob-off inertness."""
 
 from __future__ import annotations
 
@@ -126,7 +126,7 @@ def test_the_decoder_input_contract_fails_loudly(positions):
 
 
 def test_arm_shapes_infer_and_reload(positions):
-    # The surviving Step 15 arms round-trip shape inference and a strict
+    # Both cell-latent arms round-trip shape inference and a strict
     # state-dict load. The relay arm carries no per-head tensor, so its
     # head count rides the recorded-config hint.
     arms = {

@@ -271,9 +271,8 @@ def test_deck_database_refuses_a_version_mismatch(tmp_path):
 def test_telemetry_connection_closes_when_its_block_exits(deck_run):
     """``with sqlite3.connect(...)`` opens a transaction; it does not close.
 
-    The deck served 500s after two days of polling because every query
-    endpoint held its connection open, so this asserts the handle is dead
-    once the block ends rather than merely that the query worked.
+    The assertion is that the handle is dead once the block ends, not merely
+    that the query inside it worked.
     """
     _runs, run = deck_run
     with telemetry_connection(run) as conn:
@@ -323,7 +322,7 @@ def test_repeated_queries_leave_no_connection_open(deck_run, monkeypatch):
 
 def test_a_missing_telemetry_database_still_maps_to_404(deck_run, tmp_path):
     """Entering the connection inside the request must not cost the status
-    codes: the failure now happens one frame later than it used to."""
+    codes: a run without a telemetry database still maps to 404."""
     runs, _run = deck_run
     (runs / "empty").mkdir()
     with TestClient(create_app(runs, device="cpu")) as client:

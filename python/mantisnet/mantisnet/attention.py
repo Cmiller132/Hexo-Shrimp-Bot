@@ -2,10 +2,8 @@
 
 Each position attends over its live ``[4 state latents; stones]`` prefix and
 nothing else: keys past the prefix are masked hard, and a query tile past the
-prefix performs no key work. There is no learned pair bias — the Step-11
-knock-out measured the geometric bias channel decorative in the trained
-function, and its removal also removed the one nondeterministic accumulation
-(the bias-table gradient's atomic adds) from the backward.
+prefix performs no key work. There is no learned pair bias, so the backward
+carries no atomic accumulation and is run-to-run deterministic.
 """
 
 from __future__ import annotations

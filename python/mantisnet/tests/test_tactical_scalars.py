@@ -1,4 +1,4 @@
-"""Step 5 tactical scalars: engine oracle, D6, collation, and knob wiring.
+"""Tactical scalars: engine oracle, D6, collation, and knob wiring.
 
 The eleven per-action values are recomputed here by actually playing each
 action on a board copy and reading the successor's windows from the engine

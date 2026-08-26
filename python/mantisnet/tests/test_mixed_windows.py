@@ -1,8 +1,8 @@
 """The baked all-nonempty scope: ternary laws, builder parity, and structure.
 
-The ternary tables are the MANTIS_GRAFT_SPEC §4 (Step 12) class laws; the
-builder is checked against the engine's window walk as the independent oracle,
-against the Rust builder field for field, and with window attention on and off.
+The ternary tables are the MANTIS_GRAFT_SPEC §4 class laws; the builder is
+checked against the engine's window walk as the independent oracle, against
+the Rust builder field for field, and with window attention on and off.
 """
 
 from __future__ import annotations
@@ -116,8 +116,8 @@ def test_rust_python_parity():
 
 
 def test_baked_model_forward_and_shapes():
-    """The baked model builds, runs every head, and sizes its tables;
-    the deleted §5.1c stage leaves no parameters."""
+    """The baked model builds, runs every head, and sizes its tables, and
+    carries no §5.1c stage parameters."""
     cfg = MantisConfig(h=32, heads=2, blocks=2, policy_hidden=32, value_hidden=32)
     torch.manual_seed(0)
     model = MantisNet(cfg).eval()

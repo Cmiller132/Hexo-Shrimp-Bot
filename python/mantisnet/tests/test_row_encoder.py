@@ -1,4 +1,4 @@
-"""The Step 4 row encoder: reference semantics and kernel parity."""
+"""The row encoder: reference semantics and kernel parity."""
 
 from __future__ import annotations
 

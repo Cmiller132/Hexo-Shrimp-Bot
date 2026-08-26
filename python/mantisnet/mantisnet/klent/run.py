@@ -5,7 +5,7 @@ Run directory: ``config.json``, ``invocations.jsonl``, ``metrics.jsonl``,
 ``STOP`` / ``CHECKPOINT`` sentinel files request clean exit / checkpoint at
 the next iteration boundary.
 
-    uv run python -m mantisnet.klent.run --out runs/pure-1 \
+    uv run python -m mantisnet.klent.run --out runs/<name> \
         --iterations 100 --games 64
 """
 

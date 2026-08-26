@@ -1,4 +1,4 @@
-"""Step 15 cell latents: typed attention over the decoder incidence, and the
+"""Cell latents: typed attention over the decoder incidence, and the
 per-line window tables.
 
 Every window↔window interaction the game defines — fork, block, shared
@@ -311,9 +311,9 @@ if triton is not None:
     ):
         # Query sweep, two passes over the run. Pass one recomputes alpha
         # from the saved stats, emits alpha and dalpha, and totals
-        # delta = sum(alpha * dalpha) — the softmax-backward constant the
-        # old path formed from the saved output rows. Pass two turns the
-        # stored dalpha into dscore and accumulates dq. Deterministic, no
+        # delta = sum(alpha * dalpha) — the softmax-backward constant, formed
+        # from per-edge quantities so no output row is needed. Pass two turns
+        # the stored dalpha into dscore and accumulates dq. Deterministic, no
         # atomics; delta lands in a buffer for the source sweep.
         pid = tl.program_id(0)
         w = pid // HEADS

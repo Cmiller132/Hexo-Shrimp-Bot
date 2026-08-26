@@ -7,8 +7,7 @@ without tree search, using a closed-form improved policy derived from reverse-KL
 regularization and entropy regularization.
 
 This document describes how KLENT is adapted and configured for the Hexo game.
-The algorithm is specified in [KLENT_PAPER.md](KLENT_PAPER.md); measured
-outcomes and configuration selection live in [ABLATIONS.md](ABLATIONS.md). The
+The algorithm is specified in [KLENT_PAPER.md](KLENT_PAPER.md). The
 implementation lives in `python/mantisnet/mantisnet/klent/`.
 
 The paper's coefficients $(\alpha, \beta)$ for entropy and reverse-KL are this

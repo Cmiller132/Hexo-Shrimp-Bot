@@ -1,10 +1,10 @@
 """Mixed-scope run-reduced sums: kernel parity and gradients vs the literal.
 
-The oracle is the literal gather/``index_add_`` formulation the mixed paths
-used before ``class_row_sum`` and ``incidence_row_sum``; the ops must match
-it in value and gradient while never materializing the (E, H) per-edge
-gather.  The oracle deliberately does not use the run discovery or any
-reordered view beyond what the call site itself hands the op.
+The oracle is the literal gather/``index_add_`` formulation of the same
+sums; ``class_row_sum`` and ``incidence_row_sum`` must match it in value and
+gradient while never materializing the (E, H) per-edge gather.  The oracle
+deliberately does not use the run discovery or any reordered view beyond
+what the call site itself hands the op.
 """
 
 from __future__ import annotations

@@ -1,4 +1,4 @@
-﻿"""Packed imitation and outcome-horizon evaluation for lab and KLENT weights."""
+"""Packed imitation and outcome-horizon evaluation for lab and KLENT weights."""
 
 from __future__ import annotations
 

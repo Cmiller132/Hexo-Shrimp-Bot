@@ -214,7 +214,7 @@ def fit(
         critic_ce = -(
             critic_target * F.log_softmax(taken, dim=-1)
         ).sum(dim=-1).mean()
-        # Cross-arm curve only: measured under no_grad and absent from the
+        # Diagnostic only: computed under no_grad and absent from the
         # objective, so it cannot double-cover Q.
         with torch.no_grad():
             q_mse = (compose_q(taken) - returns).square().mean()

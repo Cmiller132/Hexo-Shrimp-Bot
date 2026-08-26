@@ -64,12 +64,12 @@ Architecture knobs (validated jointly at construction):
 | `cell_structure` | `False` | structured covered-cell init and a nonlinear cell update (requires `cell_latents`) |
 | `action_tactical` | `False` | encodes the §4.4 tactical scalars into the action row through a small MLP |
 
-The production training configuration at this writing is `cell_latents=True,
-cell_nodes=True, cell_node_scope="all"`; the default configuration keeps
-cell state off. Parameter count is 4,537,925 at defaults (pinned by tests)
-and 5,195,909 at the production configuration. `cell_structure` adds 726·H + 8·H for its two static tables
-and B·(2H + 3H² + 2H) for the per-block update MLP — 292,608 at the default
-widths and four blocks.
+The production training configuration is `cell_latents=True, cell_nodes=True,
+cell_node_scope="all"`; the default configuration keeps cell state off.
+Parameter count is 4,537,925 at defaults (pinned by tests) and 5,195,909 at
+the production configuration. `cell_structure` adds 726·H + 8·H for its two
+static tables and B·(2H + 3H² + 2H) for the per-block update MLP — 292,608 at
+the default widths and four blocks.
 
 ## 3. Input entities
 
@@ -94,10 +94,10 @@ axis); a cell likewise.
 
 ### 3.3 State latents
 
-Four position-level latent rows replace the single "global token" of earlier
-designs. They initialize as a learned 4×H base plus an embedding of
-`moves_remaining` (1 or 2 stones left in the current turn — the only
-whole-position scalar the model consumes). Each block lets them attend with
+Four learned latent rows carry position-level context. They initialize as a
+learned 4×H base plus an embedding of `moves_remaining` (1 or 2 stones left in
+the current turn — the only whole-position scalar the model consumes). Each
+block lets them attend with
 the stones (§5.3), read the window set, mix among themselves, and broadcast
 back to the windows (§5.4). After the final block their normalized mean is
 the global context row `g` the heads consume.
@@ -126,8 +126,7 @@ invariant static encodings of the cell's own coverage join it — the sum over
 its containing live windows of a learned row per 726-class decoder incidence
 class (§4.3), its nearest-stone bucket (the same 10-bucket table uncovered
 cells initialize from, §4.2), and a bucketed count of how many live windows
-contain it (§4.2). Uncovered cells are unchanged. The knob requires
-`cell_latents`.
+contain it (§4.2). Uncovered cells are unchanged.
 
 ### 3.5 Excluded inputs
 
@@ -143,9 +142,7 @@ Stone self-attention (§5.3) carries no learned pair bias: scores are
 content-only, and each position's rows attend within their live
 `[latents; stones]` prefix with keys past it masked hard. Geometry reaches
 the model only through the relational structures of §5 and the radius-edge
-vocabulary of §4.2. (An eval-time knock-out measured the former per-pair
-orbit bias decorative in the trained function; the measurement lives in
-`docs/ABLATIONS.md`.)
+vocabulary of §4.2.
 
 ### 4.2 Cell-node vocabularies
 
@@ -167,10 +164,8 @@ distance for cell features uses 10 buckets.
 
 `cell_structure` adds one more invariant cell feature: **coverage count**,
 the number of live windows containing the cell, 1..18 (six per axis), folded
-into **8 buckets** — 1, 2, 3, 4, 5-6, 7-9, 10-13, 14-18. Resolution where it
-separates a barely-touched cell from a contested one, coarse in the crowded
-tail where one more window changes little. The count is the cell's decoder
-incidence degree, so it needs nothing new on the wire.
+into **8 buckets** — 1, 2, 3, 4, 5-6, 7-9, 10-13, 14-18. The count is the
+cell's decoder incidence degree, so it needs nothing new on the wire.
 
 ### 4.3 Ternary window classes and the incidence fold
 
@@ -231,23 +226,22 @@ in order:
    after it — `c += MLP_c([LN(c₀); W_o·read_win + R_o·read_stone])`, a 2H→H
    layer, the trunk's ReLU, then H→H — where `c₀` is the block's incoming
    cell state and the second input sums the same read outputs the additive
-   path applied. The knob strictly nests the incumbent, recovering it
-   exactly at zero output weights. Without `cell_nodes` there is no stone
-   read and the second input is the window read alone. The window read-back
-   and the adjacency pass are unaffected. With cell state off, a
+   path applied. Without `cell_nodes` there is no stone read and the second
+   input is the window read alone. The window read-back and the adjacency
+   pass are unaffected. With cell state off, a
    parameter-tied transient relay lets windows exchange state through shared
    empty cells instead.
 3. **§5.2 stone ← windows** — the mirror of §5.1: stones aggregate their
    windows plus the class row sum.
-5. **§5.3 stone self-attention** — attention over `[latent rows; stones]`,
+4. **§5.3 stone self-attention** — attention over `[latent rows; stones]`,
    block-diagonal per position, content-only scores (§4.1). The four latent
    rows attend as ordinary rows. In the last block only the four latent-row
    reads are computed: no head reads post-trunk stone rows, so their
    attention outputs and FFN half would be dead work.
-6. **§5.4 window-latent cycle** — the latents read the window set
+5. **§5.4 window-latent cycle** — the latents read the window set
    (attention over each position's real windows), mix among themselves
    (dense 4×4 attention), and broadcast back to the windows.
-7. **FFN** — one shared feed-forward over stones and latents (latents
+6. **FFN** — one shared feed-forward over stones and latents (latents
    alone in the last block).
 
 Every stage is residual with pre-LayerNorm; every ragged attention runs its
@@ -324,18 +318,12 @@ assuming it. Ragged softmaxes, segment reductions, and the categorical
 compositions run in fp32 unconditionally. Custom kernels have deterministic
 backward passes — no atomics — and CPU reference paths asserted equal at
 tolerance on CUDA. Embeddings, the latent and cell bases, and the value
-queries initialize N(0, 0.02); decoder output layers initialize to zero;
-attention key projections and the spec's bare matrices are bias-free (a
-backward passes — no atomics — and CPU reference paths asserted equal at
-tolerance on CUDA. Embeddings, the latent and cell bases, and the value
-queries initialize N(0, 0.02); decoder output layers initialize to zero, as
-do the output layers and static tables a knob adds, so every knob-on arm
-starts at exactly the incumbent function — for `cell_structure` that is both
-static tables and the cell-update MLP's output layer, its one remaining
-init-time difference being the nearest-stone row covered cells newly read
-off a table that is not new; attention key projections and the spec's bare
-matrices are bias-free (a
-shared key bias cancels in softmax), while FFN, MLP, and the remaining
+queries initialize N(0, 0.02); decoder output layers initialize to zero, as do
+the output layers and the new static tables a knob adds — for `cell_structure`
+that is the cell-update MLP's output layer and its two new tables, while the
+nearest-stone row covered cells newly read comes off an existing table and is
+not zero. Attention key projections and the spec's bare matrices are bias-free
+(a shared key bias cancels in softmax), while FFN, MLP, and the remaining
 attention linears keep the framework-default bias.
 
 ## 11. Interface and versioning
@@ -355,7 +343,7 @@ One forward answers every head:
 encoding; `ACTION_ORDER_VERSION` (engine-owned) governs legal-move
 indexing; either bump invalidates checkpoints, and loaders refuse
 mismatches rather than adapt. Checkpoints record their `model_config`;
-configurations from the architecture's knob era are accepted exactly when
+recorded fields the architecture no longer carries are accepted exactly when
 they match the baked values (`axis_bias=False`, `off_axis_bias=False`, `d_max=12`,
 `cell_pass=True`, `cell_pass_from=0`, `cell_pass_rounds=1`,
 `joint_incidence=True`, `mixed_windows=True`, `action_rows=True`,

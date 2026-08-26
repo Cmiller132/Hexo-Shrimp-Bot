@@ -1,4 +1,4 @@
-"""S1 `cell_structure`: structured covered-cell init and the nonlinear
+"""`cell_structure`: structured covered-cell init and the nonlinear
 two-input cell update (CPU)."""
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from .conftest import d6_transforms
 
 
 _MOVES = [(0, 0), (3, 0), (-2, 2), (0, 3), (1, -2), (-1, 3)]
-# The production trunk, and arm B of the Step 5/6 screen on top of it.
+# The production trunk, and the same trunk with the tactical knob on top.
 PRODUCTION = dict(
     cell_latents=True,
     cell_nodes=True,

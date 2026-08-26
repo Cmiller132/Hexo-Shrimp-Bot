@@ -412,8 +412,8 @@ def bench_fit(
 ) -> dict:
     """Benchmark a production KLENT fit or one supervised corpus epoch.
 
-    With ``steady_warmup``/``steady_measure`` set, the run is the campaign
-    speed harness of ``docs/MANTIS_GRAFT_SPEC.md`` §2.2: one epoch whose first
+    With ``steady_warmup``/``steady_measure`` set, the run is the speed
+    harness of ``docs/MANTIS_GRAFT_SPEC.md`` §2.2: one epoch whose first
     ``steady_warmup`` chunks absorb compilation and cache warm-up untimed,
     followed by a CUDA-synchronized window of ``steady_measure`` chunks that
     yields the reported throughput; the epoch then stops early.
@@ -521,7 +521,7 @@ def bench_fit(
     if steady_warmup is not None:
         # §2.2 window: one epoch, warm-up absorbed by its leading chunks. The
         # reported peak VRAM covers the whole truncated epoch, compilation
-        # included — conservative, and identical in kind across arms.
+        # included.
         _vram_reset(device)
         metrics = run_epoch(seed, steady=(steady_warmup, steady_measure))
         window = metrics["steady"]

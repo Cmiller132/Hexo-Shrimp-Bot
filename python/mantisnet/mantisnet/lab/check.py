@@ -267,8 +267,8 @@ def run_check(
         identity = {"variant": variant, "model_kw": normalized_kw}
     if corpus is None:
         # Cohort generation is representation-neutral: Collector owns the
-        # production Rust batch path, so a not-yet-approved variant does not
-        # act here before its declared collator has been validated.
+        # production Rust batch path, so a variant does not act here before
+        # its declared collator has been validated.
         cases = selfplay_cohort(
             envs=envs,
             steps=steps,

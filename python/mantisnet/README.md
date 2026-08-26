@@ -2,17 +2,16 @@
 
 Python 3.12+. The MantisNet package contains a board-game neural network
 architecture, the KLENT reinforcement-learning training loop, a frozen-corpus
-supervised laboratory harness, and the Shrimp Control Deck telemetry dashboard. Algorithm obligations are in
-`docs/KLENT_FOR_HEXO.md`; measured experiment outcomes are in
-`docs/ABLATIONS.md`.
+supervised laboratory harness, and the Shrimp Control Deck telemetry
+dashboard. Algorithm obligations are in `docs/KLENT_FOR_HEXO.md`.
 
 ## The model: MantisNet
 
-MantisNet is a graph network whose incumbent nodes are stones, nonempty win
-windows, and four invariant state latents. The transient `cell_nodes` Step 13
-knob extends the Step 15 persistent-cell path to every legal cell. It consumes
-only mover-relative cell fields and D6-canonical relative geometry; absolute
-cell coordinates never enter the model.
+MantisNet is a graph network whose nodes are stones, nonempty win windows, and
+four invariant state latents. `cell_latents` gives covered cells persistent
+state; `cell_nodes` extends that state to every legal cell. Both consume only
+mover-relative cell fields and D6-canonical relative geometry; absolute cell
+coordinates never enter the model.
 
 A **window** is six consecutive cells along one hex axis. Every nonempty
 candidate window is represented under ternary slot patterns
@@ -30,9 +29,9 @@ latents read the real windows, self-mix, and broadcast back to those windows;
 their final normalized mean is the global context consumed by the heads.
 
 With `cell_nodes=True`, uncovered legal cells initialize from the
-nearest-stone-distance embedding, while covered cells retain the Step 15
-learned-base initialization. In every block cells also attend to all stones
-within radius 8 through exact orbit-48, source-owner, and on-axis classes.
+nearest-stone-distance embedding, while covered cells retain the learned-base
+initialization. In every block cells also attend to all stones within radius 8
+through exact orbit-48, source-owner, and on-axis classes.
 `cell_node_scope="all"` is the default and sends those radius edges to every
 legal cell; `"uncovered"` sends them only to cells with no decoder incidence.
 The scope filters edges only: every legal cell retains its latent and its
@@ -61,11 +60,10 @@ structured start and the cell stage a nonlinear second residual:
   `cell_nodes` there is no radius read and the second input is the window
   read alone. The window read-back and the adjacency pass are untouched.
 
-The knob strictly nests the incumbent: both static tables and the MLP's
-output layer are zero at init, so a fresh knob-on model computes exactly the
-incumbent function apart from the nearest-stone row that covered cells newly
-read, off a table that is not new. Zeroing that table makes the two arms
-byte-identical, which is what the no-op-at-init test asserts.
+Both new static tables and the MLP's output layer are zero at init, so a fresh
+knob-on model computes the knob-off function apart from the nearest-stone row
+covered cells newly read off an existing table. Zeroing that table makes the
+two builds byte-identical, which is what the no-op-at-init test asserts.
 
 Three heads read the trunk output:
 
@@ -254,7 +252,7 @@ across seeds (mean and sample SD per metric).
 
 ### Screen protocol v2
 
-`python -m mantisnet.lab.screen` holds the current ablation screen as code:
+`python -m mantisnet.lab.screen` holds the supervised screen protocol as code:
 `train` fits one cell under the protocol's recipe (4 epochs over the whole
 realized train split, lean budgets, EMA 0.995); `evaluate` scores a cell on
 val and test with raw and EMA weights; `verdict` judges arms against the
@@ -266,8 +264,7 @@ seeds. The composite `S = (2·z_critic + z_policy) / sqrt(5 + 4ρ)`, with each
 no more than one SE worse is `keep`; `S ≥ 2` otherwise is `policy-regressed`;
 `S ≤ −2` is `negative`; two cells in a critic basin (optimist or agnostic at
 1–4 plies from the end) make the arm `pathology-prone` regardless. Speed and
-other benefits are decided outside the module. Per-arm rows and the fixture's
-numbers go to `docs/ABLATIONS.md`.
+other benefits are decided outside the module.
 
 ### Checkpoint families
 
@@ -299,7 +296,7 @@ scoreable families are `trinomial-joint`, `bipolar-joint`, and
 | `profile fit` | Profile optimizer steps and bucket kernel self-time |
 | `mass` | Measure committed mass, Q/M behavior, and acting-floor sensitivity |
 | `check` | Run D6, batch-parity, decoder-coverage, and builder contracts |
-| `alias` | Report structural alias groups before/after the Step 4 row inputs |
+| `alias` | Report structural alias groups before/after the action-row inputs |
 | `smoke` | Tiny end-to-end freeze, CPU cell, evaluation, and report |
 
 ## Control deck
@@ -415,7 +412,6 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
   adaptation and training obligations.
 - [`docs/KLENT_PAPER.md`](../../docs/KLENT_PAPER.md) records the source
   algorithm.
-- [`docs/ABLATIONS.md`](../../docs/ABLATIONS.md) owns measured run outcomes.
 - `python/hexo-py` supplies engine positions and the shared Rust encoder.
 - `crates/models/mantisnet` consumes the same checkpoint and encoder semantics
   from the native container.
@@ -431,8 +427,8 @@ uv run uvicorn mantisnet.deck.app:app --host 0.0.0.0 --port 8000
 | `__init__.py` | Public exports: model, builder, losses, representation constants |
 | `model.py` | `MantisConfig`, `MantisNet` trunk, policy/action-value/state-value heads, `ModelOutput` |
 | `builder.py` | Position-to-graph representation, Rust batch conversion, collation, version constants |
-| `cell_latents.py` | Step 15 typed legal-cell/window attention table derivation |
-| `cell_nodes.py` | Step 13 radius/adjacency edge plans on the typed cell-attention kernels |
+| `cell_latents.py` | Typed legal-cell/window attention table derivation |
+| `cell_nodes.py` | Radius/adjacency edge plans on the typed cell-attention kernels |
 | `attention.py` | Fused block-diagonal multi-head attention (§5.3) with Triton kernels and reference path |
 | `row_encoder.py` | Action-row encoder: 729-class post-placement window rows for both decoder heads |
 | `window_latents.py` | Fused ragged window-latent read/broadcast cycle for the state latents |

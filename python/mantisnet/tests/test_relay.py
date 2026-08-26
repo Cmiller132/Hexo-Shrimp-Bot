@@ -173,7 +173,7 @@ def test_kernel_gradients_match_the_spec(positions, dtype):
 
 @_CUDA
 def test_kernel_is_deterministic(positions):
-    # The segment reductions replace the old nondeterministic atomic
+    # The segment reductions accumulate in a fixed order, unlike an atomic
     # ``index_add_``: two identical passes must agree bitwise.
     batch = _batch(positions)
     tables = _tables(batch, "cuda")

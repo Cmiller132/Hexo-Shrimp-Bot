@@ -591,7 +591,7 @@ class Telemetry:
         return match_id
 
     def write_crossplay(self, results: list[dict], *, ply_cap: int, seed: int) -> None:
-        """The A7 matrix, replacing the last one — the same wholesale
+        """The crossplay matrix, replacing the last one — the same wholesale
         semantics `crossplay.json` has."""
         with self._conn:
             self._conn.execute("DELETE FROM crossplay")

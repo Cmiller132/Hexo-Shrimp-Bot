@@ -1,4 +1,4 @@
-"""Fused ragged attention for the Step 2 window-latent cycle.
+"""Fused ragged attention for the window-latent cycle.
 
 The read maps each position's flat window run into its four latent queries;
 the broadcast maps every flat window query back over those four latents. CUDA
@@ -388,7 +388,7 @@ if triton is not None:
     ):
         # All four slots sit in one tile, so alpha and dalpha rebuild in
         # registers and delta = sum(alpha * dalpha) — the softmax-backward
-        # constant the old path formed from the saved output rows — lands in
+        # constant, formed per edge so no output row is needed — lands in
         # a buffer for the latent-side sweep.
         pid = tl.program_id(0)
         window = pid // HEADS

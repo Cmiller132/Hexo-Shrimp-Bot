@@ -1,7 +1,7 @@
 """Checkpoint-family compatibility for the MantisNet laboratory.
 
-Identifies a checkpoint's historical critic format and loads it with its
-native readout, without guessing how an experimental head behaved.
+Identifies a checkpoint's critic format and loads it with that format's own
+readout, rather than guessing how a different head behaved.
 """
 
 from __future__ import annotations
@@ -210,9 +210,9 @@ _BLOCK_SUFFIXES = {
 }
 
 # Trunk-stage parameter groups: the relay (§5.1b), typed window attention
-# (§5.1c), and joint incidence classes are baked into this build. The profile is still read off the state dict so an
-# unexpected checkpoint shape refuses with its actual profile named, rather
-# than a key-set mismatch.
+# (§5.1c), and joint incidence classes are baked into this build. The profile
+# is still read off the state dict so an unexpected checkpoint shape refuses
+# with its actual profile named, rather than a key-set mismatch.
 _CP_SUFFIXES = {
     "ln_cp_in.weight", "ln_cp_in.bias", "u_cp.weight", "e_cp.weight",
     "ln_cp_w.weight", "ln_cp_w.bias", "mlp_cp.lin_a.weight",
@@ -262,7 +262,7 @@ _CELL_STRUCTURE_SUFFIXES = {
     "mlp_c.lin_a.weight", "mlp_c.lin_a.bias", "mlp_c.lin_b.weight",
     "mlp_c.out.weight", "mlp_c.out.bias",
 }
-# Step 5/6 knob keys live on the model, not the blocks.
+# Tactical knob keys live on the model, not the blocks.
 _TACTICAL_KEYS = {
     "tactical_a.weight", "tactical_a.bias",
     "tactical_out.weight", "tactical_out.bias",
@@ -561,12 +561,11 @@ def infer_config(
 ) -> MantisConfig:
     """Recover every tensor-backed MantisConfig field from a state dict.
 
-    The dict must carry every baked trunk stage; a knob-era or pre-knob
-    checkpoint (missing relay or §5.1c tensors, or three-row incidence
-    tables) names its actual profile in the refusal. ``heads`` is a
-    fallback from a recorded config: with every per-head knob off, no
-    tensor carries the head count, and inference without either source
-    refuses.
+    The dict must carry every baked trunk stage; an older checkpoint (missing
+    relay or §5.1c tensors, or three-row incidence tables) names its actual
+    profile in the refusal. ``heads`` is a fallback from a recorded config:
+    with every per-head knob off, no tensor carries the head count, and
+    inference without either source refuses.
     """
 
     stone = _require_tensor(state_dict, "stone_table.weight")
@@ -595,9 +594,9 @@ def infer_config(
     )
     if knobs != expected:
         raise _baked_profile_error(knobs)
-    # No unconditional per-head tensor survives the §4.1 bias removal, so
-    # the head count comes from whichever knob's per-head bias is present,
-    # falling back to the recorded-config hint.
+    # Stone attention carries no per-head pair bias (§4.1), so no
+    # unconditional tensor names the head count: it comes from whichever
+    # knob's per-head bias is present, falling back to the recorded config.
     source = None
     for name in ("cr_bias", "radius_bias", "adj_bias"):
         bias = state_dict.get(f"blocks.0.{name}")
@@ -791,9 +790,9 @@ def load_checkpoint(
     raw = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if not isinstance(raw, Mapping) or not isinstance(raw.get("model"), Mapping):
         raise ValueError(f"{checkpoint_path} is not a production checkpoint with a model state dict")
-    # Historical family checkpoints may carry these two exact per-block keys.
-    # They never affected a softmax output, so the lab can score the checkpoint
-    # exactly after dropping them. Ordinary KLENT loaders remain strict.
+    # Older checkpoints may carry these two exact per-block keys. They never
+    # affected a softmax output, so the lab can score the checkpoint exactly
+    # after dropping them. Ordinary KLENT loaders remain strict.
     state = _drop_dead_key_biases(raw["model"])
     blocks = _block_count(state)
     if blocks is not None:

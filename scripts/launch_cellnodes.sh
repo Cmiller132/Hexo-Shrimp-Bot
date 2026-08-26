@@ -1,17 +1,14 @@
 #!/bin/bash
-# cellnodes-1: KLENT successor carrying Step 13 cell nodes at the `all` scope.
+# Launch cellnodes-1: KLENT at the production cell-node configuration
+# (`cell_latents`, `cell_nodes`, scope `all`), initialized from a supervised
+# lab cell. The reference recipe is passed explicitly, as it must be on every
+# launch: the CLI defaults are the paper's coefficients and differ.
 #
-# Same recipe as stack-939 and newmodeltest wherever the recipe is the science:
-# tau/lam/mass_floor/lam_ret/gamma/lr, games/envs/batch/cap, eval cadence, seed.
-# The chunk budgets are smaller than newmodeltest's because the measured fit
-# path costs 1.64 GiB more with cell nodes (6.27 vs 4.64 GiB on the pinned
-# instrument) and newmodeltest already ran at 11.2-11.9 GiB of a 12 GiB card.
-# Chunking changes memory and speed only - gradients and metrics are identical
-# for any chunking - so this buys headroom below the paging cliff and costs
-# nothing else.
+# The chunk budgets change memory and speed only - gradients and metrics are
+# identical for any chunking.
 #
-# STRIX_SEAT_ADDR must be set: the strix seat is a client of the WSL-side
-# bridge, and an unset address is what killed newmodeltest at iteration 25.
+# STRIX_SEAT_ADDR must be set: the strix eval seat reaches the WSL-side bridge
+# through it, and `set -u` aborts the launch when it is unset.
 set -eu
 cd /workspace/python/mantisnet
 export VIRTUAL_ENV=/opt/venv

@@ -1,27 +1,18 @@
 #!/bin/bash
-# confirm-1: the Round-3 confirmation run of the round-1 integration tree —
-# the tactical-1 configuration on the tree carrying the orbit48 residual bias
-# vocabulary and the S7 cell-table trim (MODEL_REPR_VERSION 9). Round 1 of
-# screen v2 kept no new knob, so the model configuration is unchanged from
-# tactical-1; what this run confirms is the tree.
+# Launch confirm-1: KLENT at the production cell-node configuration plus
+# `action_tactical`, at MODEL_REPR_VERSION 9, initialized from a supervised
+# lab cell. The reference recipe is passed explicitly, as it must be on every
+# launch: the CLI defaults are the paper's coefficients and differ.
 #
-# Same recipe as tactical-1 wherever the recipe is the science:
-# tau/lam/mass_floor/lam_ret/gamma/lr, games/envs/batch/cap, eval cadence,
-# lean chunk budgets (2M/125k fit, 6M/600k collect — chunking changes memory
-# and speed only; gradients and metrics are identical for any chunking).
-#
-# The initialization is the screen-v2 fixture seed-0 cell: 4 epochs over the
-# full 1M-position train split on the integration tree, the strongest of the
-# six fixture seeds on the scored val split (policy NLL 1.8270, critic CE
-# 0.6168, top-1 0.4923) — the same prefit-from-screen-cell pattern that
-# seeded cellnodes-1 and tactical-1.
+# The chunk budgets change memory and speed only - gradients and metrics are
+# identical for any chunking.
 #
 # hexo_py is rebuilt unconditionally: the image's venv may carry a wheel from
 # an older tree, and an importable-but-stale extension would otherwise pass
 # the import probe and fail only at the version assert.
 #
-# STRIX_SEAT_ADDR must be set: the strix seat is a client of the WSL-side
-# bridge, and an unset address is what killed newmodeltest at iteration 25.
+# STRIX_SEAT_ADDR must be set: the strix eval seat reaches the WSL-side bridge
+# through it, and `set -u` aborts the launch when it is unset.
 set -eu
 cd /workspace/python/mantisnet
 export VIRTUAL_ENV=/opt/venv

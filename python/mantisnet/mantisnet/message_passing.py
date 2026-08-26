@@ -331,7 +331,7 @@ _CLASS_GRAD_SLICES = 8
 def _row_sum_reference(
     table: Tensor, gather: Tensor, runs: Tensor, n_dest: int
 ) -> Tensor:
-    """Literal gather/scatter row sum: the pre-kernel formulation."""
+    """Literal gather/scatter row sum."""
     rows = table.index_select(0, gather).float()
     out = torch.zeros(
         n_dest, table.shape[1], dtype=torch.float32, device=table.device

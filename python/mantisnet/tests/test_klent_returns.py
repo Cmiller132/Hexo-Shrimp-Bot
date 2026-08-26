@@ -1,5 +1,5 @@
 """``KLENT_FOR_HEXO.md`` §1.2/§1.3: the sign function and the λ-return,
-pinned per ``KLENT_FOR_HEXO.md`` §1.4.
+pinned per ``KLENT_FOR_HEXO.md`` §1.
 
 The engine cross-check is the one test that catches a parity implementation
 (K1): the sign derived from the phase is compared against the mover actually
@@ -117,7 +117,7 @@ def test_fp32_summation_slack_is_accepted_and_a_real_excursion_is_not():
     slack; an excursion a real error would produce is still refused."""
     signs = signs_from_moves_remaining([1, 1, 2])
     ulps = np.nextafter(np.float32(1.0), np.float32(2.0)) - np.float32(1.0)
-    just_over = 1.0 + 100 * float(ulps)  # ~1.2e-5, the measured magnitude
+    just_over = 1.0 + 100 * float(ulps)  # ~1.2e-5, the size of the fp32 slack
     g = lambda_returns(signs, [0.0, -just_over, just_over], 0.939, 0.99)
     assert np.abs(g).max() <= 1.0 + 1e-4
     assert np.abs(g).max() > 1.0 - 1e-2  # the slack propagated, not clipped away

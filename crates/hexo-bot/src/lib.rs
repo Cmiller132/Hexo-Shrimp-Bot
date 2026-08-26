@@ -8,7 +8,7 @@
 //! # Public operations
 //!
 //! [`init_checkpoint`], [`train`], [`play_match`], and [`serve`] are the whole
-//! surface. `play` remains forbidden until §15 names its foreign harness.
+//! surface. `play` is absent: §15 names no foreign harness.
 //!
 //! # The shape of a run
 //!

@@ -32,7 +32,7 @@ WINDOW_LEN = 6
 AXES = np.array([[1, 0], [0, 1], [1, -1]], dtype=np.int64)
 ORBIT48_CLASSES = 48
 CELL_NEAREST_UNREACHED = 9
-# Step 5: deterministic tactical scalars per legal action, all in [0, 1].
+# Deterministic tactical scalars per legal action, all in [0, 1].
 TACTICAL_FEATURES = 11
 # Global opponent-threat counts saturate here before normalization.
 _GLOBAL_THREAT_CAP = 8
@@ -185,7 +185,7 @@ def _tern_pattern_class_counts() -> np.ndarray:
 TERN_PATTERN_CLASS_COUNTS = _tern_pattern_class_counts()
 
 
-# --- Step 4 action-row tables (MANTIS_GRAFT_SPEC §4, Step 4).
+# --- Action-row tables.
 #
 # Every legal action has 18 hypothetical post-placement windows (3 axes x 6
 # candidate slots with an own stone inserted at the action cell). The
@@ -277,7 +277,7 @@ class PositionGraph:
     action_window_index: np.ndarray
     action_post1_class: np.ndarray
     action_pre_status: np.ndarray
-    # Step 5 tactical scalars, (n_legal, TACTICAL_FEATURES) float32 in [0, 1].
+    # Tactical scalars, (n_legal, TACTICAL_FEATURES) float32 in [0, 1].
     action_tactical: np.ndarray
 
     @property
@@ -296,14 +296,14 @@ def _action_tables(
     stone_own: np.ndarray,
     live_key: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """The Step 4 row tables: 18 hypothetical post-placement windows per action.
+    """The row tables: 18 hypothetical post-placement windows per action.
 
     Each legal cell's 11-cell line per axis is read once; candidate slot ``k``
     is the window starting ``k`` steps before the cell. The emitted window
     index refers to the all-nonempty kept-window list. Agreement between status
-    and index is asserted, mirroring the donor's walk-consistency check.
+    and index is asserted.
 
-    The fourth table is the Step 5 tactical vector: ``TACTICAL_FEATURES``
+    The fourth table is the tactical vector: ``TACTICAL_FEATURES``
     deterministic scalars per action, derived from the same rows. A threat
     window is opponent-only; the global threat census deduplicates threat
     windows over the row table, which covers every one because a threat
@@ -728,7 +728,7 @@ class Batch:
     act_class: torch.Tensor  # (E_d,) long, < TERN_POST1_CLASSES
     act_rev: torch.Tensor  # (E_d,) long: window-major edge order
     act_empty: torch.Tensor  # (N_c, 3) long: EMPTY rows per orbit
-    # Step 5 deterministic tactical scalars, one row per legal cell.
+    # Deterministic tactical scalars, one row per legal cell.
     act_tactical: torch.Tensor  # (N_c, TACTICAL_FEATURES) float32 in [0, 1]
 
     def to(self, device) -> "Batch":
@@ -838,7 +838,7 @@ _ACTION_SLOT_ORBIT = np.minimum(np.arange(WINDOW_LEN), WINDOW_LEN - 1 - np.arang
 
 
 def _action_fields(graphs: list[PositionGraph], dec_window: torch.Tensor) -> dict:
-    """The Step 4 collated views, from the per-position dense row tables.
+    """The collated action-row views, from the per-position dense row tables.
 
     The kept-row/decoder bijection is asserted per position — the two tables
     come from the same walk, and a silent divergence here would misclass every

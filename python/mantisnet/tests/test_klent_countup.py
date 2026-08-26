@@ -1,5 +1,5 @@
 """The two-placements-per-turn Count Up Game
-(``KLENT_FOR_HEXO.md`` §1.4).
+(``KLENT_FOR_HEXO.md`` §1).
 
 A finite game with Hexo's mover pattern — one opening placement, then two per
 turn — permits exact solution. ``improved_policy`` must converge to the

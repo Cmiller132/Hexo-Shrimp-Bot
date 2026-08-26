@@ -1,4 +1,4 @@
-"""Structural alias diagnostic (MANTIS_GRAFT_SPEC §4 Step 4; donor ACT §33).
+"""Structural alias diagnostic over the action-row inputs.
 
 Two legal actions of one position alias when all 18 post-placement row classes
 are identical, with EMPTY rows represented by their slot orbits. The model
