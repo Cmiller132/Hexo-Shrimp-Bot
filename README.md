@@ -80,9 +80,8 @@ The project's document set. Normative specifications:
 | [KLENT_FOR_HEXO.md](docs/KLENT_FOR_HEXO.md) | KLENT training path for Hexo |
 | [MANTIS_GRAFT_SPEC.md](docs/MANTIS_GRAFT_SPEC.md) | The stepwise architecture campaign: gates, screens, and owner-verdict protocol |
 
-Reference documents: [KLENT_PAPER.md](docs/KLENT_PAPER.md) (the source
-algorithm) and [ABLATIONS.md](docs/ABLATIONS.md) (the measured experimental
-record, including each campaign step's disposition).
+Reference document: [KLENT_PAPER.md](docs/KLENT_PAPER.md) (the source
+algorithm).
 
 ### `.github/workflows/`
 

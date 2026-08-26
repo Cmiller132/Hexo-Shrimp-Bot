@@ -41,10 +41,9 @@ quietly resolve in whichever direction is less work.
 
 **The training CLI defaults to the paper's coefficients, not the reference
 recipe.** A flagless `python -m mantisnet.klent.run` trains at γ = 1.0,
-λ = 0.03 — a configuration `docs/ABLATIONS.md` records as degenerate on Hexo.
-The reference recipe must be passed explicitly on every launch:
-`--gamma 0.99 --lam 0.01 --lam-ret 0.939`. Deliberate (owner ruling
-2026-07-29): defaults stay paper-faithful, deviations are always spelled out.
+λ = 0.03 — degenerate on Hexo. The reference recipe must be passed explicitly
+on every launch: `--gamma 0.99 --lam 0.01 --lam-ret 0.939`. Deliberate:
+defaults stay paper-faithful, deviations are always spelled out.
 
 ## How to write code here
 
@@ -63,8 +62,9 @@ Fail loudly. Missing or unexpected input is an error, never a silently
 substituted default.
 
 Comments say what the code does and why it does it that way, not the story of
-how it got there. Keep each crate's `README.md` current. Prune `docs/` when a
+how it got there — no run history, no measured values, no experiment
+references. Keep each crate's `README.md` current. Prune `docs/` when a
 document stops being true — but prune deliberately, not aggressively. Docs and
-READMEs are pure contract: measured results live in `docs/ABLATIONS.md`, open
-questions in `docs/KLENT_FOR_HEXO.md`, and run history in neither comments nor
-READMEs.
+READMEs are pure contract, and slim: document writes carry a high barrier to
+entry — only claims backed by statistically significant measurement, no
+hypotheses, no best-guess narratives, no run history.
